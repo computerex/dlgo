@@ -1,0 +1,39 @@
+# Model files
+*.gguf
+*.ggml
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Test data (generated)
+testdata/*.gguf
+testdata/*.ggml
+testdata/*.wav
+
+# Go build
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Cursor
+.cursor/
+
+# Misc
+*.log
+*.prof
+*.test
