@@ -22,8 +22,10 @@ var archRegistry = map[string]ArchDescriptor{
 	"gemma":     {RopeNeox: true, FFNGelu: true, EmbedScaleMode: "sqrt_dim", ChatTemplate: "gemma"},
 	"gemma2":    {RopeNeox: true, FFNGelu: true, EmbedScaleMode: "sqrt_dim", ChatTemplate: "gemma"},
 	"gemma3":    {RopeNeox: true, FFNGelu: true, EmbedScaleMode: "sqrt_dim", ChatTemplate: "gemma"},
+	"phi2":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"phi3":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"mistral":   {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "llama2"},
+	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.

@@ -143,31 +143,31 @@ func (wp *WorkerPool) Shutdown() {
 
 // PrecomputeRoPE fills RunState with precomputed cos/sin tables for RoPE.
 // maxSeqLen: maximum sequence length; ropeDim, headDim: dimensions; freqBase: RoPE frequency base.
-// neox: true for GPT-NeoX/Qwen split-half pairing, false for LLaMA interleaved.
+// ropeDim may be less than headDim for partial RoPE (e.g. Phi-2: 32 of 80).
 func (rs *RunState) PrecomputeRoPE(maxSeqLen, ropeDim, headDim int, freqBase float32) {
 	if maxSeqLen <= 0 || headDim <= 0 {
 		return
 	}
-	if ropeDim <= 0 {
+	if ropeDim <= 0 || ropeDim > headDim {
 		ropeDim = headDim
 	}
-	half := headDim / 2
+	half := ropeDim / 2
 	if half <= 0 {
 		return
 	}
 	rs.ropeHeadDim = headDim
-	rs.ropeNeox = false // use SetRopeNeox(true) for Qwen/NeoX style
+	rs.ropeDim = ropeDim
+	rs.ropeNeox = false
 	rs.ropeCos = make([]float32, maxSeqLen*half)
 	rs.ropeSin = make([]float32, maxSeqLen*half)
 	for pos := 0; pos < maxSeqLen; pos++ {
 		for i := 0; i < half; i++ {
-			theta := 1.0 / math.Pow(float64(freqBase), float64(2*i)/float64(headDim))
+			theta := 1.0 / math.Pow(float64(freqBase), float64(2*i)/float64(ropeDim))
 			angle := float64(pos) * theta
 			rs.ropeCos[pos*half+i] = float32(math.Cos(angle))
 			rs.ropeSin[pos*half+i] = float32(math.Sin(angle))
 		}
 	}
-	_ = ropeDim // reserved for partial RoPE; full rotation uses headDim
 }
 
 // SetRopeNeox sets whether to use NeoX-style (split-half) RoPE pairing.
@@ -178,12 +178,16 @@ func (rs *RunState) SetRopeNeox(neox bool) {
 
 // ApplyRoPEFast applies precomputed RoPE to vec in-place.
 // vec must be one head's worth [headDim]; pos is the token position.
-// PrecomputeRoPE must have been called first.
+// Only the first ropeDim dimensions are rotated; the rest pass through unchanged.
 func (rs *RunState) ApplyRoPEFast(vec []float32, pos int) {
 	if rs.ropeCos == nil || rs.ropeSin == nil || len(vec) < rs.ropeHeadDim {
 		return
 	}
-	half := rs.ropeHeadDim / 2
+	rd := rs.ropeDim
+	if rd <= 0 {
+		rd = rs.ropeHeadDim
+	}
+	half := rd / 2
 	base := pos * half
 	if base+half > len(rs.ropeCos) {
 		return

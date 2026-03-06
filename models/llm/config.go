@@ -20,6 +20,7 @@ type ModelConfig struct {
 	RMSNormEps    float32
 	RopeFreqBase  float32
 	RopeNeox      bool
+	RopeDim       int      // partial RoPE: 0 = full headDim, else only first RopeDim dims
 	BOS           int32
 	EOS           int32
 	StopTokens    []int32
@@ -27,6 +28,14 @@ type ModelConfig struct {
 	FFNGelu       bool     // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
 	EmbedScale    float32  // non-zero = scale embeddings (Gemma: sqrt(dim))
 	ChatTemplate  string   // chat format: "chatml", "llama2", "llama3", "gemma", "phi"
+
+	// Qwen3.5 hybrid Mamba/Attention
+	FullAttentionInterval int // 0 = all attention; N = every Nth layer is attention
+	SSMConvKernel         int
+	SSMInnerSize          int
+	SSMStateSize          int
+	SSMTimeStepRank       int
+	SSMGroupCount         int
 }
 
 // parseConfig extracts a ModelConfig from GGUF metadata.
@@ -47,6 +56,12 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		vocabSize = 32000
 	}
 
+	// Norm epsilon: try RMSNorm key first, then LayerNorm key (Phi-2)
+	normEps := metaFloat(md, arch+".attention.layer_norm_rms_epsilon", 0)
+	if normEps == 0 {
+		normEps = metaFloat(md, arch+".attention.layer_norm_epsilon", 1e-5)
+	}
+
 	c := ModelConfig{
 		Architecture:  arch,
 		VocabSize:     vocabSize,
@@ -57,11 +72,18 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		NumHeads:      metaInt(md, arch+".attention.head_count", 0),
 		NumKVHeads:    metaInt(md, arch+".attention.head_count_kv", 0),
 		HeadDim:       metaInt(md, arch+".attention.key_length", 0),
-		RMSNormEps:    metaFloat(md, arch+".attention.layer_norm_rms_epsilon", 1e-5),
+		RMSNormEps:    normEps,
 		RopeFreqBase:  metaFloat(md, arch+".rope.freq_base", 10000.0),
 		BOS:           int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
 		EOS:           int32(metaInt(md, "tokenizer.ggml.eos_token_id", 2)),
 		AddBOS:        metaBool(md, "tokenizer.ggml.add_bos_token", true),
+
+		FullAttentionInterval: metaInt(md, arch+".full_attention_interval", 0),
+		SSMConvKernel:         metaInt(md, arch+".ssm.conv_kernel", 4),
+		SSMInnerSize:          metaInt(md, arch+".ssm.inner_size", 0),
+		SSMStateSize:          metaInt(md, arch+".ssm.state_size", 0),
+		SSMTimeStepRank:       metaInt(md, arch+".ssm.time_step_rank", 0),
+		SSMGroupCount:         metaInt(md, arch+".ssm.group_count", 0),
 	}
 
 	if c.EmbeddingDim == 0 {
@@ -78,6 +100,10 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	}
 	if c.HeadDim == 0 {
 		c.HeadDim = c.EmbeddingDim / c.NumHeads
+	}
+	c.RopeDim = metaInt(md, arch+".rope.dimension_count", 0)
+	if c.RopeDim == 0 || c.RopeDim > c.HeadDim {
+		c.RopeDim = c.HeadDim
 	}
 
 	applyArchDefaults(&c)

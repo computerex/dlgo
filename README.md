@@ -21,15 +21,16 @@ fmt.Println(response) // "The capital of France is Paris."
 
 | Architecture | Models Tested | Throughput |
 |---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | ~25 tok/s |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | ~31 tok/s |
 | Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | ~30–40 tok/s |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | ~12–16 tok/s |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | ~12 tok/s |
-| Phi | Phi-3/4 | — |
-| Mistral | Mistral 7B | — |
-| Whisper | Tiny, Base, Small | — |
+| Qwen3.5 | Qwen3.5 2B (hybrid GDN+attention) | ~16 tok/s |
+| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | ~12–18 tok/s |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | ~15 tok/s |
+| Phi | Phi-2, Phi-4-mini | ~8–9 tok/s |
+| Mistral | Mistral (llama-compatible) | — |
+| Whisper | Tiny, Base, Small (speech-to-text) | — |
 
-Throughput measured on a single CPU core with Q4_K_M/Q8_0 quantization.
+Throughput measured on a single CPU thread with Q4_K_M quantization.
 
 ## Install
 
@@ -119,7 +120,7 @@ examples/        Ready-to-run examples
 
 1. **GGUF parser** reads model metadata and tensor locations from the file
 2. **Quantized tensors** stay in their compressed format in memory — only dequantized on the fly during matrix multiplication
-3. **Forward pass** runs the full transformer: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm
+3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, and hybrid SSM/attention (Gated Delta Net)
 4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA for fused dequant-dot-product kernels
 5. **Parallel matmul** distributes rows across a persistent worker pool for large projections
 6. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty

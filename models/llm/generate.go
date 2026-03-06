@@ -91,6 +91,9 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 	}
 
 	p.KVCache.Reset()
+	if p.RunState.SSMState != nil {
+		p.RunState.SSMState.Reset()
+	}
 
 	var generated []int32
 	var recentTokens []int32
@@ -206,6 +209,9 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 	}
 
 	p.KVCache.Reset()
+	if p.RunState.SSMState != nil {
+		p.RunState.SSMState.Reset()
+	}
 
 	// Prefill
 	prefillStart := time.Now()
@@ -306,6 +312,9 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 	}
 
 	p.KVCache.Reset()
+	if p.RunState.SSMState != nil {
+		p.RunState.SSMState.Reset()
+	}
 	stopStrings := collectStopStrings(p.Model.Config)
 
 	for i, tok := range tokens {
