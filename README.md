@@ -123,7 +123,3 @@ examples/        Ready-to-run examples
 4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA for fused dequant-dot-product kernels
 5. **Parallel matmul** distributes rows across a persistent worker pool for large projections
 6. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty
-
-## License
-
-MIT
