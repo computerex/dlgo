@@ -8,6 +8,38 @@ func SIMDDotProduct(data []byte, ggmlType uint32, x []float32, n int) float32 {
 	return FusedDotProduct(data, ggmlType, x, n)
 }
 
+func SIMDDotProductMany(data []byte, ggmlType uint32, xFlat []float32, cols int, out []float32, nvecs int) {
+	for i := 0; i < nvecs; i++ {
+		out[i] = FusedDotProduct(data, ggmlType, xFlat[i*cols:(i+1)*cols], cols)
+	}
+}
+
+func SIMDDotProductManyRows(data []byte, ggmlType uint32, xFlat []float32, cols int, out []float32, nrows int, bytesPerRow int, nvecs int) {
+	for r := 0; r < nrows; r++ {
+		rowData := data[r*bytesPerRow : (r+1)*bytesPerRow]
+		SIMDDotProductMany(rowData, ggmlType, xFlat, cols, out[r*nvecs:(r+1)*nvecs], nvecs)
+	}
+}
+
+func SIMDDotProductQ8K(data []byte, ggmlType uint32, xQ8K []byte, cols int) float32 {
+	x := DequantizeQ8_K(xQ8K, cols)
+	return FusedDotProduct(data, ggmlType, x, cols)
+}
+
+func SIMDDotBatchQ8K(data []byte, ggmlType uint32, xQ8K []byte, cols int, out []float32, nrows int, bytesPerRow int) {
+	x := DequantizeQ8_K(xQ8K, cols)
+	SIMDDotBatch(data, ggmlType, x, cols, out, nrows, bytesPerRow)
+}
+
+func SIMDDotProductQ8KManyRows(data []byte, ggmlType uint32, xQ8KFlat []byte, cols int, out []float32, nrows int, bytesPerRow int, nvecs int, xBytes int) {
+	for r := 0; r < nrows; r++ {
+		rowData := data[r*bytesPerRow : (r+1)*bytesPerRow]
+		for v := 0; v < nvecs; v++ {
+			out[r*nvecs+v] = SIMDDotProductQ8K(rowData, ggmlType, xQ8KFlat[v*xBytes:(v+1)*xBytes], cols)
+		}
+	}
+}
+
 func SIMDDotBatch(data []byte, ggmlType uint32, x []float32, cols int, out []float32, nrows int, bytesPerRow int) {
 	if nrows <= 0 {
 		return
@@ -37,6 +69,12 @@ func SIMDDotF32(a, b []float32, n int) float32 {
 		sum += a[i] * b[i]
 	}
 	return sum
+}
+
+func SIMDDotF32Many(a []float32, xFlat []float32, cols int, out []float32, nvecs int) {
+	for i := 0; i < nvecs; i++ {
+		out[i] = SIMDDotF32(a, xFlat[i*cols:(i+1)*cols], cols)
+	}
 }
 
 func SIMDDotF32Batch(aFlat []float32, x []float32, cols int, out []float32, nrows int) {

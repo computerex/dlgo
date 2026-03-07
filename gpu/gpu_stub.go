@@ -23,7 +23,7 @@ func MatVec(out, w, x Buf, rows, cols int, qtype uint32) error { return errNoGPU
 func RMSNorm(out, x, w Buf, n int, eps float32) error          { return errNoGPU }
 func RMSNormHeads(data, w Buf, nh, hd int, eps float32) error { return errNoGPU }
 func Softmax(Buf, int) error               { return errNoGPU }
-func RoPE(q, k Buf, nh, nkv, hd, pos int, fb float32, neox bool) error { return errNoGPU }
+func RoPE(q, k Buf, nh, nkv, hd, rd, pos int, fb float32, neox bool) error { return errNoGPU }
 func SwiGLU(out, gate, up Buf, n int) error { return errNoGPU }
 func GeGLU(out, gate, up Buf, n int) error  { return errNoGPU }
 func GELU(Buf, int) error                   { return errNoGPU }

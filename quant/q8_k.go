@@ -35,3 +35,51 @@ func DequantizeQ8_K(data []byte, n int) []float32 {
 	}
 	return result
 }
+
+// QuantizeQ8_K quantizes float32 values into GGML Q8_K blocks.
+// Each 256-value block uses one shared scale and 16 block sums.
+func QuantizeQ8_K(x []float32) []byte {
+	if len(x)%BlockSizeQ8_K != 0 {
+		panic("QuantizeQ8_K: input length must be a multiple of 256")
+	}
+	out := make([]byte, (len(x)/BlockSizeQ8_K)*BlockBytesQ8_K)
+	for block := 0; block < len(x)/BlockSizeQ8_K; block++ {
+		base := block * BlockSizeQ8_K
+		off := block * BlockBytesQ8_K
+
+		maxAbs := float32(0)
+		for i := 0; i < BlockSizeQ8_K; i++ {
+			v := float32(math.Abs(float64(x[base+i])))
+			if v > maxAbs {
+				maxAbs = v
+			}
+		}
+		d := float32(1.0)
+		if maxAbs > 0 {
+			d = maxAbs / 127.0
+		}
+		invD := float32(0)
+		if d != 0 {
+			invD = 1.0 / d
+		}
+		binary.LittleEndian.PutUint32(out[off:off+4], math.Float32bits(d))
+
+		for g := 0; g < 16; g++ {
+			sum := int16(0)
+			for i := 0; i < 16; i++ {
+				idx := base + g*16 + i
+				q := int32(math.Round(float64(x[idx] * invD)))
+				if q > 127 {
+					q = 127
+				}
+				if q < -128 {
+					q = -128
+				}
+				out[off+4+g*16+i] = byte(int8(q))
+				sum += int16(q)
+			}
+			binary.LittleEndian.PutUint16(out[off+260+g*2:off+260+g*2+2], uint16(sum))
+		}
+	}
+	return out
+}

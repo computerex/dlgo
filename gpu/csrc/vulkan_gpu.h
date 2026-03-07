@@ -41,6 +41,7 @@ typedef enum {
     PIPE_MATVEC_F16,
     PIPE_MATVEC_Q4_0,
     PIPE_MATVEC_Q8_0,
+    PIPE_MATVEC_Q3_K,
     PIPE_MATVEC_Q4_K,
     PIPE_MATVEC_Q5_0,
     PIPE_MATVEC_Q6_K,
@@ -99,7 +100,7 @@ int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float ep
 int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps);
 int gpu_softmax(GpuBuf buf, int n);
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int pos, float freq_base, int neox);
+             int head_dim, int rope_dim, int pos, float freq_base, int neox);
 int gpu_swiglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_geglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_gelu(GpuBuf buf, int n);

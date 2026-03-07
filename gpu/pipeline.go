@@ -211,7 +211,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	// Prefill: process prompt tokens one at a time on GPU
 	prefillStart := time.Now()
 	for i, tok := range tokens {
-		GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf)
+		if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+			return nil, err
+		}
 	}
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
@@ -244,7 +246,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			}
 		}
 
-		GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf)
+		if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+			return nil, err
+		}
 		pos++
 
 		nextToken = ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)

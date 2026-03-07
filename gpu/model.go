@@ -5,6 +5,7 @@ package gpu
 import (
 	"fmt"
 
+	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/quant"
 )
@@ -124,6 +125,13 @@ type GpuRunState struct {
 	Hidden   Buf // [ffnDim]
 	FFNOut   Buf // [dim]
 	Logits   Buf // [vocabSize]
+
+	// CPU scratch buffers used for correctness fallbacks when a quant type
+	// has no GPU kernel yet (for example Q3_K on Vulkan).
+	ScratchIn  []float32
+	ScratchOut []float32
+	ScratchAux []float32
+	Pool       *blas.Pool
 }
 
 // NewGpuRunState allocates all GPU activation buffers.
@@ -143,6 +151,7 @@ func NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize int) *GpuRunState {
 		Hidden:   Alloc(uint64(ffnDim * 4)),
 		FFNOut:   Alloc(uint64(dim * 4)),
 		Logits:   Alloc(uint64(vocabSize * 4)),
+		Pool:     blas.DefaultPool(),
 	}
 }
 

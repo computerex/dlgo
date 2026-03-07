@@ -13,6 +13,12 @@
 #define GET_PROC(lib, name) (void*)GetProcAddress((HMODULE)(lib), name)
 #define CLOSE_LIB(lib) FreeLibrary((HMODULE)(lib))
 typedef HMODULE LibHandle;
+#elif defined(__APPLE__)
+#include <dlfcn.h>
+#define LOAD_VULKAN() dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL)
+#define GET_PROC(lib, name) dlsym(lib, name)
+#define CLOSE_LIB(lib) dlclose(lib)
+typedef void* LibHandle;
 #else
 #include <dlfcn.h>
 #define LOAD_VULKAN() dlopen("libvulkan.so.1", RTLD_NOW)
@@ -30,10 +36,13 @@ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_ = NULL;
 #define VK_FUNC(name) static PFN_##name name##_ = NULL;
 VK_FUNC(vkCreateInstance)
 VK_FUNC(vkDestroyInstance)
+VK_FUNC(vkEnumerateInstanceExtensionProperties)
 VK_FUNC(vkEnumeratePhysicalDevices)
+VK_FUNC(vkEnumerateDeviceExtensionProperties)
 VK_FUNC(vkGetPhysicalDeviceProperties)
 VK_FUNC(vkGetPhysicalDeviceMemoryProperties)
 VK_FUNC(vkGetPhysicalDeviceQueueFamilyProperties)
+VK_FUNC(vkGetPhysicalDeviceFeatures2)
 VK_FUNC(vkCreateDevice)
 VK_FUNC(vkDestroyDevice)
 VK_FUNC(vkGetDeviceQueue)
@@ -148,6 +157,8 @@ static int load_vulkan(void) {
     if (!vkGetInstanceProcAddr_) { CLOSE_LIB(vk_lib); vk_lib = NULL; return GPU_ERR_NO_VULKAN; }
 
     vkCreateInstance_ = (PFN_vkCreateInstance)vkGetInstanceProcAddr_(NULL, "vkCreateInstance");
+    vkEnumerateInstanceExtensionProperties_ = (PFN_vkEnumerateInstanceExtensionProperties)
+        vkGetInstanceProcAddr_(NULL, "vkEnumerateInstanceExtensionProperties");
     vkEnumeratePhysicalDevices_ = (PFN_vkEnumeratePhysicalDevices)vkGetInstanceProcAddr_(NULL, "vkEnumeratePhysicalDevices");
     return GPU_OK;
 }
@@ -155,10 +166,12 @@ static int load_vulkan(void) {
 static void load_instance_funcs(VkInstance inst) {
     #define LOAD(name) name##_ = (PFN_##name)vkGetInstanceProcAddr_(inst, #name);
     LOAD(vkDestroyInstance)
+    LOAD(vkEnumerateDeviceExtensionProperties)
     LOAD(vkEnumeratePhysicalDevices)
     LOAD(vkGetPhysicalDeviceProperties)
     LOAD(vkGetPhysicalDeviceMemoryProperties)
     LOAD(vkGetPhysicalDeviceQueueFamilyProperties)
+    LOAD(vkGetPhysicalDeviceFeatures2)
     LOAD(vkCreateDevice)
     LOAD(vkDestroyDevice)
     LOAD(vkGetDeviceQueue)
@@ -209,6 +222,48 @@ static void load_instance_funcs(VkInstance inst) {
 
     vkCmdPushDescriptorSetKHR_ = (PFN_vkCmdPushDescriptorSetKHR)
         vkGetInstanceProcAddr_(g.instance, "vkCmdPushDescriptorSetKHR");
+}
+
+static int has_instance_extension(const char* name) {
+    if (!vkEnumerateInstanceExtensionProperties_) return 0;
+    uint32_t count = 0;
+    if (vkEnumerateInstanceExtensionProperties_(NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+        return 0;
+    }
+    VkExtensionProperties* exts = (VkExtensionProperties*)calloc(count, sizeof(VkExtensionProperties));
+    if (!exts) return 0;
+    int found = 0;
+    if (vkEnumerateInstanceExtensionProperties_(NULL, &count, exts) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(exts[i].extensionName, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(exts);
+    return found;
+}
+
+static int has_device_extension(VkPhysicalDevice dev, const char* name) {
+    if (!vkEnumerateDeviceExtensionProperties_) return 0;
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties_(dev, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+        return 0;
+    }
+    VkExtensionProperties* exts = (VkExtensionProperties*)calloc(count, sizeof(VkExtensionProperties));
+    if (!exts) return 0;
+    int found = 0;
+    if (vkEnumerateDeviceExtensionProperties_(dev, NULL, &count, exts) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(exts[i].extensionName, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(exts);
+    return found;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,17 +378,43 @@ int gpu_init(void) {
 
     VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+#ifdef __APPLE__
+    const char* instance_extensions[2];
+    uint32_t instance_extension_count = 0;
+    if (has_instance_extension("VK_KHR_get_physical_device_properties2")) {
+        instance_extensions[instance_extension_count++] = "VK_KHR_get_physical_device_properties2";
+    }
+    if (has_instance_extension("VK_KHR_portability_enumeration")) {
+        instance_extensions[instance_extension_count++] = "VK_KHR_portability_enumeration";
+        ici.flags |= 0x00000001; /* VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR */
+    }
+    ici.enabledExtensionCount = instance_extension_count;
+    ici.ppEnabledExtensionNames = instance_extensions;
+#endif
 
-    if (vkCreateInstance_(&ici, NULL, &g.instance) != VK_SUCCESS) return GPU_ERR_INIT_FAIL;
+    VkResult vkr = vkCreateInstance_(&ici, NULL, &g.instance);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkCreateInstance failed: %d\n", (int)vkr);
+        return GPU_ERR_INIT_FAIL;
+    }
     load_instance_funcs(g.instance);
 
     // Pick physical device (prefer discrete GPU)
     uint32_t dev_count = 0;
-    vkEnumeratePhysicalDevices_(g.instance, &dev_count, NULL);
+    vkr = vkEnumeratePhysicalDevices_(g.instance, &dev_count, NULL);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkEnumeratePhysicalDevices(count) failed: %d\n", (int)vkr);
+        return GPU_ERR_INIT_FAIL;
+    }
     if (dev_count == 0) return GPU_ERR_NO_DEVICE;
 
     VkPhysicalDevice* devs = (VkPhysicalDevice*)calloc(dev_count, sizeof(VkPhysicalDevice));
-    vkEnumeratePhysicalDevices_(g.instance, &dev_count, devs);
+    vkr = vkEnumeratePhysicalDevices_(g.instance, &dev_count, devs);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkEnumeratePhysicalDevices(list) failed: %d\n", (int)vkr);
+        free(devs);
+        return GPU_ERR_INIT_FAIL;
+    }
 
     g.physical_device = devs[0];
     for (uint32_t i = 0; i < dev_count; i++) {
@@ -372,29 +453,58 @@ int gpu_init(void) {
     dqci.queueCount = 1;
     dqci.pQueuePriorities = &priority;
 
+    VkPhysicalDeviceVulkan12Features avail12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan11Features avail11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 availFeatures2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    availFeatures2.pNext = &avail11;
+    avail11.pNext = &avail12;
+    if (vkGetPhysicalDeviceFeatures2_) {
+        vkGetPhysicalDeviceFeatures2_(g.physical_device, &availFeatures2);
+    }
+
     VkPhysicalDeviceVulkan12Features vk12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    vk12.storageBuffer8BitAccess = VK_TRUE;
-    vk12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
-    vk12.shaderInt8 = VK_TRUE;
-    vk12.scalarBlockLayout = VK_TRUE;
+    vk12.storageBuffer8BitAccess = avail12.storageBuffer8BitAccess;
+    vk12.uniformAndStorageBuffer8BitAccess = avail12.uniformAndStorageBuffer8BitAccess;
+    vk12.shaderInt8 = avail12.shaderInt8;
+    vk12.scalarBlockLayout = avail12.scalarBlockLayout;
 
     VkPhysicalDeviceVulkan11Features vk11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    vk11.storageBuffer16BitAccess = VK_TRUE;
+    vk11.storageBuffer16BitAccess = avail11.storageBuffer16BitAccess;
     vk11.pNext = &vk12;
 
     VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features2.pNext = &vk11;
 
-    const char* device_extensions[] = { "VK_KHR_push_descriptor" };
+    const char* device_extensions[2];
+    uint32_t device_extension_count = 0;
+    if (has_device_extension(g.physical_device, "VK_KHR_push_descriptor")) {
+        device_extensions[device_extension_count++] = "VK_KHR_push_descriptor";
+    }
+    if (has_device_extension(g.physical_device, "VK_KHR_portability_subset")) {
+        device_extensions[device_extension_count++] = "VK_KHR_portability_subset";
+    }
 
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &dqci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = device_extension_count;
     dci.ppEnabledExtensionNames = device_extensions;
 
-    if (vkCreateDevice_(g.physical_device, &dci, NULL, &g.device) != VK_SUCCESS) return GPU_ERR_INIT_FAIL;
+    vkr = vkCreateDevice_(g.physical_device, &dci, NULL, &g.device);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr,
+            "[dlgo/gpu] vkCreateDevice failed: %d (push_descriptor=%d portability_subset=%d int8=%d sb8=%d usb8=%d sb16=%d scalar=%d)\n",
+            (int)vkr,
+            has_device_extension(g.physical_device, "VK_KHR_push_descriptor"),
+            has_device_extension(g.physical_device, "VK_KHR_portability_subset"),
+            (int)avail12.shaderInt8,
+            (int)avail12.storageBuffer8BitAccess,
+            (int)avail12.uniformAndStorageBuffer8BitAccess,
+            (int)avail11.storageBuffer16BitAccess,
+            (int)avail12.scalarBlockLayout);
+        return GPU_ERR_INIT_FAIL;
+    }
 
     vkGetDeviceQueue_(g.device, g.queue_family, 0, &g.queue);
 
@@ -402,17 +512,29 @@ int gpu_init(void) {
     VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = g.queue_family;
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    if (vkCreateCommandPool_(g.device, &cpci, NULL, &g.cmd_pool) != VK_SUCCESS) return GPU_ERR_INIT_FAIL;
+    vkr = vkCreateCommandPool_(g.device, &cpci, NULL, &g.cmd_pool);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkCreateCommandPool failed: %d\n", (int)vkr);
+        return GPU_ERR_INIT_FAIL;
+    }
 
     VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = g.cmd_pool;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 1;
-    vkAllocateCommandBuffers_(g.device, &cbai, &g.cmd_buf);
+    vkr = vkAllocateCommandBuffers_(g.device, &cbai, &g.cmd_buf);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkAllocateCommandBuffers failed: %d\n", (int)vkr);
+        return GPU_ERR_INIT_FAIL;
+    }
 
     // Fence
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence_(g.device, &fci, NULL, &g.fence);
+    vkr = vkCreateFence_(g.device, &fci, NULL, &g.fence);
+    if (vkr != VK_SUCCESS) {
+        fprintf(stderr, "[dlgo/gpu] vkCreateFence failed: %d\n", (int)vkr);
+        return GPU_ERR_INIT_FAIL;
+    }
 
     // Staging buffer — prefer HOST_CACHED for fast CPU reads (download path).
     // HOST_CACHED + HOST_COHERENT uses system RAM which the CPU can read at
@@ -427,7 +549,10 @@ int gpu_init(void) {
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
-    if (rc != GPU_OK) return rc;
+    if (rc != GPU_OK) {
+        fprintf(stderr, "[dlgo/gpu] create staging buffer failed: %d\n", rc);
+        return rc;
+    }
     vkMapMemory_(g.device, g.staging_mem, 0, g.staging_size, 0, &g.staging_mapped);
 
     // Descriptor pool
@@ -829,6 +954,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_F16:  pipe = PIPE_MATVEC_F16; break;
         case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0; break;
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0; break;
+        case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K; break;
@@ -844,7 +970,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.num_bufs = 3;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
-    dp.groups_x = (rows + 3) / 4;
+    dp.groups_x = (qtype == QTYPE_Q3_K) ? rows : (rows + 3) / 4;
     dp.groups_y = 1;
     dp.groups_z = 1;
 
@@ -906,12 +1032,12 @@ int gpu_softmax(GpuBuf buf, int n) {
 }
 
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int pos, float freq_base, int neox) {
+             int head_dim, int rope_dim, int pos, float freq_base, int neox) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int pos; float freq_base; int neox; } pc =
-        {num_heads, num_kv_heads, head_dim, pos, freq_base, neox};
+    struct { int num_heads; int num_kv_heads; int head_dim; int rope_dim; int pos; float freq_base; int neox; } pc =
+        {num_heads, num_kv_heads, head_dim, rope_dim, pos, freq_base, neox};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ROPE;
     dp.bufs[0] = q_buf;

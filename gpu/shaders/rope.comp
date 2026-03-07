@@ -13,6 +13,7 @@ layout(push_constant) uniform Params {
     int num_heads;
     int num_kv_heads;
     int head_dim;
+    int rope_dim;
     int pos;
     float freq_base;
     int neox;
@@ -21,11 +22,12 @@ layout(push_constant) uniform Params {
 void main() {
     uint head = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
-    int half_dim = head_dim / 2;
+    int rd = rope_dim > 0 ? rope_dim : head_dim;
+    int half_dim = rd / 2;
 
     if (int(tid) >= half_dim) return;
 
-    float freq = 1.0 / pow(freq_base, float(tid * 2) / float(head_dim));
+    float freq = 1.0 / pow(freq_base, float(tid * 2) / float(rd));
     float angle = float(pos) * freq;
     float cos_val = cos(angle);
     float sin_val = sin(angle);

@@ -145,13 +145,13 @@ func Softmax(buf Buf, n int) error {
 }
 
 // RoPE applies rotary position embedding on GPU.
-func RoPE(q, k Buf, numHeads, numKVHeads, headDim, pos int, freqBase float32, neox bool) error {
+func RoPE(q, k Buf, numHeads, numKVHeads, headDim, ropeDim, pos int, freqBase float32, neox bool) error {
 	n := 0
 	if neox {
 		n = 1
 	}
 	rc := C.gpu_rope(C.GpuBuf(q), C.GpuBuf(k),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(pos), C.float(freqBase), C.int(n))
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(ropeDim), C.int(pos), C.float(freqBase), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: rope failed (%d)", rc)
 	}
