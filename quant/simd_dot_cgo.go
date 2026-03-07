@@ -3,7 +3,7 @@
 package quant
 
 /*
-#cgo CFLAGS: -O2
+#cgo CFLAGS: -O3 -march=native
 
 #include <stdint.h>
 
@@ -37,6 +37,7 @@ void vec_dot_f32_batch(const float* a_flat, const float* x, int cols,
 
 void vec_scale_add(float* out, float scale, const float* src, int n);
 void vec_swiglu(float* out, const float* gate, const float* up, int n);
+void vec_softmax(float* x, int n);
 */
 import "C"
 import "unsafe"
@@ -144,6 +145,11 @@ func SIMDScaleAdd(out []float32, scale float32, src []float32, n int) {
 // Uses fast polynomial exp approximation + Newton-Raphson reciprocal.
 func SIMDSwiGLU(out, gate, up []float32, n int) {
 	C.vec_swiglu((*C.float)(unsafe.Pointer(&out[0])), (*C.float)(unsafe.Pointer(&gate[0])), (*C.float)(unsafe.Pointer(&up[0])), C.int(n))
+}
+
+// SIMDSoftmax performs in-place softmax using AVX2 fast exp approximation.
+func SIMDSoftmax(x []float32) {
+	C.vec_softmax((*C.float)(unsafe.Pointer(&x[0])), C.int(len(x)))
 }
 
 // HasSIMDDot returns true if the AVX2+FMA fused dot product supports the given

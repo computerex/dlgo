@@ -51,6 +51,28 @@ func SIMDScaleAdd(out []float32, scale float32, src []float32, n int) {
 	}
 }
 
+func SIMDSoftmax(x []float32) {
+	// Fallback: use standard softmax
+	if len(x) == 0 {
+		return
+	}
+	maxVal := x[0]
+	for _, v := range x[1:] {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	var sum float32
+	for i, v := range x {
+		e := float32(math.Exp(float64(v - maxVal)))
+		x[i] = e
+		sum += e
+	}
+	for i := range x {
+		x[i] /= sum
+	}
+}
+
 func SIMDSwiGLU(out, gate, up []float32, n int) {
 	for i := 0; i < n; i++ {
 		g := gate[i]

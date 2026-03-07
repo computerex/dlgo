@@ -119,6 +119,33 @@ func GLU(out, input []float32, dim int) {
 	}
 }
 
+// fastExpf is a fast float32 exp approximation using the same algorithm as
+// the AVX2 version (range reduction + 4th-order polynomial), but scalar.
+// ~5 decimal digits accuracy — sufficient for softmax.
+func fastExpf(x float32) float32 {
+	if x < -88.0 {
+		return 0
+	}
+	if x > 88.0 {
+		x = 88.0
+	}
+	const log2e = 1.44269504088896
+	const ln2 = 0.6931471805599453
+
+	n := float32(math.RoundToEven(float64(x * log2e)))
+	r := x - n*ln2
+
+	p := float32(1.0/24.0)*r + float32(1.0/6.0)
+	p = p*r + 0.5
+	p = p*r + 1.0
+	p = p*r + 1.0
+
+	// 2^n via bit manipulation
+	ni := int32(n) + 127
+	pow2n := math.Float32frombits(uint32(ni) << 23)
+	return p * pow2n
+}
+
 // Softmax computes softmax in-place with numerical stability.
 func Softmax(x []float32) {
 	n := len(x)
@@ -133,7 +160,7 @@ func Softmax(x []float32) {
 	}
 	var sum float32
 	for i := 0; i < n; i++ {
-		x[i] = float32(math.Exp(float64(x[i] - maxVal)))
+		x[i] = fastExpf(x[i] - maxVal)
 		sum += x[i]
 	}
 	invSum := 1.0 / sum

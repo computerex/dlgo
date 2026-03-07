@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/computerex/dlgo/models/llm"
@@ -20,6 +21,12 @@ var defaultModels = []struct {
 }
 
 func main() {
+	if os.Getenv("DLGO_PROFILE") != "" {
+		f, _ := os.Create("cpu.prof")
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
 	models := defaultModels
 	if len(os.Args) > 1 {
 		models = nil

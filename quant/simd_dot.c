@@ -8,7 +8,7 @@
 
 // Enable AVX2/FMA/F16C at the function level via pragmas,
 // so we don't need -mavx2 -mfma -mf16c in CFLAGS (avoids CGo flag restrictions).
-#pragma GCC target("avx2,fma,f16c")
+#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
 #pragma GCC optimize("O3")
 
 #include <immintrin.h>
@@ -932,6 +932,56 @@ void vec_swiglu(float* out, const float* gate, const float* up, int n) {
         float g = gate[i];
         float eg = expf(-g);
         out[i] = g / (1.0f + eg) * up[i];
+    }
+}
+
+// ── AVX2 Softmax: out[i] = exp(x[i]-max) / sum(exp(x[j]-max)) ──
+// In-place softmax using fast exp approximation.
+void vec_softmax(float* x, int n) {
+    // Find max
+    int i = 0;
+    __m256 vmax = _mm256_set1_ps(-1e30f);
+    for (; i <= n - 8; i += 8) {
+        vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(x + i));
+    }
+    __m128 hi = _mm256_extractf128_ps(vmax, 1);
+    __m128 lo = _mm256_castps256_ps128(vmax);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_max_ss(lo, _mm_movehdup_ps(lo));
+    float maxVal = _mm_cvtss_f32(lo);
+    for (; i < n; i++) {
+        if (x[i] > maxVal) maxVal = x[i];
+    }
+
+    // exp(x[i] - max) and sum
+    __m256 voff = _mm256_set1_ps(maxVal);
+    __m256 vsum = _mm256_setzero_ps();
+    i = 0;
+    for (; i <= n - 8; i += 8) {
+        __m256 v = fast_exp_avx2(_mm256_sub_ps(_mm256_loadu_ps(x + i), voff));
+        _mm256_storeu_ps(x + i, v);
+        vsum = _mm256_add_ps(vsum, v);
+    }
+    hi = _mm256_extractf128_ps(vsum, 1);
+    lo = _mm256_castps256_ps128(vsum);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_hadd_ps(lo, lo);
+    lo = _mm_hadd_ps(lo, lo);
+    float sum = _mm_cvtss_f32(lo);
+    for (; i < n; i++) {
+        x[i] = expf(x[i] - maxVal);
+        sum += x[i];
+    }
+
+    // Normalize
+    __m256 vinv = _mm256_set1_ps(1.0f / sum);
+    i = 0;
+    for (; i <= n - 8; i += 8) {
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
+    }
+    for (; i < n; i++) {
+        x[i] /= sum;
     }
 }
 

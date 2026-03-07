@@ -3,6 +3,8 @@ package llm
 import (
 	"fmt"
 	"math/rand"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -30,11 +32,12 @@ func DefaultGenerateConfig() GenerateConfig {
 
 // Pipeline bundles a loaded model, tokenizer, KV cache, and run state for inference.
 type Pipeline struct {
-	Model     *Model
-	Tokenizer *Tokenizer
-	KVCache   *memory.MultiLayerKVCache
-	RunState  *RunState
-	MaxSeqLen int
+	Model      *Model
+	Tokenizer  *Tokenizer
+	KVCache    *memory.MultiLayerKVCache
+	RunState   *RunState
+	BatchState *BatchState
+	MaxSeqLen  int
 }
 
 // NewPipeline loads a GGUF model and creates a ready-to-use inference pipeline
@@ -68,11 +71,12 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	rs := NewRunState(m.Config, maxSeqLen)
 
 	return &Pipeline{
-		Model:     m,
-		Tokenizer: tok,
-		KVCache:   kv,
-		RunState:  rs,
-		MaxSeqLen: maxSeqLen,
+		Model:      m,
+		Tokenizer:  tok,
+		KVCache:    kv,
+		RunState:   rs,
+		BatchState: NewBatchState(m.Config, maxSeqLen),
+		MaxSeqLen:  maxSeqLen,
 	}, nil
 }
 
@@ -95,13 +99,15 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 		p.RunState.SSMState.Reset()
 	}
 
+	runtime.GC()
+	prev := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(prev)
+
 	var generated []int32
 	var recentTokens []int32
 
-	// Prefill: process all prompt tokens
-	for i, tok := range prompt {
-		Forward(p.Model, tok, i, p.KVCache, p.RunState)
-	}
+	// Prefill (batch)
+	ForwardBatch(p.Model, prompt, 0, p.KVCache, p.RunState, p.BatchState)
 
 	pos := len(prompt)
 	nextToken := ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
@@ -213,11 +219,13 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		p.RunState.SSMState.Reset()
 	}
 
-	// Prefill
+	// Minimize GC interference during inference
+	runtime.GC()
+	prev := debug.SetGCPercent(-1)
+
+	// Prefill (batch)
 	prefillStart := time.Now()
-	for i, tok := range tokens {
-		Forward(p.Model, tok, i, p.KVCache, p.RunState)
-	}
+	ForwardBatch(p.Model, tokens, 0, p.KVCache, p.RunState, p.BatchState)
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 
 	// Generate
@@ -265,6 +273,7 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 
 done:
 	genMs := float64(time.Since(genStart).Microseconds()) / 1000.0
+	debug.SetGCPercent(prev)
 	text := p.Tokenizer.Decode(generated)
 
 	var tokPerSec float64

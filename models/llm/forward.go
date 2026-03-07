@@ -6,6 +6,7 @@ import (
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/memory"
 	"github.com/computerex/dlgo/ops"
+	"github.com/computerex/dlgo/quant"
 )
 
 // RunState holds pre-allocated buffers for inference, avoiding per-token allocations.
@@ -24,7 +25,8 @@ type RunState struct {
 	Hidden   []float32 // [ffnDim] gated hidden
 	FFNOut   []float32 // [dim] FFN output
 	Logits   []float32 // [vocabSize] output logits
-	Scores   []float32 // [maxSeqLen] attention scores scratch
+	Scores     []float32   // [maxSeqLen] attention scores scratch (legacy)
+	HeadScores [][]float32 // [numHeads][maxSeqLen] per-head score buffers for parallel attention
 
 	// Qwen3.5 gated attention: Wq outputs interleaved [Q,gate] per head
 	QFull []float32 // [2*qDim] fused Q+gate output (nil for non-gated models)
@@ -52,23 +54,29 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 	ffnDim := cfg.FFNDim
 
+	headScores := make([][]float32, cfg.NumHeads)
+	for h := 0; h < cfg.NumHeads; h++ {
+		headScores[h] = make([]float32, maxSeqLen)
+	}
+
 	rs := &RunState{
-		X:        make([]float32, dim),
-		XNorm:    make([]float32, dim),
-		Q:        make([]float32, qDim),
-		K:        make([]float32, kvDim),
-		V:        make([]float32, kvDim),
-		AttnOut:  make([]float32, qDim),
-		AttnProj: make([]float32, dim),
-		FFNIn:    make([]float32, dim),
-		FFNNorm:  make([]float32, dim),
-		Gate:     make([]float32, ffnDim),
-		Up:       make([]float32, ffnDim),
-		Hidden:   make([]float32, ffnDim),
-		FFNOut:   make([]float32, dim),
-		Logits:   make([]float32, cfg.VocabSize),
-		Scores:   make([]float32, maxSeqLen),
-		Pool:     blas.DefaultPool(),
+		X:          make([]float32, dim),
+		XNorm:      make([]float32, dim),
+		Q:          make([]float32, qDim),
+		K:          make([]float32, kvDim),
+		V:          make([]float32, kvDim),
+		AttnOut:    make([]float32, qDim),
+		AttnProj:   make([]float32, dim),
+		FFNIn:      make([]float32, dim),
+		FFNNorm:    make([]float32, dim),
+		Gate:       make([]float32, ffnDim),
+		Up:         make([]float32, ffnDim),
+		Hidden:     make([]float32, ffnDim),
+		FFNOut:     make([]float32, dim),
+		Logits:     make([]float32, cfg.VocabSize),
+		Scores:     make([]float32, maxSeqLen),
+		HeadScores: headScores,
+		Pool:       blas.DefaultPool(),
 	}
 	rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
 	rs.SetRopeNeox(cfg.RopeNeox)
@@ -203,18 +211,18 @@ func forwardAttention(
 ) {
 	qDim := numHeads * headDim
 
-	// Q projection — may include fused gate for Qwen3.5
+	// Q/K/V projections — fused into single dispatch when possible
 	if layer.Spec.GatedQ {
 		blas.QMatVecMulParallel(rs.QFull, layer.Wq, rs.XNorm, pool)
 		for h := 0; h < numHeads; h++ {
 			copy(rs.Q[h*headDim:(h+1)*headDim], rs.QFull[h*2*headDim:h*2*headDim+headDim])
 			copy(rs.QGate[h*headDim:(h+1)*headDim], rs.QFull[h*2*headDim+headDim:(h+1)*2*headDim])
 		}
+		blas.QMatVecMulParallel(rs.K, layer.Wk, rs.XNorm, pool)
+		blas.QMatVecMulParallel(rs.V, layer.Wv, rs.XNorm, pool)
 	} else {
-		blas.QMatVecMulParallel(rs.Q, layer.Wq, rs.XNorm, pool)
+		blas.QTripleMatVecMulParallel(rs.Q, layer.Wq, rs.K, layer.Wk, rs.V, layer.Wv, rs.XNorm, pool)
 	}
-	blas.QMatVecMulParallel(rs.K, layer.Wk, rs.XNorm, pool)
-	blas.QMatVecMulParallel(rs.V, layer.Wv, rs.XNorm, pool)
 
 	if layer.Bq != nil {
 		ops.AddBias(rs.Q, layer.Bq)
@@ -252,21 +260,22 @@ func forwardAttention(
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 	ops.Clear(rs.AttnOut)
 
-	for h := 0; h < numHeads; h++ {
+	pool.ParallelFor(numHeads, func(h int) {
 		kvH := h / kvMul
 		qHead := rs.Q[h*headDim : (h+1)*headDim]
 		headOut := rs.AttnOut[h*headDim : (h+1)*headDim]
+		scores := rs.HeadScores[h][:seqLen]
 
 		for t := 0; t < seqLen; t++ {
 			kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
-			rs.Scores[t] = ops.DotProduct(qHead, kHead, headDim) * scale
+			scores[t] = ops.DotProduct(qHead, kHead, headDim) * scale
 		}
-		ops.Softmax(rs.Scores[:seqLen])
+		ops.Softmax(scores)
 		for t := 0; t < seqLen; t++ {
 			vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
-			ops.AddScaled(headOut, rs.Scores[t], vHead, headDim)
+			ops.AddScaled(headOut, scores[t], vHead, headDim)
 		}
-	}
+	})
 
 	if layer.Spec.GatedQ {
 		for i := 0; i < qDim; i++ {
@@ -285,7 +294,7 @@ func forwardFFN(layer *Layer, rs *RunState, input []float32, pool *blas.Pool) {
 	switch layer.Spec.FFN {
 	case FFNSwiGLU:
 		blas.QDualMatVecMulParallel(rs.Gate, layer.FFNGate, rs.Up, layer.FFNUp, input, pool)
-		ops.SwiGLU(rs.Hidden, rs.Gate, rs.Up, len(rs.Gate))
+		quant.SIMDSwiGLU(rs.Hidden, rs.Gate, rs.Up, len(rs.Gate))
 		blas.QMatVecMulParallel(rs.FFNOut, layer.FFNDown, rs.Hidden, pool)
 
 	case FFNGeGLU:
