@@ -1,0 +1,40 @@
+#version 450
+
+// F32 matrix-vector multiply: out[row] = dot(W[row,:], x)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Weights { float weight_data[]; };
+layout(set = 0, binding = 2) buffer X { float x_data[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint row_offset = row * cols;
+
+    float acc = 0.0;
+    for (int i = int(tid); i < cols; i += 256) {
+        acc += weight_data[row_offset + i] * x_data[i];
+    }
+
+    sdata[tid] = acc;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        out_data[row] = sdata[0];
+    }
+}
