@@ -60,6 +60,9 @@ typedef enum {
     PIPE_SCALE,
     PIPE_MUL,
     PIPE_COPY_F32,
+    PIPE_ATTENTION,
+    PIPE_RMSNORM_HEADS,
+    PIPE_ADD_RMSNORM,
     PIPE_COUNT
 } PipelineID;
 
@@ -93,26 +96,27 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 
 // Element-wise operations
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps);
+int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps);
 int gpu_softmax(GpuBuf buf, int n);
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int pos, float freq_base);
+             int head_dim, int pos, float freq_base, int neox);
 int gpu_swiglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_geglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_gelu(GpuBuf buf, int n);
 int gpu_add(GpuBuf out_buf, GpuBuf a_buf, GpuBuf b_buf, int n);
+int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
+                    GpuBuf a_buf, GpuBuf b_buf, GpuBuf weight_buf,
+                    int n, float eps);
 int gpu_add_bias(GpuBuf buf, GpuBuf bias_buf, int n);
 int gpu_scale(GpuBuf buf, float s, int n);
 int gpu_copy_f32(GpuBuf dst, GpuBuf src, int n);
 
-// Attention: compute scores, softmax, weighted sum
-// q_buf: [head_dim], k_cache_buf: [seq_len * kv_dim], v_cache_buf: same
-// out_buf: [head_dim]
-int gpu_attention_scores(GpuBuf scores_buf, GpuBuf q_buf, GpuBuf k_cache_buf,
-                         int head_idx, int kv_head_idx, int head_dim,
-                         int kv_dim, int seq_len, float scale);
-int gpu_attention_sum(GpuBuf out_buf, GpuBuf scores_buf, GpuBuf v_cache_buf,
-                      int head_idx, int kv_head_idx, int head_dim,
-                      int kv_dim, int seq_len);
+// Fused multi-head attention: dispatches one workgroup per head
+// q_buf: [num_heads * head_dim], k_cache/v_cache: [max_seq_len * kv_dim]
+// out_buf: [num_heads * head_dim]
+int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                  int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                  int seq_len, float scale);
 
 // KV cache operations
 int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
@@ -128,6 +132,7 @@ void gpu_sync(void);
 // Batch mode: record all dispatches into one command buffer, submit once
 void gpu_begin_batch(void);
 void gpu_end_batch(void);
+void gpu_barrier(void);
 
 #ifdef __cplusplus
 }

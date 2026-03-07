@@ -80,6 +80,7 @@ VK_FUNC(vkCmdPushConstants)
 VK_FUNC(vkCmdPipelineBarrier)
 VK_FUNC(vkCmdCopyBuffer)
 VK_FUNC(vkDeviceWaitIdle)
+static PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_ = NULL;
 #undef VK_FUNC
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,7 @@ typedef struct {
 } BufferAlloc;
 
 #define MAX_BUFFERS 8192
-#define MAX_DESCRIPTORS_PER_POOL 1024
+#define MAX_DESCRIPTORS_PER_POOL 4096
 #define STAGING_SIZE (128 * 1024 * 1024) // 128MB staging buffer
 
 static struct {
@@ -133,6 +134,7 @@ static struct {
     // Command buffer batching mode
     int recording; // 1 = batching dispatches, 0 = immediate submit
     int dispatch_count; // number of dispatches in current batch
+    int need_barrier; // 1 = insert barrier before next dispatch
 } g = {0};
 
 // ---------------------------------------------------------------------------
@@ -204,6 +206,9 @@ static void load_instance_funcs(VkInstance inst) {
     LOAD(vkCmdCopyBuffer)
     LOAD(vkDeviceWaitIdle)
     #undef LOAD
+
+    vkCmdPushDescriptorSetKHR_ = (PFN_vkCmdPushDescriptorSetKHR)
+        vkGetInstanceProcAddr_(g.instance, "vkCmdPushDescriptorSetKHR");
 }
 
 // ---------------------------------------------------------------------------
@@ -367,12 +372,27 @@ int gpu_init(void) {
     dqci.queueCount = 1;
     dqci.pQueuePriorities = &priority;
 
-    VkPhysicalDeviceFeatures features = {0};
+    VkPhysicalDeviceVulkan12Features vk12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    vk12.storageBuffer8BitAccess = VK_TRUE;
+    vk12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+    vk12.shaderInt8 = VK_TRUE;
+    vk12.scalarBlockLayout = VK_TRUE;
+
+    VkPhysicalDeviceVulkan11Features vk11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    vk11.storageBuffer16BitAccess = VK_TRUE;
+    vk11.pNext = &vk12;
+
+    VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features2.pNext = &vk11;
+
+    const char* device_extensions[] = { "VK_KHR_push_descriptor" };
 
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &features2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &dqci;
-    dci.pEnabledFeatures = &features;
+    dci.enabledExtensionCount = 1;
+    dci.ppEnabledExtensionNames = device_extensions;
 
     if (vkCreateDevice_(g.physical_device, &dci, NULL, &g.device) != VK_SUCCESS) return GPU_ERR_INIT_FAIL;
 
@@ -394,11 +414,19 @@ int gpu_init(void) {
     VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     vkCreateFence_(g.device, &fci, NULL, &g.fence);
 
-    // Staging buffer (host-visible, for uploads/downloads)
+    // Staging buffer — prefer HOST_CACHED for fast CPU reads (download path).
+    // HOST_CACHED + HOST_COHERENT uses system RAM which the CPU can read at
+    // memory bandwidth instead of slow uncached PCIe BAR reads.
     g.staging_size = STAGING_SIZE;
     rc = create_buffer(&g.staging_buf, &g.staging_mem, g.staging_size,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (rc != GPU_OK) {
+        rc = create_buffer(&g.staging_buf, &g.staging_mem, g.staging_size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
     if (rc != GPU_OK) return rc;
     vkMapMemory_(g.device, g.staging_mem, 0, g.staging_size, 0, &g.staging_mapped);
 
@@ -410,7 +438,7 @@ int gpu_init(void) {
     dpci.maxSets = MAX_DESCRIPTORS_PER_POOL;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = pool_sizes;
-    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.flags = 0;
     vkCreateDescriptorPool_(g.device, &dpci, NULL, &g.desc_pool);
 
     g.subgroup_size = 32; // NVIDIA default
@@ -510,10 +538,22 @@ int gpu_upload(GpuBuf dst, const void* src, uint64_t size_bytes, uint64_t offset
         uint64_t chunk = remaining < g.staging_size ? remaining : g.staging_size;
         memcpy(g.staging_mapped, p, chunk);
 
-        begin_cmd();
-        VkBufferCopy region = {0, dst_off, chunk};
-        vkCmdCopyBuffer_(g.cmd_buf, g.staging_buf, ba->buffer, 1, &region);
-        submit_and_wait();
+        if (g.recording) {
+            VkBufferCopy region = {0, dst_off, chunk};
+            vkCmdCopyBuffer_(g.cmd_buf, g.staging_buf, ba->buffer, 1, &region);
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier_(g.cmd_buf,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &mb, 0, NULL, 0, NULL);
+            g.dispatch_count++;
+        } else {
+            begin_cmd();
+            VkBufferCopy region = {0, dst_off, chunk};
+            vkCmdCopyBuffer_(g.cmd_buf, g.staging_buf, ba->buffer, 1, &region);
+            submit_and_wait();
+        }
 
         p += chunk;
         dst_off += chunk;
@@ -533,12 +573,27 @@ int gpu_download(void* dst, GpuBuf src, uint64_t size_bytes, uint64_t offset) {
     while (remaining > 0) {
         uint64_t chunk = remaining < g.staging_size ? remaining : g.staging_size;
 
-        begin_cmd();
-        VkBufferCopy region = {src_off, 0, chunk};
-        vkCmdCopyBuffer_(g.cmd_buf, ba->buffer, g.staging_buf, 1, &region);
-        submit_and_wait();
+        if (g.recording) {
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier_(g.cmd_buf,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 1, &mb, 0, NULL, 0, NULL);
+            VkBufferCopy region = {src_off, 0, chunk};
+            vkCmdCopyBuffer_(g.cmd_buf, ba->buffer, g.staging_buf, 1, &region);
+            g.dispatch_count++;
+            // Must end batch to get the data, then read staging
+            gpu_end_batch();
+            memcpy(p, g.staging_mapped, chunk);
+        } else {
+            begin_cmd();
+            VkBufferCopy region = {src_off, 0, chunk};
+            vkCmdCopyBuffer_(g.cmd_buf, ba->buffer, g.staging_buf, 1, &region);
+            submit_and_wait();
+            memcpy(p, g.staging_mapped, chunk);
+        }
 
-        memcpy(p, g.staging_mapped, chunk);
         p += chunk;
         src_off += chunk;
         remaining -= chunk;
@@ -577,6 +632,9 @@ static int create_compute_pipeline(PipelineID id, const uint32_t* spirv, size_t 
     VkDescriptorSetLayoutCreateInfo dslci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslci.bindingCount = num_buffers;
     dslci.pBindings = bindings;
+    if (vkCmdPushDescriptorSetKHR_) {
+        dslci.flags = 0x00000001; /* VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR */
+    }
     vkCreateDescriptorSetLayout_(g.device, &dslci, NULL, &g.desc_layouts[id]);
     free(bindings);
 
@@ -621,16 +679,7 @@ typedef struct {
 static int dispatch_compute(DispatchParams* p) {
     if (!g.pipelines[p->pipe]) return GPU_ERR_SHADER;
 
-    // Allocate descriptor set
-    VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsai.descriptorPool = g.desc_pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &g.desc_layouts[p->pipe];
-
-    VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets_(g.device, &dsai, &ds) != VK_SUCCESS) return GPU_ERR_DISPATCH;
-
-    // Write descriptor bindings
+    // Prepare descriptor writes
     VkDescriptorBufferInfo buf_infos[8];
     VkWriteDescriptorSet writes[8];
     for (int i = 0; i < p->num_bufs; i++) {
@@ -642,7 +691,7 @@ static int dispatch_compute(DispatchParams* p) {
 
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].pNext = NULL;
-        writes[i].dstSet = ds;
+        writes[i].dstSet = VK_NULL_HANDLE;
         writes[i].dstBinding = i;
         writes[i].dstArrayElement = 0;
         writes[i].descriptorCount = 1;
@@ -651,21 +700,33 @@ static int dispatch_compute(DispatchParams* p) {
         writes[i].pImageInfo = NULL;
         writes[i].pTexelBufferView = NULL;
     }
-    vkUpdateDescriptorSets_(g.device, p->num_bufs, writes, 0, NULL);
 
     if (g.recording) {
-        // Batched mode: add memory barrier then dispatch (no submit)
-        if (g.dispatch_count > 0) {
+        if (g.need_barrier) {
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             vkCmdPipelineBarrier_(g.cmd_buf,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0, 1, &mb, 0, NULL, 0, NULL);
+            g.need_barrier = 0;
         }
         vkCmdBindPipeline_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipelines[p->pipe]);
-        vkCmdBindDescriptorSets_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-            g.pipe_layouts[p->pipe], 0, 1, &ds, 0, NULL);
+        if (vkCmdPushDescriptorSetKHR_) {
+            vkCmdPushDescriptorSetKHR_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                g.pipe_layouts[p->pipe], 0, p->num_bufs, writes);
+        } else {
+            VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dsai.descriptorPool = g.desc_pool;
+            dsai.descriptorSetCount = 1;
+            dsai.pSetLayouts = &g.desc_layouts[p->pipe];
+            VkDescriptorSet ds;
+            if (vkAllocateDescriptorSets_(g.device, &dsai, &ds) != VK_SUCCESS) return GPU_ERR_DISPATCH;
+            for (int i = 0; i < p->num_bufs; i++) writes[i].dstSet = ds;
+            vkUpdateDescriptorSets_(g.device, p->num_bufs, writes, 0, NULL);
+            vkCmdBindDescriptorSets_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                g.pipe_layouts[p->pipe], 0, 1, &ds, 0, NULL);
+        }
         if (p->push_data && p->push_size > 0) {
             vkCmdPushConstants_(g.cmd_buf, g.pipe_layouts[p->pipe],
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, p->push_size, p->push_data);
@@ -673,11 +734,23 @@ static int dispatch_compute(DispatchParams* p) {
         vkCmdDispatch_(g.cmd_buf, p->groups_x, p->groups_y, p->groups_z);
         g.dispatch_count++;
     } else {
-        // Immediate mode: record, submit, wait
         begin_cmd();
         vkCmdBindPipeline_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipelines[p->pipe]);
-        vkCmdBindDescriptorSets_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
-            g.pipe_layouts[p->pipe], 0, 1, &ds, 0, NULL);
+        if (vkCmdPushDescriptorSetKHR_) {
+            vkCmdPushDescriptorSetKHR_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                g.pipe_layouts[p->pipe], 0, p->num_bufs, writes);
+        } else {
+            VkDescriptorSetAllocateInfo dsai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dsai.descriptorPool = g.desc_pool;
+            dsai.descriptorSetCount = 1;
+            dsai.pSetLayouts = &g.desc_layouts[p->pipe];
+            VkDescriptorSet ds;
+            if (vkAllocateDescriptorSets_(g.device, &dsai, &ds) != VK_SUCCESS) return GPU_ERR_DISPATCH;
+            for (int i = 0; i < p->num_bufs; i++) writes[i].dstSet = ds;
+            vkUpdateDescriptorSets_(g.device, p->num_bufs, writes, 0, NULL);
+            vkCmdBindDescriptorSets_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                g.pipe_layouts[p->pipe], 0, 1, &ds, 0, NULL);
+        }
         if (p->push_data && p->push_size > 0) {
             vkCmdPushConstants_(g.cmd_buf, g.pipe_layouts[p->pipe],
                 VK_SHADER_STAGE_COMPUTE_BIT, 0, p->push_size, p->push_data);
@@ -733,6 +806,13 @@ void gpu_end_batch(void) {
     }
     vkResetDescriptorPool_(g.device, g.desc_pool, 0);
     g.dispatch_count = 0;
+    g.need_barrier = 0;
+}
+
+void gpu_barrier(void) {
+    if (g.recording && g.dispatch_count > 0) {
+        g.need_barrier = 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -764,7 +844,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.num_bufs = 3;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
-    dp.groups_x = rows;
+    dp.groups_x = (rows + 3) / 4;
     dp.groups_y = 1;
     dp.groups_z = 1;
 
@@ -790,6 +870,24 @@ int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float ep
     return dispatch_compute(&dp);
 }
 
+int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int head_dim; float eps; } pc = {head_dim, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_RMSNORM_HEADS;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = weight_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_softmax(GpuBuf buf, int n) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
@@ -808,12 +906,12 @@ int gpu_softmax(GpuBuf buf, int n) {
 }
 
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int pos, float freq_base) {
+             int head_dim, int pos, float freq_base, int neox) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int pos; float freq_base; } pc =
-        {num_heads, num_kv_heads, head_dim, pos, freq_base};
+    struct { int num_heads; int num_kv_heads; int head_dim; int pos; float freq_base; int neox; } pc =
+        {num_heads, num_kv_heads, head_dim, pos, freq_base, neox};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ROPE;
     dp.bufs[0] = q_buf;
@@ -922,6 +1020,29 @@ int gpu_scale(GpuBuf buf, float s, int n) {
     return dispatch_compute(&dp);
 }
 
+int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
+                    GpuBuf a_buf, GpuBuf b_buf, GpuBuf weight_buf,
+                    int n, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; float eps; } pc = {n, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ADD_RMSNORM;
+    dp.bufs[0] = norm_out;
+    dp.bufs[1] = sum_out;
+    dp.bufs[2] = a_buf;
+    dp.bufs[3] = b_buf;
+    dp.bufs[4] = weight_buf;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = 1;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_copy_f32(GpuBuf dst, GpuBuf src, int n) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     BufferAlloc* s = get_buf(src);
@@ -952,17 +1073,27 @@ int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
     return GPU_ERR_SHADER;
 }
 
-int gpu_attention_scores(GpuBuf scores_buf, GpuBuf q_buf, GpuBuf k_cache_buf,
-                         int head_idx, int kv_head_idx, int head_dim,
-                         int kv_dim, int seq_len, float scale) {
-    // TODO: fused attention kernel
-    return GPU_ERR_SHADER;
-}
+int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                  int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                  int seq_len, float scale) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-int gpu_attention_sum(GpuBuf out_buf, GpuBuf scores_buf, GpuBuf v_cache_buf,
-                      int head_idx, int kv_head_idx, int head_dim,
-                      int kv_dim, int seq_len) {
-    return GPU_ERR_SHADER;
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
 }
 
 int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,

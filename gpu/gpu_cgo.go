@@ -3,11 +3,11 @@
 package gpu
 
 /*
-#cgo CFLAGS: -I${SRCDIR}
+#cgo CFLAGS: -I${SRCDIR}/csrc
 #cgo windows CFLAGS: -IC:/VulkanSDK/1.4.341.1/Include
 #cgo windows LDFLAGS: -LC:/VulkanSDK/1.4.341.1/Lib -lvulkan-1
 
-#include "vulkan_gpu.h"
+#include "vulkan_gpu.c"
 #include <stdlib.h>
 */
 import "C"
@@ -126,6 +126,15 @@ func RMSNorm(out, x, weight Buf, n int, eps float32) error {
 	return nil
 }
 
+// RMSNormHeads performs per-head in-place RMS normalization on GPU.
+func RMSNormHeads(data, weight Buf, numHeads, headDim int, eps float32) error {
+	rc := C.gpu_rmsnorm_heads(C.GpuBuf(data), C.GpuBuf(weight), C.int(numHeads), C.int(headDim), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: rmsnorm_heads failed (%d)", rc)
+	}
+	return nil
+}
+
 // Softmax performs in-place softmax on GPU.
 func Softmax(buf Buf, n int) error {
 	rc := C.gpu_softmax(C.GpuBuf(buf), C.int(n))
@@ -136,9 +145,13 @@ func Softmax(buf Buf, n int) error {
 }
 
 // RoPE applies rotary position embedding on GPU.
-func RoPE(q, k Buf, numHeads, numKVHeads, headDim, pos int, freqBase float32) error {
+func RoPE(q, k Buf, numHeads, numKVHeads, headDim, pos int, freqBase float32, neox bool) error {
+	n := 0
+	if neox {
+		n = 1
+	}
 	rc := C.gpu_rope(C.GpuBuf(q), C.GpuBuf(k),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(pos), C.float(freqBase))
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(pos), C.float(freqBase), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: rope failed (%d)", rc)
 	}
@@ -190,6 +203,16 @@ func Scale(buf Buf, s float32, n int) error {
 	return nil
 }
 
+// Attention performs fused multi-head attention entirely on GPU.
+func Attention(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32) error {
+	rc := C.gpu_attention(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention failed (%d)", rc)
+	}
+	return nil
+}
+
 // KVStore copies K and V vectors into cache buffers at the given position.
 func KVStore(kCache, vCache, k, v Buf, pos, kvDim int) error {
 	rc := C.gpu_kv_store(C.GpuBuf(kCache), C.GpuBuf(vCache),
@@ -209,3 +232,16 @@ func BeginBatch() { C.gpu_begin_batch() }
 
 // EndBatch submits all batched operations at once and waits for completion.
 func EndBatch() { C.gpu_end_batch() }
+
+// Barrier inserts a compute memory barrier so subsequent dispatches see prior writes.
+func Barrier() { C.gpu_barrier() }
+
+// AddRMSNorm performs fused Add + RMSNorm: sumOut = a+b, normOut = RMSNorm(sumOut, weight).
+func AddRMSNorm(normOut, sumOut, a, b, weight Buf, n int, eps float32) error {
+	rc := C.gpu_add_rmsnorm(C.GpuBuf(normOut), C.GpuBuf(sumOut),
+		C.GpuBuf(a), C.GpuBuf(b), C.GpuBuf(weight), C.int(n), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: add_rmsnorm failed (%d)", rc)
+	}
+	return nil
+}

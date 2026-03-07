@@ -14,6 +14,7 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm — within 16–25% of Ollama GPU on generation
 - **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 7–17% of Ollama on generation, same GGUF)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
 
@@ -128,6 +129,7 @@ core/            QuantizedTensor with row-level dequantization
 quant/           25+ GGML quantization formats, fused SIMD dot products
 format/gguf/     GGUF v2/v3 parser
 format/ggml/     Legacy GGML parser
+gpu/             Vulkan GPU compute backend (MatVec, attention, RoPE, etc.)
 ops/             RMSNorm, RoPE, Softmax, SwiGLU, GeGLU, sampling
 blas/            Quantized matrix-vector multiply, parallel worker pool
 layers/          Conv1D, LSTM, GRU, MHA, GQA, cross-attention
@@ -153,6 +155,30 @@ choosing quantization formats. Summary:
 
 All common GGUF downloads (Q4_K_M, Q5_K_M, Q3_K_L, Q8_0, etc.) use only Tier 1 types.
 
+## GPU Benchmarks vs Ollama
+
+GPU benchmarks on NVIDIA GeForce RTX 4070 Ti SUPER (16 GB VRAM). Same GGUF files loaded
+into both engines. Greedy decoding, 8-token generation.
+
+| Model | Quant | dlgo GPU gen | Ollama GPU gen | Delta |
+|---|---|---|---|---|
+| SmolLM2 360M | Q8_0 | ~420 tok/s | ~500 tok/s | −16% |
+| TinyLlama 1.1B | Q4_0 | ~390 tok/s | ~490 tok/s | −20% |
+| Qwen 2.5 0.5B | Q4_K_M | ~440 tok/s | ~575 tok/s | −24% |
+| Gemma 3 1B | Q4_K_M | ~250 tok/s | ~325 tok/s | −23% |
+
+**GPU implementation highlights:**
+- Pure Vulkan compute (cross-platform, no CUDA dependency)
+- Quantized MatVec shaders with typed struct access (`float16_t`, `uint8_t`, `int8_t`)
+- Multi-warp per row for better SM utilization on small matrices
+- Fused multi-head attention kernel (Q·K softmax, V accumulation)
+- HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
+- Single command buffer submission per token with batched dispatches
+- Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead
+
+The 16–24% gap vs Ollama's CUDA backend is attributable to Vulkan vs CUDA dispatch overhead
+and SPIR-V → PTX compilation quality vs native NVCC.
+
 ## How It Works
 
 1. **GGUF parser** reads model metadata and tensor locations from the file
@@ -160,4 +186,5 @@ All common GGUF downloads (Q4_K_M, Q5_K_M, Q3_K_L, Q8_0, etc.) use only Tier 1 t
 3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, and hybrid SSM/attention (Gated Delta Net) — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
 4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA+VNNI for QxQ integer dot products and batch prefill GEMM kernels
 5. **Parallel matmul** distributes rows across a persistent worker pool with fused multi-matrix dispatch
-6. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty
+6. **GPU acceleration** (optional, via Vulkan) offloads the entire forward pass to GPU — all weights, KV cache, and intermediate buffers reside in VRAM
+7. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty
