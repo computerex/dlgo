@@ -3,6 +3,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"strings"
 )
 
 // ModelConfig holds all architecture parameters for a decoder-only transformer LLM.
@@ -84,6 +85,7 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		SSMStateSize:          metaInt(md, arch+".ssm.state_size", 0),
 		SSMTimeStepRank:       metaInt(md, arch+".ssm.time_step_rank", 0),
 		SSMGroupCount:         metaInt(md, arch+".ssm.group_count", 0),
+		ChatTemplate:          inferChatTemplate(md, arch),
 	}
 
 	if c.EmbeddingDim == 0 {
@@ -193,4 +195,45 @@ func metaBool(md map[string]interface{}, key string, def bool) bool {
 		return b
 	}
 	return def
+}
+
+func inferChatTemplate(md map[string]interface{}, arch string) string {
+	chatTemplate := metaString(md, "tokenizer.chat_template")
+	if chatTemplate != "" {
+		lower := strings.ToLower(chatTemplate)
+		switch {
+		case strings.Contains(lower, "<|start_header_id|>") || strings.Contains(lower, "<|eot_id|>"):
+			return "llama3"
+		case strings.Contains(lower, "<|im_start|>"):
+			return "chatml"
+		case strings.Contains(lower, "<start_of_turn>"):
+			return "gemma"
+		case strings.Contains(lower, "<|assistant|>"):
+			return "llama2"
+		}
+	}
+
+	// Llama-family models can be either Llama-2/3 chat templates.
+	if arch == "llama" && hasTokenizerToken(md, "<|start_header_id|>") {
+		return "llama3"
+	}
+
+	return ""
+}
+
+func hasTokenizerToken(md map[string]interface{}, token string) bool {
+	raw, ok := md["tokenizer.ggml.tokens"]
+	if !ok {
+		return false
+	}
+	tokens, ok := raw.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, t := range tokens {
+		if s, ok := t.(string); ok && s == token {
+			return true
+		}
+	}
+	return false
 }

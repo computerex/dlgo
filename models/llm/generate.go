@@ -290,6 +290,7 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<|endoftext|>",
 		"<|end|>",
 		"</s>",
+		"<|assistant|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
 	}

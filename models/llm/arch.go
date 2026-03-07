@@ -48,6 +48,9 @@ func applyArchDefaults(config *ModelConfig) {
 	desc := GetArchDescriptor(config.Architecture)
 	config.RopeNeox = desc.RopeNeox
 	config.FFNGelu = desc.FFNGelu
+	if config.ChatTemplate == "" {
+		config.ChatTemplate = desc.ChatTemplate
+	}
 	if desc.EmbedScaleMode == "sqrt_dim" && config.EmbeddingDim > 0 {
 		config.EmbedScale = float32(math.Sqrt(float64(config.EmbeddingDim)))
 	}
@@ -77,8 +80,11 @@ func FormatChat(cfg ModelConfig, system, user string) string {
 
 // FormatMessages formats a multi-turn conversation for the model.
 func FormatMessages(cfg ModelConfig, messages []Message) string {
-	desc := GetArchDescriptor(cfg.Architecture)
-	switch desc.ChatTemplate {
+	template := cfg.ChatTemplate
+	if template == "" {
+		template = GetArchDescriptor(cfg.Architecture).ChatTemplate
+	}
+	switch template {
 	case "chatml":
 		return formatChatMLMessages(messages)
 	case "llama3":
