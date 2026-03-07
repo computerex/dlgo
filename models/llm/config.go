@@ -218,6 +218,18 @@ func inferChatTemplate(md map[string]interface{}, arch string) string {
 		return "llama3"
 	}
 
+	if strings.HasPrefix(arch, "gemma") {
+		name := strings.ToLower(metaString(md, "general.name"))
+		switch {
+		case strings.Contains(name, " instruct"), strings.Contains(name, "-instruct"), strings.Contains(name, "_instruct"):
+			return "gemma"
+		case strings.Contains(name, " it"), strings.Contains(name, "-it"), strings.Contains(name, "_it"):
+			return "gemma"
+		default:
+			return "plain"
+		}
+	}
+
 	return ""
 }
 

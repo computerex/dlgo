@@ -95,9 +95,34 @@ func FormatMessages(cfg ModelConfig, messages []Message) string {
 		return formatGemmaMessages(messages)
 	case "phi":
 		return formatPhiMessages(messages)
+	case "plain":
+		return formatPlainMessages(messages)
 	default:
 		return formatChatMLMessages(messages)
 	}
+}
+
+func formatPlainMessages(messages []Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			if m.Content != "" {
+				b.WriteString(m.Content)
+				b.WriteString("\n\n")
+			}
+		case "user":
+			b.WriteString(m.Content)
+			b.WriteString("\n")
+		case "assistant":
+			b.WriteString(m.Content)
+			b.WriteString("\n")
+		default:
+			b.WriteString(m.Content)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // formatChatMLMessages formats messages using ChatML template.
