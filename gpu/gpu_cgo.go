@@ -245,3 +245,116 @@ func AddRMSNorm(normOut, sumOut, a, b, weight Buf, n int, eps float32) error {
 	}
 	return nil
 }
+
+// LayerConf holds all buffer handles and parameters for one transformer layer.
+// Set up once per model, reused for every token.
+type LayerConf struct {
+	c C.GpuLayerConf
+}
+
+// NewLayerConf creates a LayerConf from the model's layer data.
+func NewLayerConf() *LayerConf { return &LayerConf{} }
+
+func (lc *LayerConf) SetScratch(x, xNorm, q, k, v, attnOut, attnProj Buf,
+	ffnNorm, ffnIn, gate, up, hidden, ffnOut Buf) {
+	lc.c.x = C.GpuBuf(x)
+	lc.c.x_norm = C.GpuBuf(xNorm)
+	lc.c.q = C.GpuBuf(q)
+	lc.c.k = C.GpuBuf(k)
+	lc.c.v = C.GpuBuf(v)
+	lc.c.attn_out = C.GpuBuf(attnOut)
+	lc.c.attn_proj = C.GpuBuf(attnProj)
+	lc.c.ffn_norm = C.GpuBuf(ffnNorm)
+	lc.c.ffn_in = C.GpuBuf(ffnIn)
+	lc.c.gate = C.GpuBuf(gate)
+	lc.c.up = C.GpuBuf(up)
+	lc.c.hidden = C.GpuBuf(hidden)
+	lc.c.ffn_out = C.GpuBuf(ffnOut)
+}
+
+func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
+	bq, bk, bv Buf, qNorm, kNorm Buf) {
+	lc.c.attn_norm_w = C.GpuBuf(attnNorm)
+	lc.c.wq = C.GpuBuf(wq.Buf)
+	lc.c.wq_rows = C.int(wq.Rows)
+	lc.c.wq_cols = C.int(wq.Cols)
+	lc.c.wq_type = C.int(wq.Type)
+	lc.c.wk = C.GpuBuf(wk.Buf)
+	lc.c.wk_rows = C.int(wk.Rows)
+	lc.c.wk_cols = C.int(wk.Cols)
+	lc.c.wk_type = C.int(wk.Type)
+	lc.c.wv = C.GpuBuf(wv.Buf)
+	lc.c.wv_rows = C.int(wv.Rows)
+	lc.c.wv_cols = C.int(wv.Cols)
+	lc.c.wv_type = C.int(wv.Type)
+	lc.c.wo = C.GpuBuf(wo.Buf)
+	lc.c.wo_rows = C.int(wo.Rows)
+	lc.c.wo_cols = C.int(wo.Cols)
+	lc.c.wo_type = C.int(wo.Type)
+	lc.c.bq = C.GpuBuf(bq)
+	lc.c.bk = C.GpuBuf(bk)
+	lc.c.bv = C.GpuBuf(bv)
+	lc.c.q_norm_w = C.GpuBuf(qNorm)
+	lc.c.k_norm_w = C.GpuBuf(kNorm)
+}
+
+func (lc *LayerConf) SetFFN(ffnNorm Buf, gate, up, down *GpuTensor,
+	postAttnNorm, postFFNNorm Buf) {
+	lc.c.ffn_norm_w = C.GpuBuf(ffnNorm)
+	if gate != nil {
+		lc.c.ffn_gate_w = C.GpuBuf(gate.Buf)
+		lc.c.gate_rows = C.int(gate.Rows)
+		lc.c.gate_cols = C.int(gate.Cols)
+		lc.c.gate_type = C.int(gate.Type)
+	}
+	lc.c.ffn_up_w = C.GpuBuf(up.Buf)
+	lc.c.up_rows = C.int(up.Rows)
+	lc.c.up_cols = C.int(up.Cols)
+	lc.c.up_type = C.int(up.Type)
+	lc.c.ffn_down_w = C.GpuBuf(down.Buf)
+	lc.c.down_rows = C.int(down.Rows)
+	lc.c.down_cols = C.int(down.Cols)
+	lc.c.down_type = C.int(down.Type)
+	lc.c.post_attn_norm_w = C.GpuBuf(postAttnNorm)
+	lc.c.post_ffn_norm_w = C.GpuBuf(postFFNNorm)
+}
+
+func (lc *LayerConf) SetKV(kCache, vCache Buf) {
+	lc.c.k_cache = C.GpuBuf(kCache)
+	lc.c.v_cache = C.GpuBuf(vCache)
+}
+
+func (lc *LayerConf) SetConfig(dim, headDim, numHeads, numKVHeads, kvDim int,
+	rmsEps, ropeFreqBase float32, ropeDim int, ropeNeox bool,
+	ffnType, residualType int) {
+	lc.c.dim = C.int(dim)
+	lc.c.head_dim = C.int(headDim)
+	lc.c.num_heads = C.int(numHeads)
+	lc.c.num_kv_heads = C.int(numKVHeads)
+	lc.c.kv_dim = C.int(kvDim)
+	lc.c.rms_eps = C.float(rmsEps)
+	lc.c.rope_freq_base = C.float(ropeFreqBase)
+	lc.c.rope_dim = C.int(ropeDim)
+	if ropeNeox {
+		lc.c.rope_neox = 1
+	}
+	lc.c.ffn_type = C.int(ffnType)
+	lc.c.residual_type = C.int(residualType)
+}
+
+func (lc *LayerConf) SetDP4A(q8_1Scratch Buf) {
+	lc.c.q8_1_scratch = C.GpuBuf(q8_1Scratch)
+	if q8_1Scratch != 0 {
+		lc.c.use_dp4a = 1
+	}
+}
+
+// ForwardLayer records all dispatches for one transformer layer.
+func ForwardLayer(lc *LayerConf, pos, seqLen int, scale float32, nextAttnNorm Buf) error {
+	rc := C.gpu_forward_layer(&lc.c, C.int(pos), C.int(seqLen), C.float(scale),
+		C.GpuBuf(nextAttnNorm))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: forward_layer failed (%d)", rc)
+	}
+	return nil
+}

@@ -118,7 +118,7 @@ type pair struct {
 func main() {
 	sys := "You are a helpful assistant."
 	maxTok := 128
-	prompt := "What is the capital of France?"
+	prompt := "Write a short story about a robot exploring a mysterious forest."
 
 	models := []pair{
 		{"SmolLM2 360M Q8_0", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "dlgo-smollm2-360m"},

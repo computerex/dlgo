@@ -2,6 +2,7 @@ $shaders = @(
     @{name="matvec_f32"; file="matvec_f32.comp"},
     @{name="matvec_q4_0"; file="matvec_q4_0.comp"},
     @{name="matvec_q8_0"; file="matvec_q8_0.comp"},
+    @{name="matvec_q3_k"; file="matvec_q3_k.comp"},
     @{name="matvec_q4_k"; file="matvec_q4_k.comp"},
     @{name="matvec_q5_0"; file="matvec_q5_0.comp"},
     @{name="matvec_q6_k"; file="matvec_q6_k.comp"},
@@ -15,7 +16,13 @@ $shaders = @(
     @{name="gelu"; file="gelu.comp"},
     @{name="add"; file="add.comp"},
     @{name="scale"; file="scale.comp"},
-    @{name="add_rmsnorm"; file="add_rmsnorm.comp"}
+    @{name="add_rmsnorm"; file="add_rmsnorm.comp"},
+    @{name="quantize_q8_1"; file="quantize_q8_1.comp"},
+    @{name="matvec_q4_0_dp4a"; file="matvec_q4_0_dp4a.comp"},
+    @{name="matvec_q5_0_dp4a"; file="matvec_q5_0_dp4a.comp"},
+    @{name="matvec_q8_0_dp4a"; file="matvec_q8_0_dp4a.comp"},
+    @{name="matvec_q4_k_dp4a"; file="matvec_q4_k_dp4a.comp"},
+    @{name="matvec_q6_k_dp4a"; file="matvec_q6_k_dp4a.comp"}
 )
 
 $header = @"
@@ -64,6 +71,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_f32",  spv_matvec_f32,  spv_matvec_f32_size,  3, 8},   // PIPE_MATVEC_F16 (placeholder)
     {"matvec_q4_0", spv_matvec_q4_0, spv_matvec_q4_0_size, 3, 8},   // PIPE_MATVEC_Q4_0
     {"matvec_q8_0", spv_matvec_q8_0, spv_matvec_q8_0_size, 3, 8},   // PIPE_MATVEC_Q8_0
+    {"matvec_q3_k", spv_matvec_q3_k, spv_matvec_q3_k_size, 3, 8},   // PIPE_MATVEC_Q3_K
     {"matvec_q4_k", spv_matvec_q4_k, spv_matvec_q4_k_size, 3, 8},   // PIPE_MATVEC_Q4_K
     {"matvec_q5_0", spv_matvec_q5_0, spv_matvec_q5_0_size, 3, 8},   // PIPE_MATVEC_Q5_0
     {"matvec_q6_k", spv_matvec_q6_k, spv_matvec_q6_k_size, 3, 8},   // PIPE_MATVEC_Q6_K
@@ -86,6 +94,12 @@ static const ShaderInfo shader_registry[] = {
     {"attention",   spv_attention,   spv_attention_size,   4, 24},  // PIPE_ATTENTION
     {"rmsnorm_heads", spv_rmsnorm_heads, spv_rmsnorm_heads_size, 2, 8}, // PIPE_RMSNORM_HEADS
     {"add_rmsnorm", spv_add_rmsnorm, spv_add_rmsnorm_size, 5, 8}, // PIPE_ADD_RMSNORM
+    {"quantize_q8_1", spv_quantize_q8_1, spv_quantize_q8_1_size, 2, 4}, // PIPE_QUANTIZE_Q8_1
+    {"matvec_q4_0_dp4a", spv_matvec_q4_0_dp4a, spv_matvec_q4_0_dp4a_size, 3, 8}, // PIPE_MATVEC_Q4_0_DP4A
+    {"matvec_q5_0_dp4a", spv_matvec_q5_0_dp4a, spv_matvec_q5_0_dp4a_size, 3, 8}, // PIPE_MATVEC_Q5_0_DP4A
+    {"matvec_q8_0_dp4a", spv_matvec_q8_0_dp4a, spv_matvec_q8_0_dp4a_size, 3, 8}, // PIPE_MATVEC_Q8_0_DP4A
+    {"matvec_q4_k_dp4a", spv_matvec_q4_k_dp4a, spv_matvec_q4_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q4_K_DP4A
+    {"matvec_q6_k_dp4a", spv_matvec_q6_k_dp4a, spv_matvec_q6_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q6_K_DP4A
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

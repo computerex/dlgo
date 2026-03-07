@@ -36,3 +36,14 @@ func BeginBatch()                            {}
 func EndBatch()                              {}
 func Barrier()                               {}
 func AddRMSNorm(no, so, a, b, w Buf, n int, eps float32) error { return errNoGPU }
+
+type LayerConf struct{}
+
+func NewLayerConf() *LayerConf                                            { return nil }
+func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf) {}
+func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, qn, kn Buf) {}
+func (lc *LayerConf) SetFFN(fn Buf, gate, up, down *GpuTensor, pan, pfn Buf) {}
+func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}
+func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e, f float32, rd int, n bool, ft, rt int) {}
+func (lc *LayerConf) SetDP4A(q Buf) {}
+func ForwardLayer(lc *LayerConf, pos, sl int, s float32, nan Buf) error   { return errNoGPU }

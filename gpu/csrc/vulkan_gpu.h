@@ -64,6 +64,12 @@ typedef enum {
     PIPE_ATTENTION,
     PIPE_RMSNORM_HEADS,
     PIPE_ADD_RMSNORM,
+    PIPE_QUANTIZE_Q8_1,
+    PIPE_MATVEC_Q4_0_DP4A,
+    PIPE_MATVEC_Q5_0_DP4A,
+    PIPE_MATVEC_Q8_0_DP4A,
+    PIPE_MATVEC_Q4_K_DP4A,
+    PIPE_MATVEC_Q6_K_DP4A,
     PIPE_COUNT
 } PipelineID;
 
@@ -134,6 +140,55 @@ void gpu_sync(void);
 void gpu_begin_batch(void);
 void gpu_end_batch(void);
 void gpu_barrier(void);
+
+// Quantize F32 → Q8_1 for dp4a integer dot product path
+int gpu_quantize_q8_1(GpuBuf q8_1_buf, GpuBuf f32_buf, int n_elements);
+
+// MatVec using dp4a (dotPacked4x8EXT): weights × Q8_1 input
+int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
+                    int rows, int cols, int qtype);
+
+// Fused layer: records all dispatches for one transformer layer in a single
+// CGo call, eliminating per-operation Go→C overhead.
+typedef struct {
+    GpuBuf x, x_norm, q, k, v, attn_out, attn_proj;
+    GpuBuf ffn_norm, ffn_in, gate, up, hidden, ffn_out;
+
+    GpuBuf attn_norm_w;
+    GpuBuf wq, wk, wv, wo;
+    int wq_rows, wq_cols, wq_type;
+    int wk_rows, wk_cols, wk_type;
+    int wv_rows, wv_cols, wv_type;
+    int wo_rows, wo_cols, wo_type;
+
+    GpuBuf bq, bk, bv;
+    GpuBuf q_norm_w, k_norm_w;
+
+    GpuBuf ffn_norm_w;
+    GpuBuf ffn_gate_w, ffn_up_w, ffn_down_w;
+    int gate_rows, gate_cols, gate_type;
+    int up_rows, up_cols, up_type;
+    int down_rows, down_cols, down_type;
+
+    GpuBuf post_attn_norm_w, post_ffn_norm_w;
+    GpuBuf k_cache, v_cache;
+
+    int dim, head_dim, num_heads, num_kv_heads, kv_dim;
+    float rms_eps, rope_freq_base;
+    int rope_dim;
+    int rope_neox;
+    int ffn_type;       // 0=swiglu, 1=geglu, 2=plain
+    int residual_type;  // 0=standard, 1=parallel
+
+    GpuBuf q8_1_scratch; // Q8_1 scratch buffer (reused for each quantize step)
+    int use_dp4a;        // 1 to use dp4a path, 0 for float path
+} GpuLayerConf;
+
+// Records all dispatches for one transformer layer.
+// next_attn_norm: weight buffer for next layer's attn norm (fused FFN residual
+// + next RMSNorm). Pass 0 for the last layer.
+int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
+                      GpuBuf next_attn_norm);
 
 #ifdef __cplusplus
 }

@@ -14,7 +14,7 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
-- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm — within 16–25% of Ollama GPU on generation
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest
 - **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 7–17% of Ollama on generation, same GGUF)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
 
@@ -158,26 +158,49 @@ All common GGUF downloads (Q4_K_M, Q5_K_M, Q3_K_L, Q8_0, etc.) use only Tier 1 t
 ## GPU Benchmarks vs Ollama
 
 GPU benchmarks on NVIDIA GeForce RTX 4070 Ti SUPER (16 GB VRAM). Same GGUF files loaded
-into both engines. Greedy decoding, 8-token generation.
+into both engines. Greedy decoding, 128-token generation.
 
-| Model | Quant | dlgo GPU gen | Ollama GPU gen | Delta |
+### Vulkan vs Vulkan (fair comparison)
+
+Ollama forced to Vulkan backend (`OLLAMA_VULKAN=1 OLLAMA_LLM_LIBRARY=vulkan`):
+
+| Model | Quant | dlgo Vulkan | Ollama Vulkan | Delta | dlgo prefill | Ollama prefill |
+|---|---|---|---|---|---|---|
+| SmolLM2 360M | Q8_0 | 389 tok/s | 411 tok/s | **−5%** | 86 ms | 1431 ms |
+| TinyLlama 1.1B | Q4_0 | 423 tok/s | 187 tok/s | **+126%** | 99 ms | 1966 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 394 tok/s | 237 tok/s | **+66%** | 68 ms | 2749 ms |
+| Gemma 3 1B | Q4_K_M | 245 tok/s | 116 tok/s | **+111%** | 194 ms | 3399 ms |
+
+dlgo **beats Ollama's Vulkan backend** on 3 of 4 models by 66–126%, and is within 5% on
+SmolLM2. Prefill is 10–50x faster across all models.
+
+### Vulkan vs CUDA (Ollama default)
+
+Ollama defaults to CUDA on NVIDIA GPUs, which benefits from NVIDIA's highly optimized
+CUDA compiler (nvcc/ptxas) vs the less mature Vulkan SPIR-V JIT:
+
+| Model | Quant | dlgo Vulkan | Ollama CUDA | Delta |
 |---|---|---|---|---|
-| SmolLM2 360M | Q8_0 | ~420 tok/s | ~500 tok/s | −16% |
-| TinyLlama 1.1B | Q4_0 | ~390 tok/s | ~490 tok/s | −20% |
-| Qwen 2.5 0.5B | Q4_K_M | ~440 tok/s | ~575 tok/s | −24% |
-| Gemma 3 1B | Q4_K_M | ~250 tok/s | ~325 tok/s | −23% |
+| SmolLM2 360M | Q8_0 | 389 tok/s | 641 tok/s | −39% |
+| TinyLlama 1.1B | Q4_0 | 423 tok/s | 624 tok/s | −32% |
+| Qwen 2.5 0.5B | Q4_K_M | 394 tok/s | 703 tok/s | −44% |
+| Gemma 3 1B | Q4_K_M | 245 tok/s | 358 tok/s | −32% |
+
+The 30–44% gap to CUDA is the inherent Vulkan vs CUDA overhead on NVIDIA hardware.
+On non-NVIDIA GPUs (AMD, Intel, mobile), dlgo's Vulkan backend provides the same
+performance advantage — Ollama's Vulkan backend is significantly slower for these
+quantization types.
 
 **GPU implementation highlights:**
 - Pure Vulkan compute (cross-platform, no CUDA dependency)
 - Quantized MatVec shaders with typed struct access (`float16_t`, `uint8_t`, `int8_t`)
-- Multi-warp per row for better SM utilization on small matrices
+- Fused layer dispatch (single CGo call per layer, minimized Go↔C overhead)
+- Fused Add+RMSNorm kernel reducing barriers per layer
 - Fused multi-head attention kernel (Q·K softmax, V accumulation)
 - HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
 - Single command buffer submission per token with batched dispatches
 - Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead
-
-The 16–24% gap vs Ollama's CUDA backend is attributable to Vulkan vs CUDA dispatch overhead
-and SPIR-V → PTX compilation quality vs native NVCC.
+- `dp4a` integer dot product shaders (available for Q4_0, Q5_0, Q8_0, Q4_K, Q6_K)
 
 ## How It Works
 

@@ -11,9 +11,110 @@ import (
 	"github.com/computerex/dlgo/models/llm"
 )
 
+// BuildLayerConfs creates reusable fused-layer configurations from the model,
+// run state, and KV cache. Call once after model upload; reuse for every token.
+func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache) []*LayerConf {
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	numHeads := cfg.NumHeads
+	numKVHeads := cfg.NumKVHeads
+	kvDim := numKVHeads * headDim
+
+	confs := make([]*LayerConf, cfg.NumLayers)
+	for l := 0; l < cfg.NumLayers; l++ {
+		layer := &m.Layers[l]
+		gl := &gm.Layers[l]
+		lc := NewLayerConf()
+
+		lc.SetScratch(rs.X, rs.XNorm, rs.Q, rs.K, rs.V, rs.AttnOut, rs.AttnProj,
+			rs.FFNNorm, rs.FFNIn, rs.Gate, rs.Up, rs.Hidden, rs.FFNOut)
+		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+			gl.Bq, gl.Bk, gl.Bv, gl.AttnQNorm, gl.AttnKNorm)
+
+		var ffnGate *GpuTensor
+		if gl.FFNGate != nil {
+			ffnGate = gl.FFNGate
+		}
+		lc.SetFFN(gl.FFNNorm, ffnGate, gl.FFNUp, gl.FFNDown,
+			gl.PostAttnNorm, gl.PostFFNNorm)
+		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+
+		ffnType := 0
+		switch layer.Spec.FFN {
+		case llm.FFNSwiGLU:
+			ffnType = 0
+		case llm.FFNGeGLU:
+			ffnType = 1
+		case llm.FFNPlain:
+			ffnType = 2
+		}
+		resType := 0
+		if layer.Spec.Residual == llm.ResParallel {
+			resType = 1
+		}
+
+		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
+			cfg.RMSNormEps, cfg.RopeFreqBase, cfg.RopeDim, cfg.RopeNeox,
+			ffnType, resType)
+
+		confs[l] = lc
+	}
+	return confs
+}
+
+// GpuForwardFused performs a single-token forward pass using pre-built layer
+// configurations. One CGo call per layer instead of ~20+.
+func GpuForwardFused(m *llm.Model, gm *GpuModel, token int32, pos int,
+	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, layerConfs []*LayerConf) {
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+
+	if layerConfs == nil {
+		layerConfs = BuildLayerConfs(m, gm, rs, kv)
+	}
+
+	xCPU := make([]float32, dim)
+	_ = m.TokenEmbed.DequantizeRow(int(token), xCPU)
+	if cfg.EmbedScale != 0 {
+		for i := range xCPU {
+			xCPU[i] *= cfg.EmbedScale
+		}
+	}
+	seqLen := pos + 1
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+
+	BeginBatch()
+	UploadF32(rs.X, xCPU)
+
+	if m.Layers[0].Spec.Norm == llm.NormRMS {
+		Barrier()
+		RMSNorm(rs.XNorm, rs.X, gm.Layers[0].AttnNorm, dim, cfg.RMSNormEps)
+	}
+
+	for l := 0; l < cfg.NumLayers; l++ {
+		var nextAttnNorm Buf
+		if l < cfg.NumLayers-1 {
+			nextAttnNorm = gm.Layers[l+1].AttnNorm
+		}
+		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
+	}
+
+	Barrier()
+	RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
+	Barrier()
+	output := gm.Output
+	if output == nil {
+		output = gm.TokenEmbed
+	}
+	MatVec(rs.Logits, output.Buf, rs.X, output.Rows, output.Cols, output.Type)
+	DownloadF32(rs.Logits, logitsBuf)
+}
+
 // GpuForward performs a single-token forward pass entirely on GPU.
-// All layers are recorded into a single command buffer with explicit barriers
-// placed only where data dependencies require them.
+// This is the general path with error handling and CPU fallback for
+// unsupported quant types.
 func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32) error {
 	cfg := m.Config
@@ -43,7 +144,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		spec := &layer.Spec
 		gl := &gm.Layers[l]
 
-		// RMSNorm reads X (written by previous layer's residual Add)
 		Barrier()
 		if spec.Norm == llm.NormRMS {
 			if err := RMSNorm(rs.XNorm, rs.X, gl.AttnNorm, dim, cfg.RMSNormEps); err != nil {
@@ -52,7 +152,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		}
 
 		if spec.Core == llm.CoreAttention {
-			// Q/K/V all read from XNorm, write to independent buffers -> parallel
 			Barrier()
 			if err := gpuMatVec(rs.Q, gl.Wq, layer.Wq, rs.XNorm, rs); err != nil {
 				return fmt.Errorf("layer %d wq: %w", l, err)
@@ -64,7 +163,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				return fmt.Errorf("layer %d wv: %w", l, err)
 			}
 
-			// Biases depend on their respective matmul outputs
 			Barrier()
 			if gl.Bq != 0 {
 				if err := addBuf(rs.Q, gl.Bq, numHeads*headDim); err != nil {
@@ -84,7 +182,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 			if spec.QKNorm {
 				Barrier()
-				// Q and K norms are independent
 				if err := RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps); err != nil {
 					return fmt.Errorf("layer %d qnorm: %w", l, err)
 				}
@@ -93,13 +190,11 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				}
 			}
 
-			// RoPE reads Q and K
 			Barrier()
 			if err := RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox); err != nil {
 				return fmt.Errorf("layer %d rope: %w", l, err)
 			}
 
-			// KVStore has internal compute→transfer and transfer→compute barriers.
 			if err := KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
 				return fmt.Errorf("layer %d kvstore: %w", l, err)
 			}
@@ -110,7 +205,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				return fmt.Errorf("layer %d attention: %w", l, err)
 			}
 
-			// Wo projection reads AttnOut
 			Barrier()
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
@@ -126,7 +220,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				}
 				Barrier()
 			}
-			// Fused Add + RMSNorm: saves one barrier vs separate Add then RMSNorm
 			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.FFNNorm, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
 			}

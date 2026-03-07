@@ -13,13 +13,15 @@ import (
 
 // GpuPipeline bundles a model on GPU with all state needed for inference.
 type GpuPipeline struct {
-	CPUModel  *llm.Model
-	GpuModel  *GpuModel
-	Tokenizer *llm.Tokenizer
-	KVCache   *GpuKVCache
-	RunState  *GpuRunState
-	MaxSeqLen int
-	LogitsBuf []float32
+	CPUModel     *llm.Model
+	GpuModel     *GpuModel
+	Tokenizer    *llm.Tokenizer
+	KVCache      *GpuKVCache
+	RunState     *GpuRunState
+	MaxSeqLen    int
+	LogitsBuf    []float32
+	LayerConfs   []*LayerConf
+	Q8_1Scratch  Buf
 }
 
 // UploadModel copies all model weights to GPU memory.
@@ -167,16 +169,24 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	rs := NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
 	kv := NewGpuKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
 
+	layerConfs := BuildLayerConfs(m, gm, rs, kv)
+
+	// dp4a disabled: the quantize+barrier overhead per layer (~22µs × layers)
+	// negates ALU savings. TODO: fuse quantization into MatVec shader.
+	var q8_1Scratch Buf
+
 	fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
 
 	return &GpuPipeline{
-		CPUModel:  m,
-		GpuModel:  gm,
-		Tokenizer: cpuPipeline.Tokenizer,
-		KVCache:   kv,
-		RunState:  rs,
-		MaxSeqLen: cpuPipeline.MaxSeqLen,
-		LogitsBuf: make([]float32, cfg.VocabSize),
+		CPUModel:    m,
+		GpuModel:    gm,
+		Tokenizer:   cpuPipeline.Tokenizer,
+		KVCache:     kv,
+		RunState:    rs,
+		MaxSeqLen:   cpuPipeline.MaxSeqLen,
+		LogitsBuf:   make([]float32, cfg.VocabSize),
+		LayerConfs:  layerConfs,
+		Q8_1Scratch: q8_1Scratch,
 	}, nil
 }
 
@@ -211,9 +221,7 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	// Prefill: process prompt tokens one at a time on GPU
 	prefillStart := time.Now()
 	for i, tok := range tokens {
-		if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
-			return nil, err
-		}
+		GpuForwardFused(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
 	}
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
@@ -246,9 +254,7 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			}
 		}
 
-		if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
-			return nil, err
-		}
+		GpuForwardFused(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
 		pos++
 
 		nextToken = ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)

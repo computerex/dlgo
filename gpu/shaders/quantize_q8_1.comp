@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly buffer A { vec4 data_a[]; };
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+layout(scalar, set = 0, binding = 1) writeonly buffer B { block_q8_1 data_b[]; };
+
+layout(push_constant) uniform Params {
+    int n_elements;
+};
+
+shared float shmem[32];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint block_in_wg = tid >> 3;
+    uint iqs = tid & 7u;
+
+    uint ib = gl_WorkGroupID.x * 4u + block_in_wg;
+    uint n_blocks = (uint(n_elements) + 31u) >> 5;
+    if (ib >= n_blocks) return;
+
+    uint a_idx = ib * 8u + iqs;
+    vec4 vals = (a_idx < uint(n_elements) / 4u) ? data_a[a_idx] : vec4(0.0);
+    vec4 abs_vals = abs(vals);
+
+    float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
+    shmem[tid] = thread_max;
+    barrier();
+    [[unroll]] for (uint s = 4u; s > 0u; s >>= 1u) {
+        if (iqs < s) shmem[tid] = max(shmem[tid], shmem[tid + s]);
+        barrier();
+    }
+    float amax = shmem[block_in_wg * 8u];
+
+    float d = amax / 127.0;
+    float d_inv = (d != 0.0) ? 1.0 / d : 0.0;
+    vals = round(vals * d_inv);
+
+    data_b[ib].qs[iqs] = pack32(i8vec4(ivec4(vals)));
+
+    float thread_sum = vals.x + vals.y + vals.z + vals.w;
+    shmem[tid] = thread_sum;
+    barrier();
+    [[unroll]] for (uint s = 4u; s > 0u; s >>= 1u) {
+        if (iqs < s) shmem[tid] += shmem[tid + s];
+        barrier();
+    }
+
+    if (iqs == 0u) {
+        float sum = shmem[block_in_wg * 8u];
+        data_b[ib].d = float16_t(d);
+        data_b[ib].s = float16_t(sum * d);
+    }
+}

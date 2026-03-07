@@ -1,17 +1,16 @@
 #version 450
-
-// Fused single-head attention using shared memory for scores.
-// One workgroup per head. Supports seq_len up to 4096.
-// Phase 1: compute scores[t] = dot(Q[head], K_cache[t, kv_head]) * scale
-// Phase 2: softmax over scores
-// Phase 3: weighted sum of V_cache -> out[head*head_dim + d]
+#extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
-layout(set = 0, binding = 1) buffer Q { float q_data[]; };
-layout(set = 0, binding = 2) buffer KCache { float k_cache[]; };
-layout(set = 0, binding = 3) buffer VCache { float v_cache[]; };
+layout(set = 0, binding = 0) buffer AttnOutV4 { vec4 attn_v4[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 1) readonly buffer QV4 { vec4 q_v4[]; };
+layout(set = 0, binding = 2) readonly buffer KCache { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer KV4 { vec4 k_v4[]; };
+layout(set = 0, binding = 3) readonly buffer VCache { float v_cache[]; };
+layout(set = 0, binding = 3) readonly buffer VV4 { vec4 v_v4[]; };
 
 layout(push_constant) uniform Params {
     int num_heads;
@@ -24,6 +23,7 @@ layout(push_constant) uniform Params {
 
 shared float scores[4096];
 shared float reduce[256];
+shared vec4 q_sh[64];
 
 void main() {
     uint head = gl_WorkGroupID.x;
@@ -32,29 +32,40 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint kv_mul = num_heads / num_kv_heads;
     uint kv_head = head / kv_mul;
-    uint q_base = head * head_dim;
-    uint kv_offset = kv_head * head_dim;
+    uint q_base = head * uint(head_dim);
+    uint kv_offset = kv_head * uint(head_dim);
+    uint head_dim4 = uint(head_dim) >> 2;
+    uint kv_dim4 = uint(kv_dim) >> 2;
+    uint kv_off4 = kv_offset >> 2;
 
-    // Phase 1: compute attention scores
-    for (int t = int(tid); t < seq_len; t += 256) {
-        float dot = 0.0;
-        uint k_base = t * kv_dim + kv_offset;
-        for (int d = 0; d < head_dim; d++) {
-            dot += q_data[q_base + d] * k_cache[k_base + d];
-        }
-        scores[t] = dot * scale;
+    // Pre-load Q into shared memory as vec4
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
+        q_sh[d4] = q_v4[(q_base >> 2) + d4];
     }
     barrier();
 
-    // Phase 2: softmax over scores[0..seq_len)
-    // Find max
+    // Phase 1: Q·K scores with vec4 dot products
+    for (int t = int(tid); t < seq_len; t += 256) {
+        float dot_val = 0.0;
+        uint k_base4 = uint(t) * kv_dim4 + kv_off4;
+        for (uint d4 = 0; d4 < head_dim4; d4 += 4u) {
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                if (d4 + j < head_dim4)
+                    dot_val += dot(q_sh[d4 + j], k_v4[k_base4 + d4 + j]);
+            }
+        }
+        scores[t] = dot_val * scale;
+    }
+    barrier();
+
+    // Phase 2: softmax - find max
     float mx = -1.0e30;
     for (int t = int(tid); t < seq_len; t += 256) {
         mx = max(mx, scores[t]);
     }
     reduce[tid] = mx;
     barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
         if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
         barrier();
     }
@@ -70,7 +81,7 @@ void main() {
     }
     reduce[tid] = my_sum;
     barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
         if (tid < s) reduce[tid] += reduce[tid + s];
         barrier();
     }
@@ -83,13 +94,13 @@ void main() {
     }
     barrier();
 
-    // Phase 3: weighted sum of V
-    uint out_base = head * head_dim;
-    for (int d = int(tid); d < head_dim; d += 256) {
-        float acc = 0.0;
+    // Phase 3: weighted sum of V using vec4
+    uint out_base4 = (head * uint(head_dim)) >> 2;
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
+        vec4 acc = vec4(0.0);
         for (int t = 0; t < seq_len; t++) {
-            acc += scores[t] * v_cache[t * kv_dim + kv_offset + d];
+            acc += scores[t] * v_v4[uint(t) * kv_dim4 + kv_off4 + d4];
         }
-        attn_out[out_base + d] = acc;
+        attn_v4[out_base4 + d4] = acc;
     }
 }

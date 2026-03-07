@@ -1,0 +1,161 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q4_K weights × Q8_1 input using dotPacked4x8EXT (dp4a).
+// 128 threads, 2 rows per workgroup. K_PER_ITER=16, 4 dp4a per iteration.
+// Q4_K super-blocks: 256 elements, sub-block scales.
+
+layout(local_size_x = 128) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+struct block_q4_k_p32 {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint32_t qs[32];
+};
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q4_k data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP32 { block_q4_k_p32 data_a_p32[]; };
+layout(scalar, set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+
+    uint ncols = uint(cols);
+    uint num_super_blocks = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    // 128 threads: each thread handles 16 elements per iteration (K_PER_ITER=16).
+    // 128 * 16 = 2048 elements per iteration = 8 super-blocks.
+    // Within a super-block (256 elements), threads are mapped to sub-blocks.
+    uint it_size = 128u / 16u;  // 8 threads per super-block
+    uint ix = tid >> 4;          // which super-block this thread works on (0-7)
+    uint il = tid & 15u;         // position within super-block's 16 sub-positions
+
+    // Map to Q8_1-block-level indices within the super-block
+    // Each super-block = 8 Q8_1 blocks of 32 elements each
+    uint iqs = il;  // sub-block index within the super-block (0-15)
+    // iqs maps to: Q8_1 block = iqs/2, within-block half = iqs%2
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint i = ix; i < num_super_blocks; i += it_size) {
+        // Q8_1 block index for this thread's 16 elements
+        uint b_block_base = i * 8u;  // 8 Q8_1 blocks per super-block
+        uint b_ib = b_block_base + (iqs >> 1);
+        uint b_half = iqs & 1u;
+
+        // Load Q8_1 data: 4 packed int32 for 16 elements
+        int32_t cache_b[4];
+        cache_b[0] = data_b[b_ib].qs[b_half * 4];
+        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
+        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
+        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
+        vec2 cache_dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint ib_k = (first_row + n) * num_super_blocks + i;
+
+            float d_val = float(data_a[ib_k].d);
+            float dmin_val = float(data_a[ib_k].dmin);
+
+            // Decode sub-block scale and min
+            uint is_idx = iqs >> 1;  // sub-block scale index (0-7)
+            uint sc, m;
+            if (is_idx < 4u) {
+                sc = uint(data_a[ib_k].scales[is_idx]) & 0x3Fu;
+                m = uint(data_a[ib_k].scales[is_idx + 4u]) & 0x3Fu;
+            } else {
+                uint s_hi = uint(data_a[ib_k].scales[is_idx + 4u]);
+                uint s_lo_0 = uint(data_a[ib_k].scales[is_idx - 4u]);
+                uint s_lo_4 = uint(data_a[ib_k].scales[is_idx]);
+                sc = (s_hi & 0xFu) | ((s_lo_0 & 0xC0u) >> 2);
+                m  = (s_hi >> 4)   | ((s_lo_4 & 0xC0u) >> 2);
+            }
+
+            float d_sc = d_val * float(sc);
+            float dm_m = dmin_val * float(m);
+
+            // Read 4 packed uint32 of Q4_K nibbles for 16 elements
+            uint qs_base = (iqs >> 1) * 4u + (b_half << 1);  // 4 uint32 per sub-block half
+            uint qs_shift = b_half * 4u;
+
+            // For Q4_K: qs layout within super-block:
+            // Low half (elements 0-127): qs[0..31], nibble low
+            // High half (elements 128-255): qs[0..31], nibble high
+            uint half_off = (iqs >= 8u) ? 16u : 0u;
+            uint local_iqs = iqs & 7u;
+            uint qs_idx = half_off + local_iqs * 2u;
+            uint shift = (iqs >= 8u) ? 4u : 0u;
+
+            uint32_t qs0 = (data_a_p32[ib_k].qs[qs_idx] >> shift) & 0x0F0F0F0Fu;
+            uint32_t qs1 = (data_a_p32[ib_k].qs[qs_idx + 1u] >> shift) & 0x0F0F0F0Fu;
+            uint32_t qs2 = (data_a_p32[ib_k].qs[qs_idx + 16u] >> shift) & 0x0F0F0F0Fu;
+            uint32_t qs3 = (data_a_p32[ib_k].qs[qs_idx + 17u] >> shift) & 0x0F0F0F0Fu;
+
+            i32vec4 a_qs = i32vec4(qs0, qs1, qs2, qs3);
+
+            int32_t q_sum = dotPacked4x8EXT(a_qs.x, cache_b[0])
+                          + dotPacked4x8EXT(a_qs.y, cache_b[1])
+                          + dotPacked4x8EXT(a_qs.z, cache_b[2])
+                          + dotPacked4x8EXT(a_qs.w, cache_b[3]);
+
+            temp[n] += d_sc * float(q_sum) * cache_dsb.x - dm_m * cache_dsb.y * 0.5;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[first_row + n] = sum;
+        }
+    }
+}
