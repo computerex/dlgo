@@ -10,14 +10,12 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
 	"runtime"
 	"strings"
-	"time"
 
+	"github.com/computerex/dlgo/gpu"
 	"github.com/computerex/dlgo/models/llm"
-	"github.com/computerex/dlgo/ops"
 )
 
 type turnResult struct {
@@ -31,28 +29,12 @@ type turnResult struct {
 }
 
 type chatRunner struct {
-	pipe        *llm.Pipeline
-	cachedToken []int32
+	pipe *llm.Pipeline
 }
 
-func (r *chatRunner) resetCache() {
-	r.pipe.KVCache.Reset()
-	if r.pipe.RunState.SSMState != nil {
-		r.pipe.RunState.SSMState.Reset()
-	}
-	r.cachedToken = nil
-}
-
-func commonPrefixLen(a, b []int32) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	i := 0
-	for i < n && a[i] == b[i] {
-		i++
-	}
-	return i
+type gpuChatRunner struct {
+	cpuPipe *llm.Pipeline
+	gpuPipe *gpu.GpuPipeline
 }
 
 func stopStrings() []string {
@@ -68,127 +50,71 @@ func stopStrings() []string {
 }
 
 func (r *chatRunner) generate(prompt string, cfg llm.GenerateConfig) (*turnResult, error) {
-	tokens := r.pipe.Tokenizer.Encode(prompt)
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("tokenizer produced no tokens")
+	result, err := r.pipe.GenerateDetailed(prompt, cfg)
+	if err != nil {
+		return nil, err
 	}
-	if len(tokens) >= r.pipe.MaxSeqLen {
-		return nil, fmt.Errorf("prompt too long: %d tokens (max %d)", len(tokens), r.pipe.MaxSeqLen)
-	}
-
-	common := commonPrefixLen(r.cachedToken, tokens)
-	if common != len(r.cachedToken) {
-		// Diverged prompt (history trim/edit): rebuild cache from scratch.
-		r.resetCache()
-		common = 0
-	}
-
-	prefillStart := time.Now()
-	if llm.CanBatchPrefill(r.pipe.Model) && len(tokens)-common > 1 {
-		llm.BatchPrefill(r.pipe.Model, tokens[common:], common, r.pipe.KVCache, r.pipe.RunState)
-	} else {
-		for i := common; i < len(tokens); i++ {
-			if i == len(tokens)-1 {
-				llm.Forward(r.pipe.Model, tokens[i], i, r.pipe.KVCache, r.pipe.RunState)
-			} else {
-				llm.ForwardNoLogits(r.pipe.Model, tokens[i], i, r.pipe.KVCache, r.pipe.RunState)
-			}
-		}
-	}
-	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
-
-	r.cachedToken = append(r.cachedToken[:0], tokens...)
-
-	rng := rand.New(rand.NewSource(cfg.Seed))
-	if cfg.Seed < 0 {
-		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
-	}
-
-	stops := stopStrings()
-	var recent []int32
-	var forwardTokens []int32
-	var visibleTokens int
-	var outText strings.Builder
-
-	genStart := time.Now()
-	pos := len(tokens)
-
-	for step := 0; step < cfg.MaxTokens; step++ {
-		if pos >= r.pipe.MaxSeqLen-1 {
-			break
-		}
-
-		next := int32(ops.SampleToken(r.pipe.RunState.Logits, cfg.Sampler, recent, rng))
-		if next == r.pipe.Model.Config.EOS {
-			break
-		}
-		stopTok := false
-		for _, st := range r.pipe.Model.Config.StopTokens {
-			if next == st {
-				stopTok = true
-				break
-			}
-		}
-		if stopTok {
-			break
-		}
-
-		tokText := r.pipe.Tokenizer.DecodeToken(next)
-		outText.WriteString(tokText)
-		visibleTokens++
-
-		if cfg.Stream != nil {
-			cfg.Stream(tokText)
-		}
-
-		full := outText.String()
-		matchedStop := false
-		for _, ss := range stops {
-			if strings.HasSuffix(full, ss) {
-				outText.Reset()
-				outText.WriteString(strings.TrimSuffix(full, ss))
-				matchedStop = true
-				break
-			}
-		}
-		if matchedStop {
-			break
-		}
-
-		llm.Forward(r.pipe.Model, next, pos, r.pipe.KVCache, r.pipe.RunState)
-		pos++
-		forwardTokens = append(forwardTokens, next)
-		recent = append(recent, next)
-		if len(recent) > 64 {
-			recent = recent[1:]
-		}
-	}
-	genMs := float64(time.Since(genStart).Microseconds()) / 1000.0
-
-	r.cachedToken = append(r.cachedToken, forwardTokens...)
-
-	tokPerSec := 0.0
-	if genMs > 0 {
-		tokPerSec = float64(visibleTokens) / (genMs / 1000.0)
-	}
-
+	text := strings.TrimSpace(trimStopText(result.Text))
 	return &turnResult{
-		Text:         outText.String(),
-		TokensPerSec: tokPerSec,
-		PrefillMs:    prefillMs,
-		PrefillDelta: len(tokens) - common,
-		GenerateMs:   genMs,
-		PromptTokens: len(tokens),
-		OutputTokens: visibleTokens,
+		Text:         text,
+		TokensPerSec: result.TokensPerSec,
+		PrefillMs:    result.PrefillTimeMs,
+		PrefillDelta: result.PromptTokens,
+		GenerateMs:   result.GenerateTimeMs,
+		PromptTokens: result.PromptTokens,
+		OutputTokens: result.TotalTokens,
 	}, nil
+}
+
+func (r *gpuChatRunner) generate(prompt string, cfg llm.GenerateConfig) (*turnResult, error) {
+	result, err := r.gpuPipe.GenerateDetailed(prompt, cfg)
+	if err != nil {
+		return nil, err
+	}
+	text := strings.TrimSpace(trimStopText(result.Text))
+	return &turnResult{
+		Text:         text,
+		TokensPerSec: result.TokensPerSec,
+		PrefillMs:    result.PrefillTimeMs,
+		PrefillDelta: result.PromptTokens,
+		GenerateMs:   result.GenerateTimeMs,
+		PromptTokens: result.PromptTokens,
+		OutputTokens: result.TotalTokens,
+	}, nil
+}
+
+func trimStopText(text string) string {
+	for {
+		trimmed := strings.TrimRight(text, " \t\r\n")
+		changed := false
+		for _, ss := range stopStrings() {
+			if strings.HasSuffix(trimmed, ss) {
+				trimmed = strings.TrimSuffix(trimmed, ss)
+				trimmed = strings.TrimRight(trimmed, " \t\r\n")
+				changed = true
+			}
+		}
+		if !changed {
+			return trimmed
+		}
+		text = trimmed
+	}
 }
 
 func main() {
 	ctx := flag.Int("ctx", 8192, "runtime context length (tokens)")
 	maxTokens := flag.Int("max-tokens", 256, "max tokens per assistant response")
 	temp := flag.Float64("temp", 0.7, "sampling temperature (0 = greedy)")
+	topK := flag.Int("top-k", 40, "top-k sampling (0 = disabled)")
+	topP := flag.Float64("top-p", 0.9, "top-p nucleus sampling (1.0 = disabled)")
+	minP := flag.Float64("min-p", 0.0, "min-p sampling threshold (0 = disabled)")
+	repeatPenalty := flag.Float64("repeat-penalty", 1.1, "repetition penalty (1.0 = disabled)")
+	seed := flag.Int64("seed", -1, "random seed (-1 = random)")
+	system := flag.String("system", "You are a helpful assistant.", "system prompt")
 	threads := flag.Int("threads", 0, "worker threads (0 = auto, try 128 on this machine)")
 	historyTurns := flag.Int("history-turns", 6, "number of recent user/assistant turns to keep")
+	useGPU := flag.Bool("gpu", false, "use Vulkan GPU backend")
+	stream := flag.Bool("stream", true, "stream tokens as they are generated")
 	flag.Parse()
 
 	modelPath := `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`
@@ -208,6 +134,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: --temp must be >= 0")
 		os.Exit(1)
 	}
+	if *topK < 0 {
+		fmt.Fprintln(os.Stderr, "Error: --top-k must be >= 0")
+		os.Exit(1)
+	}
+	if *topP <= 0 || *topP > 1 {
+		fmt.Fprintln(os.Stderr, "Error: --top-p must be in (0, 1]")
+		os.Exit(1)
+	}
+	if *minP < 0 || *minP > 1 {
+		fmt.Fprintln(os.Stderr, "Error: --min-p must be in [0, 1]")
+		os.Exit(1)
+	}
+	if *repeatPenalty < 1.0 {
+		fmt.Fprintln(os.Stderr, "Error: --repeat-penalty must be >= 1.0")
+		os.Exit(1)
+	}
 	if *threads < 0 {
 		fmt.Fprintln(os.Stderr, "Error: --threads must be >= 0")
 		os.Exit(1)
@@ -225,14 +167,36 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error loading model: %v\n", err)
 		os.Exit(1)
 	}
-	runner := &chatRunner{pipe: pipe}
+	cpuRunner := &chatRunner{pipe: pipe}
+	var runner interface {
+		generate(string, llm.GenerateConfig) (*turnResult, error)
+	}
+	runner = cpuRunner
+	var gpuRunner *gpuChatRunner
+	if *useGPU {
+		if err := gpu.Init(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error initializing GPU: %v\n", err)
+			os.Exit(1)
+		}
+		gp, err := gpu.NewGpuPipeline(pipe)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating GPU pipeline: %v\n", err)
+			os.Exit(1)
+		}
+		gpuRunner = &gpuChatRunner{cpuPipe: pipe, gpuPipe: gp}
+		runner = gpuRunner
+	}
 
 	cfg := llm.DefaultGenerateConfig()
 	cfg.MaxTokens = *maxTokens
 	cfg.Sampler.Temperature = float32(*temp)
+	cfg.Sampler.TopK = *topK
+	cfg.Sampler.TopP = float32(*topP)
+	cfg.Sampler.MinP = float32(*minP)
+	cfg.Sampler.RepetitionPenalty = float32(*repeatPenalty)
+	cfg.Seed = *seed
 
-	system := "You are a helpful assistant."
-	messages := []llm.Message{{Role: "system", Content: system}}
+	messages := []llm.Message{{Role: "system", Content: *system}}
 
 	fmt.Printf("Model: %s (%d layers, %d dim, %d heads, vocab %d, ctx %d)\n",
 		pipe.Model.Config.Architecture,
@@ -243,12 +207,26 @@ func main() {
 		pipe.Model.Config.ContextLength,
 	)
 	fmt.Printf("Runtime context (--ctx): %d tokens\n", pipe.MaxSeqLen)
+	if *useGPU {
+		fmt.Printf("Backend (--gpu): Vulkan GPU (%s)\n", gpu.DeviceName())
+	} else {
+		fmt.Println("Backend (--gpu): CPU")
+	}
 	if *threads > 0 {
 		fmt.Printf("Workers (--threads): %d\n", *threads)
 	} else {
 		fmt.Printf("Workers (--threads): auto (%d)\n", runtime.GOMAXPROCS(0))
 	}
-	fmt.Printf("Generation: max-tokens=%d temp=%.2f\n", cfg.MaxTokens, cfg.Sampler.Temperature)
+	fmt.Printf("Generation: max-tokens=%d temp=%.2f top-k=%d top-p=%.2f min-p=%.2f repeat-penalty=%.2f seed=%d\n",
+		cfg.MaxTokens,
+		cfg.Sampler.Temperature,
+		cfg.Sampler.TopK,
+		cfg.Sampler.TopP,
+		cfg.Sampler.MinP,
+		cfg.Sampler.RepetitionPenalty,
+		cfg.Seed,
+	)
+	fmt.Printf("Streaming (--stream): %v\n", *stream)
 	fmt.Printf("History window (--history-turns): %d turns\n", *historyTurns)
 	fmt.Println("Interactive chat ready. Type 'exit' or 'quit' to leave.")
 	fmt.Println()
@@ -274,19 +252,36 @@ func main() {
 		windowed := applyHistoryWindow(messages, *historyTurns)
 		prompt := llm.FormatMessages(pipe.Model.Config, windowed)
 
+		fmt.Print("AI> ")
+		origStream := cfg.Stream
+		if *stream {
+			cfg.Stream = func(tok string) {
+				fmt.Print(tok)
+			}
+		} else {
+			cfg.Stream = nil
+		}
 		result, err := runner.generate(prompt, cfg)
+		cfg.Stream = origStream
 		if err != nil {
+			fmt.Println()
 			fmt.Fprintf(os.Stderr, "Error generating response: %v\n", err)
 			continue
 		}
 
 		responseRaw := result.Text
 		responseDisplay := strings.TrimSpace(responseRaw)
-		if responseDisplay == "" {
-			responseDisplay = "(empty response)"
+		if *stream {
+			if responseDisplay == "" {
+				fmt.Print("(empty response)")
+			}
+			fmt.Println()
+		} else {
+			if responseDisplay == "" {
+				responseDisplay = "(empty response)"
+			}
+			fmt.Println(responseDisplay)
 		}
-
-		fmt.Println("AI>", responseDisplay)
 		fmt.Printf("   [%.1f tok/s | prefill %.0f ms (%d delta tok) | gen %.0f ms | prompt %d tok | output %d tok]\n\n",
 			result.TokensPerSec,
 			result.PrefillMs,
