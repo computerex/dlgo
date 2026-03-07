@@ -25,7 +25,7 @@ fmt.Println(response) // "The capital of France is Paris."
 | Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | ~89 tok/s |
 | Qwen3.5 | Qwen3.5 2B (hybrid GDN+attention) | ~16 tok/s |
 | Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | ~44–155 tok/s |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | ~99 tok/s |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | ~39–97 tok/s |
 | Phi | Phi-2, Phi-4-mini | ~8–9 tok/s |
 | Mistral | Mistral (llama-compatible) | — |
 | Whisper | Tiny, Base, Small (speech-to-text) | ~1x realtime |

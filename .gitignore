@@ -33,6 +33,13 @@ desktop.ini
 # Cursor
 .cursor/
 
+# Harness/benchmark artifacts
+.harness_*
+.harness_output/
+
+# Ollama Modelfiles (temp)
+Modelfile*
+
 # Misc
 *.log
 *.prof
