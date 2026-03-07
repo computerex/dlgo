@@ -5,6 +5,8 @@
 package blas
 
 import (
+	"os"
+	"strconv"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -28,9 +30,14 @@ var defaultPoolOnce sync.Once
 // DefaultPool returns a shared worker pool sized to the number of CPUs.
 func DefaultPool() *Pool {
 	defaultPoolOnce.Do(func() {
-		n := runtime.NumCPU()
+		n := runtime.GOMAXPROCS(0)
 		if n < 1 {
 			n = 1
+		}
+		if v := os.Getenv("DLGO_NUM_THREADS"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+				n = parsed
+			}
 		}
 		defaultPool = NewPool(n)
 	})

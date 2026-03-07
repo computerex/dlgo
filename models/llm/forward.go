@@ -213,8 +213,8 @@ func forwardAttention(
 	} else {
 		blas.QMatVecMulParallel(rs.Q, layer.Wq, rs.XNorm, pool)
 	}
-	blas.QMatVecMul(rs.K, layer.Wk, rs.XNorm)
-	blas.QMatVecMul(rs.V, layer.Wv, rs.XNorm)
+	blas.QMatVecMulParallel(rs.K, layer.Wk, rs.XNorm, pool)
+	blas.QMatVecMulParallel(rs.V, layer.Wv, rs.XNorm, pool)
 
 	if layer.Bq != nil {
 		ops.AddBias(rs.Q, layer.Bq)
