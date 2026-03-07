@@ -40,20 +40,23 @@ with `num_gpu=0`. Three prompts averaged per model. Ollama prompt 1 is cold star
 
 | Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
 |---|---|---|---|---|---|---|
-| TinyLlama 1.1B | Q4_0 | 62.5 tok/s | 74.7 tok/s | −16% | 171 ms | 119 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 91.9 tok/s | 115.2 tok/s | −20% | 68 ms | 43 ms |
-| Gemma 3 1B | Q4_K_M | 44.2 tok/s | 50.9 tok/s | −13% | 196 ms | 83 ms |
-| SmolLM2 360M | Q8_0 vs F16 | 99.3 tok/s | 62.1 tok/s | **+60%** | 53 ms | 29 ms |
+| TinyLlama 1.1B | Q4_0 | 60.0 tok/s | 70.6 tok/s | −15% | 185 ms | 123 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 90.8 tok/s | 114.1 tok/s | −20% | 68 ms | 35 ms |
+| Gemma 3 1B | Q4_K_M | 45.3 tok/s | 52.2 tok/s | −13% | 185 ms | 82 ms |
+| SmolLM2 360M | Q8_0 vs F16 | 100.4 tok/s | 62.5 tok/s | **+61%** | 53 ms | 24 ms |
+| SmolLM2 1.7B | Q4_K_M | 38.9 tok/s | 25.2 tok/s | **+54%** | 196 ms | 142 ms |
 | Gemma 3 270M | Q8_0 | 148 tok/s | — | — | 37 ms | — |
 
 **Notes:**
 - Generation throughput gap (13–20%) is due to Go+CGo overhead vs Ollama's native C++.
   The gap is consistent across models, meaning the SIMD kernels are at parity — the
   remaining cost is dispatch/scheduler overhead.
-- SmolLM2 is faster because dlgo uses Q8_0 (integer SIMD) while Ollama serves F16
+- SmolLM2 360M is faster because dlgo uses Q8_0 (integer SIMD) while Ollama serves F16
   (float SIMD with 4x fewer elements per instruction).
+- SmolLM2 1.7B uses Q4_K_M for both — dlgo is **54% faster** on generation, suggesting
+  Ollama's SmolLM2 serving may not be fully optimized for this architecture.
 - Ollama prefill times for prompts 2–3 benefit from system prompt KV cache reuse.
-  Cold-start prefill (prompt 1) is closer: TinyLlama dlgo=170ms vs Ollama=177ms.
+  Cold-start prefill (prompt 1) is closer: TinyLlama dlgo=190ms vs Ollama=183ms.
 
 ## Install
 
