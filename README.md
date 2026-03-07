@@ -28,7 +28,7 @@ fmt.Println(response) // "The capital of France is Paris."
 | SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | ~15 tok/s |
 | Phi | Phi-2, Phi-4-mini | ~8–9 tok/s |
 | Mistral | Mistral (llama-compatible) | — |
-| Whisper | Tiny, Base, Small (speech-to-text) | — |
+| Whisper | Tiny, Base, Small (speech-to-text) | ~1x realtime |
 
 Throughput measured on a single CPU thread with Q4_K_M quantization.
 
@@ -81,7 +81,7 @@ response, _ := model.ChatMessages([]dlgo.Message{
 ### Speech-to-text
 
 ```go
-whisper, _ := dlgo.LoadWhisper("whisper-base.gguf")
+whisper, _ := dlgo.LoadWhisper("whisper-base.gguf", "tokenizer.json")
 text, _ := whisper.TranscribeFile("audio.wav")
 fmt.Println(text)
 ```
@@ -120,7 +120,7 @@ examples/        Ready-to-run examples
 
 1. **GGUF parser** reads model metadata and tensor locations from the file
 2. **Quantized tensors** stay in their compressed format in memory — only dequantized on the fly during matrix multiplication
-3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, and hybrid SSM/attention (Gated Delta Net)
+3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, and hybrid SSM/attention (Gated Delta Net) — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
 4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA for fused dequant-dot-product kernels
 5. **Parallel matmul** distributes rows across a persistent worker pool for large projections
 6. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty
