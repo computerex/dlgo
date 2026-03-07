@@ -270,7 +270,7 @@ func forwardAttention(
 			kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
 			scores[t] = ops.DotProduct(qHead, kHead, headDim) * scale
 		}
-		ops.Softmax(scores)
+		quant.SIMDSoftmax(scores)
 		for t := 0; t < seqLen; t++ {
 			vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
 			ops.AddScaled(headOut, scores[t], vHead, headDim)

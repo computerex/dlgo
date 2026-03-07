@@ -81,7 +81,7 @@ func QQBatchGEMM(wData []byte, wType uint32, q8Flat []byte, q8Stride int, nInput
 // for the given quantization type.
 func HasQQDot(ggmlType uint32) bool {
 	switch ggmlType {
-	case 2, 8, 10, 11, 12, 13, 14:
+	case 2, 6, 8, 10, 11, 12, 13, 14:
 		return true
 	default:
 		return false

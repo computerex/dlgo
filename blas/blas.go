@@ -94,6 +94,10 @@ func (p *Pool) dispatch(total, numActive int, work func(start, end int)) {
 	if numActive > total {
 		numActive = total
 	}
+	if numActive <= 1 {
+		work(0, total)
+		return
+	}
 	chunk := (total + numActive - 1) / numActive
 	var done sync.WaitGroup
 

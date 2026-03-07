@@ -236,6 +236,82 @@ float qq_dot_q4_0_q8_0(const uint8_t* restrict xb, const uint8_t* restrict yb, i
 }
 
 // ══════════════════════════════════════════════════════════════════
+// Q5_0 × Q8_0 dot product (32 values per block pair)
+// Q5_0 block: f16 d (2B) + qh uint32 (4B) + qs (16B) = 22B
+// ══════════════════════════════════════════════════════════════════
+
+// Expand 32 bits → 32 bytes (0xFF where bit set, 0x00 where clear)
+static inline __m256i bytes_from_bits_32_qq(const uint8_t* src) {
+    uint32_t x32;
+    memcpy(&x32, src, 4);
+    const __m256i shuf_mask = _mm256_set_epi64x(
+        0x0303030303030303LL, 0x0202020202020202LL,
+        0x0101010101010101LL, 0x0000000000000000LL);
+    __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32((int)x32), shuf_mask);
+    const __m256i bit_mask = _mm256_set1_epi64x(0x8040201008040201LL);
+    bytes = _mm256_and_si256(bytes, bit_mask);
+    return _mm256_cmpeq_epi8(bytes, bit_mask);
+}
+
+float qq_dot_q5_0_q8_0(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 32;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t* x = xb + i * 22;
+        const uint8_t* y = yb + i * 34;
+
+        const __m256 d = _mm256_set1_ps(
+            f16_to_f32_qq(*(const uint16_t*)x) * f16_to_f32_qq(*(const uint16_t*)y));
+
+        __m256i qx = bytes_from_nibbles_32_qq(x + 6);
+        __m256i bxhi = bytes_from_bits_32_qq(x + 2);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+        qx = _mm256_sub_epi8(qx, _mm256_set1_epi8(16));
+
+        __m256i qy = _mm256_loadu_si256((const __m256i*)(y + 2));
+
+        acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float_qq(qx, qy), acc);
+    }
+    return hsum_float_8_qq(acc);
+}
+
+// Q5_1 × Q8_1 dot product (32 values per block pair)
+// Q5_1 block: f16 d (2B) + f16 m (2B) + qh uint32 (4B) + qs (16B) = 24B
+// Q8_1 block: f32 d (4B) + f32 s (4B) + qs (32B) = 40B
+float qq_dot_q5_1_q8_1(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 32;
+    __m256 acc = _mm256_setzero_ps();
+    float summs = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t* x = xb + i * 24;
+        const uint8_t* y = yb + i * 40;
+
+        const float dx = f16_to_f32_qq(*(const uint16_t*)x);
+        const float mx = f16_to_f32_qq(*(const uint16_t*)(x + 2));
+        float dy;
+        memcpy(&dy, y, 4);
+        float sy;
+        memcpy(&sy, y + 4, 4);
+
+        summs += mx * sy;
+
+        __m256i qx = bytes_from_nibbles_32_qq(x + 8);
+        __m256i bxhi = bytes_from_bits_32_qq(x + 4);
+        bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+        qx = _mm256_or_si256(qx, bxhi);
+
+        __m256i qy = _mm256_loadu_si256((const __m256i*)(y + 8));
+
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dx * dy),
+                              mul_sum_us8_pairs_float_qq(qx, qy), acc);
+    }
+    return hsum_float_8_qq(acc) + summs;
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Q8_0 × Q8_0 dot product
 // ══════════════════════════════════════════════════════════════════
 
@@ -657,6 +733,7 @@ void qq_dot_batch(const uint8_t* w_data, uint32_t w_type,
 
         switch (w_type) {
         case 2:  out[r] = qq_dot_q4_0_q8_0(row, q_data, cols); break;
+        case 6:  out[r] = qq_dot_q5_0_q8_0(row, q_data, cols); break;
         case 8:  out[r] = qq_dot_q8_0_q8_0(row, q_data, cols); break;
         case 10: out[r] = qq_dot_q2_K_q8_K(row, q_data, cols); break;
         case 11: out[r] = qq_dot_q3_K_q8_K(row, q_data, cols); break;
@@ -812,6 +889,58 @@ static void qq_batch_row_q8_0(const uint8_t* restrict row, const uint8_t* restri
     }
 }
 
+// Q5_0 batch kernel: process one weight row against multiple Q8 positions
+static void qq_batch_row_q5_0(const uint8_t* restrict row, const uint8_t* restrict q8_flat,
+                               int q8_stride, int n_inputs, int cols,
+                               float* restrict out_flat, int out_stride, int r) {
+    const int nb = cols / 32;
+    int p = 0;
+    for (; p + 3 < n_inputs; p += 4) {
+        const uint8_t* y0 = q8_flat + (size_t)p * q8_stride;
+        const uint8_t* y1 = q8_flat + (size_t)(p+1) * q8_stride;
+        const uint8_t* y2 = q8_flat + (size_t)(p+2) * q8_stride;
+        const uint8_t* y3 = q8_flat + (size_t)(p+3) * q8_stride;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        for (int i = 0; i < nb; i++) {
+            const uint8_t* xb = row + i * 22;
+            float xd = f16_to_f32_qq(*(const uint16_t*)xb);
+            __m256i qx = bytes_from_nibbles_32_qq(xb + 6);
+            __m256i bxhi = bytes_from_bits_32_qq(xb + 2);
+            bxhi = _mm256_and_si256(bxhi, _mm256_set1_epi8(0x10));
+            qx = _mm256_or_si256(qx, bxhi);
+            qx = _mm256_sub_epi8(qx, _mm256_set1_epi8(16));
+            const __m256i ax = _mm256_sign_epi8(qx, qx);
+
+            const uint8_t* yb0 = y0 + i * 34;
+            __m256i sy0 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(yb0 + 2)), qx);
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(xd * f16_to_f32_qq(*(const uint16_t*)yb0)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy0)), acc0);
+            const uint8_t* yb1 = y1 + i * 34;
+            __m256i sy1 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(yb1 + 2)), qx);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(xd * f16_to_f32_qq(*(const uint16_t*)yb1)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy1)), acc1);
+            const uint8_t* yb2 = y2 + i * 34;
+            __m256i sy2 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(yb2 + 2)), qx);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(xd * f16_to_f32_qq(*(const uint16_t*)yb2)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy2)), acc2);
+            const uint8_t* yb3 = y3 + i * 34;
+            __m256i sy3 = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*)(yb3 + 2)), qx);
+            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(xd * f16_to_f32_qq(*(const uint16_t*)yb3)),
+                                    _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy3)), acc3);
+        }
+        out_flat[(size_t)p * out_stride + r] = hsum_float_8_qq(acc0);
+        out_flat[(size_t)(p+1) * out_stride + r] = hsum_float_8_qq(acc1);
+        out_flat[(size_t)(p+2) * out_stride + r] = hsum_float_8_qq(acc2);
+        out_flat[(size_t)(p+3) * out_stride + r] = hsum_float_8_qq(acc3);
+    }
+    for (; p < n_inputs; p++) {
+        out_flat[(size_t)p * out_stride + r] = qq_dot_q5_0_q8_0(row, q8_flat + (size_t)p * q8_stride, cols);
+    }
+}
+
 // Batch GEMM: row-first order for batch (n_inputs > 1).
 // For each weight row, computes dot products against all n_inputs Q8 vectors.
 // Weight row data loaded once, Q8 vectors cycle through from L1/L2.
@@ -834,6 +963,9 @@ void qq_batch_gemm(const uint8_t* w_data, uint32_t w_type,
         switch (w_type) {
         case 2:
             qq_batch_row_q4_0(row, q8_flat, q8_stride, n_inputs, cols, out_flat, out_stride, r);
+            break;
+        case 6:
+            qq_batch_row_q5_0(row, q8_flat, q8_stride, n_inputs, cols, out_flat, out_stride, r);
             break;
         case 8:
             qq_batch_row_q8_0(row, q8_flat, q8_stride, n_inputs, cols, out_flat, out_stride, r);
