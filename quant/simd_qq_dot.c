@@ -65,7 +65,8 @@ static inline __m256i bytes_from_nibbles_32_qq(const uint8_t * rsi) {
 // the AVX2 maddubs+madd sequence.
 static inline __m256 dotbusd_ps_qq(const __m256i ax, const __m256i sy) {
 #if defined(__AVXVNNI__) || defined(__AVX512VNNI__)
-    return dotbusd_ps_qq(ax, sy);
+    __m256i res = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax, sy);
+    return _mm256_cvtepi32_ps(res);
 #else
     const __m256i ones = _mm256_set1_epi16(1);
     __m256i prod16 = _mm256_maddubs_epi16(ax, sy);
