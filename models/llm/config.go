@@ -208,6 +208,8 @@ func inferChatTemplate(md map[string]interface{}, arch string) string {
 			return "chatml"
 		case strings.Contains(lower, "<start_of_turn>"):
 			return "gemma"
+		case strings.Contains(lower, "<|end|>"):
+			return "phi"
 		case strings.Contains(lower, "<|assistant|>"):
 			return "llama2"
 		}

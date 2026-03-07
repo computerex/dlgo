@@ -7,8 +7,14 @@
 #pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
 #pragma GCC optimize("O3")
 
+#ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 #include <immintrin.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -68,7 +74,34 @@ static _Alignas(64) cpool_worker_t cpool_workers[CPOOL_MAX_WORKERS];
 static int cpool_nworkers = 0;
 static atomic_int cpool_alive = 0;
 static _Alignas(64) atomic_int cpool_active = 0;
+#ifdef _WIN32
 static HANDLE cpool_wake_event = NULL;
+#else
+static pthread_mutex_t cpool_wake_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cpool_wake_cv = PTHREAD_COND_INITIALIZER;
+#endif
+
+#ifndef _WIN32
+static void cpool_sleep_ms(int ms) {
+    if (ms <= 0) return;
+    usleep((useconds_t)ms * 1000);
+}
+
+static void cpool_wait_idle(int ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+    ts.tv_sec += ms / 1000 + ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+
+    pthread_mutex_lock(&cpool_wake_mu);
+    if (!atomic_load_explicit(&cpool_active, memory_order_relaxed) &&
+        atomic_load_explicit(&cpool_alive, memory_order_relaxed)) {
+        pthread_cond_timedwait(&cpool_wake_cv, &cpool_wake_mu, &ts);
+    }
+    pthread_mutex_unlock(&cpool_wake_mu);
+}
+#endif
 
 // ── Row computation ──────────────────────────────────────────
 static inline float qq_row(const uint8_t* row, uint32_t t,
@@ -129,7 +162,11 @@ static void run_task(cpool_task_t* t) {
 }
 
 // ── Worker: hybrid spin-wait / sleep ─────────────────────────
+#ifdef _WIN32
 static unsigned __stdcall worker_fn(void* arg) {
+#else
+static void* worker_fn(void* arg) {
+#endif
     cpool_worker_t* w = (cpool_worker_t*)arg;
     while (atomic_load_explicit(&cpool_alive, memory_order_relaxed)) {
         if (atomic_load_explicit(&w->has_task, memory_order_acquire)) {
@@ -139,10 +176,18 @@ static unsigned __stdcall worker_fn(void* arg) {
         } else if (atomic_load_explicit(&cpool_active, memory_order_relaxed)) {
             _mm_pause();
         } else {
+#ifdef _WIN32
             WaitForSingleObject(cpool_wake_event, 50);
+#else
+            cpool_wait_idle(50);
+#endif
         }
     }
+#ifdef _WIN32
     return 0;
+#else
+    return NULL;
+#endif
 }
 
 // ── Lifecycle ────────────────────────────────────────────────
@@ -152,19 +197,35 @@ void cpool_init(int n) {
     cpool_nworkers = n;
     atomic_store(&cpool_alive, 1);
     atomic_store(&cpool_active, 0);
+#ifdef _WIN32
     cpool_wake_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+#endif
     memset(cpool_workers, 0, sizeof(cpool_workers));
     for (int i = 0; i < n; i++) {
         atomic_store(&cpool_workers[i].has_task, 0);
+#ifdef _WIN32
         HANDLE h = (HANDLE)_beginthreadex(NULL, 0, worker_fn,
                                           &cpool_workers[i], 0, NULL);
         if (h) CloseHandle(h);
+#else
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, worker_fn, &cpool_workers[i]) == 0) {
+            pthread_detach(tid);
+        }
+#endif
     }
 }
 
 void cpool_shutdown(void) {
     atomic_store(&cpool_alive, 0);
+#ifdef _WIN32
     Sleep(20);
+#else
+    pthread_mutex_lock(&cpool_wake_mu);
+    pthread_cond_broadcast(&cpool_wake_cv);
+    pthread_mutex_unlock(&cpool_wake_mu);
+    cpool_sleep_ms(20);
+#endif
 }
 
 int cpool_workers_count(void) { return cpool_nworkers; }
@@ -172,7 +233,13 @@ int cpool_workers_count(void) { return cpool_nworkers; }
 // ── Activate/deactivate pool ─────────────────────────────────
 static void cpool_activate(void) {
     atomic_store_explicit(&cpool_active, 1, memory_order_release);
+#ifdef _WIN32
     SetEvent(cpool_wake_event);
+#else
+    pthread_mutex_lock(&cpool_wake_mu);
+    pthread_cond_broadcast(&cpool_wake_cv);
+    pthread_mutex_unlock(&cpool_wake_mu);
+#endif
 }
 
 static void cpool_deactivate(void) {

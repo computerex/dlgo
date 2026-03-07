@@ -169,7 +169,7 @@ func (p *Pipeline) GenerateText(prompt string, cfg GenerateConfig) (string, floa
 		return "", 0, err
 	}
 
-	text := p.Tokenizer.Decode(generated)
+	text := trimStopText(p.Tokenizer.Decode(generated), p.Model.Config)
 	tokPerSec := float64(len(generated)) / elapsed.Seconds()
 	return text, tokPerSec, nil
 }
@@ -274,7 +274,7 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 done:
 	genMs := float64(time.Since(genStart).Microseconds()) / 1000.0
 	debug.SetGCPercent(prev)
-	text := p.Tokenizer.Decode(generated)
+	text := trimStopText(p.Tokenizer.Decode(generated), p.Model.Config)
 
 	var tokPerSec float64
 	if genMs > 0 {
@@ -295,6 +295,8 @@ done:
 // collectStopStrings returns text-level stop sequences for the model's arch.
 func collectStopStrings(cfg ModelConfig) []string {
 	return []string{
+		"<end_of_turn><eos>",
+		"<eos>",
 		"<|im_end|>",
 		"<|endoftext|>",
 		"<|end|>",
@@ -302,6 +304,20 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<|assistant|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
+	}
+}
+
+func trimStopText(text string, cfg ModelConfig) string {
+	for {
+		trimmed := strings.TrimRight(text, " \t\r\n")
+		for _, ss := range collectStopStrings(cfg) {
+			trimmed = strings.TrimSuffix(trimmed, ss)
+			trimmed = strings.TrimRight(trimmed, " \t\r\n")
+		}
+		if trimmed == text {
+			return trimmed
+		}
+		text = trimmed
 	}
 }
 
@@ -388,5 +404,5 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 
 	elapsed := time.Since(start)
 	tokPerSec := float64(len(generated)) / elapsed.Seconds()
-	return genText.String(), tokPerSec, nil
+	return trimStopText(genText.String(), p.Model.Config), tokPerSec, nil
 }
