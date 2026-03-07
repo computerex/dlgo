@@ -2,25 +2,16 @@ package whisper
 
 import "github.com/computerex/dlgo/ops"
 
-// Token IDs for Whisper special tokens
 const (
-	TokenSOT  = 50257 // Start of transcript
-	TokenEOT  = 50256 // End of transcript
-	TokenSOL  = 50361 // Start of language (optional)
-	TokenNot  = 50362 // No speech
-	TokenPrev = 50363 // Previous segment
+	defaultSOT = 50257 // <|startoftranscript|>
+	defaultEOT = 50256 // <|endoftext|>
 )
 
-// Transcribe runs the full Whisper pipeline: encode audio, then greedy decode until EOT.
-// samples: raw audio samples (mono, typically 16kHz)
-// For now, samples are assumed to be pre-processed mel spectrogram features [nMels * nFrames].
-// If samples are raw audio, the caller must convert to mel first.
-//
-// Returns the decoded text as a string. For a minimal implementation, returns token IDs
-// as a string representation; a full implementation would use a vocabulary to map to text.
-func (m *WhisperModel) Transcribe(samples []float32) (string, error) {
-	// Encode: samples are mel features [nFrames * nMels]
-	encOut := EncodeAudio(m, samples)
+// Transcribe runs the full Whisper pipeline: encode audio → greedy decode.
+// mel: mel spectrogram features [nFrames × nMels].
+// tok: tokenizer for decoding token IDs to text (if nil, returns empty string).
+func (m *WhisperModel) Transcribe(mel []float32, tok *Tokenizer) (string, error) {
+	encOut := EncodeAudio(m, mel)
 	if encOut == nil {
 		return "", nil
 	}
@@ -32,48 +23,55 @@ func (m *WhisperModel) Transcribe(samples []float32) (string, error) {
 	kc := NewKVCache(cfg)
 	kc.FillCross(encOut, encLen, dim, m.DecLayers)
 
-	// Prefill with SOT (start of transcript)
-	tokens := []int32{TokenSOT}
-	pos := 0
+	// Build start-of-transcript prompt
+	var prompt []int
+	if tok != nil {
+		prompt = tok.SotSequence()
+		noTs := tok.NoTimestamps()
+		if noTs >= 0 {
+			prompt = append(prompt, noTs)
+		}
+	} else {
+		prompt = []int{defaultSOT}
+	}
 
-	logits := DecoderStep(m, encOut, encLen, TokenSOT, pos, kc)
-	pos++
+	// Prefill the prompt tokens
+	var logits []float32
+	for i, t := range prompt {
+		logits = DecoderStep(m, encOut, encLen, int32(t), i, kc)
+	}
+	pos := len(prompt)
 
 	// Greedy decode until EOT or max length
-	maxTokens := cfg.NTextCtx - 1
-	for pos < maxTokens {
-		nextToken := int32(ops.Argmax(logits))
-		if nextToken == TokenEOT {
+	eot := defaultEOT
+	if tok != nil {
+		eot = tok.Eot()
+	}
+
+	maxTokens := cfg.NTextCtx - len(prompt)
+	var decoded []int
+	for i := 0; i < maxTokens; i++ {
+		next := int32(ops.Argmax(logits))
+		if int(next) == eot {
 			break
 		}
-		tokens = append(tokens, nextToken)
-
-		logits = DecoderStep(m, encOut, encLen, nextToken, pos, kc)
+		decoded = append(decoded, int(next))
+		logits = DecoderStep(m, encOut, encLen, next, pos, kc)
 		pos++
 	}
 
-	// Convert token IDs to string (simplified: just return count for now)
-	// A full implementation would use the Whisper vocabulary to decode to text
-	return tokensToString(tokens), nil
+	if tok != nil {
+		return tok.Decode(decoded), nil
+	}
+	return "", nil
 }
 
-// tokensToString converts token IDs to a string.
-// Minimal implementation: returns placeholder; real impl would use vocab.
-func tokensToString(tokens []int32) string {
-	if len(tokens) == 0 {
-		return ""
+// TranscribeFile loads a WAV, extracts mel features, and transcribes.
+func (m *WhisperModel) TranscribeFile(wavPath string, tok *Tokenizer) (string, error) {
+	samples, err := LoadWAV(wavPath)
+	if err != nil {
+		return "", err
 	}
-	// Placeholder: in production, use Whisper's vocabulary (e.g. multilingual)
-	// to map token IDs to UTF-8 text
-	var buf []byte
-	for _, t := range tokens {
-		if t == TokenSOT || t == TokenEOT || t == TokenSOL || t == TokenNot || t == TokenPrev {
-			continue // skip special tokens in output
-		}
-		if t < 0 || t >= 256 {
-			continue
-		}
-		buf = append(buf, byte(t))
-	}
-	return string(buf)
+	mel := ExtractMel(samples, m.Config.NMels)
+	return m.Transcribe(mel, tok)
 }

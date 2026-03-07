@@ -10,25 +10,25 @@ import (
 
 // RunState holds pre-allocated buffers for inference, avoiding per-token allocations.
 type RunState struct {
-	X       []float32 // [dim] current activation
-	XNorm   []float32 // [dim] normalized activation
-	Q       []float32 // [qDim] query projection
-	K       []float32 // [kvDim] key projection
-	V       []float32 // [kvDim] value projection
-	AttnOut []float32 // [qDim] attention output
+	X        []float32 // [dim] current activation
+	XNorm    []float32 // [dim] normalized activation
+	Q        []float32 // [qDim] query projection
+	K        []float32 // [kvDim] key projection
+	V        []float32 // [kvDim] value projection
+	AttnOut  []float32 // [qDim] attention output
 	AttnProj []float32 // [dim] output projection
-	FFNIn   []float32 // [dim] FFN input (after residual)
-	FFNNorm []float32 // [dim] FFN normalized
-	Gate    []float32 // [ffnDim] gate projection
-	Up      []float32 // [ffnDim] up projection
-	Hidden  []float32 // [ffnDim] gated hidden
-	FFNOut  []float32 // [dim] FFN output
-	Logits  []float32 // [vocabSize] output logits
-	Scores  []float32 // [maxSeqLen] attention scores scratch
+	FFNIn    []float32 // [dim] FFN input (after residual)
+	FFNNorm  []float32 // [dim] FFN normalized
+	Gate     []float32 // [ffnDim] gate projection
+	Up       []float32 // [ffnDim] up projection
+	Hidden   []float32 // [ffnDim] gated hidden
+	FFNOut   []float32 // [dim] FFN output
+	Logits   []float32 // [vocabSize] output logits
+	Scores   []float32 // [maxSeqLen] attention scores scratch
 
 	// Qwen3.5 gated attention: Wq outputs interleaved [Q,gate] per head
-	QFull  []float32 // [2*qDim] fused Q+gate output (nil for non-gated models)
-	QGate  []float32 // [qDim] attention gate values (nil for non-gated models)
+	QFull []float32 // [2*qDim] fused Q+gate output (nil for non-gated models)
+	QGate []float32 // [qDim] attention gate values (nil for non-gated models)
 
 	// Precomputed RoPE tables (populated by PrecomputeRoPE)
 	ropeCos     []float32
@@ -53,33 +53,31 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 	ffnDim := cfg.FFNDim
 
 	rs := &RunState{
-		X:       make([]float32, dim),
-		XNorm:   make([]float32, dim),
-		Q:       make([]float32, qDim),
-		K:       make([]float32, kvDim),
-		V:       make([]float32, kvDim),
-		AttnOut: make([]float32, qDim),
+		X:        make([]float32, dim),
+		XNorm:    make([]float32, dim),
+		Q:        make([]float32, qDim),
+		K:        make([]float32, kvDim),
+		V:        make([]float32, kvDim),
+		AttnOut:  make([]float32, qDim),
 		AttnProj: make([]float32, dim),
-		FFNIn:   make([]float32, dim),
-		FFNNorm: make([]float32, dim),
-		Gate:    make([]float32, ffnDim),
-		Up:      make([]float32, ffnDim),
-		Hidden:  make([]float32, ffnDim),
-		FFNOut:  make([]float32, dim),
-		Logits:  make([]float32, cfg.VocabSize),
-		Scores:  make([]float32, maxSeqLen),
-		Pool:    blas.DefaultPool(),
+		FFNIn:    make([]float32, dim),
+		FFNNorm:  make([]float32, dim),
+		Gate:     make([]float32, ffnDim),
+		Up:       make([]float32, ffnDim),
+		Hidden:   make([]float32, ffnDim),
+		FFNOut:   make([]float32, dim),
+		Logits:   make([]float32, cfg.VocabSize),
+		Scores:   make([]float32, maxSeqLen),
+		Pool:     blas.DefaultPool(),
 	}
 	rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
 	rs.SetRopeNeox(cfg.RopeNeox)
 
-	// Allocate gated attention buffers for Qwen3.5 (fused Q+gate in Wq)
 	if cfg.FullAttentionInterval > 0 {
 		rs.QFull = make([]float32, 2*qDim)
 		rs.QGate = make([]float32, qDim)
 	}
 
-	// Allocate SSM buffers for hybrid Mamba/Attention models
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
 		numHeads := cfg.SSMTimeStepRank
 		headVDim := cfg.SSMInnerSize / numHeads
@@ -114,8 +112,6 @@ func isSSMLayer(l int, cfg ModelConfig) bool {
 }
 
 // Forward performs a single-token forward pass through the model.
-// Uses parallel matmul via the RunState's worker pool for acceleration.
-// Returns logits for the next token.
 func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
@@ -125,65 +121,67 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 	kvMul := numHeads / numKVHeads
 	pool := rs.Pool
 
-	// 1. Token embedding
 	_ = m.TokenEmbed.DequantizeRow(int(token), rs.X)
 	if cfg.EmbedScale != 0 {
 		ops.Scale(rs.X, cfg.EmbedScale)
 	}
 
-	// 2. Layer loop
 	for l := 0; l < cfg.NumLayers; l++ {
 		layer := &m.Layers[l]
+		spec := &layer.Spec
 
-		// Pre-norm: LayerNorm (Phi-2) or RMSNorm
-		if layer.AttnNormBias != nil {
-			ops.LayerNorm(rs.XNorm, rs.X, layer.AttnNorm, layer.AttnNormBias, cfg.RMSNormEps)
-		} else {
+		// Pre-norm
+		switch spec.Norm {
+		case NormRMS:
 			ops.RMSNorm(rs.XNorm, rs.X, layer.AttnNorm, cfg.RMSNormEps)
+		case NormLayer:
+			ops.LayerNorm(rs.XNorm, rs.X, layer.AttnNorm, layer.AttnNormBias, cfg.RMSNormEps)
 		}
 
-		// Branch: SSM (delta net) or attention
-		if isSSMLayer(l, cfg) && layer.SSMInProj != nil {
+		// Layer core
+		switch spec.Core {
+		case CoreSSM:
 			forwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
-		} else {
+		case CoreAttention:
 			forwardAttention(layer, rs, kv, l, pos, numHeads, numKVHeads, headDim, kvMul, cfg, pool)
 		}
 
-		if layer.FFNNorm != nil {
-			// Standard with separate FFN norm (LLaMA, Gemma, Qwen2/3)
+		// Residual wiring + FFN
+		switch spec.Residual {
+		case ResStandard:
 			if layer.PostAttnNorm != nil {
 				ops.RMSNormInPlace(rs.AttnProj, layer.PostAttnNorm, cfg.RMSNormEps)
 			}
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
-			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
+			forwardFFN(layer, rs, rs.FFNNorm, pool)
 			if layer.PostFFNNorm != nil {
 				ops.RMSNormInPlace(rs.FFNOut, layer.PostFFNNorm, cfg.RMSNormEps)
 			}
 			ops.Add(rs.X, rs.FFNIn, rs.FFNOut)
-		} else if layer.PostAttnNorm != nil {
-			// Qwen3.5: post_attn_norm applied to residual, serves as FFN input norm
+
+		case ResPostAttnFFN:
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.PostAttnNorm, cfg.RMSNormEps)
-			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
+			forwardFFN(layer, rs, rs.FFNNorm, pool)
 			ops.Add(rs.X, rs.FFNIn, rs.FFNOut)
-		} else {
-			// Parallel attention+FFN (Phi-2): both use same pre-norm, residual sums both
-			forwardFFN(layer, rs, rs.XNorm, cfg, pool)
+
+		case ResParallel:
+			forwardFFN(layer, rs, rs.XNorm, pool)
 			for i := 0; i < dim; i++ {
 				rs.X[i] = rs.X[i] + rs.AttnProj[i] + rs.FFNOut[i]
 			}
 		}
 	}
 
-	// 3. Final norm: LayerNorm or RMSNorm
+	// Final norm
 	if m.OutputNormBias != nil {
 		ops.LayerNorm(rs.X[:dim], rs.X[:dim], m.OutputNorm, m.OutputNormBias, cfg.RMSNormEps)
 	} else {
 		ops.RMSNormInPlace(rs.X[:dim], m.OutputNorm, cfg.RMSNormEps)
 	}
 
-	// 4. Logits — parallelize (largest single matmul: vocabSize rows)
+	// Logits
 	output := m.Output
 	if output == nil {
 		output = m.TokenEmbed
@@ -204,10 +202,9 @@ func forwardAttention(
 	cfg ModelConfig, pool *blas.Pool,
 ) {
 	qDim := numHeads * headDim
-	gatedQ := rs.QFull != nil && layer.Wq.Rows > qDim
 
-	if gatedQ {
-		// Fused Q+gate projection (Qwen3.5): Wq outputs [Q0,gate0,Q1,gate1,...] interleaved
+	// Q projection — may include fused gate for Qwen3.5
+	if layer.Spec.GatedQ {
 		blas.QMatVecMulParallel(rs.QFull, layer.Wq, rs.XNorm, pool)
 		for h := 0; h < numHeads; h++ {
 			copy(rs.Q[h*headDim:(h+1)*headDim], rs.QFull[h*2*headDim:h*2*headDim+headDim])
@@ -229,12 +226,10 @@ func forwardAttention(
 		ops.AddBias(rs.V, layer.Bv)
 	}
 
-	if layer.AttnQNorm != nil {
+	if layer.Spec.QKNorm {
 		for h := 0; h < numHeads; h++ {
 			ops.RMSNormInPlace(rs.Q[h*headDim:(h+1)*headDim], layer.AttnQNorm, cfg.RMSNormEps)
 		}
-	}
-	if layer.AttnKNorm != nil {
 		for h := 0; h < numKVHeads; h++ {
 			ops.RMSNormInPlace(rs.K[h*headDim:(h+1)*headDim], layer.AttnKNorm, cfg.RMSNormEps)
 		}
@@ -273,8 +268,7 @@ func forwardAttention(
 		}
 	}
 
-	// Gated attention (Qwen3.5): attn_out *= sigmoid(gate)
-	if gatedQ {
+	if layer.Spec.GatedQ {
 		for i := 0; i < qDim; i++ {
 			rs.AttnOut[i] *= ops.Sigmoid(rs.QGate[i])
 		}
@@ -286,21 +280,20 @@ func forwardAttention(
 	}
 }
 
-// forwardFFN runs the feed-forward network for one layer.
-// input is the normalized activation to feed into the FFN.
-// Result is written to rs.FFNOut.
-func forwardFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
-	if layer.FFNGate != nil {
-		// Gated FFN: SwiGLU or GeGLU
+// forwardFFN runs the feed-forward network. Result written to rs.FFNOut.
+func forwardFFN(layer *Layer, rs *RunState, input []float32, pool *blas.Pool) {
+	switch layer.Spec.FFN {
+	case FFNSwiGLU:
 		blas.QDualMatVecMulParallel(rs.Gate, layer.FFNGate, rs.Up, layer.FFNUp, input, pool)
-		if cfg.FFNGelu {
-			ops.GeGLU(rs.Hidden, rs.Gate, rs.Up, cfg.FFNDim)
-		} else {
-			ops.SwiGLU(rs.Hidden, rs.Gate, rs.Up, cfg.FFNDim)
-		}
+		ops.SwiGLU(rs.Hidden, rs.Gate, rs.Up, len(rs.Gate))
 		blas.QMatVecMulParallel(rs.FFNOut, layer.FFNDown, rs.Hidden, pool)
-	} else {
-		// Plain MLP: up → GELU → down (Phi-2)
+
+	case FFNGeGLU:
+		blas.QDualMatVecMulParallel(rs.Gate, layer.FFNGate, rs.Up, layer.FFNUp, input, pool)
+		ops.GeGLU(rs.Hidden, rs.Gate, rs.Up, len(rs.Gate))
+		blas.QMatVecMulParallel(rs.FFNOut, layer.FFNDown, rs.Hidden, pool)
+
+	case FFNPlain:
 		blas.QMatVecMulParallel(rs.Up, layer.FFNUp, input, pool)
 		if layer.FFNUpBias != nil {
 			ops.AddBias(rs.Up, layer.FFNUpBias)
@@ -308,6 +301,7 @@ func forwardFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, po
 		ops.GELU(rs.Up)
 		blas.QMatVecMulParallel(rs.FFNOut, layer.FFNDown, rs.Up, pool)
 	}
+
 	if layer.FFNDownBias != nil {
 		ops.AddBias(rs.FFNOut, layer.FFNDownBias)
 	}

@@ -4,8 +4,60 @@ import (
 	"github.com/computerex/dlgo/core"
 )
 
+// ---------------------------------------------------------------------------
+// Layer specification enums — resolved once at load time, zero-cost dispatch.
+// ---------------------------------------------------------------------------
+
+// NormKind selects the pre-layer normalization variant.
+type NormKind uint8
+
+const (
+	NormRMS   NormKind = iota // RMSNorm (LLaMA, Qwen, Gemma, SmolLM2, Qwen3.5)
+	NormLayer                 // LayerNorm with bias (Phi-2)
+)
+
+// CoreKind selects the per-layer compute core.
+type CoreKind uint8
+
+const (
+	CoreAttention CoreKind = iota // Standard grouped-query attention
+	CoreSSM                       // Gated Delta Network (Qwen3.5 linear attention)
+)
+
+// ResKind selects the residual connection + FFN-norm wiring.
+type ResKind uint8
+
+const (
+	ResStandard    ResKind = iota // Separate FFNNorm; optional PostAttnNorm/PostFFNNorm (LLaMA, Gemma, Qwen)
+	ResPostAttnFFN                // PostAttnNorm doubles as FFN norm (Qwen3.5)
+	ResParallel                   // Parallel attn+FFN on same pre-norm; X += attn + FFN (Phi-2)
+)
+
+// FFNKind selects the feed-forward network variant.
+type FFNKind uint8
+
+const (
+	FFNSwiGLU FFNKind = iota // gate·SiLU ⊙ up → down (LLaMA, Qwen)
+	FFNGeGLU                 // gate·GELU ⊙ up → down (Gemma)
+	FFNPlain                 // up → GELU → down (Phi-2)
+)
+
+// LayerSpec captures all architectural choices for one transformer layer.
+// Resolved once at load time from tensor presence; the forward pass dispatches
+// on these fields via switch statements that compile to jump tables.
+type LayerSpec struct {
+	Norm     NormKind
+	Core     CoreKind
+	Residual ResKind
+	FFN      FFNKind
+	GatedQ   bool // Fused Q+gate projection (Qwen3.5 attention layers)
+	QKNorm   bool // Per-head QK normalization (Gemma 3, Qwen3)
+}
+
 // Layer holds the weights for one transformer block.
 type Layer struct {
+	Spec LayerSpec // architectural choices, resolved at load time
+
 	// Attention
 	AttnNorm     []float32            // [dim] norm weight
 	AttnNormBias []float32            // [dim] optional LayerNorm bias (Phi-2)

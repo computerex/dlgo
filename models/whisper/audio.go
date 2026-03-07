@@ -116,14 +116,3 @@ func resample(samples []float32, fromRate, toRate int) []float32 {
 	return out
 }
 
-// TranscribeFile loads a WAV file, extracts mel features, runs the encoder
-// and decoder, and returns the transcribed text.
-func (m *WhisperModel) TranscribeFile(wavPath string) (string, error) {
-	samples, err := LoadWAV(wavPath)
-	if err != nil {
-		return "", fmt.Errorf("load WAV: %w", err)
-	}
-
-	mel := ExtractMel(samples, m.Config.NMels)
-	return m.Transcribe(mel)
-}

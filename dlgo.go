@@ -131,27 +131,33 @@ func (m *LLM) ModelInfo() ModelInfo {
 
 // Whisper wraps a loaded Whisper model for speech-to-text.
 type Whisper struct {
-	model *whisper.WhisperModel
+	model     *whisper.WhisperModel
+	tokenizer *whisper.Tokenizer
 }
 
 // LoadWhisper loads a Whisper GGUF model for speech recognition.
-func LoadWhisper(modelPath string) (*Whisper, error) {
+// tokenizerPath is the path to a HuggingFace tokenizer.json file or directory.
+func LoadWhisper(modelPath, tokenizerPath string) (*Whisper, error) {
 	m, err := whisper.LoadWhisperModel(modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("load Whisper: %w", err)
 	}
-	return &Whisper{model: m}, nil
+	tok, err := whisper.LoadTokenizer(tokenizerPath)
+	if err != nil {
+		return nil, fmt.Errorf("load tokenizer: %w", err)
+	}
+	return &Whisper{model: m, tokenizer: tok}, nil
 }
 
 // TranscribeFile transcribes a WAV audio file to text.
 func (w *Whisper) TranscribeFile(wavPath string) (string, error) {
-	return w.model.TranscribeFile(wavPath)
+	return w.model.TranscribeFile(wavPath, w.tokenizer)
 }
 
 // TranscribeSamples transcribes raw 16kHz mono audio samples to text.
 func (w *Whisper) TranscribeSamples(samples []float32) (string, error) {
 	mel := whisper.ExtractMel(samples, w.model.Config.NMels)
-	return w.model.Transcribe(mel)
+	return w.model.Transcribe(mel, w.tokenizer)
 }
 
 // Message represents a chat message with a role and content.

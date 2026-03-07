@@ -312,18 +312,18 @@ func inferRowsCols(dims []int64) (int, int) {
 	if len(dims) == 1 {
 		return int(dims[0]), 1
 	}
-	// GGUF stores [cols, ..., rows] - last dim is rows
-	return int(dims[len(dims)-1]), int(dims[0])
+	// Whisper GGUF stores [rows, cols] (row-major convention)
+	return int(dims[0]), int(dims[len(dims)-1])
 }
 
 func inferConvRowsCols(dims []int64) (int, int) {
 	if len(dims) < 3 {
 		return 1, 1
 	}
-	// Conv weight [outCh, inCh, kernelSize] in GGUF as [kernelSize, inCh, outCh]
-	// So rows = outCh = dims[2], cols = inCh * kernelSize = dims[0] * dims[1]
-	rows := int(dims[2])
-	cols := int(dims[0] * dims[1])
+	// GGUF 3D: dims=[outCh, inCh, kernelSize] for conv weights
+	// Flatten to 2D: rows=outCh, cols=inCh*kernelSize
+	rows := int(dims[0])
+	cols := int(dims[1] * dims[2])
 	return rows, cols
 }
 

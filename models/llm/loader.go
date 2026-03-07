@@ -75,11 +75,53 @@ func LoadModel(path string) (*Model, error) {
 		m.Output = m.TokenEmbed
 	}
 
-	// No NumHeads fixup needed: for Qwen3.5, attention layers have fused Q+gate
-	// in Wq (4096 rows = 2 * numHeads * headDim), but the actual head count is
-	// correctly specified in the GGUF metadata (head_count=8 for 2B model).
+	// Resolve per-layer specs from loaded tensor presence
+	for i := range m.Layers {
+		m.Layers[i].Spec = resolveLayerSpec(&m.Layers[i], cfg, i)
+	}
 
 	return m, nil
+}
+
+// resolveLayerSpec infers all architectural choices for a layer from its loaded
+// weights. Called once at load time so the forward pass can dispatch via switch.
+func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
+	var s LayerSpec
+
+	if l.AttnNormBias != nil {
+		s.Norm = NormLayer
+	} else {
+		s.Norm = NormRMS
+	}
+
+	if isSSMLayer(layerIdx, cfg) && l.SSMInProj != nil {
+		s.Core = CoreSSM
+	} else {
+		s.Core = CoreAttention
+	}
+
+	if l.FFNNorm != nil {
+		s.Residual = ResStandard
+	} else if l.PostAttnNorm != nil {
+		s.Residual = ResPostAttnFFN
+	} else {
+		s.Residual = ResParallel
+	}
+
+	if l.FFNGate != nil {
+		if cfg.FFNGelu {
+			s.FFN = FFNGeGLU
+		} else {
+			s.FFN = FFNSwiGLU
+		}
+	} else {
+		s.FFN = FFNPlain
+	}
+
+	s.GatedQ = l.Wq != nil && l.Wq.Rows > cfg.NumHeads*cfg.HeadDim
+	s.QKNorm = l.AttnQNorm != nil
+
+	return s
 }
 
 func readTensorData(f *os.File, dataOffset int64, ti gguf.TensorInfo) ([]byte, error) {
