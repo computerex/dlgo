@@ -54,12 +54,12 @@ type pair struct {
 }
 
 var models = []pair{
-	{"TinyLlama 1.1B", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`, "tinyllama:1.1b", "Q4_0"},
-	{"Qwen 2.5 0.5B", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`, "qwen2.5:0.5b", "Q4_K_M"},
-	{"Gemma 3 1B", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`, "gemma3:1b", "Q4_K_M"},
-	{"SmolLM2 360M", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "smollm2:360m", "dlgo=Q8_0 ollama=F16"},
-	{"SmolLM2 1.7B", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`, "smollm2:1.7b", "Q4_K_M"},
-	{"Gemma 3 270M", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`, "", "Q8_0 (dlgo only)"},
+	{"TinyLlama 1.1B", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`, "dlgo-tinyllama", "Q4_0 same GGUF"},
+	{"Qwen 2.5 0.5B", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`, "dlgo-qwen25", "Q4_K_M same GGUF"},
+	{"Gemma 3 1B", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`, "dlgo-gemma3", "Q4_K_M same GGUF"},
+	{"SmolLM2 360M", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "dlgo-smollm2-360m", "Q8_0 same GGUF"},
+	{"SmolLM2 1.7B", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`, "dlgo-smollm2-1.7b", "Q4_K_M same GGUF"},
+	{"Gemma 3 270M", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`, "dlgo-gemma3-270m", "Q8_0 same GGUF"},
 }
 
 func ollamaBench(model, sys, prompt string, max int) (*result, error) {

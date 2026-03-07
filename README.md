@@ -14,7 +14,7 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
-- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 13–20% of Ollama on generation)
+- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 7–17% of Ollama on generation, same GGUF)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
 
 ## Supported Architectures
@@ -34,29 +34,27 @@ Throughput measured with AVX2+FMA SIMD, parallel worker pool, batch prefill. CPU
 
 ## Benchmarks vs Ollama (CPU-only)
 
-All benchmarks use `temperature=0`, `seed=42`, `max_tokens=128`, Ollama forced CPU-only
-with `num_gpu=0`. Three prompts averaged per model. Ollama prompt 1 is cold start; prompts
-2–3 benefit from KV cache reuse.
+Benchmarks use the **exact same GGUF file** loaded into both engines via `ollama create`
+with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=128`, Ollama forced CPU-only
+(`num_gpu=0`). Three prompts averaged per model.
 
 | Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
 |---|---|---|---|---|---|---|
-| TinyLlama 1.1B | Q4_0 | 60.0 tok/s | 70.6 tok/s | −15% | 185 ms | 123 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 90.8 tok/s | 114.1 tok/s | −20% | 68 ms | 35 ms |
-| Gemma 3 1B | Q4_K_M | 45.3 tok/s | 52.2 tok/s | −13% | 185 ms | 82 ms |
-| SmolLM2 360M | Q8_0 vs F16 | 100.4 tok/s | 62.5 tok/s | **+61%** | 53 ms | 24 ms |
-| SmolLM2 1.7B | Q4_K_M | 38.9 tok/s | 25.2 tok/s | **+54%** | 196 ms | 142 ms |
-| Gemma 3 270M | Q8_0 | 148 tok/s | — | — | 37 ms | — |
+| TinyLlama 1.1B | Q4_0 | 62.0 tok/s | 70.9 tok/s | −12% | 177 ms | 122 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 90.4 tok/s | 109.6 tok/s | −17% | 64 ms | 23 ms |
+| Gemma 3 1B | Q4_K_M | 43.6 tok/s | 50.4 tok/s | −14% | 194 ms | 85 ms |
+| SmolLM2 360M | Q8_0 | 97.4 tok/s | 111.1 tok/s | −12% | 52 ms | 37 ms |
+| SmolLM2 1.7B | Q4_K_M | 38.6 tok/s | 42.7 tok/s | −10% | 188 ms | 130 ms |
+| Gemma 3 270M | Q8_0 | 140.0 tok/s | 149.9 tok/s | −7% | 38 ms | 11 ms |
 
 **Notes:**
-- Generation throughput gap (13–20%) is due to Go+CGo overhead vs Ollama's native C++.
-  The gap is consistent across models, meaning the SIMD kernels are at parity — the
-  remaining cost is dispatch/scheduler overhead.
-- SmolLM2 360M is faster because dlgo uses Q8_0 (integer SIMD) while Ollama serves F16
-  (float SIMD with 4x fewer elements per instruction).
-- SmolLM2 1.7B uses Q4_K_M for both — dlgo is **54% faster** on generation, suggesting
-  Ollama's SmolLM2 serving may not be fully optimized for this architecture.
-- Ollama prefill times for prompts 2–3 benefit from system prompt KV cache reuse.
-  Cold-start prefill (prompt 1) is closer: TinyLlama dlgo=190ms vs Ollama=183ms.
+- Generation gap (7–17%) is consistent across all models and quantizations, indicating
+  the SIMD compute kernels are at parity with llama.cpp — the remaining cost is Go+CGo
+  dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge).
+- The gap shrinks on smaller models (270M: −7%) where per-token overhead is a larger
+  fraction of total work.
+- Ollama prefill times for prompts 2–3 benefit from KV cache reuse of the system prompt.
+  Cold-start prefill (prompt 1) is closer: TinyLlama dlgo=172ms vs Ollama=184ms.
 
 ## Install
 
