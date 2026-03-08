@@ -328,12 +328,7 @@ done:
 // per-architecture validation. Some families still diverge from the known-good
 // single-token fused path during prompt eval.
 func supportsBatchPrefillGPU(m *llm.Model) bool {
-	switch m.Config.Architecture {
-	case "phi3":
-		return false
-	default:
-		return true
-	}
+	return true
 }
 
 // supportsFusedForwardGPU reports whether the fused single-token path can
