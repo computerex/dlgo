@@ -1,0 +1,30 @@
+#version 450
+
+// Deinterleave QFull into Q and QGate.
+// QFull layout: for each head h, [Q_h (head_dim) | Gate_h (head_dim)]
+// Q layout: [h0 (head_dim) | h1 (head_dim) | ...]
+// QGate layout: [h0 (head_dim) | h1 (head_dim) | ...]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer QFull { float qfull[]; };    // [2 * num_heads * head_dim]
+layout(set = 0, binding = 1) buffer QOut { float q_out[]; };     // [num_heads * head_dim]
+layout(set = 0, binding = 2) buffer GateOut { float gate_out[]; }; // [num_heads * head_dim]
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int head_dim;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = uint(num_heads) * uint(head_dim);
+    if (idx >= total) return;
+
+    uint h = idx / uint(head_dim);
+    uint d = idx % uint(head_dim);
+
+    uint src_base = h * 2u * uint(head_dim);
+    q_out[idx] = qfull[src_base + d];
+    gate_out[idx] = qfull[src_base + uint(head_dim) + d];
+}

@@ -87,6 +87,12 @@ func UploadF32(dst Buf, src []float32) error {
 	return nil
 }
 
+// ZeroFill writes zeros to a GPU buffer.
+func ZeroFill(dst Buf, sizeBytes uint64) {
+	zeros := make([]byte, sizeBytes)
+	Upload(dst, zeros)
+}
+
 // Download copies data from GPU to CPU.
 func Download(src Buf, dst []byte) error {
 	if len(dst) == 0 {
@@ -277,6 +283,10 @@ func (lc *LayerConf) SetScratch(x, xNorm, q, k, v, attnOut, attnProj Buf,
 	lc.c.ffn_out = C.GpuBuf(ffnOut)
 }
 
+func (lc *LayerConf) SetAttnNormOnly(attnNorm Buf) {
+	lc.c.attn_norm_w = C.GpuBuf(attnNorm)
+}
+
 func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
 	bq, bk, bv Buf, qNorm, kNorm Buf) {
 	lc.c.attn_norm_w = C.GpuBuf(attnNorm)
@@ -347,6 +357,10 @@ func (lc *LayerConf) SetConfig(dim, headDim, numHeads, numKVHeads, kvDim int,
 	lc.c.residual_type = C.int(residualType)
 }
 
+func (lc *LayerConf) SetCoreType(coreType int) {
+	lc.c.core_type = C.int(coreType)
+}
+
 func (lc *LayerConf) SetDP4A(q8_1Scratch Buf) {
 	lc.c.q8_1_scratch = C.GpuBuf(q8_1Scratch)
 	if q8_1Scratch != 0 {
@@ -400,6 +414,71 @@ func CopyRegion(dst Buf, dstOff uint64, src Buf, srcOff, size uint64) error {
 		C.GpuBuf(src), C.uint64_t(srcOff), C.uint64_t(size))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: copy_region failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMConv1dSiLU performs single-step causal conv1d with state + SiLU.
+func SSMConv1dSiLU(qkv, convState, convW Buf, channels, convK int) error {
+	rc := C.gpu_ssm_conv1d_silu(C.GpuBuf(qkv), C.GpuBuf(convState), C.GpuBuf(convW),
+		C.int(channels), C.int(convK))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_conv1d_silu failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMPreprocess computes decay/lr and L2-normalizes Q/K per head.
+func SSMPreprocess(alpha, beta, ssma, dtBias, qkv Buf, numHeads, headKDim, keyDim int,
+	rmsEps float32, hasDtBias bool) error {
+	dtb := 0
+	if hasDtBias {
+		dtb = 1
+	}
+	rc := C.gpu_ssm_preprocess(C.GpuBuf(alpha), C.GpuBuf(beta), C.GpuBuf(ssma),
+		C.GpuBuf(dtBias), C.GpuBuf(qkv), C.int(numHeads), C.int(headKDim),
+		C.int(keyDim), C.float(rmsEps), C.int(dtb))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_preprocess failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMDeltaRule performs the delta rule state update and output computation.
+func SSMDeltaRule(state, qkv, alpha, beta, y Buf, numHeads, headKDim, headVDim, keyDim int) error {
+	rc := C.gpu_ssm_delta_rule(C.GpuBuf(state), C.GpuBuf(qkv), C.GpuBuf(alpha),
+		C.GpuBuf(beta), C.GpuBuf(y), C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_delta_rule failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMNormGate applies per-head RMSNorm + SiLU gate.
+func SSMNormGate(y, z, normW Buf, numHeads, headVDim int, eps float32) error {
+	rc := C.gpu_ssm_norm_gate(C.GpuBuf(y), C.GpuBuf(z), C.GpuBuf(normW),
+		C.int(numHeads), C.int(headVDim), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_norm_gate failed (%d)", rc)
+	}
+	return nil
+}
+
+// DeinterleaveQGate splits QFull into Q and QGate.
+func DeinterleaveQGate(qfull, q, qgate Buf, numHeads, headDim int) error {
+	rc := C.gpu_deinterleave_qgate(C.GpuBuf(qfull), C.GpuBuf(q), C.GpuBuf(qgate),
+		C.int(numHeads), C.int(headDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: deinterleave_qgate failed (%d)", rc)
+	}
+	return nil
+}
+
+// SigmoidGate applies out[i] *= sigmoid(gate[i]).
+func SigmoidGate(out, gate Buf, n int) error {
+	rc := C.gpu_sigmoid_gate(C.GpuBuf(out), C.GpuBuf(gate), C.int(n))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: sigmoid_gate failed (%d)", rc)
 	}
 	return nil
 }

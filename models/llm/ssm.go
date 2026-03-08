@@ -17,7 +17,7 @@ type SSMRunState struct {
 	Y     []float32 // [valueDim] attention/SSM output
 }
 
-// forwardSSMLayer runs one Gated Delta Net layer for single-token autoregressive inference.
+// ForwardSSMLayer runs one Gated Delta Net layer for single-token autoregressive inference.
 //
 // Implements the recurrent delta rule with error correction:
 //
@@ -26,7 +26,7 @@ type SSMRunState struct {
 //	delta  = v - v_pred                              // error signal
 //	S[h]  += sigmoid(beta[h]) * outer(k, delta)      // error-corrected update
 //	out[h] = S^T @ (q / sqrt(headKDim))              // scaled output
-func forwardSSMLayer(
+func ForwardSSMLayer(
 	layer *Layer,
 	rs *RunState,
 	ssm *SSMRunState,

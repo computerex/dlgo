@@ -122,7 +122,7 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			for p := 0; p < nPos; p++ {
 				copy(rs.X, bs.XBatch[p*dim:(p+1)*dim])
 				ops.RMSNorm(rs.XNorm, rs.X, layer.AttnNorm, cfg.RMSNormEps)
-				forwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
+				ForwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
 				copy(bs.ProjBatch[p*dim:(p+1)*dim], rs.AttnProj)
 			}
 			batchResidualFFN(layer, bs, rs, nPos, dim, cfg, pool)

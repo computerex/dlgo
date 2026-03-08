@@ -14,20 +14,20 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
-- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest
-- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 0–22% of Ollama on generation for most models, same GGUF)
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm, custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
+- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 0–18% of Ollama on generation for most models, same GGUF)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
 
 ## Supported Architectures
 
 | Architecture | Models Tested | CPU tok/s | GPU tok/s |
 |---|---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 42–46 | 333–343 |
-| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 46–68 | 273–359 |
-| Qwen3.5 | Qwen3.5 2B (hybrid GDN+attention) | ~16 | — |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 33–95 | 230–420 |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 27–70 | 252–370 |
-| Phi | Phi-2, Phi-4-mini | 9–12 | 77 |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 44–50 | 350–367 |
+| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 45–79 | 301–371 |
+| Qwen3.5 | Qwen3.5 0.8B (hybrid GDN+attention) | ~22 | ~239 |
+| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 35–110 | 242–456 |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 34–67 | 260–420 |
+| Phi | Phi-2, Phi-4-mini | 9–13 | ~90 |
 | Mistral | Mistral (llama-compatible) | — | — |
 | Whisper | Tiny, Base, Small (speech-to-text) | ~1x RT | — |
 
@@ -42,25 +42,28 @@ with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU
 
 | Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
 |---|---|---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 94.9 tok/s | 86.4 tok/s | **+10%** | 32 ms | 16 ms |
-| SmolLM2 360M | Q8_0 | 69.8 tok/s | 82.2 tok/s | −15% | 77 ms | 37 ms |
-| TinyLlama 1.1B | Q4_0 | 45.6 tok/s | 58.1 tok/s | −22% | 233 ms | 137 ms |
-| Qwen3 0.6B | Q8_0 | 46.3 tok/s | 47.1 tok/s | **−2%** | 95 ms | 43 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 67.9 tok/s | 68.0 tok/s | **~0%** | 88 ms | 33 ms |
-| Gemma 3 1B | Q4_K_M | 32.6 tok/s | 40.8 tok/s | −20% | 176 ms | 109 ms |
-| SmolLM2 1.7B | Q4_K_M | 27.3 tok/s | 28.8 tok/s | **−5%** | 259 ms | 153 ms |
-| Llama 3.2 1B | Q4_K_M | 41.6 tok/s | 44.8 tok/s | **−7%** | 153 ms | 68 ms |
-| Phi-4-mini 3.8B | Q3_K_M | 12.1 tok/s | 17.3 tok/s | −30% | 885 ms | 194 ms |
+| Gemma 3 270M | Q8_0 | 109.5 tok/s | 106.5 tok/s | **+3%** | 29 ms | 16 ms |
+| SmolLM2 360M | Q8_0 | 67.1 tok/s | 62.6 tok/s | **+7%** | 71 ms | 43 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 78.6 tok/s | 81.6 tok/s | **−4%** | 85 ms | 31 ms |
+| Qwen3.5 0.8B | Q8_0 | 22.4 tok/s | 23.3 tok/s | **−4%** | 810 ms | 94 ms |
+| SmolLM2 1.7B | Q4_K_M | 33.7 tok/s | 36.7 tok/s | **−8%** | 216 ms | 158 ms |
+| Llama 3.2 1B | Q4_K_M | 43.8 tok/s | 47.9 tok/s | **−9%** | 164 ms | 67 ms |
+| Gemma 3 1B | Q4_K_M | 34.6 tok/s | 40.0 tok/s | −14% | 162 ms | 96 ms |
+| TinyLlama 1.1B | Q4_0 | 49.9 tok/s | 61.1 tok/s | −18% | 243 ms | 134 ms |
+| Qwen3 0.6B | Q8_0 | 45.3 tok/s | 55.2 tok/s | −18% | 91 ms | 40 ms |
+| Phi-4-mini 3.8B | Q3_K_M | 12.8 tok/s | 19.4 tok/s | −34% | 920 ms | 173 ms |
 
 **Notes:**
-- Generation is **within 0–7% of Ollama** for 4 of 9 models, and within 22% for most.
+- Generation is **within 0–9% of Ollama** for 6 of 10 models, and within 18% for most.
   The SIMD compute kernels (QxQ integer dot products, `maddubs`+`madd` inner loops) are
   at parity with llama.cpp's — both operate at the DRAM bandwidth limit (~39 GB/s measured).
-- Gemma 3 270M is **10% faster** than Ollama, showing that small Q8_0 models with efficient
-  dispatch can outperform llama.cpp.
+- Gemma 3 270M (+3%) and SmolLM2 360M (+7%) are **faster** than Ollama, showing that small
+  models with efficient dispatch can outperform llama.cpp.
+- Qwen3.5 (−4%) uses a hybrid GDN+attention architecture (Gated Delta Net SSM) with
+  sequential recurrent state — dlgo's CPU path is nearly at parity.
 - The remaining gap is Go+CGo dispatch overhead (channel-based worker pool, goroutine
   scheduling, CGo call bridge per matmul chunk).
-- Phi-4-mini (−30%) is a 3.8B parameter model in Q3_K_M, the largest and most complex
+- Phi-4-mini (−34%) is a 3.8B parameter model in Q3_K_M, the largest and most complex
   model tested — the gap scales with the number of CGo calls per token.
 
 ## Install
@@ -168,24 +171,27 @@ into both engines. Greedy decoding, `temperature=0`, `seed=42`.
 
 ### Vulkan vs CUDA (Ollama default)
 
-Ollama defaults to CUDA on NVIDIA GPUs. All 9 tested models:
+Ollama defaults to CUDA on NVIDIA GPUs. All 10 tested models:
 
 | Model | Quant | dlgo Vulkan | Ollama CUDA | Delta |
 |---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 420 tok/s | 446 tok/s | **−6%** |
-| SmolLM2 360M | Q8_0 | 370 tok/s | 460 tok/s | −20% |
-| TinyLlama 1.1B | Q4_0 | 343 tok/s | 447 tok/s | −23% |
-| Qwen 2.5 0.5B | Q4_K_M | 359 tok/s | 459 tok/s | −22% |
-| Qwen3 0.6B | Q8_0 | 273 tok/s | 306 tok/s | −11% |
-| Llama 3.2 1B | Q4_K_M | 333 tok/s | 351 tok/s | **−5%** |
-| SmolLM2 1.7B | Q4_K_M | 252 tok/s | 280 tok/s | −10% |
-| Gemma 3 1B | Q4_K_M | 230 tok/s | 287 tok/s | −20% |
-| Phi-4-mini 3.8B | Q3_K_M | 77 tok/s | 147 tok/s | −47% |
+| Qwen3.5 0.8B | Q8_0 | 239 tok/s | 187 tok/s | **+28%** |
+| Gemma 3 270M | Q8_0 | 456 tok/s | 503 tok/s | **−9%** |
+| SmolLM2 360M | Q8_0 | 420 tok/s | 451 tok/s | **−7%** |
+| SmolLM2 1.7B | Q4_K_M | 260 tok/s | 295 tok/s | −12% |
+| Qwen3 0.6B | Q8_0 | 301 tok/s | 350 tok/s | −14% |
+| Llama 3.2 1B | Q4_K_M | 350 tok/s | 411 tok/s | −15% |
+| Gemma 3 1B | Q4_K_M | 242 tok/s | 304 tok/s | −20% |
+| Qwen 2.5 0.5B | Q4_K_M | 371 tok/s | 478 tok/s | −22% |
+| TinyLlama 1.1B | Q4_0 | 367 tok/s | 488 tok/s | −25% |
+| Phi-4-mini 3.8B | Q3_K_M | 90 tok/s | 165 tok/s | −46% |
 
-The 5–23% gap to CUDA for most models is the inherent Vulkan vs CUDA overhead on NVIDIA
-hardware. On non-NVIDIA GPUs (AMD, Intel, mobile), dlgo's Vulkan backend provides
-a significant advantage — Ollama's Vulkan backend is much slower for these quantization
-types.
+Qwen3.5 is **28% faster** than Ollama's CUDA backend thanks to custom Vulkan compute
+shaders for the Gated Delta Net (GDN) SSM layers — the first GPU-accelerated pure Vulkan
+implementation of this architecture. The 7–25% gap to CUDA for standard attention models
+is the inherent Vulkan vs CUDA overhead on NVIDIA hardware. On non-NVIDIA GPUs (AMD,
+Intel, mobile), dlgo's Vulkan backend provides a significant advantage — Ollama's Vulkan
+backend is much slower for these quantization types.
 
 ### Vulkan vs Vulkan (fair comparison)
 
@@ -207,6 +213,7 @@ SmolLM2. Prefill is 10–50x faster across all models.
 - Fused layer dispatch (single CGo call per layer, minimized Go↔C overhead)
 - Fused Add+RMSNorm kernel reducing barriers per layer
 - Fused multi-head attention kernel (Q·K softmax, V accumulation)
+- Custom SSM/GDN shaders (conv1d+SiLU, delta rule, L2 norm, sigmoid gate) — full Gated Delta Net on GPU
 - HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
 - Single command buffer submission per token with batched dispatches
 - Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead

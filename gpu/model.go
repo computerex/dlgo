@@ -97,6 +97,19 @@ type GpuLayer struct {
 	FFNUpBias    Buf
 	FFNDownBias  Buf
 	PostFFNNorm  Buf
+
+	// SSM (Gated Delta Net) weights and per-layer state on GPU
+	SSMInProj  *GpuTensor // [qkvDim × dim]
+	SSMGate    *GpuTensor // [valueDim × dim] (AttnGate)
+	SSMAlpha   *GpuTensor // [numHeads × dim]
+	SSMBeta    *GpuTensor // [numHeads × dim]
+	SSMConv1dW Buf        // [channels × convK] float32
+	SSMA       Buf        // [numHeads] float32
+	SSMDtBias  Buf        // [numHeads] float32 (may be 0)
+	SSMNorm    Buf        // [headVDim] float32
+	SSMOut     *GpuTensor // [dim × valueDim]
+	SSMState   Buf        // [numHeads × headKDim × headVDim] float32 (persistent)
+	SSMConvBuf Buf        // [convK × channels] float32 (persistent)
 }
 
 // GpuModel holds all model weights on the GPU.
@@ -126,6 +139,17 @@ type GpuRunState struct {
 	FFNOut   Buf // [dim]
 	Logits   Buf // [vocabSize]
 
+	// SSM (Gated Delta Net) scratch buffers
+	SSMQKV   Buf // [qkvDim] SSM in-projection output
+	SSMZ     Buf // [valueDim] gate projection output
+	SSMAlpha Buf // [numHeads] alpha scratch
+	SSMBeta  Buf // [numHeads] beta scratch
+	SSMY     Buf // [valueDim] SSM output
+
+	// GatedQ attention scratch buffers
+	QFull Buf // [2*qDim] fused Q+gate output
+	QGate Buf // [qDim] attention gate values
+
 	// CPU scratch buffers used for correctness fallbacks when a quant type
 	// has no GPU kernel yet (for example Q3_K on Vulkan).
 	ScratchIn  []float32
@@ -153,6 +177,21 @@ func NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize int) *GpuRunState {
 		Logits:   Alloc(uint64(vocabSize * 4)),
 		Pool:     blas.DefaultPool(),
 	}
+}
+
+// AllocSSMScratch allocates GPU scratch buffers for SSM layers.
+func (rs *GpuRunState) AllocSSMScratch(qkvDim, valueDim, numHeads int) {
+	rs.SSMQKV = Alloc(uint64(qkvDim * 4))
+	rs.SSMZ = Alloc(uint64(valueDim * 4))
+	rs.SSMAlpha = Alloc(uint64(numHeads * 4))
+	rs.SSMBeta = Alloc(uint64(numHeads * 4))
+	rs.SSMY = Alloc(uint64(valueDim * 4))
+}
+
+// AllocGatedQScratch allocates GPU scratch buffers for GatedQ attention.
+func (rs *GpuRunState) AllocGatedQScratch(qDim int) {
+	rs.QFull = Alloc(uint64(2 * qDim * 4))
+	rs.QGate = Alloc(uint64(qDim * 4))
 }
 
 // GpuBatchState holds batch-sized GPU buffers for prefill.

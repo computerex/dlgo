@@ -26,6 +26,9 @@ type GpuPipeline struct {
 	BatchState      *GpuBatchState
 	BatchLayerConfs []*LayerConf
 	UseFusedForward bool
+
+	HasSSM    bool
+	HasGatedQ bool
 }
 
 // UploadModel copies all model weights to GPU memory.
@@ -82,21 +85,29 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 			}
 		}
 
-		gl.Wq, err = UploadTensor(cl.Wq)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d wq: %w", l, err)
+		if cl.Wq != nil {
+			gl.Wq, err = UploadTensor(cl.Wq)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d wq: %w", l, err)
+			}
 		}
-		gl.Wk, err = UploadTensor(cl.Wk)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d wk: %w", l, err)
+		if cl.Wk != nil {
+			gl.Wk, err = UploadTensor(cl.Wk)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d wk: %w", l, err)
+			}
 		}
-		gl.Wv, err = UploadTensor(cl.Wv)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d wv: %w", l, err)
+		if cl.Wv != nil {
+			gl.Wv, err = UploadTensor(cl.Wv)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d wv: %w", l, err)
+			}
 		}
-		gl.Wo, err = UploadTensor(cl.Wo)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d wo: %w", l, err)
+		if cl.Wo != nil {
+			gl.Wo, err = UploadTensor(cl.Wo)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d wo: %w", l, err)
+			}
 		}
 
 		if cl.Bq != nil {
@@ -125,13 +136,17 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 		}
 
 		gl.FFNGate, _ = UploadTensor(cl.FFNGate)
-		gl.FFNUp, err = UploadTensor(cl.FFNUp)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d ffn_up: %w", l, err)
+		if cl.FFNUp != nil {
+			gl.FFNUp, err = UploadTensor(cl.FFNUp)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d ffn_up: %w", l, err)
+			}
 		}
-		gl.FFNDown, err = UploadTensor(cl.FFNDown)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d ffn_down: %w", l, err)
+		if cl.FFNDown != nil {
+			gl.FFNDown, err = UploadTensor(cl.FFNDown)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d ffn_down: %w", l, err)
+			}
 		}
 
 		if cl.FFNUpBias != nil {
@@ -142,6 +157,35 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 		}
 		if cl.PostFFNNorm != nil {
 			gl.PostFFNNorm, _ = UploadF32Slice(cl.PostFFNNorm)
+		}
+
+		// SSM (Gated Delta Net) weights
+		if cl.SSMInProj != nil {
+			gl.SSMInProj, _ = UploadTensor(cl.SSMInProj)
+		}
+		if cl.AttnGate != nil {
+			gl.SSMGate, _ = UploadTensor(cl.AttnGate)
+		}
+		if cl.SSMAlpha != nil {
+			gl.SSMAlpha, _ = UploadTensor(cl.SSMAlpha)
+		}
+		if cl.SSMBeta != nil {
+			gl.SSMBeta, _ = UploadTensor(cl.SSMBeta)
+		}
+		if cl.SSMConv1dW != nil {
+			gl.SSMConv1dW, _ = UploadF32Slice(cl.SSMConv1dW)
+		}
+		if cl.SSMA != nil {
+			gl.SSMA, _ = UploadF32Slice(cl.SSMA)
+		}
+		if cl.SSMDtBias != nil {
+			gl.SSMDtBias, _ = UploadF32Slice(cl.SSMDtBias)
+		}
+		if cl.SSMNorm != nil {
+			gl.SSMNorm, _ = UploadF32Slice(cl.SSMNorm)
+		}
+		if cl.SSMOut != nil {
+			gl.SSMOut, _ = UploadTensor(cl.SSMOut)
 		}
 	}
 
@@ -181,7 +225,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
 
-	return &GpuPipeline{
+	pipe := &GpuPipeline{
 		CPUModel:    m,
 		GpuModel:    gm,
 		Tokenizer:   cpuPipeline.Tokenizer,
@@ -192,7 +236,47 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		LayerConfs:  layerConfs,
 		Q8_1Scratch: q8_1Scratch,
 		UseFusedForward: supportsFusedForwardGPU(m),
-	}, nil
+	}
+
+	hasGatedQ := false
+	for l := 0; l < cfg.NumLayers; l++ {
+		if m.Layers[l].Spec.GatedQ {
+			hasGatedQ = true
+			break
+		}
+	}
+	if hasGatedQ {
+		rs.AllocGatedQScratch(qDim)
+		pipe.HasGatedQ = true
+	}
+
+	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
+		numHeads := cfg.SSMTimeStepRank
+		headVDim := cfg.SSMInnerSize / numHeads
+		headKDim := cfg.SSMStateSize
+		valueDim := numHeads * headVDim
+		keyDim := numHeads * headKDim
+		qkvDim := keyDim*2 + valueDim
+		convK := cfg.SSMConvKernel
+
+		rs.AllocSSMScratch(qkvDim, valueDim, numHeads)
+
+		ssmLayerCount := 0
+		for l := 0; l < cfg.NumLayers; l++ {
+			if m.Layers[l].Spec.Core == llm.CoreSSM {
+				gl := &gm.Layers[l]
+				gl.SSMState = Alloc(uint64(numHeads * headKDim * headVDim * 4))
+				gl.SSMConvBuf = Alloc(uint64(convK * qkvDim * 4))
+				ssmLayerCount++
+			}
+		}
+
+		pipe.HasSSM = true
+		fmt.Printf("[dlgo/gpu] SSM state on GPU (%d SSM layers, %d heads, state=%dx%d)\n",
+			ssmLayerCount, numHeads, headKDim, headVDim)
+	}
+
+	return pipe, nil
 }
 
 // FreeAll releases all GPU resources held by this pipeline.
@@ -234,6 +318,21 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	}
 
 	p.KVCache.Reset()
+	if p.HasSSM {
+		mcfg2 := p.CPUModel.Config
+		numHeads := mcfg2.SSMTimeStepRank
+		headVDim := mcfg2.SSMInnerSize / numHeads
+		headKDim := mcfg2.SSMStateSize
+		qkvDim := numHeads*headKDim*2 + numHeads*headVDim
+		convK := mcfg2.SSMConvKernel
+		for l := 0; l < mcfg2.NumLayers; l++ {
+			gl := &p.GpuModel.Layers[l]
+			if gl.SSMState != 0 {
+				ZeroFill(gl.SSMState, uint64(numHeads*headKDim*headVDim*4))
+				ZeroFill(gl.SSMConvBuf, uint64(convK*qkvDim*4))
+			}
+		}
+	}
 
 	mcfg := p.CPUModel.Config
 	npos := len(tokens)
@@ -259,8 +358,8 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	} else {
 		for i, tok := range tokens {
 			if p.UseFusedForward {
-				GpuForwardFused(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
-			} else if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			} else if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
 				return nil, err
 			}
 		}
@@ -297,8 +396,8 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		}
 
 		if p.UseFusedForward {
-			GpuForwardFused(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
-		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
 			return nil, err
 		}
 		pos++
@@ -337,9 +436,17 @@ done:
 }
 
 // supportsBatchPrefillGPU gates the newer batched prefill path behind
-// per-architecture validation. Some families still diverge from the known-good
-// single-token fused path during prompt eval.
+// per-architecture validation. SSM layers are recurrent and cannot batch
+// across positions.
 func supportsBatchPrefillGPU(m *llm.Model) bool {
+	if m.Config.FullAttentionInterval > 0 && m.Config.SSMInnerSize > 0 {
+		return false
+	}
+	for i := range m.Layers {
+		if m.Layers[i].Spec.GatedQ {
+			return false
+		}
+	}
 	return true
 }
 
@@ -359,12 +466,32 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	}
 	for i := range m.Layers {
 		l := &m.Layers[i]
-		for _, t := range []*core.QuantizedTensor{
-			l.Wq, l.Wk, l.Wv, l.Wo,
-			l.FFNGate, l.FFNUp, l.FFNDown,
-		} {
-			if !supported(t) {
-				return false
+		if l.Spec.Core == llm.CoreSSM {
+			for _, t := range []*core.QuantizedTensor{
+				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,
+				l.FFNGate, l.FFNUp, l.FFNDown,
+			} {
+				if !supported(t) {
+					return false
+				}
+			}
+		} else if l.Spec.GatedQ {
+			for _, t := range []*core.QuantizedTensor{
+				l.Wq, l.Wk, l.Wv, l.Wo,
+				l.FFNGate, l.FFNUp, l.FFNDown,
+			} {
+				if !supported(t) {
+					return false
+				}
+			}
+		} else {
+			for _, t := range []*core.QuantizedTensor{
+				l.Wq, l.Wk, l.Wv, l.Wo,
+				l.FFNGate, l.FFNUp, l.FFNDown,
+			} {
+				if !supported(t) {
+					return false
+				}
 			}
 		}
 	}

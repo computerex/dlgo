@@ -1,0 +1,39 @@
+#version 450
+
+// Single-step causal conv1d with state buffer + SiLU activation.
+// Shifts conv_state left by one, stores new input, applies depthwise conv, then SiLU.
+// One thread per channel.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer QKV { float qkv[]; };           // [channels] in/out
+layout(set = 0, binding = 1) buffer ConvState { float conv_buf[]; }; // [conv_k * channels]
+layout(set = 0, binding = 2) buffer ConvW { float conv_w[]; };       // [channels * conv_k]
+
+layout(push_constant) uniform Params {
+    int channels;
+    int conv_k;
+};
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= channels) return;
+
+    // Shift state left: copy slots [1..conv_k-1] to [0..conv_k-2]
+    for (int t = 0; t < conv_k - 1; t++) {
+        conv_buf[t * channels + c] = conv_buf[(t + 1) * channels + c];
+    }
+    // Store new input at end
+    conv_buf[(conv_k - 1) * channels + c] = qkv[c];
+
+    // Depthwise convolution
+    float acc = 0.0;
+    int wOff = int(c) * conv_k;
+    for (int k = 0; k < conv_k; k++) {
+        acc += conv_buf[k * channels + c] * conv_w[wOff + k];
+    }
+
+    // SiLU activation
+    float s = acc / (1.0 + exp(-acc));
+    qkv[c] = s;
+}

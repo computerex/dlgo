@@ -71,6 +71,12 @@ typedef enum {
     PIPE_MATVEC_Q8_0_DP4A,
     PIPE_MATVEC_Q4_K_DP4A,
     PIPE_MATVEC_Q6_K_DP4A,
+    PIPE_SSM_CONV1D_SILU,
+    PIPE_SSM_PREPROCESS,
+    PIPE_SSM_DELTA_RULE,
+    PIPE_SSM_NORM_GATE,
+    PIPE_DEINTERLEAVE_QGATE,
+    PIPE_SIGMOID_GATE,
     PIPE_COUNT
 } PipelineID;
 
@@ -183,6 +189,7 @@ typedef struct {
 
     GpuBuf q8_1_scratch; // Q8_1 scratch buffer (reused for each quantize step)
     int use_dp4a;        // 1 to use dp4a path, 0 for float path
+    int core_type;       // 0=attention, 1=SSM (skip attn, Go fills attn_proj)
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.
@@ -201,6 +208,21 @@ int gpu_batch_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, in
 
 // Copy a region between GPU buffers.
 int gpu_copy_region(GpuBuf dst, uint64_t dst_offset, GpuBuf src, uint64_t src_offset, uint64_t size);
+
+// SSM (Gated Delta Net) operations
+int gpu_ssm_conv1d_silu(GpuBuf qkv, GpuBuf conv_state, GpuBuf conv_w, int channels, int conv_k);
+int gpu_ssm_preprocess(GpuBuf alpha, GpuBuf beta, GpuBuf ssma, GpuBuf dt_bias,
+                       GpuBuf qkv, int num_heads, int head_k_dim, int key_dim,
+                       float rms_eps, int has_dt_bias);
+int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
+                       GpuBuf y, int num_heads, int head_k_dim, int head_v_dim, int key_dim);
+int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
+                      int num_heads, int head_v_dim, float eps);
+
+// GatedQ attention operations
+int gpu_deinterleave_qgate(GpuBuf qfull, GpuBuf q, GpuBuf qgate,
+                           int num_heads, int head_dim);
+int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n);
 
 #ifdef __cplusplus
 }

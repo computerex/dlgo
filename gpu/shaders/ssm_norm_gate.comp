@@ -1,0 +1,46 @@
+#version 450
+
+// Per-head RMSNorm on Y + SiLU gate: y[h][j] = rmsnorm(y[h][j]) * z[h][j] * sigmoid(z[h][j])
+// One workgroup per head.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer YBuf { float y_data[]; };    // [valueDim] in/out
+layout(set = 0, binding = 1) buffer ZBuf { float z_data[]; };    // [valueDim] read-only
+layout(set = 0, binding = 2) buffer NormW { float norm_w[]; };   // [headVDim] shared weight
+
+layout(push_constant) uniform Params {
+    int head_v_dim;
+    float eps;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+    uint base = h * uint(head_v_dim);
+
+    // RMSNorm: compute sum of squares
+    float ss = 0.0;
+    for (int i = int(tid); i < head_v_dim; i += 256) {
+        float v = y_data[base + uint(i)];
+        ss += v * v;
+    }
+    sdata[tid] = ss;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(head_v_dim) + eps);
+    barrier();
+
+    // Apply RMSNorm + SiLU gate
+    for (int i = int(tid); i < head_v_dim; i += 256) {
+        float y_val = y_data[base + uint(i)] * inv_rms * norm_w[i];
+        float z_val = z_data[base + uint(i)];
+        float sig = 1.0 / (1.0 + exp(-z_val));
+        y_data[base + uint(i)] = y_val * z_val * sig;
+    }
+}

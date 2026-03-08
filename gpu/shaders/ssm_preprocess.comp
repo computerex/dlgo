@@ -1,0 +1,86 @@
+#version 450
+
+// SSM preprocessing: compute decay/lr from alpha/beta projections,
+// L2-normalize Q and K per head, scale Q by 1/sqrt(headKDim).
+// One workgroup per head for the L2 normalization (needs reduction).
+// Alpha/beta processing uses threads from head 0 only (numHeads is small).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AlphaBuf { float alpha_data[]; }; // [numHeads] in/out
+layout(set = 0, binding = 1) buffer BetaBuf { float beta_data[]; };   // [numHeads] in/out
+layout(set = 0, binding = 2) buffer SSMABuf { float ssma_data[]; };   // [numHeads] read-only
+layout(set = 0, binding = 3) buffer DtBiasBuf { float dt_bias[]; };   // [numHeads] read-only (may be empty)
+layout(set = 0, binding = 4) buffer QKVBuf { float qkv[]; };         // [qkvDim] Q and K regions modified
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int head_k_dim;
+    int key_dim;      // num_heads * head_k_dim
+    float rms_eps;
+    int has_dt_bias;   // 1 if dt_bias is valid, 0 if not
+};
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint h = gl_WorkGroupID.x;
+
+    if (h >= num_heads) return;
+
+    // --- Alpha/Beta computation (all threads in each head's workgroup, thread 0 does it) ---
+    if (tid == 0) {
+        float a = alpha_data[h];
+        if (has_dt_bias != 0) {
+            a += dt_bias[h];
+        }
+        // softplus
+        float sp = log(1.0 + exp(a));
+        // decay = SSMA * softplus(alpha)
+        alpha_data[h] = ssma_data[h] * sp;
+
+        // sigmoid for beta
+        float b = beta_data[h];
+        beta_data[h] = 1.0 / (1.0 + exp(-b));
+    }
+
+    // --- L2-normalize Q for this head ---
+    uint qBase = h * uint(head_k_dim);
+    float sq = 0.0;
+    for (int i = int(tid); i < head_k_dim; i += 256) {
+        float v = qkv[qBase + uint(i)];
+        sq += v * v;
+    }
+    sdata[tid] = sq;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float invNormQ = 1.0 / sqrt(sdata[0] + rms_eps);
+
+    // Scale Q: L2 normalize + 1/sqrt(headKDim)
+    float qScale = invNormQ / sqrt(float(head_k_dim));
+    for (int i = int(tid); i < head_k_dim; i += 256) {
+        qkv[qBase + uint(i)] *= qScale;
+    }
+
+    // --- L2-normalize K for this head ---
+    uint kBase = uint(key_dim) + h * uint(head_k_dim);
+    float sk = 0.0;
+    for (int i = int(tid); i < head_k_dim; i += 256) {
+        float v = qkv[kBase + uint(i)];
+        sk += v * v;
+    }
+    sdata[tid] = sk;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float invNormK = 1.0 / sqrt(sdata[0] + rms_eps);
+    for (int i = int(tid); i < head_k_dim; i += 256) {
+        qkv[kBase + uint(i)] *= invNormK;
+    }
+}

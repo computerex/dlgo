@@ -1391,6 +1391,105 @@ int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
 }
 
 // ---------------------------------------------------------------------------
+// SSM (Gated Delta Net) operations
+// ---------------------------------------------------------------------------
+
+int gpu_ssm_conv1d_silu(GpuBuf qkv, GpuBuf conv_state, GpuBuf conv_w,
+                        int channels, int conv_k) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int channels; int conv_k; } pc = {channels, conv_k};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_CONV1D_SILU;
+    dp.bufs[0] = qkv; dp.bufs[1] = conv_state; dp.bufs[2] = conv_w;
+    dp.num_bufs = 3;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = (channels + 255) / 256; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_preprocess(GpuBuf alpha, GpuBuf beta, GpuBuf ssma, GpuBuf dt_bias,
+                       GpuBuf qkv, int num_heads, int head_k_dim, int key_dim,
+                       float rms_eps, int has_dt_bias) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int key_dim; float rms_eps; int has_dt_bias; }
+        pc = {num_heads, head_k_dim, key_dim, rms_eps, has_dt_bias};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_PREPROCESS;
+    dp.bufs[0] = alpha; dp.bufs[1] = beta; dp.bufs[2] = ssma;
+    dp.bufs[3] = dt_bias ? dt_bias : alpha;
+    dp.bufs[4] = qkv;
+    dp.num_bufs = 5;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
+                       GpuBuf y, int num_heads, int head_k_dim, int head_v_dim, int key_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int head_v_dim; int key_dim; }
+        pc = {num_heads, head_k_dim, head_v_dim, key_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_DELTA_RULE;
+    dp.bufs[0] = state; dp.bufs[1] = qkv; dp.bufs[2] = alpha; dp.bufs[3] = beta; dp.bufs[4] = y;
+    dp.num_bufs = 5;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
+                      int num_heads, int head_v_dim, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int head_v_dim; float eps; } pc = {head_v_dim, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_NORM_GATE;
+    dp.bufs[0] = y; dp.bufs[1] = z; dp.bufs[2] = norm_w;
+    dp.num_bufs = 3;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_deinterleave_qgate(GpuBuf qfull, GpuBuf q, GpuBuf qgate,
+                           int num_heads, int head_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int total = num_heads * head_dim;
+    struct { int num_heads; int head_dim; } pc = {num_heads, head_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_DEINTERLEAVE_QGATE;
+    dp.bufs[0] = qfull; dp.bufs[1] = q; dp.bufs[2] = qgate;
+    dp.num_bufs = 3;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = (total + 255) / 256; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; } pc = {n};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SIGMOID_GATE;
+    dp.bufs[0] = out_buf; dp.bufs[1] = gate_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// ---------------------------------------------------------------------------
 // Fused layer forward — all dispatches for one transformer layer in a single
 // C call, eliminating per-operation CGo overhead.
 // ---------------------------------------------------------------------------
@@ -1402,49 +1501,49 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
     int num_kv_heads = lc->num_kv_heads;
     int kv_dim = lc->kv_dim;
 
-    // Q/K/V MatVecs (write to independent buffers, can run without barriers between them)
-    gpu_barrier();
-    if (lc->use_dp4a && lc->q8_1_scratch) {
-        gpu_quantize_q8_1(lc->q8_1_scratch, lc->x_norm, dim);
+    // core_type 1 = SSM: Go side already filled attn_proj, skip to residual+FFN
+    if (lc->core_type == 0) {
+        // Q/K/V MatVecs (write to independent buffers, can run without barriers between them)
         gpu_barrier();
-        gpu_matvec_dp4a(lc->q, lc->wq, lc->q8_1_scratch, lc->wq_rows, lc->wq_cols, lc->wq_type);
-        gpu_matvec_dp4a(lc->k, lc->wk, lc->q8_1_scratch, lc->wk_rows, lc->wk_cols, lc->wk_type);
-        gpu_matvec_dp4a(lc->v, lc->wv, lc->q8_1_scratch, lc->wv_rows, lc->wv_cols, lc->wv_type);
-    } else {
-        gpu_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, lc->wq_type);
-        gpu_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, lc->wk_type);
-        gpu_matvec(lc->v, lc->wv, lc->x_norm, lc->wv_rows, lc->wv_cols, lc->wv_type);
-    }
-
-    if (lc->bq || lc->bk || lc->bv || lc->q_norm_w) {
-        gpu_barrier();
-        if (lc->bq) gpu_add(lc->q, lc->q, lc->bq, num_heads * head_dim);
-        if (lc->bk) gpu_add(lc->k, lc->k, lc->bk, kv_dim);
-        if (lc->bv) gpu_add(lc->v, lc->v, lc->bv, kv_dim);
-        if (lc->q_norm_w) {
+        if (lc->use_dp4a && lc->q8_1_scratch) {
+            gpu_quantize_q8_1(lc->q8_1_scratch, lc->x_norm, dim);
             gpu_barrier();
-            gpu_rmsnorm_heads(lc->q, lc->q_norm_w, num_heads, head_dim, lc->rms_eps);
-            gpu_rmsnorm_heads(lc->k, lc->k_norm_w, num_kv_heads, head_dim, lc->rms_eps);
+            gpu_matvec_dp4a(lc->q, lc->wq, lc->q8_1_scratch, lc->wq_rows, lc->wq_cols, lc->wq_type);
+            gpu_matvec_dp4a(lc->k, lc->wk, lc->q8_1_scratch, lc->wk_rows, lc->wk_cols, lc->wk_type);
+            gpu_matvec_dp4a(lc->v, lc->wv, lc->q8_1_scratch, lc->wv_rows, lc->wv_cols, lc->wv_type);
+        } else {
+            gpu_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, lc->wq_type);
+            gpu_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, lc->wk_type);
+            gpu_matvec(lc->v, lc->wv, lc->x_norm, lc->wv_rows, lc->wv_cols, lc->wv_type);
         }
-    }
 
-    gpu_barrier();
-    gpu_rope(lc->q, lc->k, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_freq_base, lc->rope_neox);
-    // kv_store has internal barriers that cover both COMPUTE→TRANSFER (for
-    // RoPE K writes) and TRANSFER→COMPUTE (for attention reads). The first
-    // barrier also covers COMPUTE→COMPUTE for Q visibility to attention.
-    gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        if (lc->bq || lc->bk || lc->bv || lc->q_norm_w) {
+            gpu_barrier();
+            if (lc->bq) gpu_add(lc->q, lc->q, lc->bq, num_heads * head_dim);
+            if (lc->bk) gpu_add(lc->k, lc->k, lc->bk, kv_dim);
+            if (lc->bv) gpu_add(lc->v, lc->v, lc->bv, kv_dim);
+            if (lc->q_norm_w) {
+                gpu_barrier();
+                gpu_rmsnorm_heads(lc->q, lc->q_norm_w, num_heads, head_dim, lc->rms_eps);
+                gpu_rmsnorm_heads(lc->k, lc->k_norm_w, num_kv_heads, head_dim, lc->rms_eps);
+            }
+        }
 
-    gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                  num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
-
-    gpu_barrier();
-    if (lc->use_dp4a && lc->q8_1_scratch) {
-        gpu_quantize_q8_1(lc->q8_1_scratch, lc->attn_out, num_heads * head_dim);
         gpu_barrier();
-        gpu_matvec_dp4a(lc->attn_proj, lc->wo, lc->q8_1_scratch, lc->wo_rows, lc->wo_cols, lc->wo_type);
-    } else {
-        gpu_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, lc->wo_type);
+        gpu_rope(lc->q, lc->k, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_freq_base, lc->rope_neox);
+        gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+
+        gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                      num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
+
+        gpu_barrier();
+        if (lc->use_dp4a && lc->q8_1_scratch) {
+            gpu_quantize_q8_1(lc->q8_1_scratch, lc->attn_out, num_heads * head_dim);
+            gpu_barrier();
+            gpu_matvec_dp4a(lc->attn_proj, lc->wo, lc->q8_1_scratch, lc->wo_rows, lc->wo_cols, lc->wo_type);
+        } else {
+            gpu_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, lc->wo_type);
+        }
     }
 
     if (lc->residual_type == 0) {

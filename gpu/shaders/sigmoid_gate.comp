@@ -1,0 +1,20 @@
+#version 450
+
+// Sigmoid gate: out[i] *= sigmoid(gate[i])
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Gate { float gate_data[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n) return;
+
+    float g = gate_data[idx];
+    out_data[idx] *= 1.0 / (1.0 + exp(-g));
+}

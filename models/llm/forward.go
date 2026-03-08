@@ -149,9 +149,9 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 		// Layer core
 		switch spec.Core {
 		case CoreSSM:
-			forwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
+			ForwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
 		case CoreAttention:
-			forwardAttention(layer, rs, kv, l, pos, numHeads, numKVHeads, headDim, kvMul, cfg, pool)
+			ForwardAttention(layer, rs, kv, l, pos, numHeads, numKVHeads, headDim, kvMul, cfg, pool)
 		}
 
 		// Residual wiring + FFN
@@ -204,7 +204,7 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 }
 
 // forwardAttention runs one full-attention layer. Writes result to rs.AttnProj.
-func forwardAttention(
+func ForwardAttention(
 	layer *Layer, rs *RunState, kv *memory.MultiLayerKVCache,
 	l, pos, numHeads, numKVHeads, headDim, kvMul int,
 	cfg ModelConfig, pool *blas.Pool,
