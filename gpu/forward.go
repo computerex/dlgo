@@ -440,7 +440,7 @@ func gpuForwardFFN(layer *llm.Layer, gl *GpuLayer, rs *GpuRunState, input Buf, d
 
 func supportsGPUQType(qtype uint32) bool {
 	switch qtype {
-	case 0, 1, 2, 6, 8, 11, 12, 14:
+	case 0, 1, 2, 6, 8, 11, 12, 13, 14:
 		return true
 	default:
 		return false

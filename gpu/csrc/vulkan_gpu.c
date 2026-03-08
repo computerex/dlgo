@@ -956,6 +956,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K; break;
+        case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K; break;
         default: return GPU_ERR_DISPATCH;
@@ -967,7 +968,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     int rows_per_wg = 4;
     if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K) {
         rows_per_wg = 2;
-    } else if (qtype == QTYPE_Q3_K) {
+    } else if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) {
         rows_per_wg = 1;
     }
 
@@ -1258,6 +1259,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K; break;
+        case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K; break;
         default: return GPU_ERR_DISPATCH;
@@ -1265,7 +1267,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 
     int rows_per_wg = 4;
     if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K) rows_per_wg = 2;
-    else if (qtype == QTYPE_Q3_K) rows_per_wg = 1;
+    else if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) rows_per_wg = 1;
 
     struct { int rows; int cols; } pc = {rows, cols};
     DispatchParams dp = {0};

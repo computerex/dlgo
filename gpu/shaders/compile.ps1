@@ -4,6 +4,7 @@ $shaders = @(
     @{name="matvec_q8_0"; file="matvec_q8_0.comp"},
     @{name="matvec_q3_k"; file="matvec_q3_k.comp"},
     @{name="matvec_q4_k"; file="matvec_q4_k.comp"},
+    @{name="matvec_q5_k"; file="matvec_q5_k.comp"},
     @{name="matvec_q5_0"; file="matvec_q5_0.comp"},
     @{name="matvec_q6_k"; file="matvec_q6_k.comp"},
     @{name="attention"; file="attention.comp"},
@@ -73,6 +74,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_q8_0", spv_matvec_q8_0, spv_matvec_q8_0_size, 3, 8},   // PIPE_MATVEC_Q8_0
     {"matvec_q3_k", spv_matvec_q3_k, spv_matvec_q3_k_size, 3, 8},   // PIPE_MATVEC_Q3_K
     {"matvec_q4_k", spv_matvec_q4_k, spv_matvec_q4_k_size, 3, 8},   // PIPE_MATVEC_Q4_K
+    {"matvec_q5_k", spv_matvec_q5_k, spv_matvec_q5_k_size, 3, 8},   // PIPE_MATVEC_Q5_K
     {"matvec_q5_0", spv_matvec_q5_0, spv_matvec_q5_0_size, 3, 8},   // PIPE_MATVEC_Q5_0
     {"matvec_q6_k", spv_matvec_q6_k, spv_matvec_q6_k_size, 3, 8},   // PIPE_MATVEC_Q6_K
     {"matvec_q4_0", spv_matvec_q4_0, spv_matvec_q4_0_size, 3, 8},   // PIPE_DEQUANT_Q4_0 (placeholder)
