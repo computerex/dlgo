@@ -31,26 +31,22 @@ uint byte_at(uint x, int idx) {
 
 int unpack_scale(uint i0, uint i1, uint t, int idx) {
     if (idx < 4) {
-        uint b = byte_at(i0, idx);
-        uint tb = byte_at(t, idx);
-        return int((b & 0x3Fu) | ((tb & 0x03u) << 4));
+        return int(byte_at(i0, idx) & 0x3Fu);
     }
     int j = idx - 4;
-    uint b = byte_at(i1, j);
-    uint tb = byte_at(t, j);
-    return int((b & 0x3Fu) | (((tb >> 4) & 0x03u) << 4));
+    uint lo4 = byte_at(t, j) & 0x0Fu;
+    uint hi2 = (byte_at(i0, j) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
 }
 
 int unpack_min(uint i0, uint i1, uint t, int idx) {
     if (idx < 4) {
-        uint b = byte_at(i0, idx);
-        uint tb = byte_at(t, idx);
-        return int((b & 0x3Fu) | (((tb >> 2) & 0x03u) << 4));
+        return int(byte_at(i1, idx) & 0x3Fu);
     }
     int j = idx - 4;
-    uint b = byte_at(i1, j);
-    uint tb = byte_at(t, j);
-    return int((b & 0x3Fu) | (((tb >> 6) & 0x03u) << 4));
+    uint lo4 = (byte_at(t, j) >> 4) & 0x0Fu;
+    uint hi2 = (byte_at(i1, j) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
 }
 
 void main() {
