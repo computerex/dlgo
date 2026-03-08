@@ -83,7 +83,7 @@ func CPoolShutdown() {
 	C.cpool_shutdown()
 }
 
-func CPoolHas() bool    { return false }
+func CPoolHas() bool      { return false }
 func CPoolBatchHas() bool { return false }
 
 func CPoolQQMatVec(wData []byte, wType uint32, x []float32, cols int,

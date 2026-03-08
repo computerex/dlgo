@@ -304,10 +304,10 @@ func QDualMatVecMulParallel(out1 []float32, qt1 *core.QuantizedTensor,
 	if useQQ1 && useQQ2 && qt1.Type == qt2.Type && qt1.Cols == qt2.Cols {
 		q8Size := quant.Q8BufferSize(qt1.Type, qt1.Cols)
 		q8Buf := getQ8Buf(q8Size)
-		quant.QuantizeForType(x, q8Buf, qt1.Type)
-
 		bpr1 := quant.BytesForN(qt1.Type, qt1.Cols)
 		bpr2 := quant.BytesForN(qt2.Type, qt2.Cols)
+
+		quant.QuantizeForType(x, q8Buf, qt1.Type)
 		rows1, rows2 := qt1.Rows, qt2.Rows
 		totalRows := rows1 + rows2
 
@@ -362,11 +362,11 @@ func QTripleMatVecMulParallel(
 	if useQQ {
 		q8Size := quant.Q8BufferSize(qt1.Type, qt1.Cols)
 		q8Buf := getQ8Buf(q8Size)
-		quant.QuantizeForType(x, q8Buf, qt1.Type)
-
 		bpr1 := quant.BytesForN(qt1.Type, qt1.Cols)
 		bpr2 := quant.BytesForN(qt2.Type, qt2.Cols)
 		bpr3 := quant.BytesForN(qt3.Type, qt3.Cols)
+
+		quant.QuantizeForType(x, q8Buf, qt1.Type)
 		r1, r2, r3 := qt1.Rows, qt2.Rows, qt3.Rows
 		totalRows := r1 + r2 + r3
 
