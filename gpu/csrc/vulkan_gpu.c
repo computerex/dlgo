@@ -1306,6 +1306,17 @@ int gpu_copy_region(GpuBuf dst, uint64_t dst_offset, GpuBuf src, uint64_t src_of
     return GPU_OK;
 }
 
+static int gpu_batch_add_bias_expand(GpuBuf dst_buf, GpuBuf bias_buf, GpuBuf scratch_buf,
+                                     int elems_per_pos, int npos) {
+    uint64_t bytes_per_pos = (uint64_t) elems_per_pos * 4u;
+    for (int p = 0; p < npos; ++p) {
+        int rc = gpu_copy_region(scratch_buf, (uint64_t) p * bytes_per_pos,
+                                 bias_buf, 0, bytes_per_pos);
+        if (rc != GPU_OK) return rc;
+    }
+    return gpu_add(dst_buf, dst_buf, scratch_buf, elems_per_pos * npos);
+}
+
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
     // TODO: implement dequantize shaders
     return GPU_ERR_SHADER;
@@ -1620,6 +1631,22 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
     gpu_batch_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, npos, lc->wq_type);
     gpu_batch_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, npos, lc->wk_type);
     gpu_batch_matvec(lc->v, lc->wv, lc->x_norm, lc->wv_rows, lc->wv_cols, npos, lc->wv_type);
+
+    if (lc->bq || lc->bk || lc->bv) {
+        gpu_barrier();
+        if (lc->bq) {
+            int rc = gpu_batch_add_bias_expand(lc->q, lc->bq, lc->attn_out, num_heads * head_dim, npos);
+            if (rc != GPU_OK) return rc;
+        }
+        if (lc->bk) {
+            int rc = gpu_batch_add_bias_expand(lc->k, lc->bk, lc->attn_out, kv_dim, npos);
+            if (rc != GPU_OK) return rc;
+        }
+        if (lc->bv) {
+            int rc = gpu_batch_add_bias_expand(lc->v, lc->bv, lc->attn_out, kv_dim, npos);
+            if (rc != GPU_OK) return rc;
+        }
+    }
 
     if (lc->q_norm_w) {
         gpu_barrier();

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/ops"
 )
@@ -24,6 +25,7 @@ type GpuPipeline struct {
 	Q8_1Scratch     Buf
 	BatchState      *GpuBatchState
 	BatchLayerConfs []*LayerConf
+	UseFusedForward bool
 }
 
 // UploadModel copies all model weights to GPU memory.
@@ -189,6 +191,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		LogitsBuf:   make([]float32, cfg.VocabSize),
 		LayerConfs:  layerConfs,
 		Q8_1Scratch: q8_1Scratch,
+		UseFusedForward: supportsFusedForwardGPU(m),
 	}, nil
 }
 
@@ -223,20 +226,33 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	mcfg := p.CPUModel.Config
 	npos := len(tokens)
 
-	if p.BatchState == nil || p.BatchState.Npos < npos {
-		if p.BatchState != nil {
-			p.BatchState.Free()
+	useBatchPrefill := supportsBatchPrefillGPU(p.CPUModel)
+	if useBatchPrefill {
+		if p.BatchState == nil || p.BatchState.Npos < npos {
+			if p.BatchState != nil {
+				p.BatchState.Free()
+			}
+			dim := mcfg.EmbeddingDim
+			qDim := mcfg.NumHeads * mcfg.HeadDim
+			kvDim := mcfg.NumKVHeads * mcfg.HeadDim
+			ffnDim := mcfg.FFNDim
+			p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
+			p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
 		}
-		dim := mcfg.EmbeddingDim
-		qDim := mcfg.NumHeads * mcfg.HeadDim
-		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
-		ffnDim := mcfg.FFNDim
-		p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
-		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
 	}
 
 	prefillStart := time.Now()
-	GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState, p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+	if useBatchPrefill {
+		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState, p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+	} else {
+		for i, tok := range tokens {
+			if p.UseFusedForward {
+				GpuForwardFused(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
+			} else if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+				return nil, err
+			}
+		}
+	}
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 
@@ -268,7 +284,11 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			}
 		}
 
-		GpuForwardFused(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
+		if p.UseFusedForward {
+			GpuForwardFused(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
+		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf); err != nil {
+			return nil, err
+		}
 		pos++
 
 		nextToken = ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
@@ -302,4 +322,44 @@ done:
 		TotalTokens:    len(generated),
 		PromptTokens:   len(tokens),
 	}, nil
+}
+
+// supportsBatchPrefillGPU gates the newer batched prefill path behind
+// per-architecture validation. Some families still diverge from the known-good
+// single-token fused path during prompt eval.
+func supportsBatchPrefillGPU(m *llm.Model) bool {
+	switch m.Config.Architecture {
+	case "phi3":
+		return false
+	default:
+		return true
+	}
+}
+
+// supportsFusedForwardGPU reports whether the fused single-token path can
+// execute the model without silently skipping any quantized matvecs. The
+// fused C path does not have CPU fallback, so every tensor it touches must
+// have a native GPU kernel.
+func supportsFusedForwardGPU(m *llm.Model) bool {
+	supported := func(t *core.QuantizedTensor) bool {
+		if t == nil {
+			return true
+		}
+		return supportsGPUQType(t.Type)
+	}
+	if m.Output != nil && !supported(m.Output) {
+		return false
+	}
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		for _, t := range []*core.QuantizedTensor{
+			l.Wq, l.Wk, l.Wv, l.Wo,
+			l.FFNGate, l.FFNUp, l.FFNDown,
+		} {
+			if !supported(t) {
+				return false
+			}
+		}
+	}
+	return true
 }
