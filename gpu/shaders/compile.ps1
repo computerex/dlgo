@@ -109,3 +109,9 @@ static const ShaderInfo shader_registry[] = {
 
 $header | Out-File -FilePath "..\csrc\shaders_spirv.h" -Encoding ascii
 Write-Host "Generated csrc/shaders_spirv.h"
+
+# Touch vulkan_gpu.c so Go's CGo build cache detects the shader change.
+# Go tracks .c file modification times but not transitively-included .h files,
+# so without this, `go build` may silently reuse stale cached shader data.
+(Get-Item "..\csrc\vulkan_gpu.c").LastWriteTime = Get-Date
+Write-Host "Touched csrc/vulkan_gpu.c (cache invalidation)"

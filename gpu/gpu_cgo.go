@@ -7,6 +7,11 @@ package gpu
 #cgo windows CFLAGS: -IC:/VulkanSDK/1.4.341.1/Include
 #cgo windows LDFLAGS: -LC:/VulkanSDK/1.4.341.1/Lib -lvulkan-1
 
+// Force Go to track shaders_spirv.h for build cache invalidation.
+// Without this, Go only tracks vulkan_gpu.c but not headers it includes,
+// so shader changes can be silently missed by the build cache.
+#include "shaders_spirv.h"
+
 #include "vulkan_gpu.c"
 #include <stdlib.h>
 */
