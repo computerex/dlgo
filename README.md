@@ -15,19 +15,19 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
 - **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest
-- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 1–16% of Ollama on generation for most models, same GGUF)
+- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 0–22% of Ollama on generation for most models, same GGUF)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
 
 ## Supported Architectures
 
 | Architecture | Models Tested | CPU tok/s | GPU tok/s |
 |---|---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 44–52 | 368–411 |
-| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 52–72 | 324–384 |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 42–46 | 333–343 |
+| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 46–68 | 273–359 |
 | Qwen3.5 | Qwen3.5 2B (hybrid GDN+attention) | ~16 | — |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 37–114 | 253–481 |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 37–94 | 293–426 |
-| Phi | Phi-2, Phi-4-mini | 9–13 | 97 |
+| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 33–95 | 230–420 |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 27–70 | 252–370 |
+| Phi | Phi-2, Phi-4-mini | 9–12 | 77 |
 | Mistral | Mistral (llama-compatible) | — | — |
 | Whisper | Tiny, Base, Small (speech-to-text) | ~1x RT | — |
 
@@ -42,25 +42,25 @@ with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU
 
 | Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
 |---|---|---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 113.9 tok/s | 116.2 tok/s | **−2%** | 30 ms | 16 ms |
-| SmolLM2 360M | Q8_0 | 93.7 tok/s | 117.5 tok/s | −20% | 60 ms | 37 ms |
-| TinyLlama 1.1B | Q4_0 | 52.0 tok/s | 52.5 tok/s | **−1%** | 226 ms | 134 ms |
-| Qwen3 0.6B | Q8_0 | 51.9 tok/s | 59.2 tok/s | −12% | 102 ms | 37 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 71.7 tok/s | 92.5 tok/s | −23% | 120 ms | 32 ms |
-| Gemma 3 1B | Q4_K_M | 36.5 tok/s | 43.5 tok/s | −16% | 162 ms | 94 ms |
-| SmolLM2 1.7B | Q4_K_M | 37.3 tok/s | 42.0 tok/s | −11% | 183 ms | 132 ms |
-| Llama 3.2 1B | Q4_K_M | 44.3 tok/s | 50.3 tok/s | −12% | 144 ms | 77 ms |
-| Phi-4-mini 3.8B | Q3_K_M | 12.9 tok/s | 19.2 tok/s | −33% | 869 ms | 153 ms |
+| Gemma 3 270M | Q8_0 | 94.9 tok/s | 86.4 tok/s | **+10%** | 32 ms | 16 ms |
+| SmolLM2 360M | Q8_0 | 69.8 tok/s | 82.2 tok/s | −15% | 77 ms | 37 ms |
+| TinyLlama 1.1B | Q4_0 | 45.6 tok/s | 58.1 tok/s | −22% | 233 ms | 137 ms |
+| Qwen3 0.6B | Q8_0 | 46.3 tok/s | 47.1 tok/s | **−2%** | 95 ms | 43 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 67.9 tok/s | 68.0 tok/s | **~0%** | 88 ms | 33 ms |
+| Gemma 3 1B | Q4_K_M | 32.6 tok/s | 40.8 tok/s | −20% | 176 ms | 109 ms |
+| SmolLM2 1.7B | Q4_K_M | 27.3 tok/s | 28.8 tok/s | **−5%** | 259 ms | 153 ms |
+| Llama 3.2 1B | Q4_K_M | 41.6 tok/s | 44.8 tok/s | **−7%** | 153 ms | 68 ms |
+| Phi-4-mini 3.8B | Q3_K_M | 12.1 tok/s | 17.3 tok/s | −30% | 885 ms | 194 ms |
 
 **Notes:**
-- Generation is **within 1–16% of Ollama** for 7 of 9 models. The SIMD compute kernels
-  (QxQ integer dot products, `maddubs`+`madd` inner loops) are at parity with llama.cpp's
-  — both operate at the DRAM bandwidth limit (~39 GB/s measured).
+- Generation is **within 0–7% of Ollama** for 4 of 9 models, and within 22% for most.
+  The SIMD compute kernels (QxQ integer dot products, `maddubs`+`madd` inner loops) are
+  at parity with llama.cpp's — both operate at the DRAM bandwidth limit (~39 GB/s measured).
+- Gemma 3 270M is **10% faster** than Ollama, showing that small Q8_0 models with efficient
+  dispatch can outperform llama.cpp.
 - The remaining gap is Go+CGo dispatch overhead (channel-based worker pool, goroutine
   scheduling, CGo call bridge per matmul chunk).
-- SmolLM2 360M (−20%) and Qwen 2.5 0.5B (−23%) show a larger gap because the small
-  model size makes per-dispatch overhead proportionally larger.
-- Phi-4-mini (−33%) is a 3.8B parameter model in Q3_K_M, the largest and most complex
+- Phi-4-mini (−30%) is a 3.8B parameter model in Q3_K_M, the largest and most complex
   model tested — the gap scales with the number of CGo calls per token.
 
 ## Install
@@ -172,17 +172,17 @@ Ollama defaults to CUDA on NVIDIA GPUs. All 9 tested models:
 
 | Model | Quant | dlgo Vulkan | Ollama CUDA | Delta |
 |---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 481 tok/s | 529 tok/s | **−9%** |
-| SmolLM2 360M | Q8_0 | 426 tok/s | 502 tok/s | −15% |
-| TinyLlama 1.1B | Q4_0 | 411 tok/s | 472 tok/s | −13% |
-| Qwen 2.5 0.5B | Q4_K_M | 384 tok/s | 552 tok/s | −31% |
-| Qwen3 0.6B | Q8_0 | 324 tok/s | 372 tok/s | −13% |
-| Llama 3.2 1B | Q4_K_M | 368 tok/s | 437 tok/s | −16% |
-| SmolLM2 1.7B | Q4_K_M | 293 tok/s | 350 tok/s | −16% |
-| Gemma 3 1B | Q4_K_M | 253 tok/s | 291 tok/s | −13% |
-| Phi-4-mini 3.8B | Q3_K_M | 97 tok/s | 178 tok/s | −46% |
+| Gemma 3 270M | Q8_0 | 420 tok/s | 446 tok/s | **−6%** |
+| SmolLM2 360M | Q8_0 | 370 tok/s | 460 tok/s | −20% |
+| TinyLlama 1.1B | Q4_0 | 343 tok/s | 447 tok/s | −23% |
+| Qwen 2.5 0.5B | Q4_K_M | 359 tok/s | 459 tok/s | −22% |
+| Qwen3 0.6B | Q8_0 | 273 tok/s | 306 tok/s | −11% |
+| Llama 3.2 1B | Q4_K_M | 333 tok/s | 351 tok/s | **−5%** |
+| SmolLM2 1.7B | Q4_K_M | 252 tok/s | 280 tok/s | −10% |
+| Gemma 3 1B | Q4_K_M | 230 tok/s | 287 tok/s | −20% |
+| Phi-4-mini 3.8B | Q3_K_M | 77 tok/s | 147 tok/s | −47% |
 
-The 9–16% gap to CUDA for most models is the inherent Vulkan vs CUDA overhead on NVIDIA
+The 5–23% gap to CUDA for most models is the inherent Vulkan vs CUDA overhead on NVIDIA
 hardware. On non-NVIDIA GPUs (AMD, Intel, mobile), dlgo's Vulkan backend provides
 a significant advantage — Ollama's Vulkan backend is much slower for these quantization
 types.
