@@ -239,3 +239,84 @@ func NewGpuKVCache(nLayers, maxSeqLen, kvDim int) *GpuKVCache {
 }
 
 func (c *GpuKVCache) Reset() { c.Len = 0 }
+
+func freeTensor(gt *GpuTensor) {
+	if gt != nil && gt.Buf != 0 {
+		Free(gt.Buf)
+	}
+}
+
+func freeBuf(b Buf) {
+	if b != 0 {
+		Free(b)
+	}
+}
+
+// FreeModel releases all GPU buffers held by a GpuModel.
+func (gm *GpuModel) FreeAll() {
+	if gm == nil {
+		return
+	}
+	freeTensor(gm.TokenEmbed)
+	freeBuf(gm.OutputNorm)
+	freeBuf(gm.OutputNormBias)
+	freeTensor(gm.Output)
+	freeBuf(gm.OutputBias)
+	for i := range gm.Layers {
+		gl := &gm.Layers[i]
+		freeBuf(gl.AttnNorm)
+		freeBuf(gl.AttnNormBias)
+		freeTensor(gl.Wq)
+		freeTensor(gl.Wk)
+		freeTensor(gl.Wv)
+		freeTensor(gl.Wo)
+		freeBuf(gl.Bq)
+		freeBuf(gl.Bk)
+		freeBuf(gl.Bv)
+		freeBuf(gl.Bo)
+		freeBuf(gl.AttnQNorm)
+		freeBuf(gl.AttnKNorm)
+		freeBuf(gl.PostAttnNorm)
+		freeBuf(gl.FFNNorm)
+		freeTensor(gl.FFNGate)
+		freeTensor(gl.FFNUp)
+		freeTensor(gl.FFNDown)
+		freeBuf(gl.FFNUpBias)
+		freeBuf(gl.FFNDownBias)
+		freeBuf(gl.PostFFNNorm)
+	}
+}
+
+// FreeAll releases all GPU buffers held by a GpuRunState.
+func (rs *GpuRunState) FreeAll() {
+	if rs == nil {
+		return
+	}
+	freeBuf(rs.X)
+	freeBuf(rs.XNorm)
+	freeBuf(rs.Q)
+	freeBuf(rs.K)
+	freeBuf(rs.V)
+	freeBuf(rs.AttnOut)
+	freeBuf(rs.AttnProj)
+	freeBuf(rs.FFNIn)
+	freeBuf(rs.FFNNorm)
+	freeBuf(rs.Gate)
+	freeBuf(rs.Up)
+	freeBuf(rs.Hidden)
+	freeBuf(rs.FFNOut)
+	freeBuf(rs.Logits)
+}
+
+// FreeAll releases all GPU buffers held by a GpuKVCache.
+func (c *GpuKVCache) FreeAll() {
+	if c == nil {
+		return
+	}
+	for _, b := range c.KeyBufs {
+		freeBuf(b)
+	}
+	for _, b := range c.ValBufs {
+		freeBuf(b)
+	}
+}

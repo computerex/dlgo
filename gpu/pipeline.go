@@ -195,6 +195,18 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	}, nil
 }
 
+// FreeAll releases all GPU resources held by this pipeline.
+func (p *GpuPipeline) FreeAll() {
+	if p == nil {
+		return
+	}
+	p.GpuModel.FreeAll()
+	p.RunState.FreeAll()
+	p.KVCache.FreeAll()
+	p.BatchState.Free()
+	freeBuf(p.Q8_1Scratch)
+}
+
 // GenerateResult holds detailed output from a GPU generation run.
 type GenerateResult struct {
 	Text           string

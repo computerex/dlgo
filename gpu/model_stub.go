@@ -26,3 +26,6 @@ func UploadF32Slice([]float32) (Buf, error)                  { return 0, errNoGP
 func NewGpuRunState(_, _, _, _, _ int) *GpuRunState           { return nil }
 func NewGpuKVCache(_, _, _ int) *GpuKVCache                   { return nil }
 func (c *GpuKVCache) Reset()                                  {}
+func (gm *GpuModel) FreeAll()                                 {}
+func (rs *GpuRunState) FreeAll()                               {}
+func (c *GpuKVCache) FreeAll()                                 {}
