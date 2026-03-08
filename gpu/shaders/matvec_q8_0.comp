@@ -30,10 +30,13 @@ void main() {
     uint sub_id = tid >> 5;
     uint sub_tid = tid & 31u;
     uint row = gl_WorkGroupID.x * 4u + sub_id;
+    uint pos_id = gl_WorkGroupID.y;
 
     if (row >= uint(rows)) return;
 
     uint ncols = uint(cols);
+    uint x_off = pos_id * (ncols >> 2);
+    uint out_off = pos_id * uint(rows);
     uint bpr = ncols >> 5;
 
     uint num_iters = ncols / 256u;
@@ -50,8 +53,8 @@ void main() {
             uint iqs = col & 31u;
             float d = float(data_a[ib].d);
 
-            vec4 bv0 = data_b_v4[col >> 2];
-            vec4 bv1 = data_b_v4[(col >> 2) + 1u];
+            vec4 bv0 = data_b_v4[x_off + (col >> 2)];
+            vec4 bv1 = data_b_v4[x_off + (col >> 2) + 1u];
 
             vec4 v0 = vec4(float(data_a[ib].qs[iqs]), float(data_a[ib].qs[iqs+1u]),
                            float(data_a[ib].qs[iqs+2u]), float(data_a[ib].qs[iqs+3u]));
@@ -70,8 +73,8 @@ void main() {
         uint iqs = col & 31u;
         float d = float(data_a[ib].d);
 
-        vec4 bv0 = data_b_v4[col >> 2];
-        vec4 bv1 = data_b_v4[(col >> 2) + 1u];
+        vec4 bv0 = data_b_v4[x_off + (col >> 2)];
+        vec4 bv1 = data_b_v4[x_off + (col >> 2) + 1u];
 
         vec4 v0 = vec4(float(data_a[ib].qs[iqs]), float(data_a[ib].qs[iqs+1u]),
                        float(data_a[ib].qs[iqs+2u]), float(data_a[ib].qs[iqs+3u]));
@@ -83,5 +86,5 @@ void main() {
     }
 
     float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
-    if (sub_tid == 0u) out_data[row] = acc;
+    if (sub_tid == 0u) out_data[out_off + row] = acc;
 }

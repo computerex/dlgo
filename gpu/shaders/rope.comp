@@ -21,44 +21,47 @@ layout(push_constant) uniform Params {
 
 void main() {
     uint head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
     int rd = rope_dim > 0 ? rope_dim : head_dim;
     int half_dim = rd / 2;
 
     if (int(tid) >= half_dim) return;
 
+    int actual_pos = pos + int(pos_id);
+    uint q_stride = uint(num_heads) * uint(head_dim);
+    uint k_stride = uint(num_kv_heads) * uint(head_dim);
+
     float freq = 1.0 / pow(freq_base, float(tid * 2) / float(rd));
-    float angle = float(pos) * freq;
+    float angle = float(actual_pos) * freq;
     float cos_val = cos(angle);
     float sin_val = sin(angle);
 
     if (neox != 0) {
-        // Neox style: pairs at (i, i+half_dim)
         if (head < num_heads) {
-            uint base = head * head_dim;
+            uint base = pos_id * q_stride + head * uint(head_dim);
             float q0 = q_data[base + tid];
-            float q1 = q_data[base + tid + half_dim];
+            float q1 = q_data[base + tid + uint(half_dim)];
             q_data[base + tid] = q0 * cos_val - q1 * sin_val;
-            q_data[base + tid + half_dim] = q0 * sin_val + q1 * cos_val;
+            q_data[base + tid + uint(half_dim)] = q0 * sin_val + q1 * cos_val;
         }
         if (head < num_kv_heads) {
-            uint base = head * head_dim;
+            uint base = pos_id * k_stride + head * uint(head_dim);
             float k0 = k_data[base + tid];
-            float k1 = k_data[base + tid + half_dim];
+            float k1 = k_data[base + tid + uint(half_dim)];
             k_data[base + tid] = k0 * cos_val - k1 * sin_val;
-            k_data[base + tid + half_dim] = k0 * sin_val + k1 * cos_val;
+            k_data[base + tid + uint(half_dim)] = k0 * sin_val + k1 * cos_val;
         }
     } else {
-        // Standard interleaved: pairs at (2*i, 2*i+1)
         if (head < num_heads) {
-            uint base = head * head_dim;
+            uint base = pos_id * q_stride + head * uint(head_dim);
             float q0 = q_data[base + 2 * tid];
             float q1 = q_data[base + 2 * tid + 1];
             q_data[base + 2 * tid] = q0 * cos_val - q1 * sin_val;
             q_data[base + 2 * tid + 1] = q0 * sin_val + q1 * cos_val;
         }
         if (head < num_kv_heads) {
-            uint base = head * head_dim;
+            uint base = pos_id * k_stride + head * uint(head_dim);
             float k0 = k_data[base + 2 * tid];
             float k1 = k_data[base + 2 * tid + 1];
             k_data[base + 2 * tid] = k0 * cos_val - k1 * sin_val;

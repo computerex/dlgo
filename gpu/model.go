@@ -155,6 +155,64 @@ func NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize int) *GpuRunState {
 	}
 }
 
+// GpuBatchState holds batch-sized GPU buffers for prefill.
+type GpuBatchState struct {
+	X        Buf
+	XNorm    Buf
+	Q        Buf
+	K        Buf
+	V        Buf
+	AttnOut  Buf
+	AttnProj Buf
+	FFNIn    Buf
+	FFNNorm  Buf
+	Gate     Buf
+	Up       Buf
+	Hidden   Buf
+	FFNOut   Buf
+	Npos     int
+}
+
+// NewGpuBatchState allocates batch-sized GPU activation buffers.
+func NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim int) *GpuBatchState {
+	return &GpuBatchState{
+		X:        Alloc(uint64(npos * dim * 4)),
+		XNorm:    Alloc(uint64(npos * dim * 4)),
+		Q:        Alloc(uint64(npos * qDim * 4)),
+		K:        Alloc(uint64(npos * kvDim * 4)),
+		V:        Alloc(uint64(npos * kvDim * 4)),
+		AttnOut:  Alloc(uint64(npos * qDim * 4)),
+		AttnProj: Alloc(uint64(npos * dim * 4)),
+		FFNIn:    Alloc(uint64(npos * dim * 4)),
+		FFNNorm:  Alloc(uint64(npos * dim * 4)),
+		Gate:     Alloc(uint64(npos * ffnDim * 4)),
+		Up:       Alloc(uint64(npos * ffnDim * 4)),
+		Hidden:   Alloc(uint64(npos * ffnDim * 4)),
+		FFNOut:   Alloc(uint64(npos * dim * 4)),
+		Npos:     npos,
+	}
+}
+
+// FreeBatchState releases all batch GPU buffers.
+func (bs *GpuBatchState) Free() {
+	if bs == nil {
+		return
+	}
+	Free(bs.X)
+	Free(bs.XNorm)
+	Free(bs.Q)
+	Free(bs.K)
+	Free(bs.V)
+	Free(bs.AttnOut)
+	Free(bs.AttnProj)
+	Free(bs.FFNIn)
+	Free(bs.FFNNorm)
+	Free(bs.Gate)
+	Free(bs.Up)
+	Free(bs.Hidden)
+	Free(bs.FFNOut)
+}
+
 // GpuKVCache holds GPU-resident KV cache for all layers.
 type GpuKVCache struct {
 	KeyBufs []Buf // [nLayers] each is [maxSeqLen * kvDim] floats

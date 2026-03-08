@@ -1021,3 +1021,12 @@ void quantize_for_type(const float* x, uint8_t* out, uint32_t w_type, int n) {
         break;
     }
 }
+
+void batch_quantize_for_type(const float* x_flat, uint8_t* out_flat,
+                             uint32_t w_type, int cols, int q8_stride, int n_pos) {
+    for (int p = 0; p < n_pos; p++) {
+        quantize_for_type(x_flat + (size_t)p * cols,
+                          out_flat + (size_t)p * q8_stride,
+                          w_type, cols);
+    }
+}

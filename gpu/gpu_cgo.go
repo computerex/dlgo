@@ -358,3 +358,43 @@ func ForwardLayer(lc *LayerConf, pos, seqLen int, scale float32, nextAttnNorm Bu
 	}
 	return nil
 }
+
+// ForwardLayerBatch records all dispatches for npos tokens through one layer.
+func ForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nextAttnNorm Buf) error {
+	rc := C.gpu_forward_layer_batch(&lc.c, C.int(npos), C.int(startPos), C.float(scale),
+		C.GpuBuf(nextAttnNorm))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: forward_layer_batch failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchRMSNorm performs RMS normalization over npos positions.
+func BatchRMSNorm(out, x, weight Buf, n, npos int, eps float32) error {
+	rc := C.gpu_batch_rmsnorm(C.GpuBuf(out), C.GpuBuf(x), C.GpuBuf(weight),
+		C.int(n), C.int(npos), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_rmsnorm failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchMatVec performs batched matrix-vector multiply for npos positions.
+func BatchMatVec(out, weights, x Buf, rows, cols, npos int, qtype uint32) error {
+	rc := C.gpu_batch_matvec(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.int(rows), C.int(cols), C.int(npos), C.int(qtype))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_matvec failed (%d)", rc)
+	}
+	return nil
+}
+
+// CopyRegion copies a region between GPU buffers.
+func CopyRegion(dst Buf, dstOff uint64, src Buf, srcOff, size uint64) error {
+	rc := C.gpu_copy_region(C.GpuBuf(dst), C.uint64_t(dstOff),
+		C.GpuBuf(src), C.uint64_t(srcOff), C.uint64_t(size))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: copy_region failed (%d)", rc)
+	}
+	return nil
+}

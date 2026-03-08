@@ -18,11 +18,12 @@ shared float sdata[256];
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    uint base = pos_id * uint(n);
 
-    // Compute sum of squares
     float ss = 0.0;
     for (int i = int(tid); i < n; i += 256) {
-        ss += x_data[i] * x_data[i];
+        ss += x_data[base + uint(i)] * x_data[base + uint(i)];
     }
     sdata[tid] = ss;
     barrier();
@@ -37,8 +38,7 @@ void main() {
 
     barrier();
 
-    // Apply normalization
     for (int i = int(tid); i < n; i += 256) {
-        out_data[i] = x_data[i] * inv_rms * w_data[i];
+        out_data[base + uint(i)] = x_data[base + uint(i)] * inv_rms * w_data[i];
     }
 }

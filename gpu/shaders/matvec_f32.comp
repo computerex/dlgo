@@ -21,10 +21,13 @@ void main() {
     uint sub_id = tid >> 5;
     uint sub_tid = tid & 31u;
     uint row = gl_WorkGroupID.x * 4u + sub_id;
+    uint pos_id = gl_WorkGroupID.y;
 
     if (row >= uint(rows)) return;
 
     uint ncols = uint(cols);
+    uint x_off = pos_id * (ncols >> 2);
+    uint out_off = pos_id * uint(rows);
     uint row_off = row * (ncols >> 2);
 
     uint num_iters = ncols / 256u;
@@ -38,7 +41,7 @@ void main() {
         [[unroll]] for (uint k = 0; k < 4u; k++) {
             uint col = (i + k) * 256u + 8u * sub_tid;
             uint idx = col >> 2;
-            float r = dot(x_v4[idx], w_v4[row_off + idx]) + dot(x_v4[idx + 1u], w_v4[row_off + idx + 1u]);
+            float r = dot(x_v4[x_off + idx], w_v4[row_off + idx]) + dot(x_v4[x_off + idx + 1u], w_v4[row_off + idx + 1u]);
             if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
             else if (k == 2u) acc2 += r; else acc3 += r;
         }
@@ -47,10 +50,10 @@ void main() {
     while (i < num_iters) {
         uint col = i * 256u + 8u * sub_tid;
         uint idx = col >> 2;
-        acc0 += dot(x_v4[idx], w_v4[row_off + idx]) + dot(x_v4[idx + 1u], w_v4[row_off + idx + 1u]);
+        acc0 += dot(x_v4[x_off + idx], w_v4[row_off + idx]) + dot(x_v4[x_off + idx + 1u], w_v4[row_off + idx + 1u]);
         i++;
     }
 
     float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
-    if (sub_tid == 0u) out_data[row] = acc;
+    if (sub_tid == 0u) out_data[out_off + row] = acc;
 }

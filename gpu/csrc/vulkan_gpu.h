@@ -190,6 +190,17 @@ typedef struct {
 int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
                       GpuBuf next_attn_norm);
 
+// Batched layer forward: processes npos tokens through one transformer layer.
+// All scratch buffers in lc must be npos× the single-token size.
+int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
+                            float scale, GpuBuf next_attn_norm);
+
+// Batch RMS normalization (groups_y = npos).
+int gpu_batch_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, int npos, float eps);
+
+// Copy a region between GPU buffers.
+int gpu_copy_region(GpuBuf dst, uint64_t dst_offset, GpuBuf src, uint64_t src_offset, uint64_t size);
+
 #ifdef __cplusplus
 }
 #endif

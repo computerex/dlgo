@@ -1272,3 +1272,44 @@ void vec_scale_add(float* out, float scale, const float* src, int n) {
         out[i] += scale * src[i];
     }
 }
+
+// ── Fused causal attention for one head ─────────────────────────
+// Computes dot(q, k[t]) * scale for t in [0, seqLen), softmax, then
+// weighted sum of v[t]. All in a single C call to avoid Go/CGo overhead.
+// k_base/v_base point to pre-gathered flat [maxSeqLen][kvDim] buffers.
+// kv_offset is kvH*headDim; kv_stride is kvDim (distance between timesteps).
+// scores is a scratch buffer of at least seqLen floats.
+void causal_attn_head(
+    const float* q, int head_dim,
+    const float* k_base, const float* v_base,
+    int kv_offset, int kv_stride,
+    int seq_len, float scale,
+    float* scores,
+    float* out)
+{
+    for (int t = 0; t < seq_len; t++) {
+        scores[t] = vec_dot_f32(q, k_base + (size_t)t * kv_stride + kv_offset, head_dim) * scale;
+    }
+
+    float maxv = scores[0];
+    for (int t = 1; t < seq_len; t++) {
+        if (scores[t] > maxv) maxv = scores[t];
+    }
+    float sum = 0.0f;
+    for (int t = 0; t < seq_len; t++) {
+        scores[t] = expf(scores[t] - maxv);
+        sum += scores[t];
+    }
+    float inv_sum = 1.0f / sum;
+    for (int t = 0; t < seq_len; t++) {
+        scores[t] *= inv_sum;
+    }
+
+    for (int i = 0; i < head_dim; i++) {
+        out[i] = 0.0f;
+    }
+
+    for (int t = 0; t < seq_len; t++) {
+        vec_scale_add(out, scores[t], v_base + (size_t)t * kv_stride + kv_offset, head_dim);
+    }
+}

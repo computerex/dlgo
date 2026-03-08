@@ -32,6 +32,10 @@ type BatchState struct {
 	FFNBatch   []float32 // [maxPos * dim]
 
 	Q8Buf []byte // pre-allocated Q8 quantization buffer
+
+	ScoreBufs [][]float32 // [numWorkers][maxPos] pre-allocated attention score buffers
+	KGather   []float32  // [numKVHeads * maxPos * headDim] dense per-head K gather
+	VGather   []float32  // [numKVHeads * maxPos * headDim] dense per-head V gather
 }
 
 // NewBatchState allocates batch buffers for up to maxPos positions.
@@ -48,6 +52,12 @@ func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
 	q8SizeK := quant.Q8BufferSize(12, maxDim) // K-quant Q8 size
 	if q8SizeK > q8Size {
 		q8Size = q8SizeK
+	}
+
+	numWorkers := blas.DefaultPool().NumWorkers()
+	scoreBufs := make([][]float32, numWorkers)
+	for i := range scoreBufs {
+		scoreBufs[i] = make([]float32, maxPos)
 	}
 
 	return &BatchState{
@@ -70,6 +80,9 @@ func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
 		HidBatch:   make([]float32, maxPos*ffnDim),
 		FFNBatch:   make([]float32, maxPos*dim),
 		Q8Buf:      make([]byte, maxPos*q8Size),
+		ScoreBufs:  scoreBufs,
+		KGather:    make([]float32, maxPos*kvDim),
+		VGather:    make([]float32, maxPos*kvDim),
 	}
 }
 
@@ -93,15 +106,13 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 	kvMul := numHeads / numKVHeads
 	pool := rs.Pool
 
-	// Embed all tokens
-	for p := 0; p < nPos; p++ {
+	// Embed all tokens — parallelized
+	pool.ParallelFor(nPos, func(p int) {
 		_ = m.TokenEmbed.DequantizeRow(int(tokens[p]), bs.XBatch[p*dim:(p+1)*dim])
-	}
-	if cfg.EmbedScale != 0 {
-		for p := 0; p < nPos; p++ {
+		if cfg.EmbedScale != 0 {
 			ops.Scale(bs.XBatch[p*dim:(p+1)*dim], cfg.EmbedScale)
 		}
-	}
+	})
 
 	for l := 0; l < cfg.NumLayers; l++ {
 		layer := &m.Layers[l]
@@ -118,8 +129,8 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			continue
 		}
 
-		// Batch norm
-		for p := 0; p < nPos; p++ {
+		// Batch norm — parallelize across positions
+		pool.ParallelFor(nPos, func(p int) {
 			x := bs.XBatch[p*dim : (p+1)*dim]
 			xn := bs.XNormBatch[p*dim : (p+1)*dim]
 			switch spec.Norm {
@@ -128,7 +139,7 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			case NormLayer:
 				ops.LayerNorm(xn, x, layer.AttnNorm, layer.AttnNormBias, cfg.RMSNormEps)
 			}
-		}
+		})
 
 		// Batch Q/K/V projections (fused: quantize input once, single dispatch)
 		qDim := numHeads * headDim
@@ -139,8 +150,12 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			bs.XNormBatch[:nPos*dim], nPos, pool,
 		)
 
-		// Per-position: bias, QK norm, RoPE, KV store
-		for p := 0; p < nPos; p++ {
+		// Pre-compute attention constants needed for KV gather fusion
+		maxSeqLen := startPos + nPos
+		useSIMDAttn := quant.HasCausalAttn()
+
+		// Per-position: bias, QK norm, RoPE, KV store — parallelized
+		pool.ParallelFor(nPos, func(p int) {
 			pos := startPos + p
 			qp := bs.QBatch[p*qDim : (p+1)*qDim]
 			kp := bs.KBatch[p*kvDim : (p+1)*kvDim]
@@ -177,41 +192,79 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			}
 
 			kv.Layers[l].Store(pos, kp, vp)
+
+			if useSIMDAttn {
+				for kvH := 0; kvH < numKVHeads; kvH++ {
+					srcOff := kvH * headDim
+					dstOff := kvH*maxSeqLen*headDim + pos*headDim
+					copy(bs.KGather[dstOff:dstOff+headDim], kp[srcOff:srcOff+headDim])
+					copy(bs.VGather[dstOff:dstOff+headDim], vp[srcOff:srcOff+headDim])
+				}
+			}
+		})
+
+		if useSIMDAttn && startPos > 0 {
+			// Gather historical positions not covered by the KV store above.
+			kd := kv.Layers[l].KeyData
+			vd := kv.Layers[l].ValData
+			pool.ParallelFor(startPos, func(t int) {
+				for kvH := 0; kvH < numKVHeads; kvH++ {
+					srcOff := t*kvDim + kvH*headDim
+					dstOff := kvH*maxSeqLen*headDim + t*headDim
+					copy(bs.KGather[dstOff:dstOff+headDim], kd[srcOff:srcOff+headDim])
+					copy(bs.VGather[dstOff:dstOff+headDim], vd[srcOff:srcOff+headDim])
+				}
+			})
 		}
 
-		// Batch causal attention
+		// Batch causal attention — parallelise over heads × positions
 		scale := float32(1.0 / math.Sqrt(float64(headDim)))
-		for p := 0; p < nPos; p++ {
-			ops.Clear(bs.AttnBatch[p*qDim : (p+1)*qDim])
+		ops.Clear(bs.AttnBatch[:nPos*qDim])
+		numTasks := numHeads * nPos
+		numW := pool.NumWorkers()
+		if numW > numTasks {
+			numW = numTasks
 		}
 
-		pool.ParallelFor(numHeads, func(h int) {
-			kvH := h / kvMul
-			for p := 0; p < nPos; p++ {
+		pool.DispatchChunked(numTasks, numW, func(workerID, start, end int) {
+			scores := bs.ScoreBufs[workerID][:maxSeqLen]
+			for idx := start; idx < end; idx++ {
+				h := idx / nPos
+				p := idx % nPos
+				kvH := h / kvMul
 				pos := startPos + p
 				seqLen := pos + 1
+
 				qHead := bs.QBatch[p*qDim+h*headDim : p*qDim+(h+1)*headDim]
 				headOut := bs.AttnBatch[p*qDim+h*headDim : p*qDim+(h+1)*headDim]
-				scores := rs.HeadScores[h][:seqLen]
 
-				for t := 0; t < seqLen; t++ {
-					kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
-					scores[t] = ops.DotProduct(qHead, kHead, headDim) * scale
-				}
-				ops.Softmax(scores)
-				for t := 0; t < seqLen; t++ {
-					vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
-					ops.AddScaled(headOut, scores[t], vHead, headDim)
+				if useSIMDAttn {
+					kvBase := kvH * maxSeqLen * headDim
+					quant.CausalAttnHead(qHead, headDim,
+						bs.KGather[kvBase:], bs.VGather[kvBase:],
+						0, headDim, seqLen, scale,
+						scores[:seqLen], headOut)
+				} else {
+					sc := scores[:seqLen]
+					for t := 0; t < seqLen; t++ {
+						kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
+						sc[t] = ops.DotProduct(qHead, kHead, headDim) * scale
+					}
+					ops.Softmax(sc)
+					for t := 0; t < seqLen; t++ {
+						vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
+						ops.AddScaled(headOut, sc[t], vHead, headDim)
+					}
 				}
 			}
 		})
 
 		// Batch output projection
 		blas.QBatchGEMMParallel(bs.ProjBatch[:nPos*dim], layer.Wo, bs.AttnBatch[:nPos*qDim], nPos, pool)
-		for p := 0; p < nPos; p++ {
-			if layer.Bo != nil {
+		if layer.Bo != nil {
+			pool.ParallelFor(nPos, func(p int) {
 				ops.AddBias(bs.ProjBatch[p*dim:(p+1)*dim], layer.Bo)
-			}
+			})
 		}
 
 		// Residual + FFN
@@ -248,7 +301,7 @@ func batchResidualFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int,
 
 	switch spec.Residual {
 	case ResStandard:
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			proj := bs.ProjBatch[p*dim : (p+1)*dim]
 			x := bs.XBatch[p*dim : (p+1)*dim]
 			ffnIn := bs.FFNInBatch[p*dim : (p+1)*dim]
@@ -257,38 +310,38 @@ func batchResidualFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int,
 			}
 			ops.Add(ffnIn, x, proj)
 			ops.RMSNorm(bs.NormBatch[p*dim:(p+1)*dim], ffnIn, layer.FFNNorm, cfg.RMSNormEps)
-		}
+		})
 		batchFFN(layer, bs, rs, nPos, dim, ffnDim, bs.NormBatch, pool)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			if layer.PostFFNNorm != nil {
 				ops.RMSNormInPlace(bs.FFNBatch[p*dim:(p+1)*dim], layer.PostFFNNorm, cfg.RMSNormEps)
 			}
 			ops.Add(bs.XBatch[p*dim:(p+1)*dim], bs.FFNInBatch[p*dim:(p+1)*dim], bs.FFNBatch[p*dim:(p+1)*dim])
-		}
+		})
 
 	case ResPostAttnFFN:
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			x := bs.XBatch[p*dim : (p+1)*dim]
 			proj := bs.ProjBatch[p*dim : (p+1)*dim]
 			ffnIn := bs.FFNInBatch[p*dim : (p+1)*dim]
 			ops.Add(ffnIn, x, proj)
 			ops.RMSNorm(bs.NormBatch[p*dim:(p+1)*dim], ffnIn, layer.PostAttnNorm, cfg.RMSNormEps)
-		}
+		})
 		batchFFN(layer, bs, rs, nPos, dim, ffnDim, bs.NormBatch, pool)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			ops.Add(bs.XBatch[p*dim:(p+1)*dim], bs.FFNInBatch[p*dim:(p+1)*dim], bs.FFNBatch[p*dim:(p+1)*dim])
-		}
+		})
 
 	case ResParallel:
 		batchFFN(layer, bs, rs, nPos, dim, ffnDim, bs.XNormBatch, pool)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			x := bs.XBatch[p*dim : (p+1)*dim]
 			proj := bs.ProjBatch[p*dim : (p+1)*dim]
 			ffn := bs.FFNBatch[p*dim : (p+1)*dim]
 			for i := 0; i < dim; i++ {
 				x[i] = x[i] + proj[i] + ffn[i]
 			}
-		}
+		})
 	}
 }
 
@@ -301,14 +354,14 @@ func batchFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim, ffnDim int,
 			bs.UpBatch[:nPos*ffnDim], layer.FFNUp,
 			inputBatch[:nPos*dim], nPos, pool,
 		)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			quant.SIMDSwiGLU(
 				bs.HidBatch[p*ffnDim:(p+1)*ffnDim],
 				bs.GateBatch[p*ffnDim:(p+1)*ffnDim],
 				bs.UpBatch[p*ffnDim:(p+1)*ffnDim],
 				ffnDim,
 			)
-		}
+		})
 		blas.QBatchGEMMParallel(bs.FFNBatch[:nPos*dim], layer.FFNDown, bs.HidBatch[:nPos*ffnDim], nPos, pool)
 
 	case FFNGeGLU:
@@ -317,31 +370,31 @@ func batchFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim, ffnDim int,
 			bs.UpBatch[:nPos*ffnDim], layer.FFNUp,
 			inputBatch[:nPos*dim], nPos, pool,
 		)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			ops.GeGLU(
 				bs.HidBatch[p*ffnDim:(p+1)*ffnDim],
 				bs.GateBatch[p*ffnDim:(p+1)*ffnDim],
 				bs.UpBatch[p*ffnDim:(p+1)*ffnDim],
 				ffnDim,
 			)
-		}
+		})
 		blas.QBatchGEMMParallel(bs.FFNBatch[:nPos*dim], layer.FFNDown, bs.HidBatch[:nPos*ffnDim], nPos, pool)
 
 	case FFNPlain:
 		blas.QBatchGEMMParallel(bs.UpBatch[:nPos*ffnDim], layer.FFNUp, inputBatch[:nPos*dim], nPos, pool)
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			up := bs.UpBatch[p*ffnDim : (p+1)*ffnDim]
 			if layer.FFNUpBias != nil {
 				ops.AddBias(up, layer.FFNUpBias)
 			}
 			ops.GELU(up)
-		}
+		})
 		blas.QBatchGEMMParallel(bs.FFNBatch[:nPos*dim], layer.FFNDown, bs.UpBatch[:nPos*ffnDim], nPos, pool)
 	}
 
 	if layer.FFNDownBias != nil {
-		for p := 0; p < nPos; p++ {
+		pool.ParallelFor(nPos, func(p int) {
 			ops.AddBias(bs.FFNBatch[p*dim:(p+1)*dim], layer.FFNDownBias)
-		}
+		})
 	}
 }

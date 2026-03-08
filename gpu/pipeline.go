@@ -13,15 +13,17 @@ import (
 
 // GpuPipeline bundles a model on GPU with all state needed for inference.
 type GpuPipeline struct {
-	CPUModel     *llm.Model
-	GpuModel     *GpuModel
-	Tokenizer    *llm.Tokenizer
-	KVCache      *GpuKVCache
-	RunState     *GpuRunState
-	MaxSeqLen    int
-	LogitsBuf    []float32
-	LayerConfs   []*LayerConf
-	Q8_1Scratch  Buf
+	CPUModel        *llm.Model
+	GpuModel        *GpuModel
+	Tokenizer       *llm.Tokenizer
+	KVCache         *GpuKVCache
+	RunState        *GpuRunState
+	MaxSeqLen       int
+	LogitsBuf       []float32
+	LayerConfs      []*LayerConf
+	Q8_1Scratch     Buf
+	BatchState      *GpuBatchState
+	BatchLayerConfs []*LayerConf
 }
 
 // UploadModel copies all model weights to GPU memory.
@@ -218,11 +220,23 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	p.KVCache.Reset()
 
-	// Prefill: process prompt tokens one at a time on GPU
-	prefillStart := time.Now()
-	for i, tok := range tokens {
-		GpuForwardFused(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs)
+	mcfg := p.CPUModel.Config
+	npos := len(tokens)
+
+	if p.BatchState == nil || p.BatchState.Npos < npos {
+		if p.BatchState != nil {
+			p.BatchState.Free()
+		}
+		dim := mcfg.EmbeddingDim
+		qDim := mcfg.NumHeads * mcfg.HeadDim
+		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
+		ffnDim := mcfg.FFNDim
+		p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
+		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
 	}
+
+	prefillStart := time.Now()
+	GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState, p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 

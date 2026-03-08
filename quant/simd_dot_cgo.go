@@ -38,6 +38,14 @@ void vec_dot_f32_batch(const float* a_flat, const float* x, int cols,
 void vec_scale_add(float* out, float scale, const float* src, int n);
 void vec_swiglu(float* out, const float* gate, const float* up, int n);
 void vec_softmax(float* x, int n);
+
+void causal_attn_head(
+    const float* q, int head_dim,
+    const float* k_base, const float* v_base,
+    int kv_offset, int kv_stride,
+    int seq_len, float scale,
+    float* scores,
+    float* out);
 */
 import "C"
 import "unsafe"
@@ -151,6 +159,26 @@ func SIMDSwiGLU(out, gate, up []float32, n int) {
 func SIMDSoftmax(x []float32) {
 	C.vec_softmax((*C.float)(unsafe.Pointer(&x[0])), C.int(len(x)))
 }
+
+// CausalAttnHead computes causal attention for one (head, position) pair using SIMD.
+// kBase/vBase are pre-gathered flat [maxSeqLen][kvDim] buffers.
+// kvOffset is kvH*headDim; kvStride is kvDim.
+func CausalAttnHead(q []float32, headDim int, kBase, vBase []float32, kvOffset, kvStride, seqLen int, scale float32, scores, out []float32) {
+	C.causal_attn_head(
+		(*C.float)(unsafe.Pointer(&q[0])),
+		C.int(headDim),
+		(*C.float)(unsafe.Pointer(&kBase[0])),
+		(*C.float)(unsafe.Pointer(&vBase[0])),
+		C.int(kvOffset), C.int(kvStride),
+		C.int(seqLen),
+		C.float(scale),
+		(*C.float)(unsafe.Pointer(&scores[0])),
+		(*C.float)(unsafe.Pointer(&out[0])),
+	)
+}
+
+// HasCausalAttn returns true if the SIMD causal attention kernel is available.
+func HasCausalAttn() bool { return true }
 
 // HasSIMDDot returns true if the AVX2+FMA fused dot product supports the given
 // type. Types not listed here use the dequantize-then-dot path which can produce

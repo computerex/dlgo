@@ -15,6 +15,9 @@ func Q8BufferSize(wType uint32, n int) int {
 // QuantizeForType is a stub that does nothing on non-AVX2 platforms.
 func QuantizeForType(x []float32, out []byte, wType uint32) {}
 
+// BatchQuantizeForType is a stub on non-AVX2 platforms.
+func BatchQuantizeForType(xFlat []float32, q8Flat []byte, wType uint32, cols, q8Stride, nPos int) {}
+
 // QQDotBatch falls back to the float-based path on non-AVX2 platforms.
 func QQDotBatch(wData []byte, wType uint32, qData []byte, cols int,
 	out []float32, nrows int, bytesPerRow int) {

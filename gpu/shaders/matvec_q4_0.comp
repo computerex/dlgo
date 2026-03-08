@@ -6,9 +6,6 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// 128 threads = 4 subgroups. Each subgroup handles one row.
-// 4x outer loop unrolling. Q4_0 QUANT_R=2.
-
 layout(local_size_x = 128) in;
 
 struct block_q4_0 {
@@ -45,19 +42,46 @@ void main() {
     if (num_iters * 256u + 8u * sub_tid < ncols) num_iters++;
     uint unrolled = num_iters & ~3u;
 
+    uint pos_id = gl_WorkGroupID.y;
+    uint x_off = pos_id * (ncols >> 2);
+    uint out_off = pos_id * uint(rows);
+
     float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     uint i = 0;
 
     while (i < unrolled) {
-        [[unroll]] for (uint k = 0; k < 4u; k++) {
-            uint col = (i + k) * 256u + 8u * sub_tid;
+            [[unroll]] for (uint k = 0; k < 4u; k++) {
+                uint col = (i + k) * 256u + 8u * sub_tid;
+                uint ib = row * bpr + (col >> 5);
+                uint iqs = (col & 31u) >> 1;
+                float d = float(data_a[ib].d);
+
+                uint b_base = col - (col & 31u);
+                vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
+                vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
+                vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
+                vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
+
+                uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
+                vec4 v0 = vec4(vui0 & 0xFu, (vui0 >> 4) & 0xFu, (vui0 >> 8) & 0xFu, vui0 >> 12) - 8.0;
+                uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
+                vec4 v1 = vec4(vui1 & 0xFu, (vui1 >> 4) & 0xFu, (vui1 >> 8) & 0xFu, vui1 >> 12) - 8.0;
+
+                float r = d * (dot(bv0, v0) + dot(bv1, v1));
+                if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
+                else if (k == 2u) acc2 += r; else acc3 += r;
+            }
+            i += 4u;
+    }
+    while (i < num_iters) {
+            uint col = i * 256u + 8u * sub_tid;
             uint ib = row * bpr + (col >> 5);
             uint iqs = (col & 31u) >> 1;
             float d = float(data_a[ib].d);
 
             uint b_base = col - (col & 31u);
-            vec4 bv_lo = data_b_v4[(b_base + iqs) >> 2];
-            vec4 bv_hi = data_b_v4[(b_base + iqs + 16u) >> 2];
+            vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
+            vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
             vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
             vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
 
@@ -66,33 +90,10 @@ void main() {
             uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
             vec4 v1 = vec4(vui1 & 0xFu, (vui1 >> 4) & 0xFu, (vui1 >> 8) & 0xFu, vui1 >> 12) - 8.0;
 
-            float r = d * (dot(bv0, v0) + dot(bv1, v1));
-            if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
-            else if (k == 2u) acc2 += r; else acc3 += r;
-        }
-        i += 4u;
-    }
-    while (i < num_iters) {
-        uint col = i * 256u + 8u * sub_tid;
-        uint ib = row * bpr + (col >> 5);
-        uint iqs = (col & 31u) >> 1;
-        float d = float(data_a[ib].d);
-
-        uint b_base = col - (col & 31u);
-        vec4 bv_lo = data_b_v4[(b_base + iqs) >> 2];
-        vec4 bv_hi = data_b_v4[(b_base + iqs + 16u) >> 2];
-        vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
-        vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
-
-        uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
-        vec4 v0 = vec4(vui0 & 0xFu, (vui0 >> 4) & 0xFu, (vui0 >> 8) & 0xFu, vui0 >> 12) - 8.0;
-        uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
-        vec4 v1 = vec4(vui1 & 0xFu, (vui1 >> 4) & 0xFu, (vui1 >> 8) & 0xFu, vui1 >> 12) - 8.0;
-
         acc0 += d * (dot(bv0, v0) + dot(bv1, v1));
         i++;
     }
 
     float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
-    if (sub_tid == 0u) out_data[row] = acc;
+    if (sub_tid == 0u) out_data[out_off + row] = acc;
 }

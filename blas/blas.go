@@ -136,6 +136,46 @@ func (p *Pool) ParallelFor(n int, fn func(i int)) {
 	})
 }
 
+// NumWorkers returns the number of workers in the pool.
+func (p *Pool) NumWorkers() int { return p.numWorkers }
+
+// DispatchChunked distributes [0, total) across numActive workers.
+// work receives workerID (for per-worker scratch buffers), start, end.
+func (p *Pool) DispatchChunked(total, numActive int, work func(workerID, start, end int)) {
+	if total <= 0 || !p.alive.Load() {
+		return
+	}
+	if numActive > p.numWorkers {
+		numActive = p.numWorkers
+	}
+	if numActive > total {
+		numActive = total
+	}
+	if numActive <= 1 {
+		work(0, 0, total)
+		return
+	}
+	chunk := (total + numActive - 1) / numActive
+	var done sync.WaitGroup
+	for w := 0; w < numActive; w++ {
+		s := w * chunk
+		e := s + chunk
+		if s >= total {
+			break
+		}
+		if e > total {
+			e = total
+		}
+		done.Add(1)
+		wid, start, end := w, s, e
+		p.taskChs[w] <- func() {
+			work(wid, start, end)
+			done.Done()
+		}
+	}
+	done.Wait()
+}
+
 // Shutdown stops all workers.
 func (p *Pool) Shutdown() {
 	if p.alive.CompareAndSwap(true, false) {
@@ -449,17 +489,19 @@ func QBatchGEMMParallel(outFlat []float32, qt *core.QuantizedTensor, xFlat []flo
 	if quant.HasQQDot(qt.Type) {
 		q8Size := quant.Q8BufferSize(qt.Type, qt.Cols)
 
-		// Contiguous Q8 buffer for all positions
 		q8Flat := getQ8Buf(q8Size * nPos)
-		for p := 0; p < nPos; p++ {
-			quant.QuantizeForType(xFlat[p*qt.Cols:(p+1)*qt.Cols], q8Flat[p*q8Size:(p+1)*q8Size], qt.Type)
-		}
+		quant.BatchQuantizeForType(xFlat, q8Flat, qt.Type, qt.Cols, q8Size, nPos)
 
-		pool.dispatch(qt.Rows, pool.numWorkers, func(start, end int) {
-			nrows := end - start
-			sb := start * bytesPerRow
-			quant.QQBatchGEMM(qt.Data[sb:sb+nrows*bytesPerRow], qt.Type, q8Flat, q8Size, nPos, qt.Cols, outFlat[start:], nrows, qt.Rows, bytesPerRow)
-		})
+		if quant.CPoolBatchHas() {
+			quant.CPoolQQBatchGEMM(qt.Data, qt.Type, q8Flat, q8Size, nPos, qt.Cols,
+				outFlat, qt.Rows, qt.Rows, bytesPerRow)
+		} else {
+			pool.dispatch(qt.Rows, pool.numWorkers, func(start, end int) {
+				nrows := end - start
+				sb := start * bytesPerRow
+				quant.QQBatchGEMM(qt.Data[sb:sb+nrows*bytesPerRow], qt.Type, q8Flat, q8Size, nPos, qt.Cols, outFlat[start:], nrows, qt.Rows, bytesPerRow)
+			})
+		}
 
 		putQ8Buf(q8Flat)
 		return
@@ -518,53 +560,59 @@ func QTripleBatchGEMMParallel(
 	if quant.HasQQDot(qt1.Type) {
 		q8Size := quant.Q8BufferSize(qt1.Type, cols)
 
-		// Contiguous Q8 buffer for all positions
 		q8Flat := getQ8Buf(q8Size * nPos)
-		for p := 0; p < nPos; p++ {
-			quant.QuantizeForType(xFlat[p*cols:(p+1)*cols], q8Flat[p*q8Size:(p+1)*q8Size], qt1.Type)
-		}
+		quant.BatchQuantizeForType(xFlat, q8Flat, qt1.Type, cols, q8Size, nPos)
 
-		totalRows := qt1.Rows + qt2.Rows + qt3.Rows
-		pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
-			r1 := qt1.Rows
-			r12 := r1 + qt2.Rows
-			s, e := start, end
-			if s < r1 {
-				e1 := e
-				if e1 > r1 {
-					e1 = r1
+		if quant.CPoolBatchHas() {
+			quant.CPoolQQTripleBatchGEMM(
+				qt1.Data, qt1.Type, qt1.Rows, bpr1, out1,
+				qt2.Data, qt2.Type, qt2.Rows, bpr2, out2,
+				qt3.Data, qt3.Type, qt3.Rows, bpr3, out3,
+				q8Flat, q8Size, nPos, cols, qt1.Rows, qt2.Rows, qt3.Rows,
+			)
+		} else {
+			totalRows := qt1.Rows + qt2.Rows + qt3.Rows
+			pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
+				r1 := qt1.Rows
+				r12 := r1 + qt2.Rows
+				s, e := start, end
+				if s < r1 {
+					e1 := e
+					if e1 > r1 {
+						e1 = r1
+					}
+					n := e1 - s
+					sb := s * bpr1
+					quant.QQBatchGEMM(qt1.Data[sb:sb+n*bpr1], qt1.Type, q8Flat, q8Size, nPos, cols, out1[s:], n, qt1.Rows, bpr1)
 				}
-				n := e1 - s
-				sb := s * bpr1
-				quant.QQBatchGEMM(qt1.Data[sb:sb+n*bpr1], qt1.Type, q8Flat, q8Size, nPos, cols, out1[s:], n, qt1.Rows, bpr1)
-			}
-			if e > r1 && s < r12 {
-				s2 := s - r1
-				if s2 < 0 {
-					s2 = 0
+				if e > r1 && s < r12 {
+					s2 := s - r1
+					if s2 < 0 {
+						s2 = 0
+					}
+					e2 := e - r1
+					if e2 > qt2.Rows {
+						e2 = qt2.Rows
+					}
+					n := e2 - s2
+					sb := s2 * bpr2
+					quant.QQBatchGEMM(qt2.Data[sb:sb+n*bpr2], qt2.Type, q8Flat, q8Size, nPos, cols, out2[s2:], n, qt2.Rows, bpr2)
 				}
-				e2 := e - r1
-				if e2 > qt2.Rows {
-					e2 = qt2.Rows
+				if e > r12 {
+					s3 := s - r12
+					if s3 < 0 {
+						s3 = 0
+					}
+					e3 := e - r12
+					if e3 > qt3.Rows {
+						e3 = qt3.Rows
+					}
+					n := e3 - s3
+					sb := s3 * bpr3
+					quant.QQBatchGEMM(qt3.Data[sb:sb+n*bpr3], qt3.Type, q8Flat, q8Size, nPos, cols, out3[s3:], n, qt3.Rows, bpr3)
 				}
-				n := e2 - s2
-				sb := s2 * bpr2
-				quant.QQBatchGEMM(qt2.Data[sb:sb+n*bpr2], qt2.Type, q8Flat, q8Size, nPos, cols, out2[s2:], n, qt2.Rows, bpr2)
-			}
-			if e > r12 {
-				s3 := s - r12
-				if s3 < 0 {
-					s3 = 0
-				}
-				e3 := e - r12
-				if e3 > qt3.Rows {
-					e3 = qt3.Rows
-				}
-				n := e3 - s3
-				sb := s3 * bpr3
-				quant.QQBatchGEMM(qt3.Data[sb:sb+n*bpr3], qt3.Type, q8Flat, q8Size, nPos, cols, out3[s3:], n, qt3.Rows, bpr3)
-			}
-		})
+			})
+		}
 
 		putQ8Buf(q8Flat)
 		return
@@ -597,39 +645,44 @@ func QDualBatchGEMMParallel(
 	if quant.HasQQDot(qt1.Type) {
 		q8Size := quant.Q8BufferSize(qt1.Type, cols)
 
-		// Contiguous Q8 buffer for all positions
 		q8Flat := getQ8Buf(q8Size * nPos)
-		for p := 0; p < nPos; p++ {
-			quant.QuantizeForType(xFlat[p*cols:(p+1)*cols], q8Flat[p*q8Size:(p+1)*q8Size], qt1.Type)
-		}
+		quant.BatchQuantizeForType(xFlat, q8Flat, qt1.Type, cols, q8Size, nPos)
 
-		totalRows := qt1.Rows + qt2.Rows
-		pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
-			r1 := qt1.Rows
-			s, e := start, end
-			if s < r1 {
-				e1 := e
-				if e1 > r1 {
-					e1 = r1
+		if quant.CPoolBatchHas() {
+			quant.CPoolQQDualBatchGEMM(
+				qt1.Data, qt1.Type, qt1.Rows, bpr1, out1,
+				qt2.Data, qt2.Type, qt2.Rows, bpr2, out2,
+				q8Flat, q8Size, nPos, cols, qt1.Rows, qt2.Rows,
+			)
+		} else {
+			totalRows := qt1.Rows + qt2.Rows
+			pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
+				r1 := qt1.Rows
+				s, e := start, end
+				if s < r1 {
+					e1 := e
+					if e1 > r1 {
+						e1 = r1
+					}
+					n := e1 - s
+					sb := s * bpr1
+					quant.QQBatchGEMM(qt1.Data[sb:sb+n*bpr1], qt1.Type, q8Flat, q8Size, nPos, cols, out1[s:], n, qt1.Rows, bpr1)
 				}
-				n := e1 - s
-				sb := s * bpr1
-				quant.QQBatchGEMM(qt1.Data[sb:sb+n*bpr1], qt1.Type, q8Flat, q8Size, nPos, cols, out1[s:], n, qt1.Rows, bpr1)
-			}
-			if e > r1 {
-				s2 := s - r1
-				if s2 < 0 {
-					s2 = 0
+				if e > r1 {
+					s2 := s - r1
+					if s2 < 0 {
+						s2 = 0
+					}
+					e2 := e - r1
+					if e2 > qt2.Rows {
+						e2 = qt2.Rows
+					}
+					n := e2 - s2
+					sb := s2 * bpr2
+					quant.QQBatchGEMM(qt2.Data[sb:sb+n*bpr2], qt2.Type, q8Flat, q8Size, nPos, cols, out2[s2:], n, qt2.Rows, bpr2)
 				}
-				e2 := e - r1
-				if e2 > qt2.Rows {
-					e2 = qt2.Rows
-				}
-				n := e2 - s2
-				sb := s2 * bpr2
-				quant.QQBatchGEMM(qt2.Data[sb:sb+n*bpr2], qt2.Type, q8Flat, q8Size, nPos, cols, out2[s2:], n, qt2.Rows, bpr2)
-			}
-		})
+			})
+		}
 
 		putQ8Buf(q8Flat)
 		return

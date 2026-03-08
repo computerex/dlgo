@@ -19,7 +19,9 @@ shared float sdata[256];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint head = gl_WorkGroupID.x;
-    uint base = head * uint(head_dim);
+    uint pos_id = gl_WorkGroupID.y;
+    uint total_heads = gl_NumWorkGroups.x;
+    uint base = pos_id * total_heads * uint(head_dim) + head * uint(head_dim);
 
     float ss = 0.0;
     for (int i = int(tid); i < head_dim; i += 256) {

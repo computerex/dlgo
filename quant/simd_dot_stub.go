@@ -118,6 +118,11 @@ func SIMDSwiGLU(out, gate, up []float32, n int) {
 	}
 }
 
+func CausalAttnHead(q []float32, headDim int, kBase, vBase []float32, kvOffset, kvStride, seqLen int, scale float32, scores, out []float32) {
+}
+
+func HasCausalAttn() bool { return false }
+
 func HasSIMDDot(ggmlType uint32) bool {
 	switch ggmlType {
 	case 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14:

@@ -1,22 +1,29 @@
 package memory
 
 // KVCache stores key and value tensors for one attention layer.
-// Keys and Vals are stored as [maxPos][dim], with Len tracking the current fill level.
+// Data is stored in contiguous flat buffers (KeyData/ValData) for efficient
+// SIMD access. The Keys/Vals slice-of-slice view is maintained for API compat.
 type KVCache struct {
-	Keys [][]float32 // [maxPos][dim]
-	Vals [][]float32 // [maxPos][dim]
-	Len  int
+	Keys    [][]float32 // [maxPos][dim] — slices into KeyData
+	Vals    [][]float32 // [maxPos][dim] — slices into ValData
+	KeyData []float32   // flat contiguous [maxPos * dim]
+	ValData []float32   // flat contiguous [maxPos * dim]
+	Len     int
+	Dim     int
 }
 
 // NewKVCache creates a KV cache that can hold up to maxPos positions of dimension dim.
 func NewKVCache(maxPos, dim int) *KVCache {
 	c := &KVCache{
-		Keys: make([][]float32, maxPos),
-		Vals: make([][]float32, maxPos),
+		Keys:    make([][]float32, maxPos),
+		Vals:    make([][]float32, maxPos),
+		KeyData: make([]float32, maxPos*dim),
+		ValData: make([]float32, maxPos*dim),
+		Dim:     dim,
 	}
 	for p := 0; p < maxPos; p++ {
-		c.Keys[p] = make([]float32, dim)
-		c.Vals[p] = make([]float32, dim)
+		c.Keys[p] = c.KeyData[p*dim : (p+1)*dim]
+		c.Vals[p] = c.ValData[p*dim : (p+1)*dim]
 	}
 	return c
 }
@@ -37,19 +44,22 @@ func (c *KVCache) Store(pos int, key, val []float32) {
 
 // Clone creates a deep copy of the cache up to currentPos.
 func (c *KVCache) Clone(currentPos int) *KVCache {
+	maxPos := len(c.Keys)
 	d := &KVCache{
-		Keys: make([][]float32, len(c.Keys)),
-		Vals: make([][]float32, len(c.Vals)),
-		Len:  c.Len,
+		Keys:    make([][]float32, maxPos),
+		Vals:    make([][]float32, maxPos),
+		KeyData: make([]float32, maxPos*c.Dim),
+		ValData: make([]float32, maxPos*c.Dim),
+		Len:     c.Len,
+		Dim:     c.Dim,
 	}
-	dim := len(c.Keys[0])
-	for p := 0; p < len(c.Keys); p++ {
-		d.Keys[p] = make([]float32, dim)
-		d.Vals[p] = make([]float32, dim)
-		if p < currentPos {
-			copy(d.Keys[p], c.Keys[p])
-			copy(d.Vals[p], c.Vals[p])
-		}
+	for p := 0; p < maxPos; p++ {
+		d.Keys[p] = d.KeyData[p*c.Dim : (p+1)*c.Dim]
+		d.Vals[p] = d.ValData[p*c.Dim : (p+1)*c.Dim]
+	}
+	if currentPos > 0 {
+		copy(d.KeyData[:currentPos*c.Dim], c.KeyData[:currentPos*c.Dim])
+		copy(d.ValData[:currentPos*c.Dim], c.ValData[:currentPos*c.Dim])
 	}
 	return d
 }

@@ -9,6 +9,8 @@ package quant
 
 int q8_buffer_size(uint32_t w_type, int n);
 void quantize_for_type(const float* x, uint8_t* out, uint32_t w_type, int n);
+void batch_quantize_for_type(const float* x_flat, uint8_t* out_flat,
+                             uint32_t w_type, int cols, int q8_stride, int n_pos);
 void qq_dot_batch(const uint8_t* w_data, uint32_t w_type,
                   const uint8_t* q_data, int cols,
                   float* out, int nrows, int bpr);
@@ -34,6 +36,21 @@ func QuantizeForType(x []float32, out []byte, wType uint32) {
 		(*C.uint8_t)(unsafe.Pointer(&out[0])),
 		C.uint32_t(wType),
 		C.int(len(x)),
+	)
+}
+
+// BatchQuantizeForType quantizes nPos float32 vectors in a single CGo call.
+func BatchQuantizeForType(xFlat []float32, q8Flat []byte, wType uint32, cols, q8Stride, nPos int) {
+	if nPos == 0 {
+		return
+	}
+	C.batch_quantize_for_type(
+		(*C.float)(unsafe.Pointer(&xFlat[0])),
+		(*C.uint8_t)(unsafe.Pointer(&q8Flat[0])),
+		C.uint32_t(wType),
+		C.int(cols),
+		C.int(q8Stride),
+		C.int(nPos),
 	)
 }
 

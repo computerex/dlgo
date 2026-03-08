@@ -103,7 +103,7 @@ typedef struct {
 } BufferAlloc;
 
 #define MAX_BUFFERS 8192
-#define MAX_DESCRIPTORS_PER_POOL 4096
+#define MAX_DESCRIPTORS_PER_POOL 65536
 #define STAGING_SIZE (128 * 1024 * 1024) // 128MB staging buffer
 
 static struct {
@@ -1245,14 +1245,65 @@ int gpu_copy_f32(GpuBuf dst, GpuBuf src, int n) {
 
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos, int qtype) {
-    // For batch, dispatch one matvec per position (simple initial impl)
-    // TODO: fused batch kernel
-    for (int p = 0; p < npos; p++) {
-        // Each position's input/output is offset by cols/rows floats
-        // This requires the caller to handle offsets or we need sub-buffer views
-        // For now, use single matvec dispatch
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0) return GPU_OK;
+    if (npos == 1) return gpu_matvec(out_buf, weights_buf, x_buf, rows, cols, qtype);
+
+    PipelineID pipe;
+    switch (qtype) {
+        case QTYPE_F32:  pipe = PIPE_MATVEC_F32; break;
+        case QTYPE_F16:  pipe = PIPE_MATVEC_F16; break;
+        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0; break;
+        case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0; break;
+        case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K; break;
+        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K; break;
+        case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K; break;
+        default: return GPU_ERR_DISPATCH;
     }
-    return gpu_matvec(out_buf, weights_buf, x_buf, rows, cols, qtype);
+
+    int rows_per_wg = 4;
+    if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K) rows_per_wg = 2;
+    else if (qtype == QTYPE_Q3_K) rows_per_wg = 1;
+
+    struct { int rows; int cols; } pc = {rows, cols};
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_copy_region(GpuBuf dst, uint64_t dst_offset, GpuBuf src, uint64_t src_offset, uint64_t size) {
+    BufferAlloc* s = get_buf(src);
+    BufferAlloc* d = get_buf(dst);
+    if (!s || !d) return GPU_ERR_DISPATCH;
+
+    if (g.recording) {
+        VkBufferCopy region = {src_offset, dst_offset, size};
+        vkCmdCopyBuffer_(g.cmd_buf, s->buffer, d->buffer, 1, &region);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier_(g.cmd_buf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+        g.dispatch_count++;
+    } else {
+        begin_cmd();
+        VkBufferCopy region = {src_offset, dst_offset, size};
+        vkCmdCopyBuffer_(g.cmd_buf, s->buffer, d->buffer, 1, &region);
+        submit_and_wait();
+    }
+    return GPU_OK;
 }
 
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
@@ -1532,4 +1583,236 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
     }
 
     return GPU_OK;
+} // end gpu_forward_layer
+
+int gpu_batch_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, int npos, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0) return GPU_OK;
+
+    struct { int n; float eps; } pc = {n, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_RMSNORM;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = x_buf;
+    dp.bufs[2] = weight_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = 1;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
 }
+
+int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
+                            float scale, GpuBuf next_attn_norm) {
+    if (npos <= 0) return GPU_OK;
+    if (npos == 1) return gpu_forward_layer(lc, start_pos, start_pos + 1, scale, next_attn_norm);
+
+    int dim = lc->dim;
+    int head_dim = lc->head_dim;
+    int num_heads = lc->num_heads;
+    int num_kv_heads = lc->num_kv_heads;
+    int kv_dim = lc->kv_dim;
+
+    gpu_barrier();
+    gpu_batch_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, npos, lc->wq_type);
+    gpu_batch_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, npos, lc->wk_type);
+    gpu_batch_matvec(lc->v, lc->wv, lc->x_norm, lc->wv_rows, lc->wv_cols, npos, lc->wv_type);
+
+    if (lc->q_norm_w) {
+        gpu_barrier();
+        {
+            struct { int hd; float eps; } pc = {head_dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_RMSNORM_HEADS;
+            dp.bufs[0] = lc->q; dp.bufs[1] = lc->q_norm_w; dp.num_bufs = 2;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+        }
+        {
+            struct { int hd; float eps; } pc = {head_dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_RMSNORM_HEADS;
+            dp.bufs[0] = lc->k; dp.bufs[1] = lc->k_norm_w; dp.num_bufs = 2;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = num_kv_heads; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+        }
+    }
+
+    gpu_barrier();
+    {
+        struct { int nh; int nkv; int hd; int rd; int pos; float fb; int neox; } pc =
+            {num_heads, num_kv_heads, head_dim, lc->rope_dim, start_pos, lc->rope_freq_base, lc->rope_neox};
+        DispatchParams dp = {0};
+        dp.pipe = PIPE_ROPE;
+        dp.bufs[0] = lc->q; dp.bufs[1] = lc->k; dp.num_bufs = 2;
+        dp.push_data = &pc; dp.push_size = sizeof(pc);
+        dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
+        dp.groups_y = npos; dp.groups_z = 1;
+        dispatch_compute(&dp);
+    }
+
+    {
+        BufferAlloc* kc = get_buf(lc->k_cache);
+        BufferAlloc* vc = get_buf(lc->v_cache);
+        BufferAlloc* kb = get_buf(lc->k);
+        BufferAlloc* vb = get_buf(lc->v);
+        if (!kc || !vc || !kb || !vb) return GPU_ERR_DISPATCH;
+
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier_(g.cmd_buf,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+
+        VkBufferCopy kr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
+        vkCmdCopyBuffer_(g.cmd_buf, kb->buffer, kc->buffer, 1, &kr);
+        VkBufferCopy vr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
+        vkCmdCopyBuffer_(g.cmd_buf, vb->buffer, vc->buffer, 1, &vr);
+
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier_(g.cmd_buf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &mb, 0, NULL, 0, NULL);
+        g.dispatch_count++;
+    }
+
+    {
+        struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
+            {num_heads, num_kv_heads, head_dim, kv_dim, start_pos + 1, scale};
+        DispatchParams dp = {0};
+        dp.pipe = PIPE_ATTENTION;
+        dp.bufs[0] = lc->attn_out; dp.bufs[1] = lc->q;
+        dp.bufs[2] = lc->k_cache; dp.bufs[3] = lc->v_cache;
+        dp.num_bufs = 4;
+        dp.push_data = &pc; dp.push_size = sizeof(pc);
+        dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+        dispatch_compute(&dp);
+    }
+
+    gpu_barrier();
+    gpu_batch_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, npos, lc->wo_type);
+
+    if (lc->residual_type == 0) {
+        gpu_barrier();
+        if (lc->post_attn_norm_w) {
+            struct { int n; float eps; } pc = {dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_RMSNORM;
+            dp.bufs[0] = lc->attn_proj; dp.bufs[1] = lc->attn_proj;
+            dp.bufs[2] = lc->post_attn_norm_w; dp.num_bufs = 3;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+            gpu_barrier();
+        }
+        {
+            struct { int n; float eps; } pc = {dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_ADD_RMSNORM;
+            dp.bufs[0] = lc->ffn_norm; dp.bufs[1] = lc->ffn_in;
+            dp.bufs[2] = lc->x; dp.bufs[3] = lc->attn_proj;
+            dp.bufs[4] = lc->ffn_norm_w; dp.num_bufs = 5;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+        }
+
+        gpu_barrier();
+        if (lc->ffn_type == 0) {
+            gpu_batch_matvec(lc->gate, lc->ffn_gate_w, lc->ffn_norm, lc->gate_rows, lc->gate_cols, npos, lc->gate_type);
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        } else if (lc->ffn_type == 1) {
+            gpu_batch_matvec(lc->gate, lc->ffn_gate_w, lc->ffn_norm, lc->gate_rows, lc->gate_cols, npos, lc->gate_type);
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        } else {
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_gelu(lc->up, lc->up_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->up, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        }
+
+        gpu_barrier();
+        if (lc->post_ffn_norm_w) {
+            struct { int n; float eps; } pc = {dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_RMSNORM;
+            dp.bufs[0] = lc->ffn_out; dp.bufs[1] = lc->ffn_out;
+            dp.bufs[2] = lc->post_ffn_norm_w; dp.num_bufs = 3;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+            gpu_barrier();
+        }
+        if (next_attn_norm) {
+            struct { int n; float eps; } pc = {dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_ADD_RMSNORM;
+            dp.bufs[0] = lc->x_norm; dp.bufs[1] = lc->x;
+            dp.bufs[2] = lc->ffn_in; dp.bufs[3] = lc->ffn_out;
+            dp.bufs[4] = next_attn_norm; dp.num_bufs = 5;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+        } else {
+            gpu_add(lc->x, lc->ffn_in, lc->ffn_out, dim * npos);
+        }
+    } else {
+        GpuBuf ffn_input = lc->x_norm;
+        gpu_barrier();
+        if (lc->ffn_type == 0) {
+            gpu_batch_matvec(lc->gate, lc->ffn_gate_w, ffn_input, lc->gate_rows, lc->gate_cols, npos, lc->gate_type);
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        } else if (lc->ffn_type == 1) {
+            gpu_batch_matvec(lc->gate, lc->ffn_gate_w, ffn_input, lc->gate_rows, lc->gate_cols, npos, lc->gate_type);
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        } else {
+            gpu_batch_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, npos, lc->up_type);
+            gpu_barrier();
+            gpu_gelu(lc->up, lc->up_rows * npos);
+            gpu_barrier();
+            gpu_batch_matvec(lc->ffn_out, lc->ffn_down_w, lc->up, lc->down_rows, lc->down_cols, npos, lc->down_type);
+        }
+        gpu_barrier();
+        gpu_add(lc->x, lc->x, lc->attn_proj, dim * npos);
+        gpu_barrier();
+        gpu_add(lc->x, lc->x, lc->ffn_out, dim * npos);
+        if (next_attn_norm) {
+            gpu_barrier();
+            struct { int n; float eps; } pc = {dim, lc->rms_eps};
+            DispatchParams dp = {0};
+            dp.pipe = PIPE_RMSNORM;
+            dp.bufs[0] = lc->x_norm; dp.bufs[1] = lc->x;
+            dp.bufs[2] = next_attn_norm; dp.num_bufs = 3;
+            dp.push_data = &pc; dp.push_size = sizeof(pc);
+            dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
+            dispatch_compute(&dp);
+        }
+    }
+
+    return GPU_OK;
+} // end gpu_forward_layer_batch

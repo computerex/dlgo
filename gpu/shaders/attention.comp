@@ -27,13 +27,16 @@ shared vec4 q_sh[64];
 
 void main() {
     uint head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
     if (head >= num_heads) return;
 
     uint tid = gl_LocalInvocationID.x;
     uint kv_mul = num_heads / num_kv_heads;
     uint kv_head = head / kv_mul;
-    uint q_base = head * uint(head_dim);
+    uint q_dim = uint(num_heads) * uint(head_dim);
+    uint q_base = pos_id * q_dim + head * uint(head_dim);
     uint kv_offset = kv_head * uint(head_dim);
+    int actual_seq_len = seq_len + int(pos_id);
     uint head_dim4 = uint(head_dim) >> 2;
     uint kv_dim4 = uint(kv_dim) >> 2;
     uint kv_off4 = kv_offset >> 2;
@@ -45,7 +48,7 @@ void main() {
     barrier();
 
     // Phase 1: Q·K scores with vec4 dot products
-    for (int t = int(tid); t < seq_len; t += 256) {
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
         float dot_val = 0.0;
         uint k_base4 = uint(t) * kv_dim4 + kv_off4;
         for (uint d4 = 0; d4 < head_dim4; d4 += 4u) {
@@ -60,7 +63,7 @@ void main() {
 
     // Phase 2: softmax - find max
     float mx = -1.0e30;
-    for (int t = int(tid); t < seq_len; t += 256) {
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
         mx = max(mx, scores[t]);
     }
     reduce[tid] = mx;
@@ -74,7 +77,7 @@ void main() {
 
     // Exp and sum
     float my_sum = 0.0;
-    for (int t = int(tid); t < seq_len; t += 256) {
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
         float e = exp(scores[t] - max_val);
         scores[t] = e;
         my_sum += e;
@@ -89,16 +92,16 @@ void main() {
     barrier();
 
     // Normalize
-    for (int t = int(tid); t < seq_len; t += 256) {
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
         scores[t] *= inv_sum;
     }
     barrier();
 
     // Phase 3: weighted sum of V using vec4
-    uint out_base4 = (head * uint(head_dim)) >> 2;
+    uint out_base4 = (pos_id * q_dim + head * uint(head_dim)) >> 2;
     for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
         vec4 acc = vec4(0.0);
-        for (int t = 0; t < seq_len; t++) {
+        for (int t = 0; t < actual_seq_len; t++) {
             acc += scores[t] * v_v4[uint(t) * kv_dim4 + kv_off4 + d4];
         }
         attn_v4[out_base4 + d4] = acc;

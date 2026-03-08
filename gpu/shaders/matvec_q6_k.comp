@@ -62,6 +62,7 @@ void main() {
         if (first_row >= uint(rows)) return;
     }
 
+    uint pos_id = gl_WorkGroupID.y;
     float temp[NUM_ROWS];
     [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
 
@@ -73,61 +74,61 @@ void main() {
         uint i = i0 + ix;
         bool all_threads = (i0 < nbr_all_th);
 
-        uint y_idx = i * 256u + y_offset;
+        uint y_idx = pos_id * ncols + i * 256u + y_offset;
 
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            uint ib0 = (first_row + n) * num_blocks_per_row;
-            csel ^= 1u;
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+                uint ib0 = (first_row + n) * num_blocks_per_row;
+                csel ^= 1u;
 
-            if (!all_threads) {
-                if (i < num_blocks_per_row)
+                if (!all_threads) {
+                    if (i < num_blocks_per_row)
+                        sccache[csel][ix][itid] = float(data_a[ib0 + i].scales[itid]);
+                    barrier();
+                    if (i >= num_blocks_per_row) continue;
+                }
+
+                uint ql0_u32 = uint(data_a_p16[ib0 + i].ql[ql_offset >> 1]) | (uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 1u]) << 16);
+                uint ql32_u32 = uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 16u]) | (uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 17u]) << 16);
+                uint qh_u32 = uint(data_a_p16[ib0 + i].qh[qh_offset >> 1]) | (uint(data_a_p16[ib0 + i].qh[(qh_offset >> 1) + 1u]) << 16);
+
+                uint ql0_lo = ql0_u32 & 0x0F0F0F0Fu;
+                uint ql0_hi = (ql0_u32 >> 4) & 0x0F0F0F0Fu;
+                uint ql32_lo = ql32_u32 & 0x0F0F0F0Fu;
+                uint ql32_hi = (ql32_u32 >> 4) & 0x0F0F0F0Fu;
+
+                uint qh0 = (qh_u32 & 0x03030303u) << 4;
+                uint qh2 = (qh_u32 & 0x0C0C0C0Cu) << 2;
+                uint qh4 = (qh_u32 & 0x30303030u);
+                uint qh6 = (qh_u32 & 0xC0C0C0C0u) >> 2;
+
+                vec4 q0 = vec4(unpack8(ql0_lo | qh0)) - 32.0;
+                vec4 q1 = vec4(unpack8(ql32_lo | qh2)) - 32.0;
+                vec4 q2 = vec4(unpack8(ql0_hi | qh4)) - 32.0;
+                vec4 q3 = vec4(unpack8(ql32_hi | qh6)) - 32.0;
+
+                if (all_threads) {
                     sccache[csel][ix][itid] = float(data_a[ib0 + i].scales[itid]);
-                barrier();
-                if (i >= num_blocks_per_row) continue;
+                    barrier();
+                }
+
+                float d_val = float(data_a[ib0 + i].d);
+
+                vec4 by0 = data_b_v4[y_idx >> 2];
+                vec4 by32 = data_b_v4[(y_idx >> 2) + 8u];
+                vec4 by64 = data_b_v4[(y_idx >> 2) + 16u];
+                vec4 by96 = data_b_v4[(y_idx >> 2) + 24u];
+
+                float sum0 = dot(by0, q0);
+                float sum1 = dot(by32, q1);
+                float sum2 = dot(by64, q2);
+                float sum3 = dot(by96, q3);
+
+                temp[n] = fma(fma(sum0, sccache[csel][ix][s_offset],
+                              fma(sum1, sccache[csel][ix][s_offset + 2u],
+                              fma(sum2, sccache[csel][ix][s_offset + 4u],
+                                  sum3 * sccache[csel][ix][s_offset + 6u]))),
+                          d_val, temp[n]);
             }
-
-            uint ql0_u32 = uint(data_a_p16[ib0 + i].ql[ql_offset >> 1]) | (uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 1u]) << 16);
-            uint ql32_u32 = uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 16u]) | (uint(data_a_p16[ib0 + i].ql[(ql_offset >> 1) + 17u]) << 16);
-            uint qh_u32 = uint(data_a_p16[ib0 + i].qh[qh_offset >> 1]) | (uint(data_a_p16[ib0 + i].qh[(qh_offset >> 1) + 1u]) << 16);
-
-            uint ql0_lo = ql0_u32 & 0x0F0F0F0Fu;
-            uint ql0_hi = (ql0_u32 >> 4) & 0x0F0F0F0Fu;
-            uint ql32_lo = ql32_u32 & 0x0F0F0F0Fu;
-            uint ql32_hi = (ql32_u32 >> 4) & 0x0F0F0F0Fu;
-
-            uint qh0 = (qh_u32 & 0x03030303u) << 4;
-            uint qh2 = (qh_u32 & 0x0C0C0C0Cu) << 2;
-            uint qh4 = (qh_u32 & 0x30303030u);
-            uint qh6 = (qh_u32 & 0xC0C0C0C0u) >> 2;
-
-            vec4 q0 = vec4(unpack8(ql0_lo | qh0)) - 32.0;
-            vec4 q1 = vec4(unpack8(ql32_lo | qh2)) - 32.0;
-            vec4 q2 = vec4(unpack8(ql0_hi | qh4)) - 32.0;
-            vec4 q3 = vec4(unpack8(ql32_hi | qh6)) - 32.0;
-
-            if (all_threads) {
-                sccache[csel][ix][itid] = float(data_a[ib0 + i].scales[itid]);
-                barrier();
-            }
-
-            float d_val = float(data_a[ib0 + i].d);
-
-            vec4 by0 = data_b_v4[y_idx >> 2];
-            vec4 by32 = data_b_v4[(y_idx >> 2) + 8u];
-            vec4 by64 = data_b_v4[(y_idx >> 2) + 16u];
-            vec4 by96 = data_b_v4[(y_idx >> 2) + 24u];
-
-            float sum0 = dot(by0, q0);
-            float sum1 = dot(by32, q1);
-            float sum2 = dot(by64, q2);
-            float sum3 = dot(by96, q3);
-
-            temp[n] = fma(fma(sum0, sccache[csel][ix][s_offset],
-                          fma(sum1, sccache[csel][ix][s_offset + 2u],
-                          fma(sum2, sccache[csel][ix][s_offset + 4u],
-                              sum3 * sccache[csel][ix][s_offset + 6u]))),
-                      d_val, temp[n]);
-        }
     }
 
     [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
@@ -147,7 +148,7 @@ void main() {
             [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
                 sum += tmpsh[n][s];
             }
-            out_data[first_row + n] = sum;
+            out_data[pos_id * uint(rows) + first_row + n] = sum;
         }
     }
 }

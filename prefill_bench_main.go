@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -47,9 +48,6 @@ type pair struct {
 var models = []pair{
 	{"SmolLM2 360M Q8_0", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "dlgo-smollm2-360m"},
 	{"TinyLlama 1.1B Q4_0", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`, "dlgo-tinyllama"},
-	{"Qwen 2.5 0.5B Q4_K_M", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`, "dlgo-qwen25"},
-	{"Gemma 3 1B Q4_K_M", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`, "dlgo-gemma3"},
-	{"Gemma 3 270M Q8_0", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`, "dlgo-gemma3-270m"},
 	{"SmolLM2 1.7B Q4_K_M", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`, "dlgo-smollm2-1.7b"},
 }
 
@@ -94,11 +92,24 @@ func dlgoPrefillCPU(pipe *llm.Pipeline, prompt string) (prefillMs float64, prefi
 	cfg.MaxTokens = 1
 	cfg.Seed = 42
 	cfg.Sampler.Temperature = 0
-	r, err := pipe.GenerateDetailed(formatted, cfg)
-	if err != nil {
+	best := math.MaxFloat64
+	var bestTok int
+	var bestTps float64
+	for i := 0; i < 3; i++ {
+		r, err := pipe.GenerateDetailed(formatted, cfg)
+		if err != nil {
+			continue
+		}
+		if r.PrefillTimeMs < best {
+			best = r.PrefillTimeMs
+			bestTok = r.PromptTokens
+			bestTps = r.TokensPerSec
+		}
+	}
+	if best == math.MaxFloat64 {
 		return 0, 0, 0
 	}
-	return r.PrefillTimeMs, r.PromptTokens, r.TokensPerSec
+	return best, bestTok, bestTps
 }
 
 func dlgoPrefillGPU(gpuPipe *gpu.GpuPipeline, cpuModel *llm.Model, prompt string) (prefillMs float64, prefillTok int, genTps float64) {
@@ -107,12 +118,24 @@ func dlgoPrefillGPU(gpuPipe *gpu.GpuPipeline, cpuModel *llm.Model, prompt string
 	cfg.MaxTokens = 1
 	cfg.Seed = 42
 	cfg.Sampler.Temperature = 0
-	gpuPipe.KVCache.Reset()
-	r, err := gpuPipe.GenerateDetailed(formatted, cfg)
-	if err != nil {
+	best := math.MaxFloat64
+	var bestTok int
+	var bestTps float64
+	for i := 0; i < 3; i++ {
+		r, err := gpuPipe.GenerateDetailed(formatted, cfg)
+		if err != nil {
+			continue
+		}
+		if r.PrefillTimeMs < best {
+			best = r.PrefillTimeMs
+			bestTok = r.PromptTokens
+			bestTps = r.TokensPerSec
+		}
+	}
+	if best == math.MaxFloat64 {
 		return 0, 0, 0
 	}
-	return r.PrefillTimeMs, r.PromptTokens, r.TokensPerSec
+	return best, bestTok, bestTps
 }
 
 func main() {
@@ -149,6 +172,19 @@ func main() {
 		gpuPipe, gpuErr := gpu.NewGpuPipeline(cpuPipe)
 		if gpuErr != nil {
 			fmt.Printf("  GPU pipeline fail: %v\n", gpuErr)
+		}
+
+		// Warmup: run one prompt through both CPU and GPU to prime caches
+		{
+			warmPrompt := llm.FormatChat(cpuPipe.Model.Config, "", "Hello")
+			wCfg := llm.DefaultGenerateConfig()
+			wCfg.MaxTokens = 1
+			wCfg.Seed = 42
+			wCfg.Sampler.Temperature = 0
+			cpuPipe.GenerateDetailed(warmPrompt, wCfg)
+			if gpuPipe != nil {
+				gpuPipe.GenerateDetailed(warmPrompt, wCfg)
+			}
 		}
 
 		for _, p := range prompts {

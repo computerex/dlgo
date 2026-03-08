@@ -112,6 +112,110 @@ func GpuForwardFused(m *llm.Model, gm *GpuModel, token int32, pos int,
 	DownloadF32(rs.Logits, logitsBuf)
 }
 
+// BuildBatchLayerConfs creates layer configs that point to batch-sized scratch
+// buffers while sharing the same weight/norm buffers as single-token configs.
+func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *GpuKVCache) []*LayerConf {
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	numHeads := cfg.NumHeads
+	numKVHeads := cfg.NumKVHeads
+	kvDim := numKVHeads * headDim
+
+	confs := make([]*LayerConf, cfg.NumLayers)
+	for l := 0; l < cfg.NumLayers; l++ {
+		layer := &m.Layers[l]
+		gl := &gm.Layers[l]
+		lc := NewLayerConf()
+
+		lc.SetScratch(bs.X, bs.XNorm, bs.Q, bs.K, bs.V, bs.AttnOut, bs.AttnProj,
+			bs.FFNNorm, bs.FFNIn, bs.Gate, bs.Up, bs.Hidden, bs.FFNOut)
+		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+			gl.Bq, gl.Bk, gl.Bv, gl.AttnQNorm, gl.AttnKNorm)
+
+		var ffnGate *GpuTensor
+		if gl.FFNGate != nil {
+			ffnGate = gl.FFNGate
+		}
+		lc.SetFFN(gl.FFNNorm, ffnGate, gl.FFNUp, gl.FFNDown,
+			gl.PostAttnNorm, gl.PostFFNNorm)
+		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+
+		ffnType := 0
+		switch layer.Spec.FFN {
+		case llm.FFNSwiGLU:
+			ffnType = 0
+		case llm.FFNGeGLU:
+			ffnType = 1
+		case llm.FFNPlain:
+			ffnType = 2
+		}
+		resType := 0
+		if layer.Spec.Residual == llm.ResParallel {
+			resType = 1
+		}
+
+		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
+			cfg.RMSNormEps, cfg.RopeFreqBase, cfg.RopeDim, cfg.RopeNeox,
+			ffnType, resType)
+
+		confs[l] = lc
+	}
+	return confs
+}
+
+// GpuForwardPrefillBatch processes all prompt tokens in a single batched pass.
+// After this call, the KV cache is populated for all positions, and logitsBuf
+// contains the logits from the last prompt token.
+func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
+	kv *GpuKVCache, rs *GpuRunState, bs *GpuBatchState, logitsBuf []float32,
+	batchLayerConfs []*LayerConf) {
+
+	npos := len(tokens)
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+
+	xBatch := make([]float32, npos*dim)
+	for i, tok := range tokens {
+		_ = m.TokenEmbed.DequantizeRow(int(tok), xBatch[i*dim:(i+1)*dim])
+		if cfg.EmbedScale != 0 {
+			for j := 0; j < dim; j++ {
+				xBatch[i*dim+j] *= cfg.EmbedScale
+			}
+		}
+	}
+
+	BeginBatch()
+	UploadF32(bs.X, xBatch)
+
+	if m.Layers[0].Spec.Norm == llm.NormRMS {
+		Barrier()
+		BatchRMSNorm(bs.XNorm, bs.X, gm.Layers[0].AttnNorm, dim, npos, cfg.RMSNormEps)
+	}
+
+	for l := 0; l < cfg.NumLayers; l++ {
+		var nextAttnNorm Buf
+		if l < cfg.NumLayers-1 {
+			nextAttnNorm = gm.Layers[l+1].AttnNorm
+		}
+		ForwardLayerBatch(batchLayerConfs[l], npos, 0, scale, nextAttnNorm)
+	}
+
+	Barrier()
+	CopyRegion(rs.X, 0, bs.X, uint64((npos-1)*dim*4), uint64(dim*4))
+	Barrier()
+	RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
+	Barrier()
+	output := gm.Output
+	if output == nil {
+		output = gm.TokenEmbed
+	}
+	MatVec(rs.Logits, output.Buf, rs.X, output.Rows, output.Cols, output.Type)
+	DownloadF32(rs.Logits, logitsBuf)
+}
+
 // GpuForward performs a single-token forward pass entirely on GPU.
 // This is the general path with error handling and CPU fallback for
 // unsupported quant types.

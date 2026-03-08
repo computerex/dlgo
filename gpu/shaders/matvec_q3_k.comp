@@ -58,45 +58,48 @@ void main() {
     if (row >= uint(rows)) return;
 
     int bpr = cols >> 8;
+
+    uint pos_id = gl_WorkGroupID.y;
+    uint pos_x_off = pos_id * uint(cols);
     float acc = 0.0;
 
     for (int b = 0; b < bpr; b++) {
-        uint bi = row * uint(bpr) + uint(b);
-        float d_all = float(blocks[bi].d);
+            uint bi = row * uint(bpr) + uint(b);
+            float d_all = float(blocks[bi].d);
 
-        uint i0 = uint(blocks[bi].scales[0]) | (uint(blocks[bi].scales[1]) << 8) |
-            (uint(blocks[bi].scales[2]) << 16) | (uint(blocks[bi].scales[3]) << 24);
-        uint i1 = uint(blocks[bi].scales[4]) | (uint(blocks[bi].scales[5]) << 8) |
-            (uint(blocks[bi].scales[6]) << 16) | (uint(blocks[bi].scales[7]) << 24);
-        uint t = uint(blocks[bi].scales[8]) | (uint(blocks[bi].scales[9]) << 8) |
-            (uint(blocks[bi].scales[10]) << 16) | (uint(blocks[bi].scales[11]) << 24);
+            uint i0 = uint(blocks[bi].scales[0]) | (uint(blocks[bi].scales[1]) << 8) |
+                (uint(blocks[bi].scales[2]) << 16) | (uint(blocks[bi].scales[3]) << 24);
+            uint i1 = uint(blocks[bi].scales[4]) | (uint(blocks[bi].scales[5]) << 8) |
+                (uint(blocks[bi].scales[6]) << 16) | (uint(blocks[bi].scales[7]) << 24);
+            uint t = uint(blocks[bi].scales[8]) | (uint(blocks[bi].scales[9]) << 8) |
+                (uint(blocks[bi].scales[10]) << 16) | (uint(blocks[bi].scales[11]) << 24);
 
-        int lane16 = int(lane & 15u);
-        bool hi = lane >= 16u;
-        int h_idx = lane16 + (hi ? 16 : 0);
-        int x_block = b * 256;
-        uint m = 1u;
+            int lane16 = int(lane & 15u);
+            bool hi = lane >= 16u;
+            int h_idx = lane16 + (hi ? 16 : 0);
+            int x_block = b * 256;
+            uint m = 1u;
 
-        for (int n128 = 0; n128 < 2; n128++) {
-            int q_base = n128 * 32;
-            int x_base = x_block + n128 * 128;
+            for (int n128 = 0; n128 < 2; n128++) {
+                int q_base = n128 * 32;
+                int x_base = x_block + n128 * 128;
 
-            for (int j = 0; j < 4; j++) {
-                int scale_idx = n128 * 8 + j * 2 + (hi ? 1 : 0);
-                float dl = d_all * float(unpack_scale(i0, i1, t, scale_idx) - 32);
+                for (int j = 0; j < 4; j++) {
+                    int scale_idx = n128 * 8 + j * 2 + (hi ? 1 : 0);
+                    float dl = d_all * float(unpack_scale(i0, i1, t, scale_idx) - 32);
 
-                int q_idx = q_base + h_idx;
-                int v = int((uint(blocks[bi].qs[q_idx]) >> uint(j * 2)) & 0x03u);
-                if ((uint(blocks[bi].hmask[h_idx]) & m) == 0u) {
-                    v -= 4;
+                    int q_idx = q_base + h_idx;
+                    int v = int((uint(blocks[bi].qs[q_idx]) >> uint(j * 2)) & 0x03u);
+                    if ((uint(blocks[bi].hmask[h_idx]) & m) == 0u) {
+                        v -= 4;
+                    }
+
+                    int x_idx = int(pos_x_off) + x_base + j * 32 + int(lane);
+                    acc += dl * float(v) * x_data[x_idx];
+                    m <<= 1;
                 }
-
-                int x_idx = x_base + j * 32 + int(lane);
-                acc += dl * float(v) * x_data[x_idx];
-                m <<= 1;
             }
         }
-    }
 
     partial[lane] = acc;
     barrier();
@@ -109,6 +112,6 @@ void main() {
     }
 
     if (lane == 0u) {
-        out_data[row] = partial[0];
+        out_data[pos_id * uint(rows) + row] = partial[0];
     }
 }
