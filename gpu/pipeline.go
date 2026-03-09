@@ -45,40 +45,32 @@ type GpuPipeline struct {
 	CPUBatchState *llm.BatchState           // batch state for CPU prefill
 }
 
-// estimateOverheadVRAM estimates GPU memory needed for non-weight allocations
-// (run state, KV cache, batch state, etc.) in bytes.
-func estimateOverheadVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
+// estimateFixedVRAM estimates GPU memory for non-per-layer allocations
+// (run state, batch state, SSM scratch). Does NOT include KV cache or
+// per-layer weights — those are computed per-layer in the budget solver.
+func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	dim := int64(cfg.EmbeddingDim)
 	qDim := int64(cfg.NumHeads * cfg.HeadDim)
 	kvDim := int64(cfg.NumKVHeads * cfg.HeadDim)
 	ffnDim := int64(cfg.FFNDim)
 	vocab := int64(cfg.VocabSize)
-	nLayers := int64(cfg.NumLayers)
-	seq := int64(maxSeqLen)
 
 	var total int64
 
-	// Run state: ~15 buffers of dim-sized float32
+	// Run state buffers
 	total += (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim + vocab) * 4
 
-	// KV cache: 2 * nLayers * maxSeqLen * kvDim * 4
-	total += 2 * nLayers * seq * kvDim * 4
-
-	// SSM state (if applicable)
+	// SSM scratch (shared, not per-layer)
 	if cfg.SSMInnerSize > 0 {
 		numHeads := int64(cfg.SSMTimeStepRank)
-		headKDim := int64(cfg.SSMStateSize)
 		headVDim := int64(cfg.SSMInnerSize) / numHeads
 		numKVGroups := int64(cfg.SSMGroupCount)
 		if numKVGroups <= 0 {
 			numKVGroups = numHeads
 		}
+		headKDim := int64(cfg.SSMStateSize)
 		keyDim := numKVGroups * headKDim
 		qkvDim := keyDim*2 + numHeads*headVDim
-		convK := int64(cfg.SSMConvKernel)
-		ssmLayerState := numHeads*headKDim*headVDim*4 + convK*qkvDim*4
-		ssmLayers := nLayers / 2 // rough estimate
-		total += ssmLayers * ssmLayerState
 		total += (qkvDim + numHeads*headVDim + numHeads + numHeads + numHeads*headVDim) * 4
 	}
 
@@ -86,22 +78,26 @@ func estimateOverheadVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	batchTokens := int64(128)
 	total += batchTokens * (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim) * 4
 
-	// Safety margin (256 MB)
-	total += 256 * 1024 * 1024
+	// Non-layer weight buffers (embed, output, norms)
+	// Accounted separately from per-layer weights.
+
+	// Safety margin (64 MB)
+	total += 64 * 1024 * 1024
 
 	return total
 }
 
-// computeGPULayerBudget determines how many layers fit in available VRAM.
+// computeGPULayerBudget determines how many layers fit in available VRAM,
+// accounting for both weight data AND per-layer KV cache VRAM.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	totalVRAM := int64(VRAMBytes())
 	if totalVRAM <= 0 {
 		return 0
 	}
 
-	overhead := estimateOverheadVRAM(m.Config, maxSeqLen)
+	fixedOverhead := estimateFixedVRAM(m.Config, maxSeqLen)
 
-	// Estimate non-layer weight VRAM (embed + output)
+	// Non-layer weight VRAM (embed + output)
 	var nonLayerBytes int64
 	if m.TokenEmbed != nil {
 		nonLayerBytes += int64(len(m.TokenEmbed.Data))
@@ -111,19 +107,42 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
 
-	available := totalVRAM - overhead - nonLayerBytes
+	available := totalVRAM - fixedOverhead - nonLayerBytes
 	if available <= 0 {
 		return 0
 	}
 
-	// Greedily add layers until budget exhausted
+	// Per-layer KV cache cost
+	kvDim := int64(m.Config.NumKVHeads * m.Config.HeadDim)
+	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 4 // K + V buffers
+
+	// Per-layer SSM state cost (only for SSM layers)
+	var ssmPerLayer int64
+	if m.Config.SSMInnerSize > 0 {
+		numHeads := int64(m.Config.SSMTimeStepRank)
+		headKDim := int64(m.Config.SSMStateSize)
+		headVDim := int64(m.Config.SSMInnerSize) / numHeads
+		numKVGroups := int64(m.Config.SSMGroupCount)
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		convK := int64(m.Config.SSMConvKernel)
+		ssmPerLayer = numHeads*headKDim*headVDim*4 + convK*qkvDim*4
+	}
+
+	// Greedily add layers: each layer costs weights + KV cache + optional SSM state
 	numLayers := 0
 	for l := 0; l < len(m.Layers); l++ {
-		layerBytes := llm.EstimateLayerBytes(&m.Layers[l])
-		if layerBytes > available {
+		layerCost := llm.EstimateLayerBytes(&m.Layers[l]) + kvPerLayer
+		if m.Layers[l].Spec.Core == llm.CoreSSM {
+			layerCost += ssmPerLayer
+		}
+		if layerCost > available {
 			break
 		}
-		available -= layerBytes
+		available -= layerCost
 		numLayers++
 	}
 	return numLayers
@@ -369,7 +388,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	ffnDim := cfg.FFNDim
 
 	rs := NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
-	kv := NewGpuKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+	kv := NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim)
 
 	layerConfs := BuildLayerConfs(m, gm, rs, kv)
 

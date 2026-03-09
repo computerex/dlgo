@@ -303,15 +303,17 @@ type GpuKVCache struct {
 }
 
 // NewGpuKVCache allocates GPU buffers for KV cache.
-func NewGpuKVCache(nLayers, maxSeqLen, kvDim int) *GpuKVCache {
+// gpuLayers controls how many layers get GPU-allocated KV buffers.
+// Layers beyond gpuLayers get zero-valued (nil) buffers.
+func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int) *GpuKVCache {
 	c := &GpuKVCache{
-		KeyBufs: make([]Buf, nLayers),
-		ValBufs: make([]Buf, nLayers),
+		KeyBufs: make([]Buf, totalLayers),
+		ValBufs: make([]Buf, totalLayers),
 		KVDim:   kvDim,
 		MaxSeq:  maxSeqLen,
 	}
 	size := uint64(maxSeqLen * kvDim * 4)
-	for l := 0; l < nLayers; l++ {
+	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		c.KeyBufs[l] = Alloc(size)
 		c.ValBufs[l] = Alloc(size)
 	}
