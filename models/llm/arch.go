@@ -28,8 +28,9 @@ var archRegistry = map[string]ArchDescriptor{
 	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"deepseek2": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
+	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "harmony"},
 	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen3next": {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.
@@ -99,6 +100,8 @@ func FormatMessages(cfg ModelConfig, messages []Message) string {
 		return formatGemmaMessages(messages)
 	case "phi":
 		return formatPhiMessages(messages)
+	case "harmony":
+		return formatHarmonyMessages(messages)
 	case "plain":
 		return formatPlainMessages(messages)
 	default:
@@ -206,5 +209,31 @@ func formatPhiMessages(messages []Message) string {
 		b.WriteString("<|end|>\n")
 	}
 	b.WriteString("<|assistant|>\n")
+	return b.String()
+}
+
+// formatHarmonyMessages formats messages using OpenAI Harmony template (gpt-oss).
+// GGUF vocabulary uses <|start|>, <|message|>, <|end|> (with closing >).
+func formatHarmonyMessages(messages []Message) string {
+	var b strings.Builder
+	b.WriteString("<|start|>system<|message|>")
+	b.WriteString("You are a helpful assistant.\n")
+	b.WriteString("# Valid channels: analysis, commentary, final. Channel must be included for every message.")
+	b.WriteString("<|end|>")
+	for _, m := range messages {
+		role := m.Role
+		if role == "system" {
+			b.WriteString("<|start|>developer<|message|>")
+			b.WriteString(m.Content)
+			b.WriteString("<|end|>")
+			continue
+		}
+		b.WriteString("<|start|>")
+		b.WriteString(role)
+		b.WriteString("<|message|>")
+		b.WriteString(m.Content)
+		b.WriteString("<|end|>")
+	}
+	b.WriteString("<|start|>assistant")
 	return b.String()
 }

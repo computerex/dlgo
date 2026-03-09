@@ -33,6 +33,7 @@ type GpuPipeline struct {
 	HasSSM    bool
 	HasGatedQ bool
 	HasMoE    bool
+	HasMLA    bool
 
 	// Partial GPU offloading: layers [0, NumGPULayers) are on GPU,
 	// layers [NumGPULayers, NumLayers) run on CPU (RAM or mmap).
@@ -435,6 +436,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 
+
 	hasGatedQ := false
 	for l := 0; l < cfg.NumLayers; l++ {
 		if m.Layers[l].Spec.GatedQ {
@@ -481,13 +483,28 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		pipe.HasMoE = true
 	}
 
-	// Allocate CPU-side state if needed (partial GPU, MoE, or hybrid SSM)
-	if isPartial || cfg.ExpertCount > 0 {
+	// Detect MLA (Multi-head Latent Attention) layers
+	for l := 0; l < cfg.NumLayers; l++ {
+		if m.Layers[l].Spec.Core == llm.CoreMLA {
+			pipe.HasMLA = true
+			break
+		}
+	}
+
+	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, or hybrid SSM)
+	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA
+	if needCPUState {
 		pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
 
 		if isPartial {
 			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
 			pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
+		}
+
+		// MLA needs a CPU KV cache for the compressed KV representations
+		if pipe.HasMLA && pipe.CPUKVCache == nil {
+			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+			fmt.Printf("[dlgo/gpu] MLA: allocated CPU KV cache (%d layers, kvDim=%d)\n", cfg.NumLayers, kvDim)
 		}
 
 		if cfg.ExpertCount > 0 {
@@ -635,10 +652,13 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	prefillStart := time.Now()
 	if p.IsPartialGPU {
-		// Partial GPU: prefill GPU layers, then CPU layers
-		// For simplicity, do per-token prefill through the partial forward path
 		for i, tok := range tokens {
 			GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+		}
+	} else if !p.UseFusedForward {
+		// Per-token prefill using GpuForward (has CPU fallback for unsupported quant types)
+		for i, tok := range tokens {
+			GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
 		}
 	} else {
 		isHybrid := isHybridSSMModel(p.CPUModel)
@@ -756,7 +776,6 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	for i := range m.Layers {
 		l := &m.Layers[i]
 		if l.Spec.FFN == llm.FFNMoE {
-			// MoE FFN handled on CPU; only check core (SSM/attention) tensors
 			for _, t := range []*core.QuantizedTensor{
 				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,
 				l.Wq, l.Wk, l.Wv, l.Wo,

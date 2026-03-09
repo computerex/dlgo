@@ -119,10 +119,14 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 	availRAM := int64(sysInfo.AvailablePhysical)
 	totalRAM := int64(sysInfo.TotalPhysical)
 
-	// Use the lesser of available RAM and 90% of total RAM as the budget,
-	// minus a reserve for the OS.
+	// Model weights are memory-mapped and demand-paged by the OS. With GPU
+	// offloading, the mmap pages are uploaded then can be evicted. Even on
+	// CPU-only, only the active working set is resident simultaneously.
+	// Budget only runtime buffers (KV cache, intermediate state) against
+	// available physical RAM. For safety, also ensure model + runtime fits
+	// in total system RAM (physical + swap/pagefile).
 	budget := availRAM - memReserveBytes
-	maxBudget := int64(float64(totalRAM)*0.85) - memReserveBytes
+	maxBudget := int64(float64(totalRAM)*0.90) - memReserveBytes
 	if budget > maxBudget {
 		budget = maxBudget
 	}
@@ -136,21 +140,20 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 	}
 
 	runtimeBytes := EstimateRuntimeBytes(cfg, seqLen)
-	totalNeeded := modelBytes + runtimeBytes
 
-	if totalNeeded <= budget {
+	// Only check runtime buffers against available RAM since weights are mmap'd
+	if runtimeBytes <= budget {
 		return seqLen, nil
 	}
 
-	// Try shrinking context length to fit
+	// Try shrinking context length to fit runtime buffers
 	for seqLen > minContextLen {
 		seqLen = seqLen / 2
 		if seqLen < minContextLen {
 			seqLen = minContextLen
 		}
 		runtimeBytes = EstimateRuntimeBytes(cfg, seqLen)
-		totalNeeded = modelBytes + runtimeBytes
-		if totalNeeded <= budget {
+		if runtimeBytes <= budget {
 			return seqLen, nil
 		}
 		if seqLen == minContextLen {
@@ -159,15 +162,14 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 	}
 
 	return 0, fmt.Errorf(
-		"insufficient memory: model needs ~%.1f GB (%.1f GB weights + %.1f GB runtime) "+
-			"but only %.1f GB available (%.1f GB total, %.1f GB free). "+
+		"insufficient memory: runtime buffers need ~%.1f GB "+
+			"but only %.1f GB available (%.1f GB total, %.1f GB free, %.1f GB model mmap'd). "+
 			"Close other applications or use a smaller model",
-		float64(totalNeeded)/(1<<30),
-		float64(modelBytes)/(1<<30),
 		float64(runtimeBytes)/(1<<30),
 		float64(budget)/(1<<30),
 		float64(totalRAM)/(1<<30),
 		float64(availRAM)/(1<<30),
+		float64(modelBytes)/(1<<30),
 	)
 }
 

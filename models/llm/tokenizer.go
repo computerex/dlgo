@@ -157,12 +157,20 @@ func initBPETokenizer(t *Tokenizer, md map[string]interface{}) (*Tokenizer, erro
 
 	var specialTokens []string
 	for _, s := range t.Tokens {
-		if len(s) > 2 && strings.HasPrefix(s, "<") && strings.HasSuffix(s, ">") {
-			if strings.Contains(s, "|") || strings.HasPrefix(s, "</") ||
-				strings.HasPrefix(s, "<tool") || s == "<think>" {
-				specialTokens = append(specialTokens, s)
-				t.SpecialTokens[s] = t.TokenToID[s]
+		isSpecial := false
+		if len(s) > 2 && strings.HasPrefix(s, "<") {
+			if strings.HasSuffix(s, ">") {
+				if strings.Contains(s, "|") || strings.HasPrefix(s, "</") ||
+					strings.HasPrefix(s, "<tool") || s == "<think>" {
+					isSpecial = true
+				}
+			} else if strings.HasSuffix(s, "|") && strings.Contains(s, "|") {
+				isSpecial = true
 			}
+		}
+		if isSpecial {
+			specialTokens = append(specialTokens, s)
+			t.SpecialTokens[s] = t.TokenToID[s]
 		}
 	}
 	sort.Slice(specialTokens, func(i, j int) bool {

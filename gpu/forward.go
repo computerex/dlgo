@@ -203,6 +203,15 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
 			MatVec(rs.AttnProj, gl.Wo.Buf, rs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, gl.Wo.Type)
+		} else if layer.Spec.Core == llm.CoreMLA && pipe != nil && pipe.HasMLA {
+			// MLA: download x_norm, run MLA attention on CPU, upload attn_proj
+			Sync()
+			cpuRS := pipe.CPURunState
+			DownloadF32(rs.XNorm, cpuRS.XNorm)
+			llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, pos, cfg, cpuRS.Pool)
+			BeginBatch()
+			UploadF32(rs.AttnProj, cpuRS.AttnProj)
+			Barrier()
 		}
 
 		var nextAttnNorm Buf
@@ -212,8 +221,6 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
 		if gl.IsMoE && pipe != nil && pipe.HasMoE {
-			// ForwardLayer computed pre-FFN residual+norm then returned early.
-			// Download ffn_norm, run MoE FFN on CPU, upload result, do residual.
 			Sync()
 			cpuRS := pipe.CPURunState
 			DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
@@ -335,6 +342,14 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
 			MatVec(rs.AttnProj, gl.Wo.Buf, rs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, gl.Wo.Type)
+		} else if layer.Spec.Core == llm.CoreMLA && pipe != nil && pipe.HasMLA {
+			Sync()
+			cpuRS := pipe.CPURunState
+			DownloadF32(rs.XNorm, cpuRS.XNorm)
+			llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, pos, cfg, cpuRS.Pool)
+			BeginBatch()
+			UploadF32(rs.AttnProj, cpuRS.AttnProj)
+			Barrier()
 		}
 
 		var nextAttnNorm Buf
@@ -624,17 +639,24 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 			Barrier()
 			BatchMatVec(bs.AttnProj, gl.Wo.Buf, bs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, npos, gl.Wo.Type)
 
-		} else {
-			// Standard attention (non-GatedQ, non-SSM) - handled by ForwardLayerBatch directly
-			var nextAttnNorm Buf
-			if l < cfg.NumLayers-1 {
-				nextAttnNorm = gm.Layers[l+1].AttnNorm
+		} else if layer.Spec.Core == llm.CoreMLA && pipe.HasMLA {
+			// MLA: run per-position on CPU (sequential KV cache dependency)
+			Sync()
+			cpuRS := pipe.CPURunState
+			xNormBatch := make([]float32, npos*dim)
+			DownloadF32(bs.XNorm, xNormBatch)
+			attnProjBatch := make([]float32, npos*dim)
+			for p := 0; p < npos; p++ {
+				copy(cpuRS.XNorm, xNormBatch[p*dim:(p+1)*dim])
+				llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, p, cfg, cpuRS.Pool)
+				copy(attnProjBatch[p*dim:(p+1)*dim], cpuRS.AttnProj)
 			}
-			ForwardLayerBatch(batchLayerConfs[l], npos, 0, scale, nextAttnNorm)
-			continue
+			BeginBatch()
+			UploadF32(bs.AttnProj, attnProjBatch)
+			Barrier()
 		}
 
-		// FFN + residual via ForwardLayerBatch with core_type=1 (skips attention)
+		// FFN + residual via ForwardLayerBatch
 		var nextAttnNorm Buf
 		if l < cfg.NumLayers-1 {
 			nextAttnNorm = gm.Layers[l+1].AttnNorm
@@ -796,6 +818,18 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
 			}
+		} else if spec.Core == llm.CoreMLA && p != nil && p.HasMLA {
+			Sync()
+			cpuRS := p.CPURunState
+			if err := DownloadF32(rs.XNorm, cpuRS.XNorm); err != nil {
+				return fmt.Errorf("layer %d mla download xnorm: %w", l, err)
+			}
+			llm.ForwardMLA(layer, cpuRS, p.CPUKVCache, l, pos, cfg, cpuRS.Pool)
+			BeginBatch()
+			if err := UploadF32(rs.AttnProj, cpuRS.AttnProj); err != nil {
+				return fmt.Errorf("layer %d mla upload attn_proj: %w", l, err)
+			}
+			Barrier()
 		} else if spec.Core == llm.CoreAttention {
 			Barrier()
 			if err := gpuMatVec(rs.Q, gl.Wq, layer.Wq, rs.XNorm, rs); err != nil {

@@ -24,7 +24,7 @@ type GpuKVCache struct{}
 func UploadTensor(*core.QuantizedTensor) (*GpuTensor, error) { return nil, errNoGPU }
 func UploadF32Slice([]float32) (Buf, error)                  { return 0, errNoGPU }
 func NewGpuRunState(_, _, _, _, _ int) *GpuRunState           { return nil }
-func NewGpuKVCache(_, _, _ int) *GpuKVCache                   { return nil }
+func NewGpuKVCache(_, _, _, _ int) *GpuKVCache                 { return nil }
 func (c *GpuKVCache) Reset()                                  {}
 func (gm *GpuModel) FreeAll()                                 {}
 func (rs *GpuRunState) FreeAll()                               {}
