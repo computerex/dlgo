@@ -795,6 +795,7 @@ static int create_compute_pipeline(PipelineID id, const uint32_t* spirv, size_t 
 typedef struct {
     PipelineID pipe;
     GpuBuf bufs[8];
+    uint64_t buf_offsets[8];
     int num_bufs;
     void* push_data;
     int push_size;
@@ -811,7 +812,7 @@ static int dispatch_compute(DispatchParams* p) {
         BufferAlloc* ba = get_buf(p->bufs[i]);
         if (!ba) return GPU_ERR_DISPATCH;
         buf_infos[i].buffer = ba->buffer;
-        buf_infos[i].offset = 0;
+        buf_infos[i].offset = p->buf_offsets[i];
         buf_infos[i].range = VK_WHOLE_SIZE;
 
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -987,6 +988,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ2_S:   pipe = PIPE_MATVEC_IQ2_S;   table_buf = g_iq_tables[IQ_TABLE_IQ2S]; break;
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
+        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -998,6 +1000,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ1_S: case QTYPE_IQ1_M:
         case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
         case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
+        case QTYPE_IQ4_XS:
             rows_per_wg = 2;
             break;
     }
@@ -1008,6 +1011,72 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.bufs[0] = out_buf;
     dp.bufs[1] = weights_buf;
     dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    if (table_buf) {
+        dp.bufs[3] = table_buf;
+        dp.num_bufs = 4;
+    }
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+
+    return dispatch_compute(&dp);
+}
+
+// gpu_matvec_offset: matrix-vector multiply starting from row_offset into weights.
+// Used for MoE expert projections from packed expert tensors.
+int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
+                      GpuBuf weights_buf, int weights_offset_bytes,
+                      GpuBuf x_buf, int rows, int cols, int qtype) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    PipelineID pipe;
+    GpuBuf table_buf = 0;
+    switch (qtype) {
+        case QTYPE_F32:     pipe = PIPE_MATVEC_F32; break;
+        case QTYPE_F16:     pipe = PIPE_MATVEC_F16; break;
+        case QTYPE_Q4_0:    pipe = PIPE_MATVEC_Q4_0; break;
+        case QTYPE_Q8_0:    pipe = PIPE_MATVEC_Q8_0; break;
+        case QTYPE_Q3_K:    pipe = PIPE_MATVEC_Q3_K; break;
+        case QTYPE_Q4_K:    pipe = PIPE_MATVEC_Q4_K; break;
+        case QTYPE_Q5_K:    pipe = PIPE_MATVEC_Q5_K; break;
+        case QTYPE_Q5_0:    pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q6_K:    pipe = PIPE_MATVEC_Q6_K; break;
+        case QTYPE_Q2_K:    pipe = PIPE_MATVEC_Q2_K; break;
+        case QTYPE_TQ1_0:   pipe = PIPE_MATVEC_TQ1_0; break;
+        case QTYPE_IQ1_S:   pipe = PIPE_MATVEC_IQ1_S;   table_buf = g_iq_tables[IQ_TABLE_IQ1S]; break;
+        case QTYPE_IQ1_M:   pipe = PIPE_MATVEC_IQ1_M;   table_buf = g_iq_tables[IQ_TABLE_IQ1S]; break;
+        case QTYPE_IQ2_XXS: pipe = PIPE_MATVEC_IQ2_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ2XXS]; break;
+        case QTYPE_IQ2_S:   pipe = PIPE_MATVEC_IQ2_S;   table_buf = g_iq_tables[IQ_TABLE_IQ2S]; break;
+        case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
+        case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
+        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
+        default: return GPU_ERR_DISPATCH;
+    }
+
+    int rows_per_wg = 4;
+    switch (qtype) {
+        case QTYPE_Q4_K: case QTYPE_Q6_K: case QTYPE_Q3_K: case QTYPE_Q5_K:
+        case QTYPE_Q2_K: case QTYPE_TQ1_0:
+        case QTYPE_IQ1_S: case QTYPE_IQ1_M:
+        case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
+        case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
+        case QTYPE_IQ4_XS:
+            rows_per_wg = 2;
+            break;
+    }
+
+    struct { int rows; int cols; } pc = {rows, cols};
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.buf_offsets[0] = out_offset_bytes;
+    dp.buf_offsets[1] = weights_offset_bytes;
     dp.num_bufs = 3;
     if (table_buf) {
         dp.bufs[3] = table_buf;
@@ -1307,6 +1376,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ2_S:   pipe = PIPE_MATVEC_IQ2_S;   table_buf = g_iq_tables[IQ_TABLE_IQ2S]; break;
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
+        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1317,6 +1387,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ1_S: case QTYPE_IQ1_M:
         case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
         case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
+        case QTYPE_IQ4_XS:
             rows_per_wg = 2;
             break;
     }

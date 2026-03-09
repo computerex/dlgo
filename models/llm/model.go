@@ -49,12 +49,13 @@ const (
 // Resolved once at load time from tensor presence; the forward pass dispatches
 // on these fields via switch statements that compile to jump tables.
 type LayerSpec struct {
-	Norm     NormKind
-	Core     CoreKind
-	Residual ResKind
-	FFN      FFNKind
-	GatedQ   bool // Fused Q+gate projection (Qwen3.5 attention layers)
-	QKNorm   bool // Per-head QK normalization (Gemma 3, Qwen3)
+	Norm          NormKind
+	Core          CoreKind
+	Residual      ResKind
+	FFN           FFNKind
+	GatedQ        bool // Fused Q+gate projection (Qwen3.5 attention layers)
+	QKNorm        bool // Per-head QK normalization (Gemma 3, Qwen3)
+	SlidingWindow int  // >0 = use sliding window attention with this size
 }
 
 // Layer holds the weights for one transformer block.
@@ -75,6 +76,8 @@ type Layer struct {
 	AttnQNorm    []float32            // [headDim] optional QK norm (Qwen3/Gemma3)
 	AttnKNorm    []float32            // [headDim] optional QK norm (Qwen3/Gemma3)
 	AttnGate     *core.QuantizedTensor // [dim × dim] optional gated attention (Qwen3.5)
+
+	AttnSinks    []float32            // [numKVHeads] attention sink weights (gpt-oss)
 
 	PostAttnNorm []float32            // [dim] optional post-attention norm (Gemma 3)
 	FFNNorm      []float32            // [dim] norm weight (nil = parallel attn+FFN)

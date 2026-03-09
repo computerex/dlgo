@@ -9,6 +9,7 @@ import (
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/models/llm"
+	"github.com/computerex/dlgo/quant"
 )
 
 // BuildLayerConfs creates reusable fused-layer configurations from the model,
@@ -220,7 +221,16 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		}
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
-		if gl.IsMoE && pipe != nil && pipe.HasMoE {
+	if gl.IsMoE && pipe != nil && pipe.HasMoE {
+		if gl.MoEOnGPU {
+			GpuForwardMoEFFN(gl, layer, rs, cfg)
+			Barrier()
+			if nextAttnNorm != 0 {
+				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+			} else {
+				Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+			}
+		} else {
 			Sync()
 			cpuRS := pipe.CPURunState
 			DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
@@ -235,9 +245,10 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 		}
 	}
+}
 
-	Barrier()
-	RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
+Barrier()
+RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 	Barrier()
 	output := gm.Output
 	if output == nil {
@@ -359,17 +370,27 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
 		if gl.IsMoE && pipe.HasMoE {
-			Sync()
-			cpuRS := pipe.CPURunState
-			DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
-			llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
-			BeginBatch()
-			UploadF32(rs.FFNOut, cpuRS.FFNOut)
-			Barrier()
-			if nextAttnNorm != 0 {
-				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+			if gl.MoEOnGPU {
+				GpuForwardMoEFFN(gl, layer, rs, cfg)
+				Barrier()
+				if nextAttnNorm != 0 {
+					AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+				} else {
+					Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				}
 			} else {
-				Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				Sync()
+				cpuRS := pipe.CPURunState
+				DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
+				llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+				BeginBatch()
+				UploadF32(rs.FFNOut, cpuRS.FFNOut)
+				Barrier()
+				if nextAttnNorm != 0 {
+					AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+				} else {
+					Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				}
 			}
 		}
 	}
@@ -664,8 +685,7 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		ForwardLayerBatch(batchLayerConfs[l], npos, 0, scale, nextAttnNorm)
 
 		if gl.IsMoE && pipe.HasMoE {
-			// ForwardLayerBatch computed pre-FFN residual+norm for all positions
-			// then returned early (ffn_type=3). Run MoE FFN per-position on CPU.
+			// Batch prefill MoE: always run per-position on CPU for now
 			Sync()
 			cpuRS := pipe.CPURunState
 			ffnNormBatch := make([]float32, npos*dim)
@@ -739,6 +759,13 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		ssmKeyDim = ssmKVGroups * ssmHeadKDim
 		ssmQKVDim = ssmKeyDim*2 + ssmNumHeads*ssmHeadVDim
 		ssmConvK = cfg.SSMConvKernel
+	}
+
+	if p != nil && p.AllCPUAttn {
+		cpuRS := p.CPURunState
+		llm.ForwardRange(m, token, pos, 0, cfg.NumLayers, p.CPUKVCache, cpuRS)
+		copy(logitsBuf, cpuRS.Logits)
+		return nil
 	}
 
 	BeginBatch()
@@ -831,6 +858,25 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			Barrier()
 		} else if spec.Core == llm.CoreAttention {
+			if gl.CPUAttn && p != nil {
+				EndBatch()
+				Sync()
+				cpuRS := p.CPURunState
+				if err := DownloadF32(rs.X, cpuRS.X); err != nil {
+					return fmt.Errorf("layer %d cpu fallback download: %w", l, err)
+				}
+				llm.ForwardRange(m, token, pos, l, l+1, p.CPUKVCache, cpuRS)
+				if l+1 == cfg.NumLayers {
+					copy(logitsBuf, cpuRS.Logits)
+					return nil
+				}
+				BeginBatch()
+				if err := UploadF32(rs.X, cpuRS.X); err != nil {
+					return fmt.Errorf("layer %d cpu fallback upload: %w", l, err)
+				}
+				Barrier()
+				continue
+			}
 			Barrier()
 			if err := gpuMatVec(rs.Q, gl.Wq, layer.Wq, rs.XNorm, rs); err != nil {
 				return fmt.Errorf("layer %d wq: %w", l, err)
@@ -891,7 +937,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		}
 
 		if gl.IsMoE && p != nil && p.HasMoE {
-			// MoE: compute pre-FFN residual+norm on GPU, FFN on CPU
 			ffnNormW := gl.FFNNorm
 			if spec.Residual == llm.ResPostAttnFFN {
 				ffnNormW = gl.PostAttnNorm
@@ -900,19 +945,29 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, ffnNormW, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d moe add+rmsnorm: %w", l, err)
 			}
-			Sync()
-			cpuRS := p.CPURunState
-			if err := DownloadF32(rs.FFNNorm, cpuRS.FFNNorm); err != nil {
-				return fmt.Errorf("layer %d moe download: %w", l, err)
-			}
-			llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
-			BeginBatch()
-			if err := UploadF32(rs.FFNOut, cpuRS.FFNOut); err != nil {
-				return fmt.Errorf("layer %d moe upload: %w", l, err)
-			}
-			Barrier()
-			if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
-				return fmt.Errorf("layer %d moe residual: %w", l, err)
+			if gl.MoEOnGPU {
+				if err := GpuForwardMoEFFN(gl, layer, rs, cfg); err != nil {
+					return fmt.Errorf("layer %d gpu moe: %w", l, err)
+				}
+				Barrier()
+				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
+					return fmt.Errorf("layer %d moe residual: %w", l, err)
+				}
+			} else {
+				EndBatch()
+				cpuRS := p.CPURunState
+				if err := DownloadF32(rs.FFNNorm, cpuRS.FFNNorm); err != nil {
+					return fmt.Errorf("layer %d moe download: %w", l, err)
+				}
+				llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+				BeginBatch()
+				if err := UploadF32(rs.FFNOut, cpuRS.FFNOut); err != nil {
+					return fmt.Errorf("layer %d moe upload: %w", l, err)
+				}
+				Barrier()
+				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
+					return fmt.Errorf("layer %d moe residual: %w", l, err)
+				}
 			}
 		} else {
 		switch spec.Residual {
@@ -1057,12 +1112,13 @@ func supportsGPUQType(qtype uint32) bool {
 	switch qtype {
 	case 0, 1, 2, 6, 8, 11, 12, 13, 14: // F32, F16, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
 		return true
-	case 10, 16, 18, 19, 21, 22, 29, 34: // Q2_K, IQ2_XXS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M, TQ1_0
+	case 10, 16, 18, 19, 21, 22, 23, 29, 34: // Q2_K, IQ2_XXS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, TQ1_0
 		return true
 	default:
 		return false
 	}
 }
+
 
 func ensureScratch(buf []float32, n int) []float32 {
 	if cap(buf) < n {
@@ -1090,6 +1146,194 @@ func gpuMatVec(out Buf, gpuW *GpuTensor, cpuW *core.QuantizedTensor, xBuf Buf, r
 	}
 	BeginBatch()
 	return nil
+}
+
+// GpuForwardMoEFFN runs the Mixture-of-Experts FFN entirely on GPU.
+// Router logits are downloaded for top-K selection, then expert projections
+// run on GPU using offset matmuls into packed weight tensors.
+func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig) error {
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nUsed := cfg.ExpertUsedCount
+
+	// Allocate MoE scratch buffers on first use
+	if rs.MoELogits == 0 {
+		rs.MoELogits = Alloc(uint64(cfg.ExpertCount * 4))
+		rs.MoEGate = Alloc(uint64(expDim * 4))
+		rs.MoEUp = Alloc(uint64(expDim * 4))
+		rs.MoEHidden = Alloc(uint64(expDim * 4))
+		rs.MoEExpertOut = Alloc(uint64(dim * 4))
+		shDim := cfg.SharedExpertFFNDim
+		if shDim == 0 {
+			shDim = expDim
+		}
+		rs.MoEShGate = Alloc(uint64(shDim * 4))
+		rs.MoEShUp = Alloc(uint64(shDim * 4))
+		rs.MoEShHidden = Alloc(uint64(shDim * 4))
+		rs.MoEShOut = Alloc(uint64(dim * 4))
+	}
+
+	// 1. Router: compute gated probabilities on GPU
+	Barrier()
+	MatVec(rs.MoELogits, gl.FFNRouter.Buf, rs.FFNNorm,
+		gl.FFNRouter.Rows, gl.FFNRouter.Cols, gl.FFNRouter.Type)
+	if gl.FFNRouterBias != 0 {
+		Barrier()
+		Add(rs.MoELogits, rs.MoELogits, gl.FFNRouterBias, cfg.ExpertCount)
+	}
+
+	// 2. Download router logits for top-K selection on CPU
+	Sync()
+	routerLogits := make([]float32, cfg.ExpertCount)
+	DownloadF32(rs.MoELogits, routerLogits)
+
+	// Apply gating function
+	if cfg.ExpertGatingFunc == 2 {
+		for i := range routerLogits {
+			x := routerLogits[i]
+			routerLogits[i] = 1.0 / (1.0 + float32(math.Exp(-float64(x))))
+		}
+	} else {
+		maxV := routerLogits[0]
+		for _, v := range routerLogits[1:] {
+			if v > maxV {
+				maxV = v
+			}
+		}
+		var sum float32
+		for i := range routerLogits {
+			routerLogits[i] = float32(math.Exp(float64(routerLogits[i] - maxV)))
+			sum += routerLogits[i]
+		}
+		for i := range routerLogits {
+			routerLogits[i] /= sum
+		}
+	}
+
+	// 3. Top-K selection
+	indices, weights := topKIndices(routerLogits, nUsed)
+
+	// Normalize weights
+	if cfg.ExpertWeightsNorm {
+		var wSum float32
+		for _, w := range weights {
+			wSum += w
+		}
+		if wSum < 1e-12 {
+			wSum = 1e-12
+		}
+		invSum := 1.0 / wSum
+		for i := range weights {
+			weights[i] *= invSum
+		}
+	}
+	if cfg.ExpertWeightsScale > 0 {
+		for i := range weights {
+			weights[i] *= cfg.ExpertWeightsScale
+		}
+	}
+
+	// 4. Run expert projections on GPU
+	gateBpr := quant.BytesForN(gl.FFNGateExps.Type, gl.FFNGateExps.Cols)
+	upBpr := quant.BytesForN(gl.FFNUpExps.Type, gl.FFNUpExps.Cols)
+	downBpr := quant.BytesForN(gl.FFNDownExps.Type, gl.FFNDownExps.Cols)
+
+	// Zero the FFN output
+	BeginBatch()
+	ZeroFill(rs.FFNOut, uint64(dim*4))
+
+	for e := 0; e < nUsed; e++ {
+		idx := indices[e]
+		if idx < 0 {
+			continue
+		}
+		w := weights[e]
+
+		// Gate projection: gate = GateExps[idx] @ input
+		gateOff := idx * expDim * gateBpr
+		Barrier()
+		MatVecOffset(rs.MoEGate, 0, gl.FFNGateExps.Buf, gateOff, rs.FFNNorm,
+			expDim, gl.FFNGateExps.Cols, gl.FFNGateExps.Type)
+
+		// Up projection: up = UpExps[idx] @ input
+		upOff := idx * expDim * upBpr
+		MatVecOffset(rs.MoEUp, 0, gl.FFNUpExps.Buf, upOff, rs.FFNNorm,
+			expDim, gl.FFNUpExps.Cols, gl.FFNUpExps.Type)
+
+		// SwiGLU
+		Barrier()
+		SwiGLU(rs.MoEHidden, rs.MoEGate, rs.MoEUp, expDim)
+
+		// Down projection: out = DownExps[idx] @ hidden
+		downOff := idx * dim * downBpr
+		Barrier()
+		MatVecOffset(rs.MoEExpertOut, 0, gl.FFNDownExps.Buf, downOff, rs.MoEHidden,
+			dim, gl.FFNDownExps.Cols, gl.FFNDownExps.Type)
+
+		// Weighted accumulate: FFNOut += w * expertOut
+		Barrier()
+		Scale(rs.MoEExpertOut, w, dim)
+		Barrier()
+		Add(rs.FFNOut, rs.FFNOut, rs.MoEExpertOut, dim)
+	}
+
+	// 5. Shared expert (if present)
+	if gl.FFNGateShared != nil {
+		Barrier()
+		MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
+			gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
+		MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
+			gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
+		Barrier()
+		shDim := gl.FFNGateShared.Rows
+		SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
+		Barrier()
+		MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
+			gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
+
+		if gl.FFNRouterShared != 0 {
+			// Shared expert gating: download input, compute gate on CPU, scale
+			Sync()
+			shInput := make([]float32, dim)
+			DownloadF32(rs.FFNNorm, shInput)
+			shGateW := make([]float32, dim)
+			DownloadF32(gl.FFNRouterShared, shGateW)
+			var dot float32
+			for i := 0; i < dim; i++ {
+				dot += shGateW[i] * shInput[i]
+			}
+			gate := float32(1.0 / (1.0 + math.Exp(-float64(dot))))
+			BeginBatch()
+			Scale(rs.MoEShOut, gate, dim)
+		}
+		Barrier()
+		Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
+	}
+
+	return nil
+}
+
+
+// topKIndices returns the indices and values of the top-K elements.
+func topKIndices(logits []float32, k int) ([]int, []float32) {
+	indices := make([]int, k)
+	weights := make([]float32, k)
+	for i := range indices {
+		indices[i] = -1
+	}
+	for i, v := range logits {
+		minIdx := 0
+		for j := 1; j < k; j++ {
+			if weights[j] < weights[minIdx] {
+				minIdx = j
+			}
+		}
+		if v > weights[minIdx] || indices[minIdx] < 0 {
+			indices[minIdx] = i
+			weights[minIdx] = v
+		}
+	}
+	return indices, weights
 }
 
 func gpuDualMatVec(out1 Buf, gpuW1 *GpuTensor, cpuW1 *core.QuantizedTensor, out2 Buf, gpuW2 *GpuTensor, cpuW2 *core.QuantizedTensor, xBuf Buf, rs *GpuRunState) error {

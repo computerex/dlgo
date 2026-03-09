@@ -95,7 +95,12 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		HeadScores: headScores,
 		Pool:       blas.DefaultPool(),
 	}
-	rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
+	if cfg.RopeScaleType == 2 && cfg.RopeScaleFactor > 0 {
+		rs.PrecomputeYaRNRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase,
+			cfg.RopeScaleFactor, cfg.RopeOrigMaxPos, cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow)
+	} else {
+		rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
+	}
 	rs.SetRopeNeox(cfg.RopeNeox)
 
 	if cfg.FullAttentionInterval > 0 {
@@ -330,6 +335,21 @@ func ForwardAttention(
 	kv.Layers[l].Store(pos, rs.K, rs.V)
 	seqLen := pos + 1
 
+	// Sliding window: limit attention span, preserving sink positions
+	startPos := 0
+	winSize := layer.Spec.SlidingWindow
+	hasSinks := layer.AttnSinks != nil && winSize > 0
+	sinkCount := 0
+	if hasSinks {
+		sinkCount = 1 // always attend to position 0 (initial token)
+	}
+	if winSize > 0 && seqLen > winSize {
+		startPos = seqLen - winSize
+		if startPos < sinkCount {
+			startPos = sinkCount
+		}
+	}
+
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 	ops.Clear(rs.AttnOut)
 
@@ -337,16 +357,45 @@ func ForwardAttention(
 		kvH := h / kvMul
 		qHead := rs.Q[h*headDim : (h+1)*headDim]
 		headOut := rs.AttnOut[h*headDim : (h+1)*headDim]
-		scores := rs.HeadScores[h][:seqLen]
 
-		for t := 0; t < seqLen; t++ {
+		// Count total positions: sink positions + window positions
+		windowLen := seqLen - startPos
+		totalLen := windowLen
+		if hasSinks && startPos > sinkCount {
+			totalLen += sinkCount
+		}
+		scores := rs.HeadScores[h][:totalLen]
+
+		idx := 0
+		// Score sink positions first (position 0)
+		if hasSinks && startPos > sinkCount {
+			for s := 0; s < sinkCount; s++ {
+				kHead := kv.Layers[l].Keys[s][kvH*headDim : (kvH+1)*headDim]
+				scores[idx] = ops.DotProduct(qHead, kHead, headDim)*scale + layer.AttnSinks[kvH]
+				idx++
+			}
+		}
+		// Score window positions
+		for t := startPos; t < seqLen; t++ {
 			kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
-			scores[t] = ops.DotProduct(qHead, kHead, headDim) * scale
+			scores[idx] = ops.DotProduct(qHead, kHead, headDim) * scale
+			idx++
 		}
 		quant.SIMDSoftmax(scores)
-		for t := 0; t < seqLen; t++ {
+
+		// Accumulate weighted values
+		idx = 0
+		if hasSinks && startPos > sinkCount {
+			for s := 0; s < sinkCount; s++ {
+				vHead := kv.Layers[l].Vals[s][kvH*headDim : (kvH+1)*headDim]
+				ops.AddScaled(headOut, scores[idx], vHead, headDim)
+				idx++
+			}
+		}
+		for t := startPos; t < seqLen; t++ {
 			vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
-			ops.AddScaled(headOut, scores[t], vHead, headDim)
+			ops.AddScaled(headOut, scores[idx], vHead, headDim)
+			idx++
 		}
 	})
 

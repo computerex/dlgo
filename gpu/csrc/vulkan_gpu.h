@@ -39,6 +39,7 @@ extern "C" {
 #define QTYPE_IQ3_XXS 18
 #define QTYPE_IQ2_S   22
 #define QTYPE_IQ3_S   21
+#define QTYPE_IQ4_XS  23
 #define QTYPE_IQ1_M   29
 #define QTYPE_TQ1_0   34
 
@@ -95,6 +96,7 @@ typedef enum {
     PIPE_MATVEC_IQ2_S,
     PIPE_MATVEC_IQ3_XXS,
     PIPE_MATVEC_IQ3_S,
+    PIPE_MATVEC_IQ4_XS,
     PIPE_COUNT
 } PipelineID;
 
@@ -121,6 +123,9 @@ int gpu_download(void* dst, GpuBuf src, uint64_t size_bytes, uint64_t offset);
 // out_buf: output vector on GPU (float32)
 int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                int rows, int cols, int qtype);
+int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
+                      GpuBuf weights_buf, int weights_offset_bytes,
+                      GpuBuf x_buf, int rows, int cols, int qtype);
 
 // Batch matrix-vector: out[p*rows+r] = dot(W[r,:], x[p*cols...]) for each position p
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,

@@ -98,13 +98,22 @@ type GpuLayer struct {
 	FFNDownBias  Buf
 	PostFFNNorm  Buf
 
-	// MoE shared expert weights (Q8_0, GPU-supported)
+	// MoE expert weights (packed, GPU-supported)
+	FFNRouter     *GpuTensor // [expertCount × dim] router/gating network
+	FFNRouterBias Buf        // [expertCount] optional bias
+	FFNGateExps   *GpuTensor // [expertCount*expertFFNDim × dim] packed gate
+	FFNUpExps     *GpuTensor // [expertCount*expertFFNDim × dim] packed up
+	FFNDownExps   *GpuTensor // [expertCount*dim × expertFFNDim] packed down
+	// MoE shared expert weights
 	FFNGateShared *GpuTensor // [sharedFFNDim × dim]
 	FFNUpShared   *GpuTensor // [sharedFFNDim × dim]
 	FFNDownShared *GpuTensor // [dim × sharedFFNDim]
+	FFNRouterShared Buf      // [dim] shared expert gate (float32)
 	IsMoE         bool
+	MoEOnGPU      bool       // true if expert weights are on GPU
 
-	OnGPU bool // true if this layer's weights are on GPU
+	OnGPU   bool // true if this layer's weights are on GPU
+	CPUAttn bool // true if attention matmuls need CPU fallback (unsupported qtype)
 
 	// SSM (Gated Delta Net) weights and per-layer state on GPU
 	SSMInProj  *GpuTensor // [qkvDim × dim]
@@ -157,6 +166,17 @@ type GpuRunState struct {
 	// GatedQ attention scratch buffers
 	QFull Buf // [2*qDim] fused Q+gate output
 	QGate Buf // [qDim] attention gate values
+
+	// MoE scratch buffers (allocated on first use)
+	MoELogits   Buf // [expertCount] router logits
+	MoEGate     Buf // [expertFFNDim] expert gate projection
+	MoEUp       Buf // [expertFFNDim] expert up projection
+	MoEHidden   Buf // [expertFFNDim] SwiGLU hidden
+	MoEExpertOut Buf // [dim] per-expert output
+	MoEShGate   Buf // [sharedFFNDim] shared expert gate
+	MoEShUp     Buf // [sharedFFNDim] shared expert up
+	MoEShHidden Buf // [sharedFFNDim] shared expert hidden
+	MoEShOut    Buf // [dim] shared expert output
 
 	// CPU scratch buffers used for correctness fallbacks when a quant type
 	// has no GPU kernel yet (for example Q3_K on Vulkan).

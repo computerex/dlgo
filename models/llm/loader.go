@@ -144,6 +144,19 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 	s.GatedQ = l.Wq != nil && l.Wq.Rows > cfg.NumHeads*cfg.HeadDim
 	s.QKNorm = l.AttnQNorm != nil
 
+	// Sliding window attention: apply to alternating layers if pattern is set
+	if cfg.SlidingWindow > 0 && s.Core == CoreAttention {
+		if cfg.SlidingWindowPattern <= 0 {
+			// All attention layers use sliding window
+			s.SlidingWindow = cfg.SlidingWindow
+		} else {
+			// Pattern: every Nth layer is full attention, others use sliding window
+			if ((layerIdx + 1) % cfg.SlidingWindowPattern) != 0 {
+				s.SlidingWindow = cfg.SlidingWindow
+			}
+		}
+	}
+
 	return s
 }
 
@@ -243,7 +256,8 @@ func isNormOrBias(name string) bool {
 		strings.HasSuffix(name, "_norm.bias") ||
 		strings.HasSuffix(name, "ssm_a") ||
 		strings.HasSuffix(name, "ssm_conv1d.weight") ||
-		strings.HasSuffix(name, "ffn_gate_inp_shexp.weight")
+		strings.HasSuffix(name, "ffn_gate_inp_shexp.weight") ||
+		strings.HasSuffix(name, "attn_sinks.weight")
 }
 
 func dequantToF32(data []byte, ggmlType uint32, n int) []float32 {
@@ -311,6 +325,8 @@ func mapTensorF32(m *Model, name string, data []float32) {
 			l.FFNRouterShared = data
 		case "exp_probs_b.bias":
 			l.FFNRouterBias = data
+		case "attn_sinks.weight":
+			l.AttnSinks = data
 		}
 		}
 	}
@@ -358,6 +374,8 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 			l.SSMAlpha = qt
 		case "ssm_beta.weight":
 			l.SSMBeta = qt
+		case "ssm_ba.weight":
+			splitFusedSSMBA(l, qt)
 		case "ssm_out.weight":
 			l.SSMOut = qt
 		// MoE tensors
@@ -375,6 +393,8 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 			l.FFNUpShared = qt
 		case "ffn_down_shexp.weight":
 			l.FFNDownShared = qt
+		case "ffn_gate_inp.bias":
+			l.FFNRouterBias = dequantToF32(qt.Data, qt.Type, qt.Rows)
 		}
 	}
 	}
@@ -407,6 +427,15 @@ func splitFusedQKV(l *Layer, qt *core.QuantizedTensor, qDim, kvDim, cols int) {
 	} else {
 		l.SSMInProj = qt
 	}
+}
+
+// splitFusedSSMBA splits a fused [beta|alpha] weight tensor into separate SSMBeta and SSMAlpha.
+func splitFusedSSMBA(l *Layer, qt *core.QuantizedTensor) {
+	half := qt.Rows / 2
+	bytesPerRow := quant.BytesForN(qt.Type, qt.Cols)
+	halfBytes := half * bytesPerRow
+	l.SSMBeta = &core.QuantizedTensor{Data: qt.Data[:halfBytes], Type: qt.Type, Rows: half, Cols: qt.Cols}
+	l.SSMAlpha = &core.QuantizedTensor{Data: qt.Data[halfBytes : 2*halfBytes], Type: qt.Type, Rows: half, Cols: qt.Cols}
 }
 
 // splitFusedFFNUp splits a fused [gate|up] weight tensor if it has 2x expected rows.

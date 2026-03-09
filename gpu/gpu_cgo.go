@@ -141,6 +141,18 @@ func MatVec(out, weights, x Buf, rows, cols int, qtype uint32) error {
 	return nil
 }
 
+// MatVecOffset performs matrix-vector multiply with byte offsets into the output and weight buffers.
+// Used for MoE expert projections from packed expert tensors.
+func MatVecOffset(out Buf, outOffBytes int, weights Buf, weightsOffBytes int, x Buf, rows, cols int, qtype uint32) error {
+	rc := C.gpu_matvec_offset(C.GpuBuf(out), C.int(outOffBytes),
+		C.GpuBuf(weights), C.int(weightsOffBytes),
+		C.GpuBuf(x), C.int(rows), C.int(cols), C.int(qtype))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: matvec_offset failed (%d)", rc)
+	}
+	return nil
+}
+
 // RMSNorm performs RMS normalization on GPU.
 func RMSNorm(out, x, weight Buf, n int, eps float32) error {
 	rc := C.gpu_rmsnorm(C.GpuBuf(out), C.GpuBuf(x), C.GpuBuf(weight), C.int(n), C.float(eps))

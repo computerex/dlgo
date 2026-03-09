@@ -40,7 +40,8 @@ $shaders = @(
     @{name="matvec_iq2_xxs"; file="matvec_iq2_xxs.comp"},
     @{name="matvec_iq2_s"; file="matvec_iq2_s.comp"},
     @{name="matvec_iq3_xxs"; file="matvec_iq3_xxs.comp"},
-    @{name="matvec_iq3_s"; file="matvec_iq3_s.comp"}
+    @{name="matvec_iq3_s"; file="matvec_iq3_s.comp"},
+    @{name="matvec_iq4_xs"; file="matvec_iq4_xs.comp"}
 )
 
 $header = @"
@@ -136,6 +137,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_iq2_s",   spv_matvec_iq2_s,   spv_matvec_iq2_s_size,   4, 8},   // PIPE_MATVEC_IQ2_S
     {"matvec_iq3_xxs", spv_matvec_iq3_xxs, spv_matvec_iq3_xxs_size, 4, 8},   // PIPE_MATVEC_IQ3_XXS
     {"matvec_iq3_s",   spv_matvec_iq3_s,   spv_matvec_iq3_s_size,   4, 8},   // PIPE_MATVEC_IQ3_S
+    {"matvec_iq4_xs",  spv_matvec_iq4_xs,  spv_matvec_iq4_xs_size,  3, 8},   // PIPE_MATVEC_IQ4_XS
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

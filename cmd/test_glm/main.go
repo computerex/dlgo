@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/computerex/dlgo/gpu"
+	"github.com/computerex/dlgo/memory"
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/ops"
 )
@@ -55,19 +56,32 @@ func main() {
 		cfg.Architecture, cfg.NumLayers, cfg.EmbeddingDim, cfg.NumHeads, cfg.VocabSize)
 	fmt.Printf("HeadDim=%d NumKVHeads=%d FFNDim=%d\n", cfg.HeadDim, cfg.NumKVHeads, cfg.FFNDim)
 	fmt.Printf("RopeNeox=%v RopeFreqBase=%f RopeDim=%d\n", cfg.RopeNeox, cfg.RopeFreqBase, cfg.RopeDim)
+	if cfg.RopeScaleType > 0 {
+		fmt.Printf("RoPE scaling: type=%d factor=%.1f origMaxPos=%d betaFast=%.1f betaSlow=%.1f\n",
+			cfg.RopeScaleType, cfg.RopeScaleFactor, cfg.RopeOrigMaxPos,
+			cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow)
+	}
+	if cfg.SlidingWindow > 0 {
+		fmt.Printf("SlidingWindow=%d Pattern=%d\n", cfg.SlidingWindow, cfg.SlidingWindowPattern)
+	}
 	if cfg.ExpertCount > 0 {
-		fmt.Printf("MoE: %d experts, %d active, ExpertFFNDim=%d SharedExpertFFNDim=%d\n",
-			cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNDim, cfg.SharedExpertFFNDim)
+		fmt.Printf("MoE: %d experts, %d active, ExpertFFNDim=%d SharedExpertFFNDim=%d GatingFunc=%d WeightsNorm=%v Scale=%.2f\n",
+			cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNDim, cfg.SharedExpertFFNDim,
+			cfg.ExpertGatingFunc, cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale)
 	}
 	if cfg.QLORARank > 0 {
 		fmt.Printf("MLA: qLORARank=%d kvLORARank=%d qkNope=%d qkRope=%d vHeadDim=%d\n",
 			cfg.QLORARank, cfg.KVLORARank, cfg.QKNopeDim, cfg.QKRopeDim, cfg.VHeadDim)
 	}
 
+	fmt.Printf("BOS=%d EOS=%d AddBOS=%v\n", cfg.BOS, cfg.EOS, cfg.AddBOS)
+	// gpt-oss harmony template starts with <|start|>, no BOS needed
+	if cfg.ChatTemplate == "harmony" {
+		pipe.Tokenizer.AddBOS = false
+	}
 	prompt := llm.FormatChat(cfg, "", "What is 2+2?")
 	fmt.Printf("Prompt: %q\n", prompt)
 
-	// Try GPU first, fall back to CPU
 	var useGPU bool
 	var gpuPipe *gpu.GpuPipeline
 	if !cpuOnly {
@@ -86,7 +100,15 @@ func main() {
 	maxTokens := 100
 
 	if useGPU {
-		fmt.Println("\n=== CPU vs GPU Logits Comparison ===")
+		skipCPU := false
+		for _, a := range os.Args[2:] {
+			if a == "--skip-cpu" {
+				skipCPU = true
+			}
+		}
+
+		if !skipCPU {
+		fmt.Println("\n=== CPU vs GPU Per-Token Logits Comparison ===")
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -94,17 +116,76 @@ func main() {
 				}
 			}()
 			tokens := pipe.Tokenizer.Encode(prompt)
+
+			// CPU forward
 			rs := pipe.RunState
 			pipe.KVCache.Reset()
+			cpuTops := make([]int, len(tokens))
+			cpuNorms := make([]float32, len(tokens))
 			var cpuLogits []float32
 			for i, t := range tokens {
 				cpuLogits = llm.Forward(pipe.Model, t, i, pipe.KVCache, rs)
+				cpuTops[i] = argmax(cpuLogits)
+				cpuNorms[i] = l2norm(cpuLogits)
 			}
-			cpuTop := argmax(cpuLogits)
-			fmt.Printf("CPU top token: %d (%q) logit=%.4f norm=%.4f\n",
-				cpuTop, pipe.Tokenizer.DecodeToken(int32(cpuTop)),
-				cpuLogits[cpuTop], l2norm(cpuLogits))
+			fmt.Printf("CPU final top: %d (%q) logit=%.4f norm=%.4f\n",
+				cpuTops[len(tokens)-1], pipe.Tokenizer.DecodeToken(int32(cpuTops[len(tokens)-1])),
+				cpuLogits[cpuTops[len(tokens)-1]], cpuNorms[len(tokens)-1])
+
+			// Verify per-layer ForwardRange matches full forward
+			{
+				m := pipe.Model
+				cfg := m.Config
+				cpuRS2 := llm.NewRunState(cfg, pipe.MaxSeqLen)
+				kvDim := cfg.NumKVHeads * cfg.HeadDim
+				cpuKV2 := memory.NewMultiLayerKVCache(cfg.NumLayers, pipe.MaxSeqLen, kvDim)
+				for l := 0; l < cfg.NumLayers; l++ {
+					llm.ForwardRange(m, tokens[0], 0, l, l+1, cpuKV2, cpuRS2)
+				}
+				perLayerTop := argmax(cpuRS2.Logits)
+				fullTop := cpuTops[0]
+				fmt.Printf("Per-layer ForwardRange top=%d, Full forward top=%d, match=%v\n",
+					perLayerTop, fullTop, perLayerTop == fullTop)
+			}
+
+			// GPU forward per-token comparison
+			gpuPipe.KVCache.Reset()
+			if gpuPipe.CPUKVCache != nil {
+				gpuPipe.CPUKVCache.Reset()
+			}
+			gpuLogits := make([]float32, pipe.Model.Config.VocabSize)
+			divergeAt := -1
+			for i, t := range tokens {
+				if gpuPipe.IsPartialGPU {
+					gpu.GpuForwardPartial(pipe.Model, gpuPipe.GpuModel, t, i,
+						gpuPipe.KVCache, gpuPipe.RunState, gpuLogits, gpuPipe.LayerConfs, gpuPipe)
+				} else if err := gpu.GpuForward(pipe.Model, gpuPipe.GpuModel, t, i,
+					gpuPipe.KVCache, gpuPipe.RunState, gpuLogits, gpuPipe); err != nil {
+					fmt.Printf("  GpuForward error at pos %d: %v\n", i, err)
+					break
+				}
+				gpuTop := argmax(gpuLogits)
+				if gpuTop != cpuTops[i] && divergeAt < 0 {
+					divergeAt = i
+				}
+				if i < 3 || i == len(tokens)-1 || (divergeAt >= 0 && i == divergeAt) {
+					fmt.Printf("  pos %2d tok=%5d: CPU top=%5d norm=%.2f | GPU top=%5d norm=%.2f %s\n",
+						i, t, cpuTops[i], cpuNorms[i], gpuTop, l2norm(gpuLogits),
+						func() string {
+							if gpuTop != cpuTops[i] {
+								return " ** DIVERGE **"
+							}
+							return ""
+						}())
+				}
+			}
+			if divergeAt >= 0 {
+				fmt.Printf("GPU diverges from CPU at position %d\n", divergeAt)
+			} else {
+				fmt.Println("GPU matches CPU for all prompt tokens!")
+			}
 		}()
+		}
 
 		// Run GPU prefill (resets KV cache internally)
 		fmt.Printf("\n=== GPU Inference (%d max tokens) ===\n", maxTokens)

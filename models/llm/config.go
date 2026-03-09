@@ -22,6 +22,13 @@ type ModelConfig struct {
 	RopeFreqBase  float32
 	RopeNeox      bool
 	RopeDim       int      // partial RoPE: 0 = full headDim, else only first RopeDim dims
+	RopeScaleType int      // 0=none, 1=linear, 2=yarn
+	RopeScaleFactor    float32 // scaling factor for extended context
+	RopeOrigMaxPos     int     // original max position embeddings (for YaRN)
+	RopeYaRNBetaFast   float32 // YaRN beta_fast (default 32)
+	RopeYaRNBetaSlow   float32 // YaRN beta_slow (default 1)
+	SlidingWindow      int     // sliding window attention size (0 = disabled)
+	SlidingWindowPattern int   // 0=all layers, N=alternating (every Nth layer is full)
 	BOS           int32
 	EOS           int32
 	StopTokens    []int32
@@ -91,8 +98,15 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		NumKVHeads:    metaInt(md, arch+".attention.head_count_kv", 0),
 		HeadDim:       metaInt(md, arch+".attention.key_length", 0),
 		RMSNormEps:    normEps,
-		RopeFreqBase:  metaFloat(md, arch+".rope.freq_base", 10000.0),
-		BOS:           int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
+		RopeFreqBase:       metaFloat(md, arch+".rope.freq_base", 10000.0),
+		RopeScaleType:      parseRopeScaleType(md, arch),
+		RopeScaleFactor:    metaFloat(md, arch+".rope.scaling.factor", 0),
+		RopeOrigMaxPos:     metaInt(md, arch+".rope.scaling.original_context_length", 0),
+		RopeYaRNBetaFast:   metaFloat(md, arch+".rope.scaling.yarn.beta_fast", 32.0),
+		RopeYaRNBetaSlow:   metaFloat(md, arch+".rope.scaling.yarn.beta_slow", 1.0),
+		SlidingWindow:      metaInt(md, arch+".attention.sliding_window", 0),
+		SlidingWindowPattern: metaInt(md, arch+".attention.sliding_window_pattern", 0),
+		BOS:                int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
 		EOS:           int32(metaInt(md, "tokenizer.ggml.eos_token_id", 2)),
 		AddBOS:        metaBool(md, "tokenizer.ggml.add_bos_token", true),
 
@@ -163,6 +177,31 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 
 func sqrt32(x float32) float32 {
 	return float32(math.Sqrt(float64(x)))
+}
+
+// parseRopeScaleType detects the RoPE scaling type from GGUF metadata.
+// Returns 0=none, 1=linear, 2=yarn.
+func parseRopeScaleType(md map[string]interface{}, arch string) int {
+	// Try string key (GGUF standard)
+	s := metaString(md, arch+".rope.scaling.type")
+	switch strings.ToLower(s) {
+	case "linear":
+		return 1
+	case "yarn":
+		return 2
+	}
+	// Try int key (some converters)
+	v := metaInt(md, arch+".rope.scaling.type", 0)
+	if v > 0 {
+		return v
+	}
+	// Auto-detect: if factor > 0 and original_context_length > 0, assume yarn
+	factor := metaFloat(md, arch+".rope.scaling.factor", 0)
+	origCtx := metaInt(md, arch+".rope.scaling.original_context_length", 0)
+	if factor > 1.0 && origCtx > 0 {
+		return 2
+	}
+	return 0
 }
 
 // metaString extracts a string from GGUF metadata.

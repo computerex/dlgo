@@ -78,6 +78,58 @@ func ApplyRoPEFromTable(vec []float32, pos int, headDim int, cosTable, sinTable 
 	}
 }
 
+// YaRNRoPEFrequencyTable precomputes cos/sin tables with YaRN scaling.
+// Matches the llama.cpp implementation exactly: dimensions below corrDims[0] keep
+// original frequencies, dimensions above corrDims[1] are fully interpolated by factor,
+// and dimensions in between smoothly blend. An mscale factor compensates for
+// reduced effective resolution.
+func YaRNRoPEFrequencyTable(maxLen, headDim int, freqBase float32,
+	factor float32, origMaxPos int, betaFast, betaSlow float32) (cosTable, sinTable []float32) {
+
+	half := headDim / 2
+	cosTable = make([]float32, maxLen*half)
+	sinTable = make([]float32, maxLen*half)
+
+	freqScale := 1.0 / float64(factor)
+
+	// Compute correction dimension range (matches ggml_rope_yarn_corr_dims)
+	corrDim0 := yarnCorrDim(headDim, origMaxPos, betaFast, freqBase)
+	corrDim1 := yarnCorrDim(headDim, origMaxPos, betaSlow, freqBase)
+	corrStart := math.Max(0, math.Floor(corrDim0))
+	corrEnd := math.Min(float64(half-1), math.Ceil(corrDim1))
+
+	// mscale: magnitude scaling to compensate for interpolation (matches llama.cpp)
+	mscale := 1.0 + 0.1*math.Log(float64(factor))
+
+	thetaScale := math.Pow(float64(freqBase), -2.0/float64(headDim))
+
+	for pos := 0; pos < maxLen; pos++ {
+		theta := float64(pos)
+		for i := 0; i < half; i++ {
+			thetaExtrap := theta
+			thetaInterp := freqScale * thetaExtrap
+
+			// YaRN ramp: 1 at low dims (keep original), 0 at high dims (interpolate)
+			y := (float64(i) - corrStart) / math.Max(0.001, corrEnd-corrStart)
+			ramp := 1.0 - math.Min(1, math.Max(0, y))
+
+			finalTheta := thetaInterp*(1-ramp) + thetaExtrap*ramp
+
+			cosTable[pos*half+i] = float32(math.Cos(finalTheta) * mscale)
+			sinTable[pos*half+i] = float32(math.Sin(finalTheta) * mscale)
+
+			theta *= thetaScale
+		}
+	}
+	return
+}
+
+// yarnCorrDim computes the correction dimension for YaRN RoPE.
+// Matches ggml_rope_yarn_corr_dim in llama.cpp.
+func yarnCorrDim(nDims, nCtxOrig int, nRot, freqBase float32) float64 {
+	return float64(nDims) * math.Log(float64(nCtxOrig)/(float64(nRot)*2*math.Pi)) / (2 * math.Log(float64(freqBase)))
+}
+
 // ApplyRoPEBatch applies RoPE to all Q and K heads at a given position.
 //   qFlat: [numHeads * headDim]   — all Q heads concatenated
 //   kFlat: [numKVHeads * headDim] — all K heads concatenated

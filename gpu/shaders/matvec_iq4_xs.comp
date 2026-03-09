@@ -1,0 +1,94 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+// IQ4_XS super-block: 136 bytes for 256 values
+// Layout: d:f16(2) + scales_h:u16(2) + scales_l[4](4) + qs[128](128)
+struct block_iq4_xs {
+    float16_t d;          // 2 bytes
+    uint8_t scales_h[2];  // 2 bytes (uint16 LE)
+    uint8_t scales_l[4];  // 4 bytes
+    uint8_t qs[128];      // 128 bytes
+};
+
+layout(binding = 0, scalar) buffer Out     { float out_data[]; };
+layout(binding = 1, scalar) buffer Weights { block_iq4_xs blocks[]; };
+layout(binding = 2, scalar) buffer X       { float x_data[];  };
+
+const int kvalues[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+);
+
+shared float shared_sums[128];
+
+void main() {
+    const uint row_pair = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint num_sb = uint(cols) / 256u;
+
+    for (uint n = 0u; n < 2u; n++) {
+        uint row = row_pair * 2u + n;
+        if (row >= uint(rows)) {
+            if (n == 0u) out_data[row] = 0.0;
+            continue;
+        }
+
+        float acc = 0.0;
+
+        for (uint b = tid / 32u; b < num_sb; b += 4u) {
+            uint bi = row * num_sb + b;
+            float d = float(blocks[bi].d);
+            uint lane = tid & 31u;
+
+            uint scales_h_val = uint(blocks[bi].scales_h[0]) | (uint(blocks[bi].scales_h[1]) << 8u);
+
+            uint ib32 = lane / 4u;  // sub-block index 0..7
+            uint il = lane & 3u;    // position within sub-block 0..3
+
+            // Reconstruct 6-bit scale for this sub-block
+            uint lo = (uint(blocks[bi].scales_l[ib32 / 2u]) >> (4u * (ib32 & 1u))) & 0xFu;
+            uint hi = ((scales_h_val >> (2u * ib32)) & 3u) << 4u;
+            float dl = d * float(int(lo | hi) - 32);
+
+            // Each thread processes 8 values (4 bytes of qs = 8 nibbles)
+            // Low nibbles of bytes 0-15 → values 0-15, high nibbles → values 16-31
+            uint qs_off = ib32 * 16u + il * 4u;
+            uint x_base = b * 256u + ib32 * 32u;
+
+            float sum = 0.0;
+            for (uint j = 0u; j < 4u; j++) {
+                uint qbyte = uint(blocks[bi].qs[qs_off + j]);
+                float v_lo = dl * float(kvalues[qbyte & 0xFu]);
+                float v_hi = dl * float(kvalues[qbyte >> 4u]);
+                sum += v_lo * x_data[x_base + il * 4u + j] + v_hi * x_data[x_base + 16u + il * 4u + j];
+            }
+
+            acc += sum;
+        }
+
+        acc = subgroupAdd(acc);
+
+        if ((tid & 31u) == 0u) {
+            shared_sums[tid / 32u] = acc;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += shared_sums[i];
+            }
+            out_data[row] = total;
+        }
+        barrier();
+    }
+}

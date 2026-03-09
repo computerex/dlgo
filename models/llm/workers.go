@@ -4,6 +4,8 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+
+	"github.com/computerex/dlgo/ops"
 )
 
 // WorkerPool manages persistent goroutines for parallel inference.
@@ -168,6 +170,26 @@ func (rs *RunState) PrecomputeRoPE(maxSeqLen, ropeDim, headDim int, freqBase flo
 			rs.ropeSin[pos*half+i] = float32(math.Sin(angle))
 		}
 	}
+}
+
+// PrecomputeYaRNRoPE precomputes RoPE tables with YaRN extended-context scaling.
+func (rs *RunState) PrecomputeYaRNRoPE(maxSeqLen, ropeDim, headDim int,
+	freqBase, factor float32, origMaxPos int, betaFast, betaSlow float32) {
+	if maxSeqLen <= 0 || headDim <= 0 {
+		return
+	}
+	if ropeDim <= 0 || ropeDim > headDim {
+		ropeDim = headDim
+	}
+	half := ropeDim / 2
+	if half <= 0 {
+		return
+	}
+	rs.ropeHeadDim = headDim
+	rs.ropeDim = ropeDim
+	rs.ropeNeox = false
+	rs.ropeCos, rs.ropeSin = ops.YaRNRoPEFrequencyTable(maxSeqLen, ropeDim, freqBase,
+		factor, origMaxPos, betaFast, betaSlow)
 }
 
 // SetRopeNeox sets whether to use NeoX-style (split-half) RoPE pairing.

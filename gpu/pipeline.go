@@ -44,6 +44,8 @@ type GpuPipeline struct {
 	CPURunState  *llm.RunState
 	CPUKVCache   *memory.MultiLayerKVCache // KV cache for CPU layers
 	CPUBatchState *llm.BatchState           // batch state for CPU prefill
+
+	AllCPUAttn bool // true if ALL GPU layers use CPU attention fallback
 }
 
 // estimateFixedVRAM estimates GPU memory for non-per-layer allocations
@@ -73,6 +75,16 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 		keyDim := numKVGroups * headKDim
 		qkvDim := keyDim*2 + numHeads*headVDim
 		total += (qkvDim + numHeads*headVDim + numHeads + numHeads + numHeads*headVDim) * 4
+	}
+
+	// MoE scratch buffers (shared, not per-layer)
+	if cfg.ExpertCount > 0 {
+		expDim := int64(cfg.ExpertFFNDim)
+		shDim := int64(cfg.SharedExpertFFNDim)
+		if shDim == 0 {
+			shDim = expDim
+		}
+		total += (int64(cfg.ExpertCount) + 3*expDim + 2*dim + 3*shDim) * 4
 	}
 
 	// Batch state (estimate for 128 tokens)
@@ -243,6 +255,10 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			}
 		}
 
+		if cl.Wq != nil && !supportsGPUQType(cl.Wq.Type) {
+			gl.CPUAttn = true
+		}
+
 		if cl.Bq != nil {
 			gl.Bq, _ = UploadF32Slice(cl.Bq)
 		}
@@ -270,6 +286,38 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 
 		if cl.Spec.FFN == llm.FFNMoE {
 			gl.IsMoE = true
+			// Try to upload packed expert weights to GPU
+			moeUploaded := true
+			if cl.FFNRouter != nil {
+				gl.FFNRouter, err = UploadTensor(cl.FFNRouter)
+				if err != nil {
+					moeUploaded = false
+				}
+			}
+			if cl.FFNRouterBias != nil {
+				gl.FFNRouterBias, _ = UploadF32Slice(cl.FFNRouterBias)
+			}
+			if moeUploaded && cl.FFNGateExps != nil && supportsGPUQType(cl.FFNGateExps.Type) {
+				gl.FFNGateExps, err = UploadTensor(cl.FFNGateExps)
+				if err != nil {
+					moeUploaded = false
+				}
+			} else {
+				moeUploaded = false
+			}
+			if moeUploaded && cl.FFNUpExps != nil {
+				gl.FFNUpExps, err = UploadTensor(cl.FFNUpExps)
+				if err != nil {
+					moeUploaded = false
+				}
+			}
+			if moeUploaded && cl.FFNDownExps != nil {
+				gl.FFNDownExps, err = UploadTensor(cl.FFNDownExps)
+				if err != nil {
+					moeUploaded = false
+				}
+			}
+			gl.MoEOnGPU = moeUploaded
 			if cl.FFNGateShared != nil {
 				gl.FFNGateShared, _ = UploadTensor(cl.FFNGateShared)
 			}
@@ -278,6 +326,9 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			}
 			if cl.FFNDownShared != nil {
 				gl.FFNDownShared, _ = UploadTensor(cl.FFNDownShared)
+			}
+			if cl.FFNRouterShared != nil {
+				gl.FFNRouterShared, _ = UploadF32Slice(cl.FFNRouterShared)
 			}
 		} else {
 			gl.FFNGate, _ = UploadTensor(cl.FFNGate)
@@ -431,8 +482,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		IsPartialGPU:    isPartial,
 	}
 
-	// Only use fused forward when ALL layers are on GPU
-	if !isPartial {
+	// Only use fused forward when ALL layers are on GPU and model has no MoE
+	if !isPartial && cfg.ExpertCount == 0 {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 
@@ -491,8 +542,37 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 	}
 
-	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, or hybrid SSM)
-	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA
+	// Check if any layer needs CPU attention fallback
+	hasCPUAttn := false
+	cpuAttnCount := 0
+	for l := 0; l < numGPULayers; l++ {
+		if gm.Layers[l].CPUAttn {
+			hasCPUAttn = true
+			cpuAttnCount++
+		}
+	}
+	if hasCPUAttn {
+		fmt.Printf("[dlgo/gpu] CPU attention fallback: %d/%d layers need it\n", cpuAttnCount, numGPULayers)
+		printedCPU := false
+		for l := 0; l < numGPULayers; l++ {
+			wqType := uint32(0)
+			if m.Layers[l].Wq != nil {
+				wqType = m.Layers[l].Wq.Type
+			}
+			if !gm.Layers[l].CPUAttn {
+				fmt.Printf("[dlgo/gpu]   Layer %d: GPU attention (Wq type=%d)\n", l, wqType)
+			} else if !printedCPU {
+				fmt.Printf("[dlgo/gpu]   Layer %d: CPU attention (Wq type=%d)\n", l, wqType)
+				printedCPU = true
+			}
+		}
+		if cpuAttnCount == numGPULayers {
+			pipe.AllCPUAttn = true
+		}
+	}
+
+	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM)
+	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn
 	if needCPUState {
 		pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
 
@@ -501,20 +581,31 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
 		}
 
-		// MLA needs a CPU KV cache for the compressed KV representations
-		if pipe.HasMLA && pipe.CPUKVCache == nil {
+		// MLA or CPU attention needs a CPU KV cache
+		if (pipe.HasMLA || hasCPUAttn) && pipe.CPUKVCache == nil {
 			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
-			fmt.Printf("[dlgo/gpu] MLA: allocated CPU KV cache (%d layers, kvDim=%d)\n", cfg.NumLayers, kvDim)
+			if hasCPUAttn {
+				fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
+			}
 		}
 
 		if cfg.ExpertCount > 0 {
 			moeLayerCount := 0
+			gpuMoECount := 0
 			for l := 0; l < cfg.NumLayers; l++ {
 				if m.Layers[l].Spec.FFN == llm.FFNMoE {
 					moeLayerCount++
+					if l < numGPULayers && gm.Layers[l].MoEOnGPU {
+						gpuMoECount++
+					}
 				}
 			}
-			fmt.Printf("[dlgo/gpu] Hybrid MoE: %d MoE layers (expert FFN on CPU)\n", moeLayerCount)
+			if gpuMoECount > 0 {
+				fmt.Printf("[dlgo/gpu] MoE: %d/%d MoE layers on GPU, %d on CPU\n",
+					gpuMoECount, moeLayerCount, moeLayerCount-gpuMoECount)
+			} else {
+				fmt.Printf("[dlgo/gpu] Hybrid MoE: %d MoE layers (expert FFN on CPU)\n", moeLayerCount)
+			}
 		}
 	}
 
