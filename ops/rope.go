@@ -79,12 +79,13 @@ func ApplyRoPEFromTable(vec []float32, pos int, headDim int, cosTable, sinTable 
 }
 
 // YaRNRoPEFrequencyTable precomputes cos/sin tables with YaRN scaling.
-// Matches the llama.cpp implementation exactly: dimensions below corrDims[0] keep
-// original frequencies, dimensions above corrDims[1] are fully interpolated by factor,
-// and dimensions in between smoothly blend. An mscale factor compensates for
-// reduced effective resolution.
+// Matches llama.cpp rope_yarn exactly:
+//   - extFactor controls the ramp blend (0=pure interpolation, 1=full YaRN blend)
+//   - attnFactor is the base magnitude scaling (multiplied with log correction)
+//   - Dimensions below corrDims[0] keep original frequencies, above corrDims[1]
+//     are fully interpolated, in between smoothly blends via ramp * extFactor.
 func YaRNRoPEFrequencyTable(maxLen, headDim int, freqBase float32,
-	factor float32, origMaxPos int, betaFast, betaSlow float32) (cosTable, sinTable []float32) {
+	factor float32, origMaxPos int, betaFast, betaSlow, extFactor, attnFactor float32) (cosTable, sinTable []float32) {
 
 	half := headDim / 2
 	cosTable = make([]float32, maxLen*half)
@@ -92,14 +93,16 @@ func YaRNRoPEFrequencyTable(maxLen, headDim int, freqBase float32,
 
 	freqScale := 1.0 / float64(factor)
 
-	// Compute correction dimension range (matches ggml_rope_yarn_corr_dims)
 	corrDim0 := yarnCorrDim(headDim, origMaxPos, betaFast, freqBase)
 	corrDim1 := yarnCorrDim(headDim, origMaxPos, betaSlow, freqBase)
 	corrStart := math.Max(0, math.Floor(corrDim0))
 	corrEnd := math.Min(float64(half-1), math.Ceil(corrDim1))
 
-	// mscale: magnitude scaling to compensate for interpolation (matches llama.cpp)
-	mscale := 1.0 + 0.1*math.Log(float64(factor))
+	// mscale: attn_factor * (1 + 0.1*log(factor)) when ext_factor != 0
+	mscale := float64(attnFactor)
+	if extFactor != 0 {
+		mscale *= 1.0 + 0.1*math.Log(1.0/freqScale)
+	}
 
 	thetaScale := math.Pow(float64(freqBase), -2.0/float64(headDim))
 
@@ -109,11 +112,12 @@ func YaRNRoPEFrequencyTable(maxLen, headDim int, freqBase float32,
 			thetaExtrap := theta
 			thetaInterp := freqScale * thetaExtrap
 
-			// YaRN ramp: 1 at low dims (keep original), 0 at high dims (interpolate)
-			y := (float64(i) - corrStart) / math.Max(0.001, corrEnd-corrStart)
-			ramp := 1.0 - math.Min(1, math.Max(0, y))
-
-			finalTheta := thetaInterp*(1-ramp) + thetaExtrap*ramp
+			finalTheta := thetaInterp
+			if extFactor != 0 {
+				y := (float64(i) - corrStart) / math.Max(0.001, corrEnd-corrStart)
+				rampMix := (1.0 - math.Min(1, math.Max(0, y))) * float64(extFactor)
+				finalTheta = thetaInterp*(1-rampMix) + thetaExtrap*rampMix
+			}
 
 			cosTable[pos*half+i] = float32(math.Cos(finalTheta) * mscale)
 			sinTable[pos*half+i] = float32(math.Sin(finalTheta) * mscale)

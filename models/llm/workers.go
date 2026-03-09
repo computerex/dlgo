@@ -174,7 +174,7 @@ func (rs *RunState) PrecomputeRoPE(maxSeqLen, ropeDim, headDim int, freqBase flo
 
 // PrecomputeYaRNRoPE precomputes RoPE tables with YaRN extended-context scaling.
 func (rs *RunState) PrecomputeYaRNRoPE(maxSeqLen, ropeDim, headDim int,
-	freqBase, factor float32, origMaxPos int, betaFast, betaSlow float32) {
+	freqBase, factor float32, origMaxPos int, betaFast, betaSlow, extFactor, attnFactor float32) {
 	if maxSeqLen <= 0 || headDim <= 0 {
 		return
 	}
@@ -189,7 +189,7 @@ func (rs *RunState) PrecomputeYaRNRoPE(maxSeqLen, ropeDim, headDim int,
 	rs.ropeDim = ropeDim
 	rs.ropeNeox = false
 	rs.ropeCos, rs.ropeSin = ops.YaRNRoPEFrequencyTable(maxSeqLen, ropeDim, freqBase,
-		factor, origMaxPos, betaFast, betaSlow)
+		factor, origMaxPos, betaFast, betaSlow, extFactor, attnFactor)
 }
 
 // SetRopeNeox sets whether to use NeoX-style (split-half) RoPE pairing.

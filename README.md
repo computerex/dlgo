@@ -14,10 +14,13 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
-- **Mixture of Experts (MoE)** — full MoE support with optimized expert-parallel dispatch (Qwen3.5-35B-A3B with 256 experts, IQ3_XXS/IQ4_XS quantized expert weights)
+- **Mixture of Experts (MoE)** — full MoE support with optimized expert-parallel dispatch (up to 512 experts), multiple gating functions (softmax, sigmoid, softmax-weight), shared experts
+- **Hybrid SSM+Attention** — Gated Delta Net (GDN) recurrent layers with interleaved full attention, supporting Qwen3-Coder-Next, Qwen3.5, and Qwen3.5 MoE architectures
+- **Multi-head Latent Attention (MLA)** — compressed KV cache with absorbed key projection for DeepSeek-V2 / GLM-4.7 architectures
+- **Attention Sinks** — learned "trash bin" logits for OpenAI gpt-oss models, absorbing unneeded attention mass
 - **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm, custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
 - **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, fused IQ3_XXS/IQ4_XS SIMD kernels, batch prefill GEMM, parallel worker pools (**beats Ollama on Qwen3.5 models**, within 0–18% for most others)
-- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ3_XXS, IQ4_XS), F16, BF16, F32
+- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), MXFP4, F16, BF16, F32
 
 ## Supported Architectures
 
@@ -25,9 +28,13 @@ fmt.Println(response) // "The capital of France is Paris."
 |---|---|---|---|
 | LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–59 | 421–441 |
 | Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 59–91 | 367–447 |
+| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~3.4 | — |
+| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~5.8 | — |
 | Qwen3.5 | Qwen3.5 0.8B (hybrid GDN+attention) | ~33 | ~287 |
 | Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.5–7.5 | 6.4–70.9 |
 | Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~8.1 | — |
+| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.1 | — |
+| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.1–4.4 | — |
 | Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 42–132 | 288–550 |
 | SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 39–96 | 323–467 |
 | Phi | Phi-2, Phi-4-mini | 9–19 | ~140 |
@@ -66,11 +73,22 @@ with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU
 | Qwen3.5 27B | Q3_K_M | 2.5 tok/s | 2.4 tok/s | **+4%** | 1314 ms | 1528 ms |
 | Qwen3.5 35B-A3B MoE | Q3_K_M | 8.1 tok/s | 7.6 tok/s | **+7%** | 640 ms | 441 ms |
 
+### Frontier models (MoE, hybrid architectures, 20B+ params)
+
+| Model | Quant | Size | Active Params | Architecture | CPU gen |
+|---|---|---|---|---|---|
+| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 5.8 tok/s |
+| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 3.4 tok/s |
+| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 4.4 tok/s |
+| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.1 tok/s |
+| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.1 tok/s |
+
 **Notes:**
 - **Qwen3.5 models outperform Ollama** on CPU generation: 0.8B (+22%), 9B (+4%), 27B (+4%), and 35B MoE (+7%).
   These use hybrid GDN+attention architectures where dlgo's optimized SSM kernels and fused IQ SIMD dot products give a measurable advantage.
-- The **35B MoE model** (256 experts, 8 active, 3B active params) demonstrates full Mixture-of-Experts inference with
-  SIMD-vectorized `vpshufb`/`cvtepi8` IQ3_XXS/IQ4_XS kernels and expert-parallel dispatch.
+- **Qwen3-Coder-Next** uses a novel hybrid architecture combining Gated Delta Net (GDN) SSM layers with full attention every 4th layer, plus MoE with 512 experts (10 active). Despite IQ3_XXS quantization, produces correct and coherent code output.
+- **gpt-oss-20b** is an OpenAI MoE model with attention sinks (learned "trash bin" logits in softmax) and custom SwiGLU-OAI activation. Both MXFP4 (native) and Q3_K_M quantizations produce correct output.
+- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing.
 - Generation is within 11–25% of Ollama for most small models. The gap comes from Go+CGo
   dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge per matmul chunk).
 - Phi-4-mini (−16%) is a 3.8B parameter model in Q3_K_M — gap scales with model size due to dispatch overhead.
@@ -235,7 +253,7 @@ SmolLM2. Prefill is 10–50x faster across all models.
 
 1. **GGUF parser** reads model metadata and tensor locations from the file
 2. **Quantized tensors** stay in their compressed format in memory — only dequantized on the fly during matrix multiplication
-3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, hybrid SSM/attention (Gated Delta Net), and **Mixture-of-Experts** (MoE) — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
+3. **Forward pass** runs the model: embedding, RoPE, GQA attention, Multi-head Latent Attention (MLA), SwiGLU/GeGLU FFN, RMSNorm, hybrid SSM/attention (Gated Delta Net with delta rule recurrence), attention sinks, and **Mixture-of-Experts** (MoE) with multiple gating functions — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
 4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA+VNNI for QxQ integer dot products, fused vpshufb-based IQ3_XXS/IQ4_XS kernels, and batch prefill GEMM kernels
 5. **Parallel matmul** distributes rows across a persistent worker pool with fused multi-matrix dispatch; MoE layers use batched multi-expert dispatch for full core utilization
 6. **GPU acceleration** (optional, via Vulkan) offloads the entire forward pass to GPU — all weights, KV cache, and intermediate buffers reside in VRAM

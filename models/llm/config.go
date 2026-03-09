@@ -27,6 +27,8 @@ type ModelConfig struct {
 	RopeOrigMaxPos     int     // original max position embeddings (for YaRN)
 	RopeYaRNBetaFast   float32 // YaRN beta_fast (default 32)
 	RopeYaRNBetaSlow   float32 // YaRN beta_slow (default 1)
+	RopeYaRNExtFactor  float32 // YaRN ext_factor: 0=disable ramp, 1=full ramp (default 1)
+	RopeYaRNAttnFactor float32 // YaRN attn_factor: magnitude scaling base (default 1)
 	SlidingWindow      int     // sliding window attention size (0 = disabled)
 	SlidingWindowPattern int   // 0=all layers, N=alternating (every Nth layer is full)
 	BOS           int32
@@ -50,7 +52,7 @@ type ModelConfig struct {
 	ExpertUsedCount      int     // top-K experts selected per token
 	ExpertFFNDim         int     // hidden dim per expert
 	SharedExpertFFNDim   int     // hidden dim for shared expert (0 = no shared expert)
-	ExpertGatingFunc     int     // 0=none, 1=softmax, 2=sigmoid
+	ExpertGatingFunc     int     // 0=none, 1=softmax, 2=sigmoid, 3=softmax_weight (top-k raw then softmax)
 	ExpertWeightsNorm    bool    // normalize selected expert weights by sum
 	ExpertWeightsScale   float32 // scale factor for expert weights (0 = no scaling)
 
@@ -104,6 +106,8 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		RopeOrigMaxPos:     metaInt(md, arch+".rope.scaling.original_context_length", 0),
 		RopeYaRNBetaFast:   metaFloat(md, arch+".rope.scaling.yarn.beta_fast", 32.0),
 		RopeYaRNBetaSlow:   metaFloat(md, arch+".rope.scaling.yarn.beta_slow", 1.0),
+		RopeYaRNExtFactor:  metaFloat(md, arch+".rope.scaling.yarn.ext_factor", 1.0),
+		RopeYaRNAttnFactor: metaFloat(md, arch+".rope.scaling.yarn.attn_factor", 1.0),
 		SlidingWindow:      metaInt(md, arch+".attention.sliding_window", 0),
 		SlidingWindowPattern: metaInt(md, arch+".attention.sliding_window_pattern", 0),
 		BOS:                int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
@@ -282,10 +286,14 @@ func inferChatTemplate(md map[string]interface{}, arch string) string {
 		switch {
 		case strings.Contains(lower, "<|start_header_id|>") || strings.Contains(lower, "<|eot_id|>"):
 			return "llama3"
+		case strings.Contains(lower, "<|im_start|>") && strings.Contains(lower, "<|im_sep|>"):
+			return "chatml_sep"
 		case strings.Contains(lower, "<|im_start|>"):
 			return "chatml"
 		case strings.Contains(lower, "<start_of_turn>"):
 			return "gemma"
+		case strings.Contains(lower, "[gmask]<sop>"):
+			return "chatglm"
 		case strings.Contains(lower, "<|start|") && strings.Contains(lower, "<|message|"):
 			return "harmony"
 		case strings.Contains(lower, "<|end|>"):

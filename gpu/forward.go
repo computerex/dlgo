@@ -9,6 +9,7 @@ import (
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/models/llm"
+	"github.com/computerex/dlgo/ops"
 	"github.com/computerex/dlgo/quant"
 )
 
@@ -79,7 +80,7 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache
 			ffnType = 1
 		case llm.FFNPlain:
 			ffnType = 2
-		case llm.FFNMoE:
+		case llm.FFNMoE, llm.FFNMoESwiOAI:
 			ffnType = 3
 		}
 		resType := 0
@@ -205,10 +206,10 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			Barrier()
 			MatVec(rs.AttnProj, gl.Wo.Buf, rs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, gl.Wo.Type)
 		} else if layer.Spec.Core == llm.CoreMLA && pipe != nil && pipe.HasMLA {
-			// MLA: download x_norm, run MLA attention on CPU, upload attn_proj
 			Sync()
 			cpuRS := pipe.CPURunState
-			DownloadF32(rs.XNorm, cpuRS.XNorm)
+			DownloadF32(rs.X, cpuRS.X)
+			ops.RMSNorm(cpuRS.XNorm, cpuRS.X, layer.AttnNorm, cfg.RMSNormEps)
 			llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, pos, cfg, cpuRS.Pool)
 			BeginBatch()
 			UploadF32(rs.AttnProj, cpuRS.AttnProj)
@@ -233,8 +234,9 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		} else {
 			Sync()
 			cpuRS := pipe.CPURunState
-			DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
-			llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+			DownloadF32(rs.FFNIn, cpuRS.FFNIn)
+			ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+			llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 			BeginBatch()
 			UploadF32(rs.FFNOut, cpuRS.FFNOut)
 			Barrier()
@@ -356,7 +358,8 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 		} else if layer.Spec.Core == llm.CoreMLA && pipe != nil && pipe.HasMLA {
 			Sync()
 			cpuRS := pipe.CPURunState
-			DownloadF32(rs.XNorm, cpuRS.XNorm)
+			DownloadF32(rs.X, cpuRS.X)
+			ops.RMSNorm(cpuRS.XNorm, cpuRS.X, layer.AttnNorm, cfg.RMSNormEps)
 			llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, pos, cfg, cpuRS.Pool)
 			BeginBatch()
 			UploadF32(rs.AttnProj, cpuRS.AttnProj)
@@ -381,8 +384,9 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			} else {
 				Sync()
 				cpuRS := pipe.CPURunState
-				DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
-				llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+				DownloadF32(rs.FFNIn, cpuRS.FFNIn)
+				ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 				BeginBatch()
 				UploadF32(rs.FFNOut, cpuRS.FFNOut)
 				Barrier()
@@ -472,7 +476,7 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *Gpu
 			ffnType = 1
 		case llm.FFNPlain:
 			ffnType = 2
-		case llm.FFNMoE:
+		case llm.FFNMoE, llm.FFNMoESwiOAI:
 			ffnType = 3
 		}
 		resType := 0
@@ -662,13 +666,15 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 
 		} else if layer.Spec.Core == llm.CoreMLA && pipe.HasMLA {
 			// MLA: run per-position on CPU (sequential KV cache dependency)
+			// Download raw X and recompute RMSNorm on CPU with f64 precision
 			Sync()
 			cpuRS := pipe.CPURunState
-			xNormBatch := make([]float32, npos*dim)
-			DownloadF32(bs.XNorm, xNormBatch)
+			xBatch := make([]float32, npos*dim)
+			DownloadF32(bs.X, xBatch)
 			attnProjBatch := make([]float32, npos*dim)
 			for p := 0; p < npos; p++ {
-				copy(cpuRS.XNorm, xNormBatch[p*dim:(p+1)*dim])
+				copy(cpuRS.X, xBatch[p*dim:(p+1)*dim])
+				ops.RMSNorm(cpuRS.XNorm, cpuRS.X, layer.AttnNorm, cfg.RMSNormEps)
 				llm.ForwardMLA(layer, cpuRS, pipe.CPUKVCache, l, p, cfg, cpuRS.Pool)
 				copy(attnProjBatch[p*dim:(p+1)*dim], cpuRS.AttnProj)
 			}
@@ -685,15 +691,16 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		ForwardLayerBatch(batchLayerConfs[l], npos, 0, scale, nextAttnNorm)
 
 		if gl.IsMoE && pipe.HasMoE {
-			// Batch prefill MoE: always run per-position on CPU for now
+			// Batch prefill MoE: download raw FFNIn, recompute norm on CPU with f64 precision
 			Sync()
 			cpuRS := pipe.CPURunState
-			ffnNormBatch := make([]float32, npos*dim)
-			DownloadF32(bs.FFNNorm, ffnNormBatch)
+			ffnInBatch := make([]float32, npos*dim)
+			DownloadF32(bs.FFNIn, ffnInBatch)
 			ffnOutBatch := make([]float32, npos*dim)
 			for p := 0; p < npos; p++ {
-				posInput := ffnNormBatch[p*dim : (p+1)*dim]
-				llm.ForwardMoEFFN(layer, cpuRS, posInput, cfg, cpuRS.Pool)
+				posFFNIn := ffnInBatch[p*dim : (p+1)*dim]
+				ops.RMSNorm(cpuRS.FFNNorm, posFFNIn, layer.FFNNorm, cfg.RMSNormEps)
+				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 				copy(ffnOutBatch[p*dim:(p+1)*dim], cpuRS.FFNOut)
 			}
 			BeginBatch()
@@ -848,9 +855,10 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		} else if spec.Core == llm.CoreMLA && p != nil && p.HasMLA {
 			Sync()
 			cpuRS := p.CPURunState
-			if err := DownloadF32(rs.XNorm, cpuRS.XNorm); err != nil {
-				return fmt.Errorf("layer %d mla download xnorm: %w", l, err)
+			if err := DownloadF32(rs.X, cpuRS.X); err != nil {
+				return fmt.Errorf("layer %d mla download x: %w", l, err)
 			}
+			ops.RMSNorm(cpuRS.XNorm, cpuRS.X, layer.AttnNorm, cfg.RMSNormEps)
 			llm.ForwardMLA(layer, cpuRS, p.CPUKVCache, l, pos, cfg, cpuRS.Pool)
 			BeginBatch()
 			if err := UploadF32(rs.AttnProj, cpuRS.AttnProj); err != nil {
@@ -956,10 +964,15 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			} else {
 				EndBatch()
 				cpuRS := p.CPURunState
-				if err := DownloadF32(rs.FFNNorm, cpuRS.FFNNorm); err != nil {
-					return fmt.Errorf("layer %d moe download: %w", l, err)
+				if err := DownloadF32(rs.FFNIn, cpuRS.FFNIn); err != nil {
+					return fmt.Errorf("layer %d moe download ffnin: %w", l, err)
 				}
-				llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+				cpuFFNNormW := layer.FFNNorm
+				if spec.Residual == llm.ResPostAttnFFN {
+					cpuFFNNormW = layer.PostAttnNorm
+				}
+				ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, cpuFFNNormW, cfg.RMSNormEps)
+				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 				BeginBatch()
 				if err := UploadF32(rs.FFNOut, cpuRS.FFNOut); err != nil {
 					return fmt.Errorf("layer %d moe upload: %w", l, err)

@@ -217,8 +217,10 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 			BOS:    m.Config.BOS,
 			EOS:    m.Config.EOS,
 			AddBOS: m.Config.AddBOS,
+			PreBOS: -1,
 		}
 	}
+	m.Config.AddBOS = tok.AddBOS
 
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
 	kv := memory.NewMultiLayerKVCache(m.Config.NumLayers, maxSeqLen, kvDim)
@@ -455,8 +457,11 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<|im_end|>",
 		"<|endoftext|>",
 		"<|end|>",
+		"<|return|>",
 		"</s>",
 		"<|assistant|>",
+		"<|user|>",
+		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
 	}

@@ -57,9 +57,9 @@ func main() {
 	fmt.Printf("HeadDim=%d NumKVHeads=%d FFNDim=%d\n", cfg.HeadDim, cfg.NumKVHeads, cfg.FFNDim)
 	fmt.Printf("RopeNeox=%v RopeFreqBase=%f RopeDim=%d\n", cfg.RopeNeox, cfg.RopeFreqBase, cfg.RopeDim)
 	if cfg.RopeScaleType > 0 {
-		fmt.Printf("RoPE scaling: type=%d factor=%.1f origMaxPos=%d betaFast=%.1f betaSlow=%.1f\n",
+		fmt.Printf("RoPE scaling: type=%d factor=%.1f origMaxPos=%d betaFast=%.1f betaSlow=%.1f extFactor=%.2f attnFactor=%.2f\n",
 			cfg.RopeScaleType, cfg.RopeScaleFactor, cfg.RopeOrigMaxPos,
-			cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow)
+			cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow, cfg.RopeYaRNExtFactor, cfg.RopeYaRNAttnFactor)
 	}
 	if cfg.SlidingWindow > 0 {
 		fmt.Printf("SlidingWindow=%d Pattern=%d\n", cfg.SlidingWindow, cfg.SlidingWindowPattern)
@@ -73,12 +73,50 @@ func main() {
 		fmt.Printf("MLA: qLORARank=%d kvLORARank=%d qkNope=%d qkRope=%d vHeadDim=%d\n",
 			cfg.QLORARank, cfg.KVLORARank, cfg.QKNopeDim, cfg.QKRopeDim, cfg.VHeadDim)
 	}
-
-	fmt.Printf("BOS=%d EOS=%d AddBOS=%v\n", cfg.BOS, cfg.EOS, cfg.AddBOS)
-	// gpt-oss harmony template starts with <|start|>, no BOS needed
-	if cfg.ChatTemplate == "harmony" {
-		pipe.Tokenizer.AddBOS = false
+	if cfg.FullAttentionInterval > 0 {
+		fmt.Printf("SSM Hybrid: FullAttnInterval=%d SSMInnerSize=%d SSMStateSize=%d SSMTimeStepRank=%d SSMGroupCount=%d SSMConvK=%d\n",
+			cfg.FullAttentionInterval, cfg.SSMInnerSize, cfg.SSMStateSize, cfg.SSMTimeStepRank, cfg.SSMGroupCount, cfg.SSMConvKernel)
+		ssmCount := 0
+		for l := 0; l < cfg.NumLayers; l++ {
+			if pipe.Model.Layers[l].Spec.Core == llm.CoreSSM {
+				ssmCount++
+			}
+		}
+		fmt.Printf("  Layers: %d SSM, %d attention\n", ssmCount, cfg.NumLayers-ssmCount)
+		for l := 0; l < cfg.NumLayers; l++ {
+			layer := &pipe.Model.Layers[l]
+			if layer.Spec.Core == llm.CoreSSM {
+				missing := ""
+				if layer.SSMInProj == nil { missing += " SSMInProj" }
+				if layer.AttnGate == nil { missing += " AttnGate" }
+				if layer.SSMConv1dW == nil { missing += " SSMConv1dW" }
+				if layer.SSMA == nil { missing += " SSMA" }
+				if layer.SSMAlpha == nil && layer.SSMFusedBA == nil { missing += " SSMAlpha/FusedBA" }
+				if layer.SSMBeta == nil && layer.SSMFusedBA == nil { missing += " SSMBeta/FusedBA" }
+				if layer.SSMNorm == nil { missing += " SSMNorm" }
+				if layer.SSMOut == nil { missing += " SSMOut" }
+				if layer.PostAttnNorm == nil { missing += " PostAttnNorm" }
+				if layer.FFNRouter == nil { missing += " FFNRouter" }
+				if missing != "" {
+					fmt.Printf("  L%d SSM MISSING:%s\n", l, missing)
+				}
+			} else if layer.Spec.Core == llm.CoreAttention {
+				missing := ""
+				if layer.Wq == nil { missing += " Wq" }
+				if layer.Wk == nil { missing += " Wk" }
+				if layer.Wv == nil { missing += " Wv" }
+				if layer.Wo == nil { missing += " Wo" }
+				if layer.AttnQNorm == nil { missing += " QNorm" }
+				if layer.AttnKNorm == nil { missing += " KNorm" }
+				if missing != "" {
+					fmt.Printf("  L%d ATN MISSING:%s\n", l, missing)
+				}
+			}
+		}
 	}
+
+	fmt.Printf("BOS=%d EOS=%d AddBOS=%v ChatTemplate=%s\n", cfg.BOS, cfg.EOS, cfg.AddBOS, cfg.ChatTemplate)
+
 	prompt := llm.FormatChat(cfg, "", "What is 2+2?")
 	fmt.Printf("Prompt: %q\n", prompt)
 

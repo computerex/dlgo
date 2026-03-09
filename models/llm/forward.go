@@ -73,7 +73,7 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 
 	headScores := make([][]float32, cfg.NumHeads)
 	for h := 0; h < cfg.NumHeads; h++ {
-		headScores[h] = make([]float32, maxSeqLen)
+		headScores[h] = make([]float32, maxSeqLen+1)
 	}
 
 	rs := &RunState{
@@ -97,7 +97,8 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 	}
 	if cfg.RopeScaleType == 2 && cfg.RopeScaleFactor > 0 {
 		rs.PrecomputeYaRNRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase,
-			cfg.RopeScaleFactor, cfg.RopeOrigMaxPos, cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow)
+			cfg.RopeScaleFactor, cfg.RopeOrigMaxPos, cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow,
+			cfg.RopeYaRNExtFactor, cfg.RopeYaRNAttnFactor)
 	} else {
 		rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
 	}
@@ -152,11 +153,12 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		qkvDim := keyDim*2 + valueDim
 
 		rs.SSMRun = &SSMRunState{
-			QKV:   make([]float32, qkvDim),
-			Z:     make([]float32, valueDim),
-			Alpha: make([]float32, numHeads),
-			Beta:  make([]float32, numHeads),
-			Y:     make([]float32, valueDim),
+			QKV:     make([]float32, qkvDim),
+			Z:       make([]float32, valueDim),
+			Alpha:   make([]float32, numHeads),
+			Beta:    make([]float32, numHeads),
+			FusedBA: make([]float32, 2*numHeads),
+			Y:       make([]float32, valueDim),
 		}
 		rs.SSMState = memory.NewSSMStateCache(
 			cfg.NumLayers, numHeads, numKVGroups, headKDim, headVDim,
@@ -254,6 +256,7 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 				rs.X[i] = rs.X[i] + rs.AttnProj[i] + rs.FFNOut[i]
 			}
 		}
+
 	}
 
 	if endLayer < cfg.NumLayers {
@@ -335,19 +338,12 @@ func ForwardAttention(
 	kv.Layers[l].Store(pos, rs.K, rs.V)
 	seqLen := pos + 1
 
-	// Sliding window: limit attention span, preserving sink positions
+	// Sliding window: limit attention span
 	startPos := 0
 	winSize := layer.Spec.SlidingWindow
-	hasSinks := layer.AttnSinks != nil && winSize > 0
-	sinkCount := 0
-	if hasSinks {
-		sinkCount = 1 // always attend to position 0 (initial token)
-	}
+	hasSinks := layer.AttnSinks != nil
 	if winSize > 0 && seqLen > winSize {
 		startPos = seqLen - winSize
-		if startPos < sinkCount {
-			startPos = sinkCount
-		}
 	}
 
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
@@ -358,44 +354,36 @@ func ForwardAttention(
 		qHead := rs.Q[h*headDim : (h+1)*headDim]
 		headOut := rs.AttnOut[h*headDim : (h+1)*headDim]
 
-		// Count total positions: sink positions + window positions
 		windowLen := seqLen - startPos
-		totalLen := windowLen
-		if hasSinks && startPos > sinkCount {
-			totalLen += sinkCount
+		// Attention sinks: append an extra learnable logit to the softmax
+		// (see "Attention Is Off By One" / OpenAI gpt-oss reference).
+		// After softmax the extra sink weight is discarded, so real
+		// attention weights sum to < 1, acting as a "trash bin" for
+		// unneeded attention mass.
+		extraSink := 0
+		if hasSinks {
+			extraSink = 1
 		}
+		totalLen := windowLen + extraSink
 		scores := rs.HeadScores[h][:totalLen]
 
-		idx := 0
-		// Score sink positions first (position 0)
-		if hasSinks && startPos > sinkCount {
-			for s := 0; s < sinkCount; s++ {
-				kHead := kv.Layers[l].Keys[s][kvH*headDim : (kvH+1)*headDim]
-				scores[idx] = ops.DotProduct(qHead, kHead, headDim)*scale + layer.AttnSinks[kvH]
-				idx++
-			}
-		}
 		// Score window positions
-		for t := startPos; t < seqLen; t++ {
+		for i, t := 0, startPos; t < seqLen; t++ {
 			kHead := kv.Layers[l].Keys[t][kvH*headDim : (kvH+1)*headDim]
-			scores[idx] = ops.DotProduct(qHead, kHead, headDim) * scale
-			idx++
+			scores[i] = ops.DotProduct(qHead, kHead, headDim) * scale
+			i++
+		}
+		// Append learned sink logit as extra softmax column
+		if hasSinks {
+			scores[windowLen] = layer.AttnSinks[h]
 		}
 		quant.SIMDSoftmax(scores)
 
-		// Accumulate weighted values
-		idx = 0
-		if hasSinks && startPos > sinkCount {
-			for s := 0; s < sinkCount; s++ {
-				vHead := kv.Layers[l].Vals[s][kvH*headDim : (kvH+1)*headDim]
-				ops.AddScaled(headOut, scores[idx], vHead, headDim)
-				idx++
-			}
-		}
-		for t := startPos; t < seqLen; t++ {
+		// Accumulate weighted values (skip the sink column at the end)
+		for i, t := 0, startPos; t < seqLen; t++ {
 			vHead := kv.Layers[l].Vals[t][kvH*headDim : (kvH+1)*headDim]
-			ops.AddScaled(headOut, scores[idx], vHead, headDim)
-			idx++
+			ops.AddScaled(headOut, scores[i], vHead, headDim)
+			i++
 		}
 	})
 
@@ -552,6 +540,15 @@ func topKIndices(logits []float32, k int) ([]int, []float32) {
 	return indices, values
 }
 
+// ForwardMoEFFNDispatch routes to the correct MoE implementation based on FFN type.
+func ForwardMoEFFNDispatch(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
+	if layer.Spec.FFN == FFNMoESwiOAI {
+		ForwardMoEFFN_OAI(layer, rs, input, cfg, pool)
+	} else {
+		ForwardMoEFFN(layer, rs, input, cfg, pool)
+	}
+}
+
 // ForwardMoEFFN runs the Mixture-of-Experts FFN. Result written to rs.FFNOut.
 func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
 	dim := cfg.EmbeddingDim
@@ -559,20 +556,27 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 	nUsed := cfg.ExpertUsedCount
 
 	// Router: compute gated probabilities over all experts
-	blas.QMatVecMulParallel(rs.MoELogits, layer.FFNRouter, input, pool)
+	nExperts := cfg.ExpertCount
+	blas.QMatVecMulParallel(rs.MoELogits[:nExperts], layer.FFNRouter, input, pool)
 	if layer.FFNRouterBias != nil {
-		ops.AddBias(rs.MoELogits, layer.FFNRouterBias)
-	}
-	if cfg.ExpertGatingFunc == 2 {
-		for i := range rs.MoELogits {
-			rs.MoELogits[i] = ops.Sigmoid(rs.MoELogits[i])
-		}
-	} else {
-		quant.SIMDSoftmax(rs.MoELogits)
+		ops.AddBias(rs.MoELogits[:nExperts], layer.FFNRouterBias)
 	}
 
-	// Select top-K experts
-	indices, weights := topKIndices(rs.MoELogits, nUsed)
+	var indices []int
+	var weights []float32
+	switch cfg.ExpertGatingFunc {
+	case 2:
+		for i := 0; i < nExperts; i++ {
+			rs.MoELogits[i] = ops.Sigmoid(rs.MoELogits[i])
+		}
+		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
+	case 3:
+		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
+		quant.SIMDSoftmax(weights)
+	default:
+		quant.SIMDSoftmax(rs.MoELogits[:nExperts])
+		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
+	}
 
 	// Normalize selected weights
 	if cfg.ExpertWeightsNorm {
@@ -692,6 +696,126 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 	}
 }
 
+// ForwardMoEFFN_OAI runs the gpt-oss MoE with SOFTMAX_WEIGHT gating and SwiGLU_OAI activation.
+func ForwardMoEFFN_OAI(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nUsed := cfg.ExpertUsedCount
+	nExperts := cfg.ExpertCount
+
+	// Router logits
+	blas.QMatVecMulParallel(rs.MoELogits[:nExperts], layer.FFNRouter, input, pool)
+	if layer.FFNRouterBias != nil {
+		ops.AddBias(rs.MoELogits[:nExperts], layer.FFNRouterBias)
+	}
+
+	// SOFTMAX_WEIGHT: top-k on RAW logits, then softmax only on selected
+	indices, rawWeights := topKIndices(rs.MoELogits[:nExperts], nUsed)
+	quant.SIMDSoftmax(rawWeights)
+
+	if cfg.ExpertWeightsScale > 0 && cfg.ExpertWeightsScale != 1.0 {
+		for i := range rawWeights {
+			rawWeights[i] *= cfg.ExpertWeightsScale
+		}
+	}
+
+	gateBpr := quant.BytesForN(layer.FFNGateExps.Type, layer.FFNGateExps.Cols)
+	upBpr := quant.BytesForN(layer.FFNUpExps.Type, layer.FFNUpExps.Cols)
+	downBpr := quant.BytesForN(layer.FFNDownExps.Type, layer.FFNDownExps.Cols)
+
+	gateSlices := make([]blas.ExpertSlice, 0, nUsed)
+	upSlices := make([]blas.ExpertSlice, 0, nUsed)
+	activeExperts := make([]int, 0, nUsed)
+
+	for e := 0; e < nUsed; e++ {
+		idx := indices[e]
+		if idx < 0 {
+			continue
+		}
+		activeExperts = append(activeExperts, e)
+		gateSlices = append(gateSlices, blas.ExpertSlice{
+			Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * gateBpr,
+		})
+		upSlices = append(upSlices, blas.ExpertSlice{
+			Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * upBpr,
+		})
+	}
+
+	blas.QDualMultiExpertMatVec(layer.FFNGateExps, layer.FFNUpExps,
+		gateSlices, upSlices, input, pool)
+
+	// Add expert biases and apply SwiGLU_OAI activation
+	for _, e := range activeExperts {
+		idx := indices[e]
+		if layer.FFNGateExpsBias != nil {
+			biasOff := idx * expDim
+			for i := 0; i < expDim; i++ {
+				rs.MoEGates[e][i] += layer.FFNGateExpsBias[biasOff+i]
+			}
+		}
+		if layer.FFNUpExpsBias != nil {
+			biasOff := idx * expDim
+			for i := 0; i < expDim; i++ {
+				rs.MoEUps[e][i] += layer.FFNUpExpsBias[biasOff+i]
+			}
+		}
+		ops.SwiGLU_OAI(rs.MoEHiddens[e], rs.MoEGates[e], rs.MoEUps[e], expDim, 1.702, 7.0)
+	}
+
+	// Down projections
+	ops.Clear(rs.FFNOut)
+	nActive := len(activeExperts)
+	totalDownRows := nActive * dim
+	useFusedDown := quant.HasSIMDDot(layer.FFNDownExps.Type)
+	downCols := layer.FFNDownExps.Cols
+	pool.DispatchChunked(totalDownRows, pool.NumWorkers(), func(_, start, end int) {
+		for row := start; row < end; {
+			ei := row / dim
+			rowInExpert := row % dim
+			e := activeExperts[ei]
+			idx := indices[e]
+			endInExpert := end - ei*dim
+			if endInExpert > dim {
+				endInExpert = dim
+			}
+			nrows := endInExpert - rowInExpert
+			downOff := idx*dim*downBpr + rowInExpert*downBpr
+			out := rs.MoEExpertOuts[e]
+			if useFusedDown {
+				quant.SIMDDotBatch(
+					layer.FFNDownExps.Data[downOff:downOff+nrows*downBpr],
+					layer.FFNDownExps.Type, rs.MoEHiddens[e],
+					downCols, out[rowInExpert:endInExpert], nrows, downBpr)
+			} else {
+				buf := make([]float32, downCols)
+				for r := rowInExpert; r < endInExpert; r++ {
+					rOff := idx*dim*downBpr + r*downBpr
+					quant.DequantizeInto(buf, layer.FFNDownExps.Data[rOff:rOff+downBpr], layer.FFNDownExps.Type, downCols)
+					out[r] = quant.SIMDDotF32(buf, rs.MoEHiddens[e], downCols)
+				}
+			}
+			row = (ei + 1) * dim
+		}
+	})
+
+	// Add down biases and accumulate weighted expert outputs
+	for _, e := range activeExperts {
+		w := rawWeights[e]
+		out := rs.MoEExpertOuts[e]
+		if layer.FFNDownExpsBias != nil {
+			idx := indices[e]
+			biasOff := idx * dim
+			for i := 0; i < dim; i++ {
+				rs.FFNOut[i] += w * (out[i] + layer.FFNDownExpsBias[biasOff+i])
+			}
+		} else {
+			for i := 0; i < dim; i++ {
+				rs.FFNOut[i] += w * out[i]
+			}
+		}
+	}
+}
+
 // forwardFFN runs the feed-forward network. Result written to rs.FFNOut.
 func forwardFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
 	switch layer.Spec.FFN {
@@ -715,6 +839,9 @@ func forwardFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, po
 
 	case FFNMoE:
 		ForwardMoEFFN(layer, rs, input, cfg, pool)
+		return
+	case FFNMoESwiOAI:
+		ForwardMoEFFN_OAI(layer, rs, input, cfg, pool)
 		return
 	}
 

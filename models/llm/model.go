@@ -39,10 +39,11 @@ const (
 type FFNKind uint8
 
 const (
-	FFNSwiGLU FFNKind = iota // gate·SiLU ⊙ up → down (LLaMA, Qwen)
-	FFNGeGLU                 // gate·GELU ⊙ up → down (Gemma)
-	FFNPlain                 // up → GELU → down (Phi-2)
-	FFNMoE                   // Mixture of Experts: route to top-K experts, each SwiGLU
+	FFNSwiGLU    FFNKind = iota // gate·SiLU ⊙ up → down (LLaMA, Qwen)
+	FFNGeGLU                    // gate·GELU ⊙ up → down (Gemma)
+	FFNPlain                    // up → GELU → down (Phi-2)
+	FFNMoE                      // Mixture of Experts: route to top-K experts, each SwiGLU
+	FFNMoESwiOAI                // MoE with SwiGLU_OAI activation (gpt-oss)
 )
 
 // LayerSpec captures all architectural choices for one transformer layer.
@@ -93,6 +94,9 @@ type Layer struct {
 	FFNGateExps     *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert gate
 	FFNUpExps       *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert up
 	FFNDownExps     *core.QuantizedTensor // [expertCount*dim × expertFFNDim] packed expert down
+	FFNGateExpsBias []float32             // [expertCount*expertFFNDim] packed expert gate bias
+	FFNUpExpsBias   []float32             // [expertCount*expertFFNDim] packed expert up bias
+	FFNDownExpsBias []float32             // [expertCount*dim] packed expert down bias
 	FFNGateShared   *core.QuantizedTensor // [sharedFFNDim × dim] shared expert gate
 	FFNUpShared     *core.QuantizedTensor // [sharedFFNDim × dim] shared expert up
 	FFNDownShared   *core.QuantizedTensor // [dim × sharedFFNDim] shared expert down
@@ -114,6 +118,7 @@ type Layer struct {
 	SSMA       []float32            // [numHeads] log(-A) decay parameter
 	SSMAlpha   *core.QuantizedTensor // [dim × numHeads] dt/alpha projection
 	SSMBeta    *core.QuantizedTensor // [dim × numHeads] beta/learning-rate projection
+	SSMFusedBA *core.QuantizedTensor // [dim × 2*numHeads] fused beta+alpha (interleaved per KV group)
 	SSMDtBias  []float32            // [numHeads] dt bias
 	SSMNorm    []float32            // [headVDim] per-head RMSNorm weight (shared across heads)
 	SSMOut     *core.QuantizedTensor // [dim × valueDim] output projection

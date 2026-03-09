@@ -130,7 +130,11 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 	}
 
 	if l.FFNRouter != nil && l.FFNGateExps != nil {
-		s.FFN = FFNMoE
+		if cfg.Architecture == "gpt-oss" {
+			s.FFN = FFNMoESwiOAI
+		} else {
+			s.FFN = FFNMoE
+		}
 	} else if l.FFNGate != nil {
 		if cfg.FFNGelu {
 			s.FFN = FFNGeGLU
@@ -327,6 +331,14 @@ func mapTensorF32(m *Model, name string, data []float32) {
 			l.FFNRouterBias = data
 		case "attn_sinks.weight":
 			l.AttnSinks = data
+		case "ffn_gate_inp.bias":
+			l.FFNRouterBias = data
+		case "ffn_gate_exps.bias":
+			l.FFNGateExpsBias = data
+		case "ffn_up_exps.bias":
+			l.FFNUpExpsBias = data
+		case "ffn_down_exps.bias":
+			l.FFNDownExpsBias = data
 		}
 		}
 	}
@@ -375,7 +387,7 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 		case "ssm_beta.weight":
 			l.SSMBeta = qt
 		case "ssm_ba.weight":
-			splitFusedSSMBA(l, qt)
+			l.SSMFusedBA = qt
 		case "ssm_out.weight":
 			l.SSMOut = qt
 		// MoE tensors
@@ -393,8 +405,6 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 			l.FFNUpShared = qt
 		case "ffn_down_shexp.weight":
 			l.FFNDownShared = qt
-		case "ffn_gate_inp.bias":
-			l.FFNRouterBias = dequantToF32(qt.Data, qt.Type, qt.Rows)
 		}
 	}
 	}
@@ -427,15 +437,6 @@ func splitFusedQKV(l *Layer, qt *core.QuantizedTensor, qDim, kvDim, cols int) {
 	} else {
 		l.SSMInProj = qt
 	}
-}
-
-// splitFusedSSMBA splits a fused [beta|alpha] weight tensor into separate SSMBeta and SSMAlpha.
-func splitFusedSSMBA(l *Layer, qt *core.QuantizedTensor) {
-	half := qt.Rows / 2
-	bytesPerRow := quant.BytesForN(qt.Type, qt.Cols)
-	halfBytes := half * bytesPerRow
-	l.SSMBeta = &core.QuantizedTensor{Data: qt.Data[:halfBytes], Type: qt.Type, Rows: half, Cols: qt.Cols}
-	l.SSMAlpha = &core.QuantizedTensor{Data: qt.Data[halfBytes : 2*halfBytes], Type: qt.Type, Rows: half, Cols: qt.Cols}
 }
 
 // splitFusedFFNUp splits a fused [gate|up] weight tensor if it has 2x expected rows.

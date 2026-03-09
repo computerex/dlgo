@@ -10,11 +10,12 @@ import (
 
 // SSMRunState holds pre-allocated scratch buffers for SSM (Gated Delta Net) layers.
 type SSMRunState struct {
-	QKV   []float32 // [qkvDim] in-projection output (goes through conv)
-	Z     []float32 // [valueDim] gate projection output
-	Alpha []float32 // [numHeads] raw alpha (decay param)
-	Beta  []float32 // [numHeads] raw beta (learning rate)
-	Y     []float32 // [valueDim] attention/SSM output
+	QKV     []float32 // [qkvDim] in-projection output (goes through conv)
+	Z       []float32 // [valueDim] gate projection output
+	Alpha   []float32 // [numHeads] raw alpha (decay param)
+	Beta    []float32 // [numHeads] raw beta (learning rate)
+	FusedBA []float32 // [2*numHeads] fused beta+alpha output (interleaved per KV group)
+	Y       []float32 // [valueDim] attention/SSM output
 }
 
 // ForwardSSMLayer runs one Gated Delta Net layer for single-token autoregressive inference.
@@ -53,9 +54,23 @@ func ForwardSSMLayer(
 	// 2. Gate projection: dim -> valueDim
 	blas.QMatVecMulParallel(ssm.Z, layer.AttnGate, xnorm, pool)
 
-	// 3. Alpha/Beta projections: dim -> numHeads
-	blas.QMatVecMul(ssm.Alpha, layer.SSMAlpha, xnorm)
-	blas.QMatVecMul(ssm.Beta, layer.SSMBeta, xnorm)
+	// 3. Alpha/Beta projections
+	if layer.SSMFusedBA != nil {
+		// Fused BA projection: output is interleaved per KV group.
+		// Layout: [beta_g0_v0, beta_g0_v1, alpha_g0_v0, alpha_g0_v1, beta_g1_v0, ...]
+		blas.QMatVecMulParallel(ssm.FusedBA, layer.SSMFusedBA, xnorm, pool)
+		vPerGroup := numHeads / numKVGroups
+		for g := 0; g < numKVGroups; g++ {
+			base := g * vPerGroup * 2
+			for vi := 0; vi < vPerGroup; vi++ {
+				ssm.Beta[g*vPerGroup+vi] = ssm.FusedBA[base+vi]
+				ssm.Alpha[g*vPerGroup+vi] = ssm.FusedBA[base+vPerGroup+vi]
+			}
+		}
+	} else {
+		blas.QMatVecMul(ssm.Alpha, layer.SSMAlpha, xnorm)
+		blas.QMatVecMul(ssm.Beta, layer.SSMBeta, xnorm)
+	}
 
 	// 4. Causal conv1d: shift buffer, store current input, depthwise conv
 	buf := ssmState.ConvBuf
@@ -107,10 +122,11 @@ func ForwardSSMLayer(
 	// 10. Delta rule recurrent step + output (GQA-style: K/Q grouped across V heads)
 	// Loop order: outer=i(key), inner=j(value) for sequential cache-friendly access
 	state := ssmState.State
+	headsPerGroup := numHeads / numKVGroups
 	for h := 0; h < numHeads; h++ {
 		decay := float32(math.Exp(float64(ssm.Alpha[h])))
 		lr := ssm.Beta[h]
-		kvGroup := h % numKVGroups
+		kvGroup := h / headsPerGroup
 		qH := q[kvGroup*headKDim : (kvGroup+1)*headKDim]
 		kH := k[kvGroup*headKDim : (kvGroup+1)*headKDim]
 		vH := v[h*headVDim : (h+1)*headVDim]

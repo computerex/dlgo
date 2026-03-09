@@ -18,6 +18,7 @@ type Tokenizer struct {
 	BOS       int32
 	EOS       int32
 	AddBOS    bool
+	PreBOS    int32 // token to prepend before BOS (e.g., [gMASK]); -1 = unused
 
 	// BPE/SPM-specific fields
 	MergeRanks    map[[2]string]int // GPT-2: merge pair -> priority (lower = merge first)
@@ -77,8 +78,13 @@ func NewTokenizerFromGGUF(md map[string]interface{}, cfg ModelConfig) (*Tokenize
 		BOS:           cfg.BOS,
 		EOS:           cfg.EOS,
 		AddBOS:        cfg.AddBOS,
+		PreBOS:        -1,
 		ModelType:     model,
 		SpecialTokens: make(map[string]int32),
+	}
+
+	if id, ok := tokenToID["[gMASK]"]; ok {
+		t.PreBOS = id
 	}
 
 	switch model {
@@ -153,6 +159,8 @@ func initBPETokenizer(t *Tokenizer, md map[string]interface{}) (*Tokenizer, erro
 		if b, ok := v.(bool); ok {
 			t.AddBOS = b
 		}
+	} else {
+		t.AddBOS = false
 	}
 
 	var specialTokens []string
@@ -161,12 +169,14 @@ func initBPETokenizer(t *Tokenizer, md map[string]interface{}) (*Tokenizer, erro
 		if len(s) > 2 && strings.HasPrefix(s, "<") {
 			if strings.HasSuffix(s, ">") {
 				if strings.Contains(s, "|") || strings.HasPrefix(s, "</") ||
-					strings.HasPrefix(s, "<tool") || s == "<think>" {
+					strings.HasPrefix(s, "<tool") || s == "<think>" || s == "<sop>" || s == "<eop>" {
 					isSpecial = true
 				}
 			} else if strings.HasSuffix(s, "|") && strings.Contains(s, "|") {
 				isSpecial = true
 			}
+		} else if len(s) > 2 && strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+			isSpecial = true
 		}
 		if isSpecial {
 			specialTokens = append(specialTokens, s)
@@ -224,6 +234,9 @@ func buildGPT2ByteMap() (map[rune]byte, [256]rune) {
 func (t *Tokenizer) Encode(text string) []int32 {
 	var result []int32
 	if t.AddBOS && t.BOS >= 0 {
+		if t.PreBOS >= 0 {
+			result = append(result, t.PreBOS)
+		}
 		result = append(result, t.BOS)
 	}
 

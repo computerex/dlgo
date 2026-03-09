@@ -258,6 +258,9 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 		if cl.Wq != nil && !supportsGPUQType(cl.Wq.Type) {
 			gl.CPUAttn = true
 		}
+		if cl.AttnSinks != nil {
+			gl.CPUAttn = true
+		}
 
 		if cl.Bq != nil {
 			gl.Bq, _ = UploadF32Slice(cl.Bq)
@@ -284,7 +287,7 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			gl.FFNNorm, _ = UploadF32Slice(cl.FFNNorm)
 		}
 
-		if cl.Spec.FFN == llm.FFNMoE {
+		if cl.Spec.FFN == llm.FFNMoE || cl.Spec.FFN == llm.FFNMoESwiOAI {
 			gl.IsMoE = true
 			// Try to upload packed expert weights to GPU
 			moeUploaded := true
@@ -593,7 +596,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			moeLayerCount := 0
 			gpuMoECount := 0
 			for l := 0; l < cfg.NumLayers; l++ {
-				if m.Layers[l].Spec.FFN == llm.FFNMoE {
+				if m.Layers[l].Spec.FFN == llm.FFNMoE || m.Layers[l].Spec.FFN == llm.FFNMoESwiOAI {
 					moeLayerCount++
 					if l < numGPULayers && gm.Layers[l].MoEOnGPU {
 						gpuMoECount++
@@ -866,7 +869,7 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	}
 	for i := range m.Layers {
 		l := &m.Layers[i]
-		if l.Spec.FFN == llm.FFNMoE {
+		if l.Spec.FFN == llm.FFNMoE || l.Spec.FFN == llm.FFNMoESwiOAI {
 			for _, t := range []*core.QuantizedTensor{
 				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,
 				l.Wq, l.Wk, l.Wv, l.Wo,

@@ -30,7 +30,7 @@ var archRegistry = map[string]ArchDescriptor{
 	"deepseek2": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "harmony"},
 	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"qwen3next": {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen3next": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.
@@ -58,6 +58,15 @@ func applyArchDefaults(config *ModelConfig) {
 	}
 	if desc.EmbedScaleMode == "sqrt_dim" && config.EmbeddingDim > 0 {
 		config.EmbedScale = float32(math.Sqrt(float64(config.EmbeddingDim)))
+	}
+	// gpt-oss (OpenAI MoE) architecture-specific defaults matching llama.cpp
+	if config.Architecture == "gpt-oss" {
+		if config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
+			config.SlidingWindowPattern = 2
+		}
+		if config.ExpertCount > 0 {
+			config.ExpertGatingFunc = 3
+		}
 	}
 }
 
@@ -92,6 +101,8 @@ func FormatMessages(cfg ModelConfig, messages []Message) string {
 	switch template {
 	case "chatml":
 		return formatChatMLMessages(messages)
+	case "chatml_sep":
+		return formatChatMLSepMessages(messages)
 	case "llama3":
 		return formatLlama3Messages(messages)
 	case "llama2":
@@ -100,6 +111,8 @@ func FormatMessages(cfg ModelConfig, messages []Message) string {
 		return formatGemmaMessages(messages)
 	case "phi":
 		return formatPhiMessages(messages)
+	case "chatglm":
+		return formatChatGLMMessages(messages)
 	case "harmony":
 		return formatHarmonyMessages(messages)
 	case "plain":
@@ -212,28 +225,54 @@ func formatPhiMessages(messages []Message) string {
 	return b.String()
 }
 
+// formatChatGLMMessages formats messages using the ChatGLM-4 / GLM-4.7 template.
+// The [gMASK]<sop> prefix is part of the Jinja2 template and must be tokenized.
+// Format: [gMASK]<sop><|role|>\ncontent...<|assistant|>\n
+func formatChatGLMMessages(messages []Message) string {
+	var b strings.Builder
+	b.WriteString("[gMASK]<sop>")
+	for _, m := range messages {
+		b.WriteString("<|")
+		b.WriteString(m.Role)
+		b.WriteString("|>\n")
+		b.WriteString(m.Content)
+	}
+	b.WriteString("<|assistant|>\n")
+	return b.String()
+}
+
+// formatChatMLSepMessages formats messages using ChatML with <|im_sep|> separator.
+// Matches llama.cpp LLM_CHAT_TEMPLATE_PHI_4 / Qwen3 format.
+// Format: <|im_start|>role<|im_sep|>content<|im_end|>\n
+func formatChatMLSepMessages(messages []Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		b.WriteString("<|im_start|>")
+		b.WriteString(m.Role)
+		b.WriteString("<|im_sep|>")
+		b.WriteString(m.Content)
+		b.WriteString("<|im_end|>\n")
+	}
+	b.WriteString("<|im_start|>assistant<|im_sep|>\n")
+	return b.String()
+}
+
 // formatHarmonyMessages formats messages using OpenAI Harmony template (gpt-oss).
-// GGUF vocabulary uses <|start|>, <|message|>, <|end|> (with closing >).
+// Matches llama.cpp LLM_CHAT_TEMPLATE_OPENAI_MOE.
+// Format: <|start|>role<|message|>content<|end|> (user/system) or <|return|> (assistant)
 func formatHarmonyMessages(messages []Message) string {
 	var b strings.Builder
-	b.WriteString("<|start|>system<|message|>")
-	b.WriteString("You are a helpful assistant.\n")
-	b.WriteString("# Valid channels: analysis, commentary, final. Channel must be included for every message.")
-	b.WriteString("<|end|>")
 	for _, m := range messages {
-		role := m.Role
-		if role == "system" {
-			b.WriteString("<|start|>developer<|message|>")
-			b.WriteString(m.Content)
-			b.WriteString("<|end|>")
-			continue
-		}
 		b.WriteString("<|start|>")
-		b.WriteString(role)
+		b.WriteString(m.Role)
 		b.WriteString("<|message|>")
 		b.WriteString(m.Content)
-		b.WriteString("<|end|>")
+		if m.Role == "assistant" {
+			b.WriteString("<|return|>")
+		} else {
+			b.WriteString("<|end|>")
+		}
 	}
-	b.WriteString("<|start|>assistant<|message|>")
+	b.WriteString("<|start|>assistant")
 	return b.String()
 }

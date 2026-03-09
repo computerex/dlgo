@@ -43,6 +43,35 @@ func geluScalar(x float32) float32 {
 	return float32(0.5 * v * (1.0 + math.Tanh(c*(v+0.044715*v*v*v))))
 }
 
+// SwiGLU_OAI computes the OpenAI MoE variant of SwiGLU (gpt-oss).
+// Matches llama.cpp ggml_compute_forward_swiglu_oai_f32 exactly:
+//   x = min(gate, limit)
+//   y = clamp(up, -limit, limit)
+//   out_glu = x / (1 + exp(alpha * (-x)))
+//   out = out_glu * (y + 1)
+func SwiGLU_OAI(out, gate, up []float32, n int, alpha, limit float32) {
+	for i := 0; i < n; i++ {
+		x := gate[i]
+		if x > limit {
+			x = limit
+		}
+
+		y := up[i]
+		if y < -limit {
+			y = -limit
+		} else if y > limit {
+			y = limit
+		}
+
+		outGlu := x * sigmoidScalar(alpha*x)
+		out[i] = outGlu * (y + 1)
+	}
+}
+
+func sigmoidScalar(x float32) float32 {
+	return 1.0 / (1.0 + float32(math.Exp(float64(-x))))
+}
+
 // LeakyReLU applies Leaky ReLU in-place: x[i] = max(alpha*x[i], x[i]).
 // Commonly used in GANs and some discriminator networks.
 func LeakyReLU(x []float32, alpha float32) {
