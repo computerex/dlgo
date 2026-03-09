@@ -108,7 +108,9 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 		s.Residual = ResParallel
 	}
 
-	if l.FFNGate != nil {
+	if l.FFNRouter != nil && l.FFNGateExps != nil {
+		s.FFN = FFNMoE
+	} else if l.FFNGate != nil {
 		if cfg.FFNGelu {
 			s.FFN = FFNGeGLU
 		} else {
@@ -146,6 +148,10 @@ func inferRowsCols(dims []int64) (int, int) {
 	if len(dims) == 1 {
 		return int(dims[0]), 1
 	}
+	if len(dims) == 3 {
+		// 3D tensor: [cols, inner_dim, num_experts] → rows = inner_dim*num_experts, cols = cols
+		return int(dims[1]) * int(dims[2]), int(dims[0])
+	}
 	// GGUF stores [cols, rows] (reversed from row-major convention)
 	return int(dims[len(dims)-1]), int(dims[0])
 }
@@ -157,7 +163,8 @@ func isNormOrBias(name string) bool {
 		strings.HasSuffix(name, ".bias") ||
 		strings.HasSuffix(name, "_norm.bias") ||
 		strings.HasSuffix(name, "ssm_a") ||
-		strings.HasSuffix(name, "ssm_conv1d.weight")
+		strings.HasSuffix(name, "ssm_conv1d.weight") ||
+		strings.HasSuffix(name, "ffn_gate_inp_shexp.weight")
 }
 
 func dequantToF32(data []byte, ggmlType uint32, n int) []float32 {
@@ -215,9 +222,11 @@ func mapTensorF32(m *Model, name string, data []float32) {
 				l.SSMNorm = data
 			case "ssm_a":
 				l.SSMA = data
-			case "ssm_conv1d.weight":
-				l.SSMConv1dW = data
-			}
+		case "ssm_conv1d.weight":
+			l.SSMConv1dW = data
+		case "ffn_gate_inp_shexp.weight":
+			l.FFNRouterShared = data
+		}
 		}
 	}
 }
@@ -250,32 +259,59 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 				splitFusedFFNUp(l, qt, cfg.FFNDim, cfg.EmbeddingDim)
 			case "ffn_down.weight":
 				l.FFNDown = qt
-			case "ssm_alpha.weight":
-				l.SSMAlpha = qt
-			case "ssm_beta.weight":
-				l.SSMBeta = qt
-			case "ssm_out.weight":
-				l.SSMOut = qt
-			}
+		case "ssm_alpha.weight":
+			l.SSMAlpha = qt
+		case "ssm_beta.weight":
+			l.SSMBeta = qt
+		case "ssm_out.weight":
+			l.SSMOut = qt
+		// MoE tensors
+		case "ffn_gate_inp.weight":
+			l.FFNRouter = qt
+		case "ffn_gate_exps.weight":
+			l.FFNGateExps = qt
+		case "ffn_up_exps.weight":
+			l.FFNUpExps = qt
+		case "ffn_down_exps.weight":
+			l.FFNDownExps = qt
+		case "ffn_gate_shexp.weight":
+			l.FFNGateShared = qt
+		case "ffn_up_shexp.weight":
+			l.FFNUpShared = qt
+		case "ffn_down_shexp.weight":
+			l.FFNDownShared = qt
 		}
+	}
 	}
 }
 
 // splitFusedQKV splits a fused [Q|K|V] weight tensor into separate Wq, Wk, Wv.
-// If the total rows don't match qDim+2*kvDim, the tensor is stored as SSMInProj
-// (used for Qwen3.5 SSM/delta-net layers where the in-projection has different dims).
+// Handles three cases:
+//   - qDim + 2*kvDim: standard attention split
+//   - 2*qDim + 2*kvDim: GatedQ attention (Q+gate interleaved, doubled)
+//   - other: SSM/delta-net in-projection (stored as SSMInProj)
 func splitFusedQKV(l *Layer, qt *core.QuantizedTensor, qDim, kvDim, cols int) {
 	expected := qDim + 2*kvDim
-	if qt.Rows != expected {
-		l.SSMInProj = qt
-		return
-	}
+	gatedExpected := 2*qDim + 2*kvDim
+
 	bytesPerRow := quant.BytesForN(qt.Type, cols)
-	qBytes := qDim * bytesPerRow
-	kvBytes := kvDim * bytesPerRow
-	l.Wq = &core.QuantizedTensor{Data: qt.Data[:qBytes], Type: qt.Type, Rows: qDim, Cols: cols}
-	l.Wk = &core.QuantizedTensor{Data: qt.Data[qBytes : qBytes+kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
-	l.Wv = &core.QuantizedTensor{Data: qt.Data[qBytes+kvBytes : qBytes+2*kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
+
+	if qt.Rows == expected {
+		qBytes := qDim * bytesPerRow
+		kvBytes := kvDim * bytesPerRow
+		l.Wq = &core.QuantizedTensor{Data: qt.Data[:qBytes], Type: qt.Type, Rows: qDim, Cols: cols}
+		l.Wk = &core.QuantizedTensor{Data: qt.Data[qBytes : qBytes+kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
+		l.Wv = &core.QuantizedTensor{Data: qt.Data[qBytes+kvBytes : qBytes+2*kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
+	} else if qt.Rows == gatedExpected {
+		gatedQDim := 2 * qDim
+		qBytes := gatedQDim * bytesPerRow
+		kvBytes := kvDim * bytesPerRow
+		l.Wq = &core.QuantizedTensor{Data: qt.Data[:qBytes], Type: qt.Type, Rows: gatedQDim, Cols: cols}
+		l.Wk = &core.QuantizedTensor{Data: qt.Data[qBytes : qBytes+kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
+		l.Wv = &core.QuantizedTensor{Data: qt.Data[qBytes+kvBytes : qBytes+2*kvBytes], Type: qt.Type, Rows: kvDim, Cols: cols}
+	} else {
+		l.SSMInProj = qt
+	}
 }
 
 // splitFusedFFNUp splits a fused [gate|up] weight tensor if it has 2x expected rows.

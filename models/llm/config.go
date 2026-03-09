@@ -37,6 +37,12 @@ type ModelConfig struct {
 	SSMStateSize          int
 	SSMTimeStepRank       int
 	SSMGroupCount         int
+
+	// MoE (Mixture of Experts)
+	ExpertCount          int // 0 = dense (no MoE); >0 = number of experts per layer
+	ExpertUsedCount      int // top-K experts selected per token
+	ExpertFFNDim         int // hidden dim per expert
+	SharedExpertFFNDim   int // hidden dim for shared expert (0 = no shared expert)
 }
 
 // parseConfig extracts a ModelConfig from GGUF metadata.
@@ -86,6 +92,11 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		SSMTimeStepRank:       metaInt(md, arch+".ssm.time_step_rank", 0),
 		SSMGroupCount:         metaInt(md, arch+".ssm.group_count", 0),
 		ChatTemplate:          inferChatTemplate(md, arch),
+
+		ExpertCount:        metaInt(md, arch+".expert_count", 0),
+		ExpertUsedCount:    metaInt(md, arch+".expert_used_count", 0),
+		ExpertFFNDim:       metaInt(md, arch+".expert_feed_forward_length", 0),
+		SharedExpertFFNDim: metaInt(md, arch+".expert_shared_feed_forward_length", 0),
 	}
 
 	if c.EmbeddingDim == 0 {

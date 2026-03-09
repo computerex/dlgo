@@ -5,6 +5,7 @@ package gpu
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/computerex/dlgo/core"
@@ -29,6 +30,10 @@ type GpuPipeline struct {
 
 	HasSSM    bool
 	HasGatedQ bool
+	HasMoE    bool
+
+	// CPU-side state for hybrid MoE (expert FFN runs on CPU)
+	CPURunState *llm.RunState
 }
 
 // UploadModel copies all model weights to GPU memory.
@@ -135,17 +140,30 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 			gl.FFNNorm, _ = UploadF32Slice(cl.FFNNorm)
 		}
 
-		gl.FFNGate, _ = UploadTensor(cl.FFNGate)
-		if cl.FFNUp != nil {
-			gl.FFNUp, err = UploadTensor(cl.FFNUp)
-			if err != nil {
-				return nil, fmt.Errorf("layer %d ffn_up: %w", l, err)
+		if cl.Spec.FFN == llm.FFNMoE {
+			gl.IsMoE = true
+			if cl.FFNGateShared != nil {
+				gl.FFNGateShared, _ = UploadTensor(cl.FFNGateShared)
 			}
-		}
-		if cl.FFNDown != nil {
-			gl.FFNDown, err = UploadTensor(cl.FFNDown)
-			if err != nil {
-				return nil, fmt.Errorf("layer %d ffn_down: %w", l, err)
+			if cl.FFNUpShared != nil {
+				gl.FFNUpShared, _ = UploadTensor(cl.FFNUpShared)
+			}
+			if cl.FFNDownShared != nil {
+				gl.FFNDownShared, _ = UploadTensor(cl.FFNDownShared)
+			}
+		} else {
+			gl.FFNGate, _ = UploadTensor(cl.FFNGate)
+			if cl.FFNUp != nil {
+				gl.FFNUp, err = UploadTensor(cl.FFNUp)
+				if err != nil {
+					return nil, fmt.Errorf("layer %d ffn_up: %w", l, err)
+				}
+			}
+			if cl.FFNDown != nil {
+				gl.FFNDown, err = UploadTensor(cl.FFNDown)
+				if err != nil {
+					return nil, fmt.Errorf("layer %d ffn_down: %w", l, err)
+				}
 			}
 		}
 
@@ -219,9 +237,22 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	layerConfs := BuildLayerConfs(m, gm, rs, kv)
 
-	// dp4a disabled: the quantize+barrier overhead per layer (~22µs × layers)
-	// negates ALU savings. TODO: fuse quantization into MatVec shader.
-	var q8_1Scratch Buf
+	maxDim := dim
+	if ffnDim > maxDim {
+		maxDim = ffnDim
+	}
+	q8_1NumBlocks := (maxDim + 31) / 32
+	q8_1Scratch := Alloc(uint64(q8_1NumBlocks) * 36)
+
+	// dp4a: integer dot products. Beneficial when compute dominates over
+	// the quantize+barrier overhead. Disabled by default; the improved base
+	// shaders are faster for most model sizes on current Vulkan drivers.
+	if os.Getenv("DLGO_DP4A") == "1" {
+		for _, lc := range layerConfs {
+			lc.SetDP4A(q8_1Scratch)
+		}
+		fmt.Println("[dlgo/gpu] dp4a enabled via DLGO_DP4A=1")
+	}
 
 	fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
 
@@ -252,10 +283,14 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
 		numHeads := cfg.SSMTimeStepRank
+		numKVGroups := cfg.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
 		headVDim := cfg.SSMInnerSize / numHeads
 		headKDim := cfg.SSMStateSize
 		valueDim := numHeads * headVDim
-		keyDim := numHeads * headKDim
+		keyDim := numKVGroups * headKDim
 		qkvDim := keyDim*2 + valueDim
 		convK := cfg.SSMConvKernel
 
@@ -272,8 +307,20 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 
 		pipe.HasSSM = true
-		fmt.Printf("[dlgo/gpu] SSM state on GPU (%d SSM layers, %d heads, state=%dx%d)\n",
-			ssmLayerCount, numHeads, headKDim, headVDim)
+		fmt.Printf("[dlgo/gpu] SSM state on GPU (%d SSM layers, %d heads, %d KV groups, state=%dx%d)\n",
+			ssmLayerCount, numHeads, numKVGroups, headKDim, headVDim)
+	}
+
+	if cfg.ExpertCount > 0 {
+		pipe.HasMoE = true
+		pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
+		moeLayerCount := 0
+		for l := 0; l < cfg.NumLayers; l++ {
+			if m.Layers[l].Spec.FFN == llm.FFNMoE {
+				moeLayerCount++
+			}
+		}
+		fmt.Printf("[dlgo/gpu] Hybrid MoE: %d MoE layers (expert FFN on CPU, SSM/Attention on GPU)\n", moeLayerCount)
 	}
 
 	return pipe, nil
@@ -321,9 +368,14 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	if p.HasSSM {
 		mcfg2 := p.CPUModel.Config
 		numHeads := mcfg2.SSMTimeStepRank
+		numKVGroups := mcfg2.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
 		headVDim := mcfg2.SSMInnerSize / numHeads
 		headKDim := mcfg2.SSMStateSize
-		qkvDim := numHeads*headKDim*2 + numHeads*headVDim
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
 		convK := mcfg2.SSMConvKernel
 		for l := 0; l < mcfg2.NumLayers; l++ {
 			gl := &p.GpuModel.Layers[l]
@@ -337,32 +389,42 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	mcfg := p.CPUModel.Config
 	npos := len(tokens)
 
-	useBatchPrefill := supportsBatchPrefillGPU(p.CPUModel)
-	if useBatchPrefill {
-		if p.BatchState == nil || p.BatchState.Npos < npos {
-			if p.BatchState != nil {
-				p.BatchState.Free()
+	if p.BatchState == nil || p.BatchState.Npos < npos {
+		if p.BatchState != nil {
+			p.BatchState.Free()
+		}
+		dim := mcfg.EmbeddingDim
+		qDim := mcfg.NumHeads * mcfg.HeadDim
+		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
+		ffnDim := mcfg.FFNDim
+		p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
+		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
+		if p.HasGatedQ {
+			p.BatchState.AllocGatedQBatch(npos, qDim)
+		}
+		if p.HasSSM {
+			numHeads := mcfg.SSMTimeStepRank
+			numKVGroups := mcfg.SSMGroupCount
+			if numKVGroups <= 0 {
+				numKVGroups = numHeads
 			}
-			dim := mcfg.EmbeddingDim
-			qDim := mcfg.NumHeads * mcfg.HeadDim
-			kvDim := mcfg.NumKVHeads * mcfg.HeadDim
-			ffnDim := mcfg.FFNDim
-			p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
-			p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
+			headVDim := mcfg.SSMInnerSize / numHeads
+			headKDim := mcfg.SSMStateSize
+			keyDim := numKVGroups * headKDim
+			qkvDim := keyDim*2 + numHeads*headVDim
+			valueDim := numHeads * headVDim
+			p.BatchState.AllocSSMBatch(npos, qkvDim, valueDim, numHeads)
 		}
 	}
 
 	prefillStart := time.Now()
-	if useBatchPrefill {
-		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState, p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+	isHybrid := isHybridSSMModel(p.CPUModel)
+	if isHybrid {
+		GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
+			p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p)
 	} else {
-		for i, tok := range tokens {
-			if p.UseFusedForward {
-				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-			} else if err := GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
-				return nil, err
-			}
-		}
+		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
+			p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
 	}
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
@@ -435,19 +497,20 @@ done:
 	}, nil
 }
 
-// supportsBatchPrefillGPU gates the newer batched prefill path behind
-// per-architecture validation. SSM layers are recurrent and cannot batch
-// across positions.
+// supportsBatchPrefillGPU gates the batched prefill path.
+// All models now support batch prefill: pure attention models use the standard
+// batch path, and hybrid SSM+attention models use the hybrid batch path.
 func supportsBatchPrefillGPU(m *llm.Model) bool {
-	if m.Config.FullAttentionInterval > 0 && m.Config.SSMInnerSize > 0 {
-		return false
-	}
-	for i := range m.Layers {
-		if m.Layers[i].Spec.GatedQ {
-			return false
-		}
-	}
 	return true
+}
+
+// isHybridSSMModel returns true if the model has both SSM and attention layers,
+// or if it has MoE layers (which require CPU-side expert FFN).
+func isHybridSSMModel(m *llm.Model) bool {
+	if m.Config.ExpertCount > 0 {
+		return true
+	}
+	return m.Config.FullAttentionInterval > 0 && m.Config.SSMInnerSize > 0
 }
 
 // supportsFusedForwardGPU reports whether the fused single-token path can
@@ -466,6 +529,18 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	}
 	for i := range m.Layers {
 		l := &m.Layers[i]
+		if l.Spec.FFN == llm.FFNMoE {
+			// MoE FFN handled on CPU; only check core (SSM/attention) tensors
+			for _, t := range []*core.QuantizedTensor{
+				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,
+				l.Wq, l.Wk, l.Wv, l.Wo,
+			} {
+				if !supported(t) {
+					return false
+				}
+			}
+			continue
+		}
 		if l.Spec.Core == llm.CoreSSM {
 			for _, t := range []*core.QuantizedTensor{
 				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,

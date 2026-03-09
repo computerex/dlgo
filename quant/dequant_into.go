@@ -35,10 +35,129 @@ func DequantizeInto(dst []float32, data []byte, ggmlType uint32, n int) {
 		dequantizeQ5_KInto(dst, data, n)
 	case 14: // Q6_K
 		dequantizeQ6_KInto(dst, data, n)
+	case 16: // IQ2_XXS
+		dequantizeIQ2XXSInto(dst, data, n)
+	case 17: // IQ2_XS
+		dequantizeIQ2XSInto(dst, data, n)
+	case 18: // IQ3_XXS
+		dequantizeIQ3XXSInto(dst, data, n)
+	case 19: // IQ1_S
+		dequantizeIQ1SInto(dst, data, n)
+	case 20: // IQ4_NL
+		dequantizeIQ4_NLInto(dst, data, n)
+	case 21: // IQ3_S
+		dequantizeIQ3SInto(dst, data, n)
+	case 22: // IQ2_S
+		dequantizeIQ2SInto(dst, data, n)
+	case 23: // IQ4_XS
+		dequantizeIQ4_XSInto(dst, data, n)
+	case 29: // IQ1_M
+		dequantizeIQ1MInto(dst, data, n)
 	default:
 		// Fallback: allocate and copy
 		floats, _ := Dequantize(data, ggmlType, n)
 		copy(dst, floats)
+	}
+}
+
+// Fallback Into wrappers for IQ types not yet optimized
+func dequantizeIQ2XXSInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ2XXS(data, n))
+}
+func dequantizeIQ2XSInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ2XS(data, n))
+}
+func dequantizeIQ1SInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ1S(data, n))
+}
+func dequantizeIQ3SInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ3S(data, n))
+}
+func dequantizeIQ2SInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ2S(data, n))
+}
+func dequantizeIQ1MInto(dst []float32, data []byte, n int) {
+	copy(dst, DequantizeIQ1M(data, n))
+}
+
+func dequantizeIQ3XXSInto(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeIQ3XXS
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ3XXS
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+		qsOff := off + 2
+		scalesSignsOff := off + 2 + 64
+		outBase := block * BlockSizeIQ3XXS
+		gridOff := qsOff
+		for ib32 := 0; ib32 < 8; ib32++ {
+			aux32 := binary.LittleEndian.Uint32(data[scalesSignsOff+ib32*4:])
+			db := d * (0.5 + float32(aux32>>28)) * 0.5
+			for l := 0; l < 4; l++ {
+				signIdx := (aux32 >> (7 * uint(l))) & 127
+				signs := ksigns_iq2xs[signIdx]
+				grid1 := iq3xxs_grid[data[gridOff+2*l]]
+				grid2 := iq3xxs_grid[data[gridOff+2*l+1]]
+				oIdx := outBase + ib32*32 + l*8
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid1 >> (8 * uint(j))))
+					if signs&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db * gridVal
+					} else {
+						dst[oIdx+j] = db * gridVal
+					}
+				}
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid2 >> (8 * uint(j))))
+					if signs&kmask_iq2xs[j+4] != 0 {
+						dst[oIdx+4+j] = -db * gridVal
+					} else {
+						dst[oIdx+4+j] = db * gridVal
+					}
+				}
+			}
+			gridOff += 8
+		}
+	}
+}
+
+func dequantizeIQ4_XSInto(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeIQ4_XS
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ4_XS
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+		scalesH := uint16(data[off+2]) | uint16(data[off+3])<<8
+		scalesLOff := off + 4
+		qsOff := off + 8
+		outOff := block * BlockSizeIQ4_XS
+		for ib := 0; ib < 8; ib++ {
+			lo := (data[scalesLOff+ib/2] >> uint(4*(ib%2))) & 0xf
+			hi := (byte(scalesH>>uint(2*ib)) & 3) << 4
+			ls := int(lo | hi)
+			dl := d * float32(ls-32)
+			for j := 0; j < 16; j++ {
+				qByte := data[qsOff+ib*16+j]
+				dst[outOff+j] = dl * float32(kvalues_iq4nl[qByte&0xf])
+				dst[outOff+j+16] = dl * float32(kvalues_iq4nl[qByte>>4])
+			}
+			outOff += 32
+		}
+	}
+}
+
+func dequantizeIQ4_NLInto(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeIQ4_NL
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ4_NL
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+		base := block * BlockSizeIQ4_NL
+		for j := 0; j < 16; j++ {
+			qByte := data[off+2+j]
+			dst[base+j] = d * float32(kvalues_iq4nl[qByte&0xf])
+			dst[base+j+16] = d * float32(kvalues_iq4nl[qByte>>4])
+		}
 	}
 }
 

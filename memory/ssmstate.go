@@ -10,23 +10,25 @@ type SSMLayerState struct {
 	// Stored as [(kernelSize-1) * channels], newest at the end.
 	ConvBuf []float32
 
-	NumHeads int
-	HeadKDim int
-	HeadVDim int
-	Channels int // in-projection output dim (key_dim*2 + value_dim)
-	ConvK    int // kernel size
+	NumHeads    int
+	NumKVGroups int // grouped K/Q heads (like GQA); 0 or == NumHeads means ungrouped
+	HeadKDim    int
+	HeadVDim    int
+	Channels    int // in-projection output dim (key_dim*2 + value_dim)
+	ConvK       int // kernel size
 }
 
 // NewSSMLayerState allocates a fresh SSM layer state.
-func NewSSMLayerState(numHeads, headKDim, headVDim, channels, convKernel int) *SSMLayerState {
+func NewSSMLayerState(numHeads, numKVGroups, headKDim, headVDim, channels, convKernel int) *SSMLayerState {
 	return &SSMLayerState{
-		State:    make([]float32, numHeads*headKDim*headVDim),
-		ConvBuf:  make([]float32, convKernel*channels),
-		NumHeads: numHeads,
-		HeadKDim: headKDim,
-		HeadVDim: headVDim,
-		Channels: channels,
-		ConvK:    convKernel,
+		State:       make([]float32, numHeads*headKDim*headVDim),
+		ConvBuf:     make([]float32, convKernel*channels),
+		NumHeads:    numHeads,
+		NumKVGroups: numKVGroups,
+		HeadKDim:    headKDim,
+		HeadVDim:    headVDim,
+		Channels:    channels,
+		ConvK:       convKernel,
 	}
 }
 
@@ -47,13 +49,13 @@ type SSMStateCache struct {
 
 // NewSSMStateCache creates SSM state caches for the specified layer indices.
 // layerIndices maps absolute layer index to whether it's an SSM layer.
-func NewSSMStateCache(numLayers, numHeads, headKDim, headVDim, channels, convKernel int, isSSMLayer func(int) bool) *SSMStateCache {
+func NewSSMStateCache(numLayers, numHeads, numKVGroups, headKDim, headVDim, channels, convKernel int, isSSMLayer func(int) bool) *SSMStateCache {
 	c := &SSMStateCache{
 		Layers: make([]*SSMLayerState, numLayers),
 	}
 	for l := 0; l < numLayers; l++ {
 		if isSSMLayer(l) {
-			c.Layers[l] = NewSSMLayerState(numHeads, headKDim, headVDim, channels, convKernel)
+			c.Layers[l] = NewSSMLayerState(numHeads, numKVGroups, headKDim, headVDim, channels, convKernel)
 		}
 	}
 	return c

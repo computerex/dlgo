@@ -43,7 +43,10 @@ func NewLayerConf() *LayerConf                                            { retu
 func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf) {}
 func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, qn, kn Buf) {}
 func (lc *LayerConf) SetFFN(fn Buf, gate, up, down *GpuTensor, pan, pfn Buf) {}
+func (lc *LayerConf) SetFFNMoE(fn Buf, pan Buf)                          {}
 func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}
+func (lc *LayerConf) SetCoreType(ct int)                                 {}
+func (lc *LayerConf) SetAttnNormOnly(an Buf)                             {}
 func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e, f float32, rd int, n bool, ft, rt int) {}
 func (lc *LayerConf) SetDP4A(q Buf) {}
 func ForwardLayer(lc *LayerConf, pos, sl int, s float32, nan Buf) error   { return errNoGPU }

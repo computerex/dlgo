@@ -37,11 +37,15 @@ func ForwardSSMLayer(
 ) []float32 {
 	qkvDim := ssmState.Channels
 	numHeads := ssmState.NumHeads
+	numKVGroups := ssmState.NumKVGroups
+	if numKVGroups <= 0 {
+		numKVGroups = numHeads
+	}
 	headKDim := ssmState.HeadKDim
 	headVDim := ssmState.HeadVDim
 	convK := ssmState.ConvK
 	valueDim := numHeads * headVDim
-	keyDim := numHeads * headKDim
+	keyDim := numKVGroups * headKDim
 
 	// 1. In-projection: dim -> qkvDim
 	blas.QMatVecMulParallel(ssm.QKV, layer.SSMInProj, xnorm, pool)
@@ -88,10 +92,10 @@ func ForwardSSMLayer(
 		ssm.Beta[h] = ops.Sigmoid(ssm.Beta[h])
 	}
 
-	// 8. L2-normalize Q and K per head
-	for h := 0; h < numHeads; h++ {
-		l2Normalize(q[h*headKDim:(h+1)*headKDim], cfg.RMSNormEps)
-		l2Normalize(k[h*headKDim:(h+1)*headKDim], cfg.RMSNormEps)
+	// 8. L2-normalize Q and K per KV group
+	for g := 0; g < numKVGroups; g++ {
+		l2Normalize(q[g*headKDim:(g+1)*headKDim], cfg.RMSNormEps)
+		l2Normalize(k[g*headKDim:(g+1)*headKDim], cfg.RMSNormEps)
 	}
 
 	// 9. Scale Q by 1/sqrt(headKDim) (matches llama.cpp)
@@ -100,43 +104,53 @@ func ForwardSSMLayer(
 		q[i] *= qScale
 	}
 
-	// 10. Delta rule recurrent step + output
+	// 10. Delta rule recurrent step + output (GQA-style: K/Q grouped across V heads)
+	// Loop order: outer=i(key), inner=j(value) for sequential cache-friendly access
 	state := ssmState.State
 	for h := 0; h < numHeads; h++ {
 		decay := float32(math.Exp(float64(ssm.Alpha[h])))
 		lr := ssm.Beta[h]
-		qH := q[h*headKDim : (h+1)*headKDim]
-		kH := k[h*headKDim : (h+1)*headKDim]
+		kvGroup := h % numKVGroups
+		qH := q[kvGroup*headKDim : (kvGroup+1)*headKDim]
+		kH := k[kvGroup*headKDim : (kvGroup+1)*headKDim]
 		vH := v[h*headVDim : (h+1)*headVDim]
 		sOff := h * headKDim * headVDim
+		yH := ssm.Y[h*headVDim : (h+1)*headVDim]
 
-		// Step A: Decay state
+		// Decay state
 		for idx := sOff; idx < sOff+headKDim*headVDim; idx++ {
 			state[idx] *= decay
 		}
 
-		// Step B: Predict value from key using current state
-		// v_pred[j] = sum_i S[i][j] * k[i]
-		// Step C: Compute delta = v - v_pred
-		// Step D: Update state: S[i][j] += beta * k[i] * delta[j]
-		for j := 0; j < headVDim; j++ {
-			var vPred float32
-			for i := 0; i < headKDim; i++ {
-				vPred += state[sOff+i*headVDim+j] * kH[i]
-			}
-			delta := vH[j] - vPred
-			for i := 0; i < headKDim; i++ {
-				state[sOff+i*headVDim+j] += lr * kH[i] * delta
+		// Predict: vPred = S^T @ k (row-major traversal)
+		var vPred [256]float32
+		for i := 0; i < headKDim; i++ {
+			row := state[sOff+i*headVDim : sOff+(i+1)*headVDim]
+			ki := kH[i]
+			for j := 0; j < headVDim; j++ {
+				vPred[j] += row[j] * ki
 			}
 		}
 
-		// Step E: Output: y[j] = sum_i S[i][j] * q_scaled[i]
-		for j := 0; j < headVDim; j++ {
-			var dot float32
-			for i := 0; i < headKDim; i++ {
-				dot += state[sOff+i*headVDim+j] * qH[i]
+		// Update: S += lr * outer(k, v - vPred)
+		for i := 0; i < headKDim; i++ {
+			row := state[sOff+i*headVDim : sOff+(i+1)*headVDim]
+			lrk := lr * kH[i]
+			for j := 0; j < headVDim; j++ {
+				row[j] += lrk * (vH[j] - vPred[j])
 			}
-			ssm.Y[h*headVDim+j] = dot
+		}
+
+		// Output: y = S^T @ q (row-major traversal)
+		for j := 0; j < headVDim; j++ {
+			yH[j] = 0
+		}
+		for i := 0; i < headKDim; i++ {
+			row := state[sOff+i*headVDim : sOff+(i+1)*headVDim]
+			qi := qH[i]
+			for j := 0; j < headVDim; j++ {
+				yH[j] += row[j] * qi
+			}
 		}
 	}
 
@@ -158,12 +172,16 @@ func ForwardSSMLayer(
 }
 
 func l2Normalize(v []float32, eps float32) {
-	var norm float32
+	var sum float64
 	for _, x := range v {
-		norm += x * x
+		sum += float64(x) * float64(x)
 	}
-	invNorm := float32(1.0 / math.Sqrt(float64(norm)+float64(eps)))
+	n := float32(math.Sqrt(sum))
+	if n < eps {
+		n = eps
+	}
+	scale := 1.0 / n
 	for i := range v {
-		v[i] *= invNorm
+		v[i] *= scale
 	}
 }

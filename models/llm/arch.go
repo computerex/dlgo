@@ -26,6 +26,7 @@ var archRegistry = map[string]ArchDescriptor{
 	"phi3":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"mistral":   {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "llama2"},
 	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.

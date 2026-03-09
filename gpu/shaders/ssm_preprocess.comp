@@ -45,42 +45,48 @@ void main() {
         beta_data[h] = 1.0 / (1.0 + exp(-b));
     }
 
-    // --- L2-normalize Q for this head ---
-    uint qBase = h * uint(head_k_dim);
-    float sq = 0.0;
-    for (int i = int(tid); i < head_k_dim; i += 256) {
-        float v = qkv[qBase + uint(i)];
-        sq += v * v;
-    }
-    sdata[tid] = sq;
-    barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+    // --- L2-normalize Q and K per KV group (GQA-style grouping) ---
+    // Only the first numKVGroups workgroups handle Q/K normalization.
+    int num_kv_groups = key_dim / head_k_dim;
+    if (int(h) < num_kv_groups) {
+        uint qBase = h * uint(head_k_dim);
+        float sq = 0.0;
+        for (int i = int(tid); i < head_k_dim; i += 256) {
+            float v = qkv[qBase + uint(i)];
+            sq += v * v;
+        }
+        sdata[tid] = sq;
         barrier();
-    }
-    float invNormQ = 1.0 / sqrt(sdata[0] + rms_eps);
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] += sdata[tid + s];
+            barrier();
+        }
+        float normQ = sqrt(sdata[0]);
+        if (normQ < rms_eps) normQ = rms_eps;
+        float invNormQ = 1.0 / normQ;
 
-    // Scale Q: L2 normalize + 1/sqrt(headKDim)
-    float qScale = invNormQ / sqrt(float(head_k_dim));
-    for (int i = int(tid); i < head_k_dim; i += 256) {
-        qkv[qBase + uint(i)] *= qScale;
-    }
+        float qScale = invNormQ / sqrt(float(head_k_dim));
+        for (int i = int(tid); i < head_k_dim; i += 256) {
+            qkv[qBase + uint(i)] *= qScale;
+        }
 
-    // --- L2-normalize K for this head ---
-    uint kBase = uint(key_dim) + h * uint(head_k_dim);
-    float sk = 0.0;
-    for (int i = int(tid); i < head_k_dim; i += 256) {
-        float v = qkv[kBase + uint(i)];
-        sk += v * v;
-    }
-    sdata[tid] = sk;
-    barrier();
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+        uint kBase = uint(key_dim) + h * uint(head_k_dim);
+        float sk = 0.0;
+        for (int i = int(tid); i < head_k_dim; i += 256) {
+            float v = qkv[kBase + uint(i)];
+            sk += v * v;
+        }
+        sdata[tid] = sk;
         barrier();
-    }
-    float invNormK = 1.0 / sqrt(sdata[0] + rms_eps);
-    for (int i = int(tid); i < head_k_dim; i += 256) {
-        qkv[kBase + uint(i)] *= invNormK;
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s) sdata[tid] += sdata[tid + s];
+            barrier();
+        }
+        float normK = sqrt(sdata[0]);
+        if (normK < rms_eps) normK = rms_eps;
+        float invNormK = 1.0 / normK;
+        for (int i = int(tid); i < head_k_dim; i += 256) {
+            qkv[kBase + uint(i)] *= invNormK;
+        }
     }
 }

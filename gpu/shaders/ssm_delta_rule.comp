@@ -17,7 +17,7 @@ layout(push_constant) uniform Params {
     int num_heads;
     int head_k_dim;
     int head_v_dim;
-    int key_dim;     // num_heads * head_k_dim
+    int key_dim;     // num_kv_groups * head_k_dim (may be < num_heads * head_k_dim)
 };
 
 void main() {
@@ -29,9 +29,13 @@ void main() {
     float decay = exp(alpha_data[h]);
     float lr = beta_data[h];
 
+    // GQA-style: map head h to its K/Q group (tiled, matching ggml_repeat)
+    int num_kv_groups = key_dim / head_k_dim;
+    uint kvGroup = h % uint(num_kv_groups);
+
     uint sOff = h * uint(head_k_dim) * uint(head_v_dim);
-    uint qOff = h * uint(head_k_dim);
-    uint kOff = uint(key_dim) + h * uint(head_k_dim);
+    uint qOff = kvGroup * uint(head_k_dim);
+    uint kOff = uint(key_dim) + kvGroup * uint(head_k_dim);
     uint vOff = 2u * uint(key_dim) + h * uint(head_v_dim);
 
     // Step A: Decay state column j and compute v_pred = S^T[:,j] . k

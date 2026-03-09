@@ -1,3 +1,5 @@
+//go:build ignore
+
 package main
 
 import (
@@ -6,103 +8,105 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
+
+	"github.com/computerex/dlgo/gpu"
+	"github.com/computerex/dlgo/models/llm"
 )
 
-type GenerateRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
-	Options struct {
-		Temperature float64 `json:"temperature"`
-		NumPredict  int     `json:"num_predict"`
-		Seed        int     `json:"seed"`
-		NumGPU      int     `json:"num_gpu"`
-	} `json:"options"`
+type ollamaReq struct {
+	Model   string      `json:"model"`
+	Msgs    []ollamaMsg `json:"messages"`
+	Stream  bool        `json:"stream"`
+	Options ollamaOpts  `json:"options"`
 }
-
-type GenerateResponse struct {
-	Model              string        `json:"model"`
-	CreatedAt          time.Time     `json:"created_at"`
-	Response           string        `json:"response"`
+type ollamaMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+type ollamaOpts struct {
+	Temperature float64 `json:"temperature"`
+	NumPredict  int     `json:"num_predict"`
+	Seed        int     `json:"seed"`
+	NumGPU      int     `json:"num_gpu"`
+}
+type ollamaResp struct {
+	Message            ollamaMsg     `json:"message"`
 	Done               bool          `json:"done"`
-	Context            []int         `json:"context,omitempty"`
-	TotalDuration      time.Duration `json:"total_duration,omitempty"`
-	LoadDuration       time.Duration `json:"load_duration,omitempty"`
 	PromptEvalCount    int           `json:"prompt_eval_count,omitempty"`
 	PromptEvalDuration time.Duration `json:"prompt_eval_duration,omitempty"`
 	EvalCount          int           `json:"eval_count,omitempty"`
 	EvalDuration       time.Duration `json:"eval_duration,omitempty"`
 }
 
-func main() {
-	model := "smollm2:1.7b"
-	if len(os.Args) > 1 {
-		model = os.Args[1]
-	}
-
-	prompt := "Write a short poem about the ocean."
-
-	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║               Ollama LLM Inference Benchmark                  ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
-	fmt.Printf("\nUser: %q\nMax tokens: 64 (greedy)\nModel: %s\n\n", prompt, model)
-
-	req := GenerateRequest{
+func ollamaGenerate(model, prompt string, maxTok, numGPU int) (float64, float64, int, int, error) {
+	req := ollamaReq{
 		Model:  model,
-		Prompt: prompt,
+		Msgs:   []ollamaMsg{{Role: "user", Content: prompt}},
 		Stream: false,
+		Options: ollamaOpts{Temperature: 0, NumPredict: maxTok, Seed: 42, NumGPU: numGPU},
 	}
-	req.Options.Temperature = 0
-	req.Options.NumPredict = 64
-	req.Options.Seed = 42
-	req.Options.NumGPU = 0
-
-	reqBody, err := json.Marshal(req)
+	b, _ := json.Marshal(req)
+	resp, err := http.Post("http://localhost:11434/api/chat", "application/json", bytes.NewBuffer(b))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling request: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Running benchmark...\n")
-
-	resp, err := http.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(reqBody))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
-		os.Exit(1)
+		return 0, 0, 0, 0, err
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var r ollamaResp
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("json: %v", err)
+	}
+	gms := float64(r.EvalDuration) / 1e6
+	return float64(r.PromptEvalDuration) / 1e6, gms, r.PromptEvalCount, r.EvalCount, nil
+}
 
-	body, err := io.ReadAll(resp.Body)
+func main() {
+	ggufPath := `C:\projects\evoke\models\Phi-4-mini-instruct-Q3_K_M.gguf`
+	ollamaName := "dlgo-phi4-mini"
+	prompt := "Explain what a compiler does in one paragraph."
+	maxTok := 64
+
+	fmt.Println("=== Phi-4-mini Q3_K_M Quick Benchmark ===")
+	fmt.Println()
+
+	// Ollama GPU
+	fmt.Println("--- Ollama GPU ---")
+	_, gms, _, genTok, err := ollamaGenerate(ollamaName, prompt, maxTok, 99)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
-		os.Exit(1)
+		fmt.Printf("  Ollama GPU error: %v\n", err)
+	} else {
+		ollamaTokS := float64(genTok) / (gms / 1000)
+		fmt.Printf("  Generation: %d tokens in %.1f ms = %.1f tok/s\n", genTok, gms, ollamaTokS)
 	}
 
-	var result GenerateResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		fmt.Fprintf(os.Stderr, "Error unmarshaling response: %v\n", err)
-		os.Exit(1)
+	// dlgo GPU
+	fmt.Println("--- dlgo GPU ---")
+	pipeline, err := llm.NewPipeline(ggufPath, 2048)
+	if err != nil {
+		fmt.Printf("  Load error: %v\n", err)
+		return
 	}
-
-	if !result.Done {
-		fmt.Printf("Generation not complete\n")
-		os.Exit(1)
+	gpuPipe, err := gpu.NewGpuPipeline(pipeline)
+	if err != nil {
+		fmt.Printf("  GPU upload error: %v\n", err)
+		return
 	}
+	defer gpuPipe.FreeAll()
 
-	tokensPerSec := float64(result.EvalCount) / result.EvalDuration.Seconds()
-	totalTokens := result.PromptEvalCount + result.EvalCount
-
-	preview := result.Response
-	if len(preview) > 60 {
-		preview = preview[:60] + "..."
+	cfg := llm.GenerateConfig{MaxTokens: maxTok}
+	res, err := gpuPipe.GenerateDetailed(prompt, cfg)
+	if err != nil {
+		fmt.Printf("  Generate error: %v\n", err)
+		return
 	}
+	fmt.Printf("  Generation: %d tokens in %.1f ms = %.1f tok/s\n",
+		res.TotalTokens-res.PromptTokens, res.GenerateTimeMs, res.TokensPerSec)
 
-	fmt.Printf("%-30s  %5.1f tok/s  prefill:%5.0fms  gen:%5.0fms  [%d tok]\n",
-		model, tokensPerSec,
-		float64(result.PromptEvalDuration.Milliseconds()),
-		float64(result.EvalDuration.Milliseconds()),
-		totalTokens)
-	fmt.Printf("  → %s\n\n", preview)
+	ollamaTokS := float64(genTok) / (gms / 1000)
+	fmt.Printf("\n=== Comparison ===\n")
+	fmt.Printf("  Ollama GPU: %.1f tok/s\n", ollamaTokS)
+	fmt.Printf("  dlgo GPU:   %.1f tok/s\n", res.TokensPerSec)
+	diff := (ollamaTokS - res.TokensPerSec) / ollamaTokS * 100
+	fmt.Printf("  Gap: %.1f%%\n", diff)
 }

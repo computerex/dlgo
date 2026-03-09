@@ -98,6 +98,12 @@ type GpuLayer struct {
 	FFNDownBias  Buf
 	PostFFNNorm  Buf
 
+	// MoE shared expert weights (Q8_0, GPU-supported)
+	FFNGateShared *GpuTensor // [sharedFFNDim × dim]
+	FFNUpShared   *GpuTensor // [sharedFFNDim × dim]
+	FFNDownShared *GpuTensor // [dim × sharedFFNDim]
+	IsMoE         bool
+
 	// SSM (Gated Delta Net) weights and per-layer state on GPU
 	SSMInProj  *GpuTensor // [qkvDim × dim]
 	SSMGate    *GpuTensor // [valueDim × dim] (AttnGate)
@@ -106,7 +112,7 @@ type GpuLayer struct {
 	SSMConv1dW Buf        // [channels × convK] float32
 	SSMA       Buf        // [numHeads] float32
 	SSMDtBias  Buf        // [numHeads] float32 (may be 0)
-	SSMNorm    Buf        // [headVDim] float32
+	SSMNorm    Buf        // [headVDim] float32 (shared across heads)
 	SSMOut     *GpuTensor // [dim × valueDim]
 	SSMState   Buf        // [numHeads × headKDim × headVDim] float32 (persistent)
 	SSMConvBuf Buf        // [convK × channels] float32 (persistent)
@@ -210,6 +216,17 @@ type GpuBatchState struct {
 	Hidden   Buf
 	FFNOut   Buf
 	Npos     int
+
+	// GatedQ batch buffers
+	QFull Buf // [npos * 2*qDim]
+	QGate Buf // [npos * qDim]
+
+	// SSM batch buffers (input projections batched, recurrence per-position)
+	SSMQKV   Buf // [npos * qkvDim]
+	SSMZ     Buf // [npos * valueDim]
+	SSMAlpha Buf // [npos * numHeads]
+	SSMBeta  Buf // [npos * numHeads]
+	SSMY     Buf // [npos * valueDim]
 }
 
 // NewGpuBatchState allocates batch-sized GPU activation buffers.
@@ -232,6 +249,21 @@ func NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim int) *GpuBatchState {
 	}
 }
 
+// AllocGatedQBatch allocates batch-sized GatedQ scratch buffers.
+func (bs *GpuBatchState) AllocGatedQBatch(npos, qDim int) {
+	bs.QFull = Alloc(uint64(npos * 2 * qDim * 4))
+	bs.QGate = Alloc(uint64(npos * qDim * 4))
+}
+
+// AllocSSMBatch allocates batch-sized SSM scratch buffers.
+func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) {
+	bs.SSMQKV = Alloc(uint64(npos * qkvDim * 4))
+	bs.SSMZ = Alloc(uint64(npos * valueDim * 4))
+	bs.SSMAlpha = Alloc(uint64(npos * numHeads * 4))
+	bs.SSMBeta = Alloc(uint64(npos * numHeads * 4))
+	bs.SSMY = Alloc(uint64(npos * valueDim * 4))
+}
+
 // FreeBatchState releases all batch GPU buffers.
 func (bs *GpuBatchState) Free() {
 	if bs == nil {
@@ -250,6 +282,13 @@ func (bs *GpuBatchState) Free() {
 	Free(bs.Up)
 	Free(bs.Hidden)
 	Free(bs.FFNOut)
+	Free(bs.QFull)
+	Free(bs.QGate)
+	Free(bs.SSMQKV)
+	Free(bs.SSMZ)
+	Free(bs.SSMAlpha)
+	Free(bs.SSMBeta)
+	Free(bs.SSMY)
 }
 
 // GpuKVCache holds GPU-resident KV cache for all layers.
@@ -323,6 +362,9 @@ func (gm *GpuModel) FreeAll() {
 		freeBuf(gl.FFNUpBias)
 		freeBuf(gl.FFNDownBias)
 		freeBuf(gl.PostFFNNorm)
+		freeTensor(gl.FFNGateShared)
+		freeTensor(gl.FFNUpShared)
+		freeTensor(gl.FFNDownShared)
 	}
 }
 

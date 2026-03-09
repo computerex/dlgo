@@ -963,13 +963,11 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     }
 
     // Basic quants (Q4_0, Q5_0, Q8_0, F32): 128 threads, 4 subgroups, 4 rows per WG.
-    // K-quants (Q4_K, Q6_K): 128 threads, 16 threads/superblock, 2 rows per WG.
-    // Q3_K: 32 threads, 1 subgroup, 1 row per WG.
+    // K-quants (Q3_K, Q4_K, Q5_K, Q6_K): 128 threads, 2 rows per WG.
     int rows_per_wg = 4;
-    if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K) {
+    if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K ||
+        qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) {
         rows_per_wg = 2;
-    } else if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) {
-        rows_per_wg = 1;
     }
 
     struct { int rows; int cols; } pc = {rows, cols};
@@ -1213,6 +1211,8 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
         default: return gpu_matvec(out_buf, weights_buf, q8_1_buf, rows, cols, qtype);
     }
 
@@ -1266,8 +1266,8 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     }
 
     int rows_per_wg = 4;
-    if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K) rows_per_wg = 2;
-    else if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) rows_per_wg = 1;
+    if (qtype == QTYPE_Q4_K || qtype == QTYPE_Q6_K ||
+        qtype == QTYPE_Q3_K || qtype == QTYPE_Q5_K) rows_per_wg = 2;
 
     struct { int rows; int cols; } pc = {rows, cols};
     DispatchParams dp = {0};
@@ -1490,6 +1490,79 @@ int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n) {
 }
 
 // ---------------------------------------------------------------------------
+// Batch operations exposed for hybrid prefill
+// ---------------------------------------------------------------------------
+
+int gpu_batch_rope(GpuBuf q, GpuBuf k, int num_heads, int num_kv_heads,
+                   int head_dim, int rope_dim, int start_pos, float freq_base,
+                   int neox, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    struct { int nh; int nkv; int hd; int rd; int pos; float fb; int neox; } pc =
+        {num_heads, num_kv_heads, head_dim, rope_dim, start_pos, freq_base, neox};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ROPE;
+    dp.bufs[0] = q; dp.bufs[1] = k; dp.num_bufs = 2;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
+    dp.groups_y = npos; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_kv_store(GpuBuf k_cache, GpuBuf v_cache, GpuBuf k, GpuBuf v,
+                       int start_pos, int kv_dim, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    BufferAlloc* kc = get_buf(k_cache);
+    BufferAlloc* vc = get_buf(v_cache);
+    BufferAlloc* kb = get_buf(k);
+    BufferAlloc* vb = get_buf(v);
+    if (!kc || !vc || !kb || !vb) return GPU_ERR_DISPATCH;
+
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier_(g.cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, NULL, 0, NULL);
+
+    VkBufferCopy kr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
+    vkCmdCopyBuffer_(g.cmd_buf, kb->buffer, kc->buffer, 1, &kr);
+    VkBufferCopy vr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
+    vkCmdCopyBuffer_(g.cmd_buf, vb->buffer, vc->buffer, 1, &vr);
+
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier_(g.cmd_buf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &mb, 0, NULL, 0, NULL);
+    g.dispatch_count++;
+    return GPU_OK;
+}
+
+int gpu_batch_attention(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
+                        int num_heads, int num_kv_heads, int head_dim,
+                        int kv_dim, int start_seq_len, float scale, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION;
+    dp.bufs[0] = out; dp.bufs[1] = q;
+    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+    dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_add_bias2(GpuBuf dst, GpuBuf bias, GpuBuf scratch,
+                        int elems_per_pos, int npos) {
+    return gpu_batch_add_bias_expand(dst, bias, scratch, elems_per_pos, npos);
+}
+
+// ---------------------------------------------------------------------------
 // Fused layer forward — all dispatches for one transformer layer in a single
 // C call, eliminating per-operation CGo overhead.
 // ---------------------------------------------------------------------------
@@ -1553,6 +1626,12 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
             gpu_barrier();
         }
         gpu_add_rmsnorm(lc->ffn_norm, lc->ffn_in, lc->x, lc->attn_proj, lc->ffn_norm_w, dim, lc->rms_eps);
+
+        if (lc->ffn_type == 3) {
+            // MoE skip: pre-FFN residual+norm computed (ffn_in, ffn_norm ready).
+            // Go side handles: download ffn_norm, CPU MoE FFN, upload ffn_out, residual.
+            return GPU_OK;
+        }
 
         gpu_barrier();
         if (lc->use_dp4a && lc->q8_1_scratch) {
@@ -1728,6 +1807,9 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
     int num_kv_heads = lc->num_kv_heads;
     int kv_dim = lc->kv_dim;
 
+    // core_type 1 = SSM/GatedQ: Go side already filled attn_proj, skip to residual+FFN
+    if (lc->core_type == 0) {
+
     gpu_barrier();
     gpu_batch_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, npos, lc->wq_type);
     gpu_batch_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, npos, lc->wk_type);
@@ -1828,6 +1910,8 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
     gpu_barrier();
     gpu_batch_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, npos, lc->wo_type);
 
+    } // end core_type == 0
+
     if (lc->residual_type == 0) {
         gpu_barrier();
         if (lc->post_attn_norm_w) {
@@ -1851,6 +1935,10 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
             dp.push_data = &pc; dp.push_size = sizeof(pc);
             dp.groups_x = 1; dp.groups_y = npos; dp.groups_z = 1;
             dispatch_compute(&dp);
+        }
+
+        if (lc->ffn_type == 3) {
+            return GPU_OK;
         }
 
         gpu_barrier();

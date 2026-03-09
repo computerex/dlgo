@@ -18,6 +18,8 @@ float vec_dot_q3_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q4_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q5_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q6_k(const uint8_t* data, const float* x, int n);
+float vec_dot_iq3_xxs(const uint8_t* data, const float* x, int n);
+float vec_dot_iq4_xs(const uint8_t* data, const float* x, int n);
 
 void vec_dot_q4_0_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
 void vec_dot_q4_1_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
@@ -30,6 +32,8 @@ void vec_dot_q3_k_batch(const uint8_t* data, const float* x, int n, float* out, 
 void vec_dot_q4_k_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
 void vec_dot_q5_k_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
 void vec_dot_q6_k_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
+void vec_dot_iq3_xxs_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
+void vec_dot_iq4_xs_batch(const uint8_t* data, const float* x, int n, float* out, int nrows, int bpr);
 
 float vec_dot_f32(const float* a, const float* b, int n);
 void vec_dot_f32_batch(const float* a_flat, const float* x, int cols,
@@ -83,6 +87,10 @@ func SIMDDotProduct(data []byte, ggmlType uint32, x []float32, n int) float32 {
 		return float32(C.vec_dot_q5_k((*C.uint8_t)(dp), (*C.float)(xp), C.int(n)))
 	case 14: // Q6_K
 		return float32(C.vec_dot_q6_k((*C.uint8_t)(dp), (*C.float)(xp), C.int(n)))
+	case 18: // IQ3_XXS
+		return float32(C.vec_dot_iq3_xxs((*C.uint8_t)(dp), (*C.float)(xp), C.int(n)))
+	case 23: // IQ4_XS
+		return float32(C.vec_dot_iq4_xs((*C.uint8_t)(dp), (*C.float)(xp), C.int(n)))
 	default:
 		return FusedDotProduct(data, ggmlType, x, n)
 	}
@@ -123,6 +131,10 @@ func SIMDDotBatch(data []byte, ggmlType uint32, x []float32, cols int, out []flo
 		C.vec_dot_q5_k_batch((*C.uint8_t)(dp), (*C.float)(xp), C.int(cols), (*C.float)(op), C.int(nrows), C.int(bytesPerRow))
 	case 14: // Q6_K
 		C.vec_dot_q6_k_batch((*C.uint8_t)(dp), (*C.float)(xp), C.int(cols), (*C.float)(op), C.int(nrows), C.int(bytesPerRow))
+	case 18: // IQ3_XXS
+		C.vec_dot_iq3_xxs_batch((*C.uint8_t)(dp), (*C.float)(xp), C.int(cols), (*C.float)(op), C.int(nrows), C.int(bytesPerRow))
+	case 23: // IQ4_XS
+		C.vec_dot_iq4_xs_batch((*C.uint8_t)(dp), (*C.float)(xp), C.int(cols), (*C.float)(op), C.int(nrows), C.int(bytesPerRow))
 	default:
 		for r := 0; r < nrows; r++ {
 			rowData := data[r*bytesPerRow : (r+1)*bytesPerRow]
@@ -185,7 +197,7 @@ func HasCausalAttn() bool { return true }
 // slightly different floating-point rounding due to accumulation order.
 func HasSIMDDot(ggmlType uint32) bool {
 	switch ggmlType {
-	case 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14:
+	case 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 18, 23:
 		return true
 	default:
 		return false

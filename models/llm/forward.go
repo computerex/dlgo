@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/computerex/dlgo/blas"
+	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/memory"
 	"github.com/computerex/dlgo/ops"
 	"github.com/computerex/dlgo/quant"
@@ -42,6 +43,17 @@ type RunState struct {
 	// SSM (Gated Delta Net) scratch buffers — nil for pure transformer models
 	SSMRun   *SSMRunState
 	SSMState *memory.SSMStateCache
+
+	// MoE (Mixture of Experts) scratch buffers — nil for dense models
+	MoELogits     []float32   // [expertCount] router logits
+	MoEGates      [][]float32 // [nUsed][expertFFNDim] per-expert gate (parallel)
+	MoEUps        [][]float32 // [nUsed][expertFFNDim] per-expert up (parallel)
+	MoEHiddens    [][]float32 // [nUsed][expertFFNDim] per-expert hidden (parallel)
+	MoEExpertOuts [][]float32 // [nUsed][dim] per-expert output (parallel)
+	MoEShGate     []float32   // [sharedFFNDim] shared expert gate
+	MoEShUp       []float32   // [sharedFFNDim] shared expert up
+	MoEShHidden   []float32   // [sharedFFNDim] shared expert hidden
+	MoEShOut      []float32   // [dim] shared expert output
 
 	// Worker pool for parallel matmul
 	Pool *blas.Pool
@@ -86,12 +98,40 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		rs.QGate = make([]float32, qDim)
 	}
 
+	if cfg.ExpertCount > 0 {
+		expDim := cfg.ExpertFFNDim
+		shDim := cfg.SharedExpertFFNDim
+		if shDim == 0 {
+			shDim = expDim
+		}
+		nUsed := cfg.ExpertUsedCount
+		rs.MoELogits = make([]float32, cfg.ExpertCount)
+		rs.MoEGates = make([][]float32, nUsed)
+		rs.MoEUps = make([][]float32, nUsed)
+		rs.MoEHiddens = make([][]float32, nUsed)
+		rs.MoEExpertOuts = make([][]float32, nUsed)
+		for i := 0; i < nUsed; i++ {
+			rs.MoEGates[i] = make([]float32, expDim)
+			rs.MoEUps[i] = make([]float32, expDim)
+			rs.MoEHiddens[i] = make([]float32, expDim)
+			rs.MoEExpertOuts[i] = make([]float32, dim)
+		}
+		rs.MoEShGate = make([]float32, shDim)
+		rs.MoEShUp = make([]float32, shDim)
+		rs.MoEShHidden = make([]float32, shDim)
+		rs.MoEShOut = make([]float32, dim)
+	}
+
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
 		numHeads := cfg.SSMTimeStepRank
+		numKVGroups := cfg.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
 		headVDim := cfg.SSMInnerSize / numHeads
 		headKDim := cfg.SSMStateSize
 		valueDim := numHeads * headVDim
-		keyDim := numHeads * headKDim
+		keyDim := numKVGroups * headKDim
 		qkvDim := keyDim*2 + valueDim
 
 		rs.SSMRun = &SSMRunState{
@@ -102,7 +142,7 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 			Y:     make([]float32, valueDim),
 		}
 		rs.SSMState = memory.NewSSMStateCache(
-			cfg.NumLayers, numHeads, headKDim, headVDim,
+			cfg.NumLayers, numHeads, numKVGroups, headKDim, headVDim,
 			qkvDim, cfg.SSMConvKernel,
 			func(l int) bool { return isSSMLayer(l, cfg) },
 		)
@@ -162,7 +202,7 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 			}
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
-			forwardFFN(layer, rs, rs.FFNNorm, pool)
+			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
 			if layer.PostFFNNorm != nil {
 				ops.RMSNormInPlace(rs.FFNOut, layer.PostFFNNorm, cfg.RMSNormEps)
 			}
@@ -171,11 +211,11 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 		case ResPostAttnFFN:
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.PostAttnNorm, cfg.RMSNormEps)
-			forwardFFN(layer, rs, rs.FFNNorm, pool)
+			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
 			ops.Add(rs.X, rs.FFNIn, rs.FFNOut)
 
 		case ResParallel:
-			forwardFFN(layer, rs, rs.XNorm, pool)
+			forwardFFN(layer, rs, rs.XNorm, cfg, pool)
 			for i := 0; i < dim; i++ {
 				rs.X[i] = rs.X[i] + rs.AttnProj[i] + rs.FFNOut[i]
 			}
@@ -289,8 +329,172 @@ func ForwardAttention(
 	}
 }
 
+// expertView returns a zero-copy view into a packed expert tensor for one expert.
+func expertView(packed *core.QuantizedTensor, expertIdx, expertRows int) *core.QuantizedTensor {
+	bytesPerRow := quant.BytesForN(packed.Type, packed.Cols)
+	offset := expertIdx * expertRows * bytesPerRow
+	size := expertRows * bytesPerRow
+	return &core.QuantizedTensor{
+		Data: packed.Data[offset : offset+size],
+		Type: packed.Type,
+		Rows: expertRows,
+		Cols: packed.Cols,
+	}
+}
+
+// topKIndices returns the indices and values of the K largest elements.
+func topKIndices(logits []float32, k int) ([]int, []float32) {
+	n := len(logits)
+	if k > n {
+		k = n
+	}
+	indices := make([]int, k)
+	values := make([]float32, k)
+	for i := 0; i < k; i++ {
+		indices[i] = -1
+		values[i] = -math.MaxFloat32
+	}
+	for i, v := range logits {
+		minIdx := 0
+		for j := 1; j < k; j++ {
+			if values[j] < values[minIdx] {
+				minIdx = j
+			}
+		}
+		if v > values[minIdx] {
+			values[minIdx] = v
+			indices[minIdx] = i
+		}
+	}
+	return indices, values
+}
+
+// ForwardMoEFFN runs the Mixture-of-Experts FFN. Result written to rs.FFNOut.
+func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nUsed := cfg.ExpertUsedCount
+
+	// Router: compute softmax probabilities over all experts
+	blas.QMatVecMulParallel(rs.MoELogits, layer.FFNRouter, input, pool)
+	quant.SIMDSoftmax(rs.MoELogits)
+
+	// Select top-K experts
+	indices, weights := topKIndices(rs.MoELogits, nUsed)
+
+	// Normalize selected weights
+	var wSum float32
+	for _, w := range weights {
+		wSum += w
+	}
+	if wSum < 1e-12 {
+		wSum = 1e-12
+	}
+	invSum := 1.0 / wSum
+	for i := range weights {
+		weights[i] *= invSum
+	}
+
+	// Build expert slices for batched dispatch
+	gateBpr := quant.BytesForN(layer.FFNGateExps.Type, layer.FFNGateExps.Cols)
+	upBpr := quant.BytesForN(layer.FFNUpExps.Type, layer.FFNUpExps.Cols)
+	downBpr := quant.BytesForN(layer.FFNDownExps.Type, layer.FFNDownExps.Cols)
+
+	gateSlices := make([]blas.ExpertSlice, 0, nUsed)
+	upSlices := make([]blas.ExpertSlice, 0, nUsed)
+	activeExperts := make([]int, 0, nUsed)
+
+	for e := 0; e < nUsed; e++ {
+		idx := indices[e]
+		if idx < 0 {
+			continue
+		}
+		activeExperts = append(activeExperts, e)
+		gateSlices = append(gateSlices, blas.ExpertSlice{
+			Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * gateBpr,
+		})
+		upSlices = append(upSlices, blas.ExpertSlice{
+			Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * upBpr,
+		})
+	}
+
+	// Single dispatch: all experts' gate+up projections
+	blas.QDualMultiExpertMatVec(layer.FFNGateExps, layer.FFNUpExps,
+		gateSlices, upSlices, input, pool)
+
+	// SwiGLU for all active experts
+	for _, e := range activeExperts {
+		quant.SIMDSwiGLU(rs.MoEHiddens[e], rs.MoEGates[e], rs.MoEUps[e], expDim)
+	}
+
+	// Down projections: dispatch all expert rows (nActive * dim) across all workers
+	// for full core utilization. Each row uses its expert's hidden vector as input.
+	ops.Clear(rs.FFNOut)
+	nActive := len(activeExperts)
+	totalDownRows := nActive * dim
+	useFusedDown := quant.HasSIMDDot(layer.FFNDownExps.Type)
+	downCols := layer.FFNDownExps.Cols
+	pool.DispatchChunked(totalDownRows, pool.NumWorkers(), func(_, start, end int) {
+		for row := start; row < end; {
+			ei := row / dim
+			rowInExpert := row % dim
+			e := activeExperts[ei]
+			idx := indices[e]
+			endInExpert := end - ei*dim
+			if endInExpert > dim {
+				endInExpert = dim
+			}
+			nrows := endInExpert - rowInExpert
+			downOff := idx*dim*downBpr + rowInExpert*downBpr
+			out := rs.MoEExpertOuts[e]
+			if useFusedDown {
+				quant.SIMDDotBatch(
+					layer.FFNDownExps.Data[downOff:downOff+nrows*downBpr],
+					layer.FFNDownExps.Type, rs.MoEHiddens[e],
+					downCols, out[rowInExpert:endInExpert], nrows, downBpr)
+			} else {
+				buf := make([]float32, downCols)
+				for r := rowInExpert; r < endInExpert; r++ {
+					rOff := idx*dim*downBpr + r*downBpr
+					quant.DequantizeInto(buf, layer.FFNDownExps.Data[rOff:rOff+downBpr], layer.FFNDownExps.Type, downCols)
+					out[r] = quant.SIMDDotF32(buf, rs.MoEHiddens[e], downCols)
+				}
+			}
+			row = (ei + 1) * dim
+		}
+	})
+
+	// Accumulate weighted expert outputs
+	for _, e := range activeExperts {
+		w := weights[e]
+		out := rs.MoEExpertOuts[e]
+		for i := 0; i < dim; i++ {
+			rs.FFNOut[i] += w * out[i]
+		}
+	}
+
+	// Shared expert (uses pool since it's larger)
+	if layer.FFNGateShared != nil {
+		shDim := layer.FFNGateShared.Rows
+		blas.QDualMatVecMulParallel(rs.MoEShGate, layer.FFNGateShared, rs.MoEShUp, layer.FFNUpShared, input, pool)
+		quant.SIMDSwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
+		blas.QMatVecMulParallel(rs.MoEShOut, layer.FFNDownShared, rs.MoEShHidden, pool)
+
+		if layer.FFNRouterShared != nil {
+			gate := ops.Sigmoid(ops.DotProduct(layer.FFNRouterShared, input, dim))
+			for i := 0; i < dim; i++ {
+				rs.FFNOut[i] += gate * rs.MoEShOut[i]
+			}
+		} else {
+			for i := 0; i < dim; i++ {
+				rs.FFNOut[i] += rs.MoEShOut[i]
+			}
+		}
+	}
+}
+
 // forwardFFN runs the feed-forward network. Result written to rs.FFNOut.
-func forwardFFN(layer *Layer, rs *RunState, input []float32, pool *blas.Pool) {
+func forwardFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig, pool *blas.Pool) {
 	switch layer.Spec.FFN {
 	case FFNSwiGLU:
 		blas.QDualMatVecMulParallel(rs.Gate, layer.FFNGate, rs.Up, layer.FFNUp, input, pool)
@@ -309,6 +513,10 @@ func forwardFFN(layer *Layer, rs *RunState, input []float32, pool *blas.Pool) {
 		}
 		ops.GELU(rs.Up)
 		blas.QMatVecMulParallel(rs.FFNOut, layer.FFNDown, rs.Up, pool)
+
+	case FFNMoE:
+		ForwardMoEFFN(layer, rs, input, cfg, pool)
+		return
 	}
 
 	if layer.FFNDownBias != nil {

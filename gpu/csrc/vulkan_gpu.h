@@ -71,6 +71,8 @@ typedef enum {
     PIPE_MATVEC_Q8_0_DP4A,
     PIPE_MATVEC_Q4_K_DP4A,
     PIPE_MATVEC_Q6_K_DP4A,
+    PIPE_MATVEC_Q3_K_DP4A,
+    PIPE_MATVEC_Q5_K_DP4A,
     PIPE_SSM_CONV1D_SILU,
     PIPE_SSM_PREPROCESS,
     PIPE_SSM_DELTA_RULE,
@@ -184,7 +186,7 @@ typedef struct {
     float rms_eps, rope_freq_base;
     int rope_dim;
     int rope_neox;
-    int ffn_type;       // 0=swiglu, 1=geglu, 2=plain
+    int ffn_type;       // 0=swiglu, 1=geglu, 2=plain, 3=moe_skip (CPU handles FFN)
     int residual_type;  // 0=standard, 1=parallel
 
     GpuBuf q8_1_scratch; // Q8_1 scratch buffer (reused for each quantize step)

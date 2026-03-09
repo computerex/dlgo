@@ -24,6 +24,8 @@ $shaders = @(
     @{name="matvec_q8_0_dp4a"; file="matvec_q8_0_dp4a.comp"},
     @{name="matvec_q4_k_dp4a"; file="matvec_q4_k_dp4a.comp"},
     @{name="matvec_q6_k_dp4a"; file="matvec_q6_k_dp4a.comp"},
+    @{name="matvec_q3_k_dp4a"; file="matvec_q3_k_dp4a.comp"},
+    @{name="matvec_q5_k_dp4a"; file="matvec_q5_k_dp4a.comp"},
     @{name="ssm_conv1d_silu"; file="ssm_conv1d_silu.comp"},
     @{name="ssm_preprocess"; file="ssm_preprocess.comp"},
     @{name="ssm_delta_rule"; file="ssm_delta_rule.comp"},
@@ -108,6 +110,8 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_q8_0_dp4a", spv_matvec_q8_0_dp4a, spv_matvec_q8_0_dp4a_size, 3, 8}, // PIPE_MATVEC_Q8_0_DP4A
     {"matvec_q4_k_dp4a", spv_matvec_q4_k_dp4a, spv_matvec_q4_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q4_K_DP4A
     {"matvec_q6_k_dp4a", spv_matvec_q6_k_dp4a, spv_matvec_q6_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q6_K_DP4A
+    {"matvec_q3_k_dp4a", spv_matvec_q3_k_dp4a, spv_matvec_q3_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q3_K_DP4A
+    {"matvec_q5_k_dp4a", spv_matvec_q5_k_dp4a, spv_matvec_q5_k_dp4a_size, 3, 8}, // PIPE_MATVEC_Q5_K_DP4A
     {"ssm_conv1d_silu", spv_ssm_conv1d_silu, spv_ssm_conv1d_silu_size, 3, 8},   // PIPE_SSM_CONV1D_SILU
     {"ssm_preprocess",  spv_ssm_preprocess,  spv_ssm_preprocess_size,  5, 20},  // PIPE_SSM_PREPROCESS
     {"ssm_delta_rule",  spv_ssm_delta_rule,  spv_ssm_delta_rule_size,  5, 16},  // PIPE_SSM_DELTA_RULE

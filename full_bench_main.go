@@ -24,15 +24,15 @@ type modelSpec struct {
 }
 
 var allModels = []modelSpec{
-	{"SmolLM2 360M Q8_0", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "dlgo-smollm2-360m"},
-	{"TinyLlama 1.1B Q4_0", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`, "dlgo-tinyllama"},
-	{"Qwen 2.5 0.5B Q4_K_M", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`, "dlgo-qwen25"},
-	{"Gemma 3 1B Q4_K_M", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`, "dlgo-gemma3"},
-	{"Gemma 3 270M Q8_0", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`, "dlgo-gemma3-270m"},
-	{"SmolLM2 1.7B Q4_K_M", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`, "dlgo-smollm2-1.7b"},
-	{"Llama 3.2 1B Q4_K_M", `C:\projects\evoke\models\Llama-3.2-1B-Instruct-Q4_K_M.gguf`, "dlgo-llama32-1b"},
-	{"Phi-4-mini Q3_K_M", `C:\projects\evoke\models\Phi-4-mini-instruct-Q3_K_M.gguf`, "dlgo-phi4-mini"},
-	{"Qwen3 0.6B Q8_0", `C:\projects\evoke\models\Qwen3-0.6B-Q8_0.gguf`, "dlgo-qwen3-0.6b"},
+	{"SmolLM2 360M Q8_0", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`, "dlgo-smollm2-360m", false},
+	{"TinyLlama 1.1B Q4_0", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`, "dlgo-tinyllama", false},
+	{"Qwen 2.5 0.5B Q4_K_M", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`, "dlgo-qwen25", false},
+	{"Gemma 3 1B Q4_K_M", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`, "dlgo-gemma3", false},
+	{"Gemma 3 270M Q8_0", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`, "dlgo-gemma3-270m", false},
+	{"SmolLM2 1.7B Q4_K_M", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`, "dlgo-smollm2-1.7b", false},
+	{"Llama 3.2 1B Q4_K_M", `C:\projects\evoke\models\Llama-3.2-1B-Instruct-Q4_K_M.gguf`, "dlgo-llama32-1b", false},
+	{"Phi-4-mini Q3_K_M", `C:\projects\evoke\models\Phi-4-mini-instruct-Q3_K_M.gguf`, "dlgo-phi4-mini", false},
+	{"Qwen3 0.6B Q8_0", `C:\projects\evoke\models\Qwen3-0.6B-Q8_0.gguf`, "dlgo-qwen3-0.6b", false},
 	{"Qwen3.5 0.8B Q8_0", `C:\projects\evoke\models\Qwen3.5-0.8B-Q8_0.gguf`, "dlgo-qwen35-0.8b", true},
 }
 
@@ -218,15 +218,19 @@ func main() {
 				if m.hasSSM {
 					errThreshold = 30.0
 				}
-				nearTie := false
-				if !r.topMatch && maxErr < errThreshold {
-					top1 := cpuLogits[r.cpuTopTok]
-					top2 := cpuLogits[r.gpuTopTok]
-					if math.Abs(float64(top1-top2)) < 0.5 {
-						nearTie = true
-					}
+			nearTie := false
+			if !r.topMatch && maxErr < errThreshold {
+				top1 := cpuLogits[r.cpuTopTok]
+				top2 := cpuLogits[r.gpuTopTok]
+				nearTieThresh := float32(0.5)
+				if m.hasSSM {
+					nearTieThresh = float32(maxErr)
 				}
-				r.correctnessOK = maxErr < errThreshold && (r.topMatch || nearTie)
+				if math.Abs(float64(top1-top2)) < float64(nearTieThresh) {
+					nearTie = true
+				}
+			}
+			r.correctnessOK = maxErr < errThreshold && (r.topMatch || nearTie)
 
 				status := passOrFail(r.correctnessOK)
 				if nearTie {

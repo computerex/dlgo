@@ -14,20 +14,23 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
+- **Mixture of Experts (MoE)** — full MoE support with optimized expert-parallel dispatch (Qwen3.5-35B-A3B with 256 experts, IQ3_XXS/IQ4_XS quantized expert weights)
 - **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm, custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
-- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, batch prefill GEMM, parallel worker pools (within 0–18% of Ollama on generation for most models, same GGUF)
-- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants, F16, BF16, F32
+- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, fused IQ3_XXS/IQ4_XS SIMD kernels, batch prefill GEMM, parallel worker pools (**beats Ollama on Qwen3.5 models**, within 0–18% for most others)
+- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ3_XXS, IQ4_XS), F16, BF16, F32
 
 ## Supported Architectures
 
 | Architecture | Models Tested | CPU tok/s | GPU tok/s |
 |---|---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 44–50 | 350–367 |
-| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 45–79 | 301–371 |
-| Qwen3.5 | Qwen3.5 0.8B (hybrid GDN+attention) | ~22 | ~239 |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 35–110 | 242–456 |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 34–67 | 260–420 |
-| Phi | Phi-2, Phi-4-mini | 9–13 | ~90 |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–59 | 421–441 |
+| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 59–91 | 367–447 |
+| Qwen3.5 | Qwen3.5 0.8B (hybrid GDN+attention) | ~33 | ~287 |
+| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.5–7.5 | 6.4–70.9 |
+| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~8.1 | — |
+| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 42–132 | 288–550 |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 39–96 | 323–467 |
+| Phi | Phi-2, Phi-4-mini | 9–19 | ~140 |
 | Mistral | Mistral (llama-compatible) | — | — |
 | Whisper | Tiny, Base, Small (speech-to-text) | ~1x RT | — |
 
@@ -40,31 +43,37 @@ Benchmarks use the **exact same GGUF file** loaded into both engines via `ollama
 with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU-only
 (`num_gpu=0`).
 
+### Small models (fits in VRAM)
+
 | Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
 |---|---|---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 109.5 tok/s | 106.5 tok/s | **+3%** | 29 ms | 16 ms |
-| SmolLM2 360M | Q8_0 | 67.1 tok/s | 62.6 tok/s | **+7%** | 71 ms | 43 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 78.6 tok/s | 81.6 tok/s | **−4%** | 85 ms | 31 ms |
-| Qwen3.5 0.8B | Q8_0 | 22.4 tok/s | 23.3 tok/s | **−4%** | 810 ms | 94 ms |
-| SmolLM2 1.7B | Q4_K_M | 33.7 tok/s | 36.7 tok/s | **−8%** | 216 ms | 158 ms |
-| Llama 3.2 1B | Q4_K_M | 43.8 tok/s | 47.9 tok/s | **−9%** | 164 ms | 67 ms |
-| Gemma 3 1B | Q4_K_M | 34.6 tok/s | 40.0 tok/s | −14% | 162 ms | 96 ms |
-| TinyLlama 1.1B | Q4_0 | 49.9 tok/s | 61.1 tok/s | −18% | 243 ms | 134 ms |
-| Qwen3 0.6B | Q8_0 | 45.3 tok/s | 55.2 tok/s | −18% | 91 ms | 40 ms |
-| Phi-4-mini 3.8B | Q3_K_M | 12.8 tok/s | 19.4 tok/s | −34% | 920 ms | 173 ms |
+| Gemma 3 270M | Q8_0 | 131.9 tok/s | 160.5 tok/s | −18% | 26 ms | 11 ms |
+| SmolLM2 360M | Q8_0 | 96.1 tok/s | 117.7 tok/s | −18% | 59 ms | 37 ms |
+| Qwen 2.5 0.5B | Q4_K_M | 90.8 tok/s | 121.0 tok/s | −25% | 66 ms | 24 ms |
+| Qwen3 0.6B | Q8_0 | 58.7 tok/s | 69.9 tok/s | −16% | 69 ms | 33 ms |
+| TinyLlama 1.1B | Q4_0 | 59.4 tok/s | 77.9 tok/s | −24% | 210 ms | 135 ms |
+| Gemma 3 1B | Q4_K_M | 42.2 tok/s | 52.9 tok/s | −20% | 141 ms | 86 ms |
+| Llama 3.2 1B | Q4_K_M | 52.4 tok/s | 58.6 tok/s | **−11%** | 108 ms | 51 ms |
+| SmolLM2 1.7B | Q4_K_M | 39.2 tok/s | 44.8 tok/s | **−12%** | 160 ms | 124 ms |
+| Qwen3.5 0.8B | Q8_0 | 33.2 tok/s | 27.3 tok/s | **+22%** | 191 ms | 85 ms |
+| Phi-4-mini 3.8B | Q3_K_M | 19.4 tok/s | 23.2 tok/s | −16% | 288 ms | 137 ms |
+
+### Large models (Qwen3.5 hybrid GDN+attention)
+
+| Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
+|---|---|---|---|---|---|---|
+| Qwen3.5 9B | Q3_K_M | 7.5 tok/s | 7.2 tok/s | **+4%** | 439 ms | 449 ms |
+| Qwen3.5 27B | Q3_K_M | 2.5 tok/s | 2.4 tok/s | **+4%** | 1314 ms | 1528 ms |
+| Qwen3.5 35B-A3B MoE | Q3_K_M | 8.1 tok/s | 7.6 tok/s | **+7%** | 640 ms | 441 ms |
 
 **Notes:**
-- Generation is **within 0–9% of Ollama** for 6 of 10 models, and within 18% for most.
-  The SIMD compute kernels (QxQ integer dot products, `maddubs`+`madd` inner loops) are
-  at parity with llama.cpp's — both operate at the DRAM bandwidth limit (~39 GB/s measured).
-- Gemma 3 270M (+3%) and SmolLM2 360M (+7%) are **faster** than Ollama, showing that small
-  models with efficient dispatch can outperform llama.cpp.
-- Qwen3.5 (−4%) uses a hybrid GDN+attention architecture (Gated Delta Net SSM) with
-  sequential recurrent state — dlgo's CPU path is nearly at parity.
-- The remaining gap is Go+CGo dispatch overhead (channel-based worker pool, goroutine
-  scheduling, CGo call bridge per matmul chunk).
-- Phi-4-mini (−34%) is a 3.8B parameter model in Q3_K_M, the largest and most complex
-  model tested — the gap scales with the number of CGo calls per token.
+- **Qwen3.5 models outperform Ollama** on CPU generation: 0.8B (+22%), 9B (+4%), 27B (+4%), and 35B MoE (+7%).
+  These use hybrid GDN+attention architectures where dlgo's optimized SSM kernels and fused IQ SIMD dot products give a measurable advantage.
+- The **35B MoE model** (256 experts, 8 active, 3B active params) demonstrates full Mixture-of-Experts inference with
+  SIMD-vectorized `vpshufb`/`cvtepi8` IQ3_XXS/IQ4_XS kernels and expert-parallel dispatch.
+- Generation is within 11–25% of Ollama for most small models. The gap comes from Go+CGo
+  dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge per matmul chunk).
+- Phi-4-mini (−16%) is a 3.8B parameter model in Q3_K_M — gap scales with model size due to dispatch overhead.
 
 ## Install
 
@@ -159,8 +168,9 @@ choosing quantization formats. Summary:
 | Tier | Types | Speed | Use Case |
 |---|---|---|---|
 | **Tier 1** (QxQ integer SIMD) | Q4_0, Q8_0, Q2_K–Q6_K, Q5_0 | Fastest | Recommended for all use |
+| **Tier 1b** (fused SIMD) | IQ3_XXS, IQ4_XS | Fast | Optimized vpshufb/cvtepi8 kernels, used by MoE models |
 | **Tier 2** (float SIMD) | F16, Q4_1, Q5_1 | 2–4x slower | Functional, avoid if possible |
-| **Tier 3** (dequant+dot) | IQ*, TQ*, BF16 | Slowest | Avoid for large models |
+| **Tier 3** (dequant+dot) | IQ1*, IQ2*, TQ*, BF16 | Slowest | Avoid for large models |
 
 All common GGUF downloads (Q4_K_M, Q5_K_M, Q3_K_L, Q8_0, etc.) use only Tier 1 types.
 
@@ -171,20 +181,22 @@ into both engines. Greedy decoding, `temperature=0`, `seed=42`.
 
 ### Vulkan vs CUDA (Ollama default)
 
-Ollama defaults to CUDA on NVIDIA GPUs. All 10 tested models:
+Ollama defaults to CUDA on NVIDIA GPUs. All tested models:
 
 | Model | Quant | dlgo Vulkan | Ollama CUDA | Delta |
 |---|---|---|---|---|
-| Qwen3.5 0.8B | Q8_0 | 239 tok/s | 187 tok/s | **+28%** |
-| Gemma 3 270M | Q8_0 | 456 tok/s | 503 tok/s | **−9%** |
-| SmolLM2 360M | Q8_0 | 420 tok/s | 451 tok/s | **−7%** |
-| SmolLM2 1.7B | Q4_K_M | 260 tok/s | 295 tok/s | −12% |
-| Qwen3 0.6B | Q8_0 | 301 tok/s | 350 tok/s | −14% |
-| Llama 3.2 1B | Q4_K_M | 350 tok/s | 411 tok/s | −15% |
-| Gemma 3 1B | Q4_K_M | 242 tok/s | 304 tok/s | −20% |
-| Qwen 2.5 0.5B | Q4_K_M | 371 tok/s | 478 tok/s | −22% |
-| TinyLlama 1.1B | Q4_0 | 367 tok/s | 488 tok/s | −25% |
-| Phi-4-mini 3.8B | Q3_K_M | 90 tok/s | 165 tok/s | −46% |
+| Qwen3.5 0.8B | Q8_0 | 287 tok/s | 250 tok/s | **+15%** |
+| Qwen3.5 27B | Q3_K_M | 6.4 tok/s | 4.0 tok/s | **+60%** |
+| Qwen3.5 9B | Q3_K_M | 70.9 tok/s | 86.7 tok/s | −18% |
+| Gemma 3 270M | Q8_0 | 550 tok/s | 570 tok/s | **−3%** |
+| SmolLM2 360M | Q8_0 | 467 tok/s | 545 tok/s | −14% |
+| SmolLM2 1.7B | Q4_K_M | 323 tok/s | 403 tok/s | −20% |
+| Qwen3 0.6B | Q8_0 | 367 tok/s | 421 tok/s | −13% |
+| Llama 3.2 1B | Q4_K_M | 420 tok/s | 501 tok/s | −16% |
+| Gemma 3 1B | Q4_K_M | 288 tok/s | 338 tok/s | −15% |
+| Qwen 2.5 0.5B | Q4_K_M | 447 tok/s | 666 tok/s | −33% |
+| TinyLlama 1.1B | Q4_0 | 441 tok/s | 623 tok/s | −29% |
+| Phi-4-mini 3.8B | Q3_K_M | 140 tok/s | 201 tok/s | −31% |
 
 Qwen3.5 is **28% faster** than Ollama's CUDA backend thanks to custom Vulkan compute
 shaders for the Gated Delta Net (GDN) SSM layers — the first GPU-accelerated pure Vulkan
@@ -223,8 +235,8 @@ SmolLM2. Prefill is 10–50x faster across all models.
 
 1. **GGUF parser** reads model metadata and tensor locations from the file
 2. **Quantized tensors** stay in their compressed format in memory — only dequantized on the fly during matrix multiplication
-3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, and hybrid SSM/attention (Gated Delta Net) — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
-4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA+VNNI for QxQ integer dot products and batch prefill GEMM kernels
-5. **Parallel matmul** distributes rows across a persistent worker pool with fused multi-matrix dispatch
+3. **Forward pass** runs the model: embedding, RoPE, GQA attention, SwiGLU/GeGLU FFN, RMSNorm, hybrid SSM/attention (Gated Delta Net), and **Mixture-of-Experts** (MoE) — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
+4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA+VNNI for QxQ integer dot products, fused vpshufb-based IQ3_XXS/IQ4_XS kernels, and batch prefill GEMM kernels
+5. **Parallel matmul** distributes rows across a persistent worker pool with fused multi-matrix dispatch; MoE layers use batched multi-expert dispatch for full core utilization
 6. **GPU acceleration** (optional, via Vulkan) offloads the entire forward pass to GPU — all weights, KV cache, and intermediate buffers reside in VRAM
 7. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty

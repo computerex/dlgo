@@ -49,6 +49,12 @@ static inline float hsum_float_4_qq(const __m128 x) {
     return _mm_cvtss_f32(sum);
 }
 
+static inline int hsum_i32_8_qq(const __m256i x) {
+    __m128i lo = _mm256_castsi256_si128(x);
+    __m128i hi = _mm256_extracti128_si256(x, 1);
+    return hsum_i32_4_qq(_mm_add_epi32(lo, hi));
+}
+
 static inline int dot_i8_16_qq(const __m128i x, const __m128i y) {
     const __m128i ax = _mm_sign_epi8(x, x);
     const __m128i sy = _mm_sign_epi8(y, x);
@@ -470,10 +476,10 @@ float qq_dot_q3_K_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, i
 
         int is = 0;
         uint8_t m = 1;
-        const uint8_t* hm = xp;
         const uint8_t* q3 = xp + 32;
         const int8_t* q8 = (const int8_t*)(yp + 4);
-        const __m256i hbits = _mm256_loadu_si256((const __m256i*)hm);
+        const __m256i hbits = _mm256_loadu_si256((const __m256i*)xp);
+        __m256i sumi = _mm256_setzero_si256();
 
         for (int half = 0; half < 2; half++) {
             const __m256i qbits = _mm256_loadu_si256((const __m256i*)q3);
@@ -482,23 +488,21 @@ float qq_dot_q3_K_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, i
                 __m256i q2 = shift == 0 ? _mm256_and_si256(qbits, m3)
                                         : _mm256_and_si256(_mm256_srli_epi16(qbits, shift), m3);
                 const __m256i hmask = _mm256_cmpeq_epi8(_mm256_and_si256(hbits, _mm256_set1_epi8((char)m)), zero);
-                const __m256i hsub = _mm256_and_si256(hmask, _mm256_set1_epi8(4));
-                const __m256i qv = _mm256_sub_epi8(q2, hsub);
-
-                const __m128i ql = _mm256_castsi256_si128(qv);
-                const __m128i qh = _mm256_extracti128_si256(qv, 1);
-                const __m128i y0 = _mm_loadu_si128((const __m128i*)q8);
-                const __m128i y1 = _mm_loadu_si128((const __m128i*)(q8 + 16));
-
-                const float dl0 = d_all * (float)(scales[is++] - 32);
-                sum += dl0 * (float)dot_i8_16_qq(ql, y0);
-                const float dl1 = d_all * (float)(scales[is++] - 32);
-                sum += dl1 * (float)dot_i8_16_qq(qh, y1);
+                const __m256i qv = _mm256_sub_epi8(q2, _mm256_and_si256(hmask, _mm256_set1_epi8(4)));
+                const __m256i abs_qv = _mm256_sign_epi8(qv, qv);
+                const __m256i yv = _mm256_loadu_si256((const __m256i*)q8);
+                __m256i p16 = _mm256_maddubs_epi16(abs_qv, _mm256_sign_epi8(yv, qv));
+                const __m256i sc = MM256_SET_M128I_QQ(
+                    _mm_set1_epi16((int16_t)(scales[is+1] - 32)),
+                    _mm_set1_epi16((int16_t)(scales[is] - 32)));
+                is += 2;
+                sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(sc, p16));
                 q8 += 32;
                 m <<= 1;
             }
             q3 += 32;
         }
+        sum += d_all * (float)hsum_i32_8_qq(sumi);
     }
     return sum;
 }
@@ -1283,7 +1287,7 @@ static void qq_batch_row_q6_K(const uint8_t* restrict row, const uint8_t* restri
     }
 }
 
-// Q3_K batch kernel: share scale unpack and 3-bit decode across positions.
+// Q3_K batch kernel: integer accumulation with 256-bit ops, 4 positions at a time.
 static void qq_batch_row_q3_K(const uint8_t* restrict row, const uint8_t* restrict q8_flat,
                               int q8_stride, int n_inputs, int cols,
                               float* restrict out_flat, int out_stride, int r) {
@@ -1294,44 +1298,45 @@ static void qq_batch_row_q3_K(const uint8_t* restrict row, const uint8_t* restri
     const __m256i zero = _mm256_setzero_si256();
 
     int p = 0;
-    for (; p + 1 < n_inputs; p += 2) {
+    for (; p + 3 < n_inputs; p += 4) {
         const uint8_t* y0 = q8_flat + (size_t)p * q8_stride;
-        const uint8_t* y1 = q8_flat + (size_t)(p + 1) * q8_stride;
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
+        const uint8_t* y1 = q8_flat + (size_t)(p+1) * q8_stride;
+        const uint8_t* y2 = q8_flat + (size_t)(p+2) * q8_stride;
+        const uint8_t* y3 = q8_flat + (size_t)(p+3) * q8_stride;
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
 
         for (int block = 0; block < nb; block++) {
             const uint8_t* xp = row + block * 110;
             const uint8_t* yp0 = y0 + block * 292;
             const uint8_t* yp1 = y1 + block * 292;
-            float yd0, yd1;
-            memcpy(&yd0, yp0, 4);
-            memcpy(&yd1, yp1, 4);
+            const uint8_t* yp2 = y2 + block * 292;
+            const uint8_t* yp3 = y3 + block * 292;
+            float yd0, yd1, yd2, yd3;
+            memcpy(&yd0, yp0, 4); memcpy(&yd1, yp1, 4);
+            memcpy(&yd2, yp2, 4); memcpy(&yd3, yp3, 4);
             const float wd = f16_to_f32_qq(*(const uint16_t*)(xp + 108));
-            const float d_all0 = yd0 * wd;
-            const float d_all1 = yd1 * wd;
+            const float d0 = yd0 * wd, d1 = yd1 * wd, d2 = yd2 * wd, d3 = yd3 * wd;
 
             uint32_t aux[4] = {0, 0, 0, 0};
             memcpy(aux, xp + 96, 12);
-            {
-                const uint32_t tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-            }
-
+            { const uint32_t tmp = aux[2];
+              aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+              aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+              aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+              aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4); }
             int8_t scales[16];
-            for (int i = 0; i < 16; i++) {
+            for (int i = 0; i < 16; i++)
                 scales[i] = (int8_t)((aux[i / 4] >> (8 * (i % 4))) & 0xff);
-            }
 
-            int is = 0;
-            uint8_t m = 1;
-            const uint8_t* q3 = xp + 32;
             const __m256i hbits = _mm256_loadu_si256((const __m256i*)xp);
+            const uint8_t* q3 = xp + 32;
             const int8_t* q80 = (const int8_t*)(yp0 + 4);
             const int8_t* q81 = (const int8_t*)(yp1 + 4);
+            const int8_t* q82 = (const int8_t*)(yp2 + 4);
+            const int8_t* q83 = (const int8_t*)(yp3 + 4);
+            __m256i si0 = zero, si1 = zero, si2 = zero, si3 = zero;
+            int is = 0;
+            uint8_t m = 1;
 
             for (int half = 0; half < 2; half++) {
                 const __m256i qbits = _mm256_loadu_si256((const __m256i*)q3);
@@ -1340,33 +1345,93 @@ static void qq_batch_row_q3_K(const uint8_t* restrict row, const uint8_t* restri
                     __m256i q2 = shift == 0 ? _mm256_and_si256(qbits, m3)
                                             : _mm256_and_si256(_mm256_srli_epi16(qbits, shift), m3);
                     const __m256i hmask = _mm256_cmpeq_epi8(_mm256_and_si256(hbits, _mm256_set1_epi8((char)m)), zero);
-                    const __m256i hsub = _mm256_and_si256(hmask, _mm256_set1_epi8(4));
-                    const __m256i qv = _mm256_sub_epi8(q2, hsub);
+                    const __m256i qv = _mm256_sub_epi8(q2, _mm256_and_si256(hmask, _mm256_set1_epi8(4)));
+                    const __m256i abs_qv = _mm256_sign_epi8(qv, qv);
 
-                    const __m128i ql = _mm256_castsi256_si128(qv);
-                    const __m128i qh = _mm256_extracti128_si256(qv, 1);
-                    const __m128i y00 = _mm_loadu_si128((const __m128i*)q80);
-                    const __m128i y01 = _mm_loadu_si128((const __m128i*)(q80 + 16));
-                    const __m128i y10 = _mm_loadu_si128((const __m128i*)q81);
-                    const __m128i y11 = _mm_loadu_si128((const __m128i*)(q81 + 16));
+                    const __m256i sc = MM256_SET_M128I_QQ(
+                        _mm_set1_epi16((int16_t)(scales[is+1] - 32)),
+                        _mm_set1_epi16((int16_t)(scales[is] - 32)));
+                    is += 2;
 
-                    const float s0 = (float)(scales[is++] - 32);
-                    const float s1 = (float)(scales[is++] - 32);
-                    sum0 += d_all0 * s0 * (float)dot_i8_16_qq(ql, y00);
-                    sum0 += d_all0 * s1 * (float)dot_i8_16_qq(qh, y01);
-                    sum1 += d_all1 * s0 * (float)dot_i8_16_qq(ql, y10);
-                    sum1 += d_all1 * s1 * (float)dot_i8_16_qq(qh, y11);
-
-                    q80 += 32;
-                    q81 += 32;
+                    #define Q3K_ACCUM(q8ptr, sumi) { \
+                        const __m256i yv = _mm256_loadu_si256((const __m256i*)(q8ptr)); \
+                        __m256i p16 = _mm256_maddubs_epi16(abs_qv, _mm256_sign_epi8(yv, qv)); \
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(sc, p16)); }
+                    Q3K_ACCUM(q80, si0); Q3K_ACCUM(q81, si1);
+                    Q3K_ACCUM(q82, si2); Q3K_ACCUM(q83, si3);
+                    #undef Q3K_ACCUM
+                    q80 += 32; q81 += 32; q82 += 32; q83 += 32;
                     m <<= 1;
                 }
                 q3 += 32;
             }
+            sum0 += d0 * (float)hsum_i32_8_qq(si0);
+            sum1 += d1 * (float)hsum_i32_8_qq(si1);
+            sum2 += d2 * (float)hsum_i32_8_qq(si2);
+            sum3 += d3 * (float)hsum_i32_8_qq(si3);
         }
-
         out_flat[(size_t)p * out_stride + r] = sum0;
-        out_flat[(size_t)(p + 1) * out_stride + r] = sum1;
+        out_flat[(size_t)(p+1) * out_stride + r] = sum1;
+        out_flat[(size_t)(p+2) * out_stride + r] = sum2;
+        out_flat[(size_t)(p+3) * out_stride + r] = sum3;
+    }
+
+    for (; p + 1 < n_inputs; p += 2) {
+        const uint8_t* y0 = q8_flat + (size_t)p * q8_stride;
+        const uint8_t* y1 = q8_flat + (size_t)(p+1) * q8_stride;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int block = 0; block < nb; block++) {
+            const uint8_t* xp = row + block * 110;
+            const uint8_t* yp0 = y0 + block * 292;
+            const uint8_t* yp1 = y1 + block * 292;
+            float yd0, yd1;
+            memcpy(&yd0, yp0, 4); memcpy(&yd1, yp1, 4);
+            const float wd = f16_to_f32_qq(*(const uint16_t*)(xp + 108));
+            const float d_0 = yd0 * wd, d_1 = yd1 * wd;
+            uint32_t aux[4] = {0,0,0,0};
+            memcpy(aux, xp + 96, 12);
+            { const uint32_t tmp = aux[2];
+              aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+              aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+              aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+              aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4); }
+            int8_t scales[16];
+            for (int i = 0; i < 16; i++)
+                scales[i] = (int8_t)((aux[i / 4] >> (8 * (i % 4))) & 0xff);
+            const __m256i hbits = _mm256_loadu_si256((const __m256i*)xp);
+            const uint8_t* q3 = xp + 32;
+            const int8_t* q80 = (const int8_t*)(yp0 + 4);
+            const int8_t* q81 = (const int8_t*)(yp1 + 4);
+            __m256i si0 = _mm256_setzero_si256(), si1 = _mm256_setzero_si256();
+            int is = 0; uint8_t m = 1;
+            for (int half = 0; half < 2; half++) {
+                const __m256i qbits = _mm256_loadu_si256((const __m256i*)q3);
+                for (int j = 0; j < 4; j++) {
+                    const int shift = 2*j;
+                    __m256i q2 = shift == 0 ? _mm256_and_si256(qbits, m3)
+                                            : _mm256_and_si256(_mm256_srli_epi16(qbits, shift), m3);
+                    const __m256i hmask = _mm256_cmpeq_epi8(_mm256_and_si256(hbits, _mm256_set1_epi8((char)m)), zero);
+                    const __m256i qv = _mm256_sub_epi8(q2, _mm256_and_si256(hmask, _mm256_set1_epi8(4)));
+                    const __m256i abs_qv = _mm256_sign_epi8(qv, qv);
+                    const __m256i sc = MM256_SET_M128I_QQ(
+                        _mm_set1_epi16((int16_t)(scales[is+1] - 32)),
+                        _mm_set1_epi16((int16_t)(scales[is] - 32)));
+                    is += 2;
+                    { const __m256i yv = _mm256_loadu_si256((const __m256i*)q80);
+                      __m256i p16 = _mm256_maddubs_epi16(abs_qv, _mm256_sign_epi8(yv, qv));
+                      si0 = _mm256_add_epi32(si0, _mm256_madd_epi16(sc, p16)); }
+                    { const __m256i yv = _mm256_loadu_si256((const __m256i*)q81);
+                      __m256i p16 = _mm256_maddubs_epi16(abs_qv, _mm256_sign_epi8(yv, qv));
+                      si1 = _mm256_add_epi32(si1, _mm256_madd_epi16(sc, p16)); }
+                    q80 += 32; q81 += 32; m <<= 1;
+                }
+                q3 += 32;
+            }
+            sum0 += d_0 * (float)hsum_i32_8_qq(si0);
+            sum1 += d_1 * (float)hsum_i32_8_qq(si1);
+        }
+        out_flat[(size_t)p * out_stride + r] = sum0;
+        out_flat[(size_t)(p+1) * out_stride + r] = sum1;
     }
 
     for (; p < n_inputs; p++) {

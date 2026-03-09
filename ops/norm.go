@@ -9,15 +9,15 @@ import "math"
 // Simpler and faster than LayerNorm: no mean subtraction, no bias term.
 func RMSNorm(out, x, w []float32, eps float32) {
 	n := len(x)
-	var ss float32
+	var ss float64
 	i := 0
 	for ; i <= n-4; i += 4 {
-		ss += x[i]*x[i] + x[i+1]*x[i+1] + x[i+2]*x[i+2] + x[i+3]*x[i+3]
+		ss += float64(x[i])*float64(x[i]) + float64(x[i+1])*float64(x[i+1]) + float64(x[i+2])*float64(x[i+2]) + float64(x[i+3])*float64(x[i+3])
 	}
 	for ; i < n; i++ {
-		ss += x[i] * x[i]
+		ss += float64(x[i]) * float64(x[i])
 	}
-	scale := float32(1.0 / math.Sqrt(float64(ss/float32(n)+eps)))
+	scale := float32(1.0 / math.Sqrt(ss/float64(n)+float64(eps)))
 
 	i = 0
 	for ; i <= n-4; i += 4 {
@@ -35,11 +35,11 @@ func RMSNorm(out, x, w []float32, eps float32) {
 // Used for QK-norm in models like Qwen3.
 func RMSNormInPlace(x, w []float32, eps float32) {
 	n := len(x)
-	var ss float32
+	var ss float64
 	for i := 0; i < n; i++ {
-		ss += x[i] * x[i]
+		ss += float64(x[i]) * float64(x[i])
 	}
-	scale := float32(1.0 / math.Sqrt(float64(ss/float32(n)+eps)))
+	scale := float32(1.0 / math.Sqrt(ss/float64(n)+float64(eps)))
 	for i := 0; i < n; i++ {
 		x[i] = x[i] * scale * w[i]
 	}

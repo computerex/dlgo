@@ -59,8 +59,13 @@ func ResidualLayerNorm(outNorm, residual, prev, sub, w, b []float32, scale, eps 
 	LayerNorm(outNorm, residual, w, b, eps)
 }
 
-// Sigmoid computes 1 / (1 + exp(-x)).
+// Sigmoid computes 1 / (1 + exp(-x)) using exact math.
 func Sigmoid(x float32) float32 {
+	return float32(1.0 / (1.0 + math.Exp(float64(-x))))
+}
+
+// SigmoidFast computes 1 / (1 + exp(-x)) using Schraudolph approximation.
+func SigmoidFast(x float32) float32 {
 	return 1.0 / (1.0 + FastExp(-x))
 }
 
@@ -86,8 +91,8 @@ func FastTanh(x float32) float32 {
 // SiLU applies SiLU (Swish) activation in-place: x[i] = x[i] * sigmoid(x[i]).
 func SiLU(x []float32) {
 	for i := range x {
-		v := x[i]
-		x[i] = v * Sigmoid(v)
+		v := float64(x[i])
+		x[i] = float32(v / (1.0 + math.Exp(-v)))
 	}
 }
 

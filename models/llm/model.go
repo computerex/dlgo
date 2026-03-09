@@ -40,6 +40,7 @@ const (
 	FFNSwiGLU FFNKind = iota // gate·SiLU ⊙ up → down (LLaMA, Qwen)
 	FFNGeGLU                 // gate·GELU ⊙ up → down (Gemma)
 	FFNPlain                 // up → GELU → down (Phi-2)
+	FFNMoE                   // Mixture of Experts: route to top-K experts, each SwiGLU
 )
 
 // LayerSpec captures all architectural choices for one transformer layer.
@@ -82,6 +83,16 @@ type Layer struct {
 	FFNDownBias  []float32            // [dim] optional (Phi-2)
 	PostFFNNorm  []float32            // [dim] optional post-FFN norm (Gemma 3)
 
+	// MoE (Mixture of Experts) — packed expert weights
+	FFNRouter       *core.QuantizedTensor // [expertCount × dim] router/gating network
+	FFNGateExps     *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert gate
+	FFNUpExps       *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert up
+	FFNDownExps     *core.QuantizedTensor // [expertCount*dim × expertFFNDim] packed expert down
+	FFNGateShared   *core.QuantizedTensor // [sharedFFNDim × dim] shared expert gate
+	FFNUpShared     *core.QuantizedTensor // [sharedFFNDim × dim] shared expert up
+	FFNDownShared   *core.QuantizedTensor // [dim × sharedFFNDim] shared expert down
+	FFNRouterShared []float32             // [dim] shared expert gate weight (sigmoid of dot product)
+
 	// Gated Delta Net weights — only for Qwen3.5 linear attention layers
 	SSMInProj  *core.QuantizedTensor // [dim × qkvDim] fused QKV in-projection (stored via attn_qkv when not standard attention)
 	SSMConv1dW []float32            // [channels × convKernel] depthwise conv weights (flat)
@@ -89,7 +100,7 @@ type Layer struct {
 	SSMAlpha   *core.QuantizedTensor // [dim × numHeads] dt/alpha projection
 	SSMBeta    *core.QuantizedTensor // [dim × numHeads] beta/learning-rate projection
 	SSMDtBias  []float32            // [numHeads] dt bias
-	SSMNorm    []float32            // [headVDim] per-head output norm weight
+	SSMNorm    []float32            // [headVDim] per-head RMSNorm weight (shared across heads)
 	SSMOut     *core.QuantizedTensor // [dim × valueDim] output projection
 }
 

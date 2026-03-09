@@ -334,6 +334,13 @@ func (lc *LayerConf) SetFFN(ffnNorm Buf, gate, up, down *GpuTensor,
 	lc.c.post_ffn_norm_w = C.GpuBuf(postFFNNorm)
 }
 
+// SetFFNMoE configures MoE layer norms without FFN weight tensors.
+// The C side will compute pre-FFN residual+norm then return early (ffn_type=3).
+func (lc *LayerConf) SetFFNMoE(ffnNorm Buf, postAttnNorm Buf) {
+	lc.c.ffn_norm_w = C.GpuBuf(ffnNorm)
+	lc.c.post_attn_norm_w = C.GpuBuf(postAttnNorm)
+}
+
 func (lc *LayerConf) SetKV(kCache, vCache Buf) {
 	lc.c.k_cache = C.GpuBuf(kCache)
 	lc.c.v_cache = C.GpuBuf(vCache)
@@ -479,6 +486,57 @@ func SigmoidGate(out, gate Buf, n int) error {
 	rc := C.gpu_sigmoid_gate(C.GpuBuf(out), C.GpuBuf(gate), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: sigmoid_gate failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchRoPE applies RoPE to Q and K for npos positions starting at startPos.
+func BatchRoPE(q, k Buf, numHeads, numKVHeads, headDim, ropeDim, startPos int,
+	freqBase float32, neox bool, npos int) error {
+	n := 0
+	if neox {
+		n = 1
+	}
+	rc := C.gpu_batch_rope(C.GpuBuf(q), C.GpuBuf(k),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(ropeDim),
+		C.int(startPos), C.float(freqBase), C.int(n), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_rope failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchKVStore bulk-copies K and V for npos positions into the cache starting at startPos.
+func BatchKVStore(kCache, vCache, k, v Buf, startPos, kvDim, npos int) error {
+	rc := C.gpu_batch_kv_store(C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.GpuBuf(k), C.GpuBuf(v),
+		C.int(startPos), C.int(kvDim), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_kv_store failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchAttention performs causal attention for npos positions.
+// startSeqLen is the sequence length for the first position (startPos + 1).
+func BatchAttention(out, q, kCache, vCache Buf,
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale float32, npos int) error {
+	rc := C.gpu_batch_attention(C.GpuBuf(out), C.GpuBuf(q),
+		C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
+		C.int(startSeqLen), C.float(scale), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_attention failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchAddBias adds a per-position bias using a scratch buffer for expansion.
+func BatchAddBias(dst, bias, scratch Buf, elemsPerPos, npos int) error {
+	rc := C.gpu_batch_add_bias2(C.GpuBuf(dst), C.GpuBuf(bias), C.GpuBuf(scratch),
+		C.int(elemsPerPos), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_add_bias failed (%d)", rc)
 	}
 	return nil
 }

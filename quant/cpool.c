@@ -43,6 +43,8 @@ float vec_dot_q3_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q4_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q5_k(const uint8_t* data, const float* x, int n);
 float vec_dot_q6_k(const uint8_t* data, const float* x, int n);
+float vec_dot_iq3_xxs(const uint8_t* data, const float* x, int n);
+float vec_dot_iq4_xs(const uint8_t* data, const float* x, int n);
 
 void quantize_for_type(const float* x, uint8_t* out, uint32_t w_type, int n);
 
@@ -132,6 +134,8 @@ static inline float fused_row(const uint8_t* row, uint32_t t,
     case 12: return vec_dot_q4_k(row, x, n);
     case 13: return vec_dot_q5_k(row, x, n);
     case 14: return vec_dot_q6_k(row, x, n);
+    case 18: return vec_dot_iq3_xxs(row, x, n);
+    case 23: return vec_dot_iq4_xs(row, x, n);
     default: return 0;
     }
 }
