@@ -2,8 +2,29 @@ package quant
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
+	"os"
+	"sync"
 )
+
+// HasZeroAllocDequantize returns true if the given quantization type has a
+// dedicated DequantizeInto implementation that writes directly into a
+// caller-provided buffer without heap allocation. Types that return false
+// fall back to an allocating path that is unsafe when GC is disabled.
+func HasZeroAllocDequantize(ggmlType uint32) bool {
+	switch ggmlType {
+	case 0, 1, 2, 3, 6, 7, 8, 9,
+		10, 11, 12, 13, 14,
+		16, 17, 18, 19, 20, 21, 22, 23, 29,
+		34, 35, 39:
+		return true
+	default:
+		return false
+	}
+}
+
+var dequantFallbackOnce sync.Map // ggmlType -> warned
 
 // DequantizeInto dequantizes data into an existing buffer, avoiding allocation.
 // dst must have length >= n. This is the key for reusable-buffer SIMD matmul.
@@ -53,31 +74,371 @@ func DequantizeInto(dst []float32, data []byte, ggmlType uint32, n int) {
 		dequantizeIQ4_XSInto(dst, data, n)
 	case 29: // IQ1_M
 		dequantizeIQ1MInto(dst, data, n)
+	case 34: // TQ1_0
+		dequantizeTQ1_0Into(dst, data, n)
+	case 35: // TQ2_0
+		dequantizeTQ2_0Into(dst, data, n)
+	case 39: // MXFP4
+		dequantizeMXFP4Into(dst, data, n)
 	default:
-		// Fallback: allocate and copy
+		if _, warned := dequantFallbackOnce.LoadOrStore(ggmlType, true); !warned {
+			fmt.Fprintf(os.Stderr, "[dlgo] WARNING: quant type %d has no zero-alloc DequantizeInto — "+
+				"using allocating fallback (will cause memory pressure if GC is disabled)\n", ggmlType)
+		}
 		floats, _ := Dequantize(data, ggmlType, n)
 		copy(dst, floats)
 	}
 }
 
-// Fallback Into wrappers for IQ types not yet optimized
 func dequantizeIQ2XXSInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ2XXS(data, n))
+	numBlocks := n / BlockSizeIQ2XXS
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ2XXS
+
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+
+		qsOff := off + 2 // start of qs (64 bytes of uint16 data)
+		outBase := block * BlockSizeIQ2XXS
+
+		for ib32 := 0; ib32 < 8; ib32++ {
+			byteOff := qsOff + ib32*8
+			aux1 := binary.LittleEndian.Uint32(data[byteOff+4:])
+
+			db := d * (0.5 + float32(aux1>>28)) * 0.25
+
+			for l := 0; l < 4; l++ {
+				gridIdx := data[byteOff+l]
+				grid := iq2xxs_grid[gridIdx]
+
+				signIdx := (aux1 >> (7 * uint(l))) & 127
+				signs := ksigns_iq2xs[signIdx]
+
+				oIdx := outBase + ib32*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridVal := float32(uint8(grid >> (8 * uint(j))))
+					if signs&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db * gridVal
+					} else {
+						dst[oIdx+j] = db * gridVal
+					}
+				}
+			}
+		}
+	}
 }
 func dequantizeIQ2XSInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ2XS(data, n))
+	numBlocks := n / BlockSizeIQ2XS
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ2XS
+
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+
+		qsOff := off + 2
+		scOff := off + 2 + 64
+		outBase := block * BlockSizeIQ2XS
+
+		for ib32 := 0; ib32 < 8; ib32++ {
+			scByte := data[scOff+ib32]
+			db0 := d * (0.5 + float32(scByte&0xf)) * 0.25
+			db1 := d * (0.5 + float32(scByte>>4)) * 0.25
+
+			for l := 0; l < 4; l++ {
+				qIdx := qsOff + (ib32*4+l)*2
+				qs := uint16(data[qIdx]) | uint16(data[qIdx+1])<<8
+
+				gridIdx := qs & 511
+				signIdx := qs >> 9
+				grid := iq2xs_grid[gridIdx]
+				signs := ksigns_iq2xs[signIdx]
+
+				var db float32
+				if l < 2 {
+					db = db0
+				} else {
+					db = db1
+				}
+
+				oIdx := outBase + ib32*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridVal := float32(uint8(grid >> (8 * uint(j))))
+					if signs&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db * gridVal
+					} else {
+						dst[oIdx+j] = db * gridVal
+					}
+				}
+			}
+		}
+	}
 }
 func dequantizeIQ1SInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ1S(data, n))
+	numBlocks := n / BlockSizeIQ1S
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ1S
+
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+
+		qsOff := off + 2
+		qhOff := off + 2 + 32
+		outBase := block * BlockSizeIQ1S
+
+		for ib := 0; ib < 8; ib++ {
+			qh := uint16(data[qhOff+ib*2]) | uint16(data[qhOff+ib*2+1])<<8
+
+			dl := d * float32(2*int((qh>>12)&7)+1)
+			var delta float32
+			if qh&0x8000 != 0 {
+				delta = -iq1sDelta
+			} else {
+				delta = iq1sDelta
+			}
+
+			for l := 0; l < 4; l++ {
+				gridIdx := uint16(data[qsOff+l]) | ((qh >> uint(3*l) & 7) << 8)
+				grid := iq1s_grid[gridIdx]
+
+				oIdx := outBase + ib*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridByte := uint8(grid >> (8 * uint(j)))
+					gridVal := float32(int8(gridByte))
+					dst[oIdx+j] = dl * (gridVal + delta)
+				}
+			}
+			qsOff += 4
+		}
+	}
 }
 func dequantizeIQ3SInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ3S(data, n))
+	numBlocks := n / BlockSizeIQ3S
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ3S
+
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+
+		qsStart := off + 2
+		qhStart := off + 2 + 64
+		signStart := off + 2 + 64 + 8
+		scStart := off + 2 + 64 + 8 + 32
+		outBase := block * BlockSizeIQ3S
+
+		qsOff := qsStart
+		qhOff := qhStart
+		signsOff := signStart
+
+		for ib32 := 0; ib32 < 8; ib32 += 2 {
+			scByte := data[scStart+ib32/2]
+			db1 := d * float32(1+2*int(scByte&0xf))
+			db2 := d * float32(1+2*int(scByte>>4))
+
+			qh0 := data[qhOff]
+			qh1 := data[qhOff+1]
+
+			for l := 0; l < 4; l++ {
+				gridIdx1 := uint16(data[qsOff+2*l]) | ((uint16(qh0) << (8 - 2*uint(l))) & 256)
+				gridIdx2 := uint16(data[qsOff+2*l+1]) | ((uint16(qh0) << (7 - 2*uint(l))) & 256)
+				grid1 := iq3s_grid[gridIdx1]
+				grid2 := iq3s_grid[gridIdx2]
+				signByte := data[signsOff+l]
+
+				oIdx := outBase + ib32*32 + l*8
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid1 >> (8 * uint(j))))
+					if signByte&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db1 * gridVal
+					} else {
+						dst[oIdx+j] = db1 * gridVal
+					}
+				}
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid2 >> (8 * uint(j))))
+					if signByte&kmask_iq2xs[j+4] != 0 {
+						dst[oIdx+4+j] = -db1 * gridVal
+					} else {
+						dst[oIdx+4+j] = db1 * gridVal
+					}
+				}
+			}
+			qsOff += 8
+			signsOff += 4
+
+			for l := 0; l < 4; l++ {
+				gridIdx1 := uint16(data[qsOff+2*l]) | ((uint16(qh1) << (8 - 2*uint(l))) & 256)
+				gridIdx2 := uint16(data[qsOff+2*l+1]) | ((uint16(qh1) << (7 - 2*uint(l))) & 256)
+				grid1 := iq3s_grid[gridIdx1]
+				grid2 := iq3s_grid[gridIdx2]
+				signByte := data[signsOff+l]
+
+				oIdx := outBase + (ib32+1)*32 + l*8
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid1 >> (8 * uint(j))))
+					if signByte&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db2 * gridVal
+					} else {
+						dst[oIdx+j] = db2 * gridVal
+					}
+				}
+				for j := 0; j < 4; j++ {
+					gridVal := float32(uint8(grid2 >> (8 * uint(j))))
+					if signByte&kmask_iq2xs[j+4] != 0 {
+						dst[oIdx+4+j] = -db2 * gridVal
+					} else {
+						dst[oIdx+4+j] = db2 * gridVal
+					}
+				}
+			}
+			qhOff += 2
+			qsOff += 8
+			signsOff += 4
+		}
+	}
 }
 func dequantizeIQ2SInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ2S(data, n))
+	numBlocks := n / BlockSizeIQ2S
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ2S
+
+		dBits := uint16(data[off]) | uint16(data[off+1])<<8
+		d := float16ToFloat32(dBits)
+
+		qsOff := off + 2
+		qhOff := off + 2 + 64
+		scOff := off + 2 + 64 + 8
+		outBase := block * BlockSizeIQ2S
+
+		gridLowOff := qsOff
+		signsOff := qsOff + 32
+
+		for ib32 := 0; ib32 < 8; ib32++ {
+			scByte := data[scOff+ib32]
+			db0 := d * (0.5 + float32(scByte&0xf)) * 0.25
+			db1 := d * (0.5 + float32(scByte>>4)) * 0.25
+			qhByte := data[qhOff+ib32]
+
+			for l := 0; l < 4; l++ {
+				lowByte := uint16(data[gridLowOff])
+				highBits := (uint16(qhByte) << (8 - 2*uint(l))) & 0x300
+				gridIdx := lowByte | highBits
+				grid := iq2s_grid[gridIdx]
+
+				signByte := data[signsOff]
+
+				var db float32
+				if l < 2 {
+					db = db0
+				} else {
+					db = db1
+				}
+
+				oIdx := outBase + ib32*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridVal := float32(uint8(grid >> (8 * uint(j))))
+					if signByte&kmask_iq2xs[j] != 0 {
+						dst[oIdx+j] = -db * gridVal
+					} else {
+						dst[oIdx+j] = db * gridVal
+					}
+				}
+				gridLowOff++
+				signsOff++
+			}
+		}
+	}
 }
 func dequantizeIQ1MInto(dst []float32, data []byte, n int) {
-	copy(dst, DequantizeIQ1M(data, n))
+	numBlocks := n / BlockSizeIQ1M
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesIQ1M
+
+		qsStart := off
+		qhStart := off + 32
+		scStart := off + 32 + 16
+
+		sc := [4]uint16{
+			uint16(data[scStart]) | uint16(data[scStart+1])<<8,
+			uint16(data[scStart+2]) | uint16(data[scStart+3])<<8,
+			uint16(data[scStart+4]) | uint16(data[scStart+5])<<8,
+			uint16(data[scStart+6]) | uint16(data[scStart+7])<<8,
+		}
+
+		scaleU16 := (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000)
+		d := float16ToFloat32(scaleU16)
+
+		outBase := block * BlockSizeIQ1M
+
+		qsOff := qsStart
+		qhOff := qhStart
+
+		for ib := 0; ib < 8; ib++ {
+			scIdx := ib / 2
+			scShift := 6 * (ib % 2)
+			dl1 := d * float32(2*int((sc[scIdx]>>uint(scShift))&0x7)+1)
+			dl2 := d * float32(2*int((sc[scIdx]>>uint(scShift+3))&0x7)+1)
+
+			qh0 := data[qhOff]
+			qh1 := data[qhOff+1]
+
+			var idx [4]uint16
+			var delta [4]float32
+
+			idx[0] = uint16(data[qsOff]) | (uint16(qh0)<<8)&0x700
+			idx[1] = uint16(data[qsOff+1]) | (uint16(qh0)<<4)&0x700
+			idx[2] = uint16(data[qsOff+2]) | (uint16(qh1)<<8)&0x700
+			idx[3] = uint16(data[qsOff+3]) | (uint16(qh1)<<4)&0x700
+
+			if qh0&0x08 != 0 {
+				delta[0] = -iq1mDelta
+			} else {
+				delta[0] = iq1mDelta
+			}
+			if qh0&0x80 != 0 {
+				delta[1] = -iq1mDelta
+			} else {
+				delta[1] = iq1mDelta
+			}
+			if qh1&0x08 != 0 {
+				delta[2] = -iq1mDelta
+			} else {
+				delta[2] = iq1mDelta
+			}
+			if qh1&0x80 != 0 {
+				delta[3] = -iq1mDelta
+			} else {
+				delta[3] = iq1mDelta
+			}
+
+			for l := 0; l < 2; l++ {
+				grid := iq1s_grid[idx[l]]
+				oIdx := outBase + ib*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridByte := uint8(grid >> (8 * uint(j)))
+					gridVal := float32(int8(gridByte))
+					dst[oIdx+j] = dl1 * (gridVal + delta[l])
+				}
+			}
+			for l := 2; l < 4; l++ {
+				grid := iq1s_grid[idx[l]]
+				oIdx := outBase + ib*32 + l*8
+				for j := 0; j < 8; j++ {
+					gridByte := uint8(grid >> (8 * uint(j)))
+					gridVal := float32(int8(gridByte))
+					dst[oIdx+j] = dl2 * (gridVal + delta[l])
+				}
+			}
+
+			qsOff += 4
+			qhOff += 2
+		}
+	}
 }
 
 func dequantizeIQ3XXSInto(dst []float32, data []byte, n int) {
@@ -542,5 +903,94 @@ func dequantizeQ6_KInto(dst []float32, data []byte, n int) {
 				dst[pos+96] = d * sc6 * float32(q4)
 			}
 		}
+	}
+}
+
+func dequantizeTQ1_0Into(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeTQ1_0
+	pow3 := [6]uint8{1, 3, 9, 27, 81, 243}
+	outOff := 0
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesTQ1_0
+
+		dBits := uint16(data[off+52]) | uint16(data[off+53])<<8
+		d := float16ToFloat32(dBits)
+
+		qsLen := 48
+		qsChunk32 := qsLen - (qsLen % 32)
+		for j := 0; j < qsChunk32; j += 32 {
+			for nn := 0; nn < 5; nn++ {
+				for m := 0; m < 32; m++ {
+					q := data[off+j+m]
+					q = uint8((uint16(q) * uint16(pow3[nn])) >> 0)
+					xi := int16((uint16(q) * 3) >> 8)
+					dst[outOff] = float32(xi-1) * d
+					outOff++
+				}
+			}
+		}
+		for j := qsChunk32; j < qsLen; j += 16 {
+			for nn := 0; nn < 5; nn++ {
+				for m := 0; m < 16; m++ {
+					q := data[off+j+m]
+					q = uint8((uint16(q) * uint16(pow3[nn])) >> 0)
+					xi := int16((uint16(q) * 3) >> 8)
+					dst[outOff] = float32(xi-1) * d
+					outOff++
+				}
+			}
+		}
+
+		qhOff := off + 48
+		for nn := 0; nn < 4; nn++ {
+			for j := 0; j < 4; j++ {
+				q := data[qhOff+j]
+				q = uint8((uint16(q) * uint16(pow3[nn])) >> 0)
+				xi := int16((uint16(q) * 3) >> 8)
+				dst[outOff] = float32(xi-1) * d
+				outOff++
+			}
+		}
+	}
+}
+
+func dequantizeTQ2_0Into(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeTQ2_0
+	outOff := 0
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesTQ2_0
+
+		dBits := uint16(data[off+64]) | uint16(data[off+65])<<8
+		d := float16ToFloat32(dBits)
+
+		for j := 0; j < 64; j += 32 {
+			for l := 0; l < 4; l++ {
+				shift := uint(l * 2)
+				for m := 0; m < 32; m++ {
+					q := int8((data[off+j+m] >> shift) & 3)
+					dst[outOff] = float32(q-1) * d
+					outOff++
+				}
+			}
+		}
+	}
+}
+
+func dequantizeMXFP4Into(dst []float32, data []byte, n int) {
+	numBlocks := n / BlockSizeMXFP4
+	outOff := 0
+
+	for block := 0; block < numBlocks; block++ {
+		off := block * BlockBytesMXFP4
+		d := e8m0ToFloat32Half(data[off])
+
+		for j := 0; j < 16; j++ {
+			qByte := data[off+1+j]
+			dst[outOff+j] = d * float32(kvalues_mxfp4[qByte&0xf])
+			dst[outOff+j+16] = d * float32(kvalues_mxfp4[qByte>>4])
+		}
+		outOff += 32
 	}
 }

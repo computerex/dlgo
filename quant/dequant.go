@@ -108,6 +108,8 @@ func Dequantize(data []byte, ggmlType uint32, n int) ([]float32, error) {
 		return DequantizeTQ1_0(data, n), nil
 	case 35: // TQ2_0
 		return DequantizeTQ2_0(data, n), nil
+	case 39: // MXFP4
+		return DequantizeMXFP4(data, n), nil
 	default:
 		return nil, fmt.Errorf("unsupported quantization type: %d", ggmlType)
 	}
@@ -189,6 +191,8 @@ func BytesForN(ggmlType uint32, n int) int {
 		return (n / 256) * 54
 	case 35: // TQ2_0: 256 values per block, 66 bytes
 		return (n / 256) * 66
+	case 39: // MXFP4: 32 values per block, 17 bytes
+		return (n / 32) * 17
 	default:
 		return 0
 	}

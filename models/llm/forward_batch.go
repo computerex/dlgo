@@ -322,6 +322,21 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 			continue
 		}
 
+		// MLA layers: process sequentially (KV cache has sequential dependencies)
+		if spec.Core == CoreMLA {
+			for p := 0; p < nPos; p++ {
+				pos := startPos + p
+				x := bs.XBatch[p*dim : (p+1)*dim]
+				xn := bs.XNormBatch[p*dim : (p+1)*dim]
+				ops.RMSNorm(xn, x, layer.AttnNorm, cfg.RMSNormEps)
+				copy(rs.XNorm, xn)
+				ForwardMLA(layer, rs, kv, l, pos, cfg, pool)
+				copy(bs.ProjBatch[p*dim:(p+1)*dim], rs.AttnProj)
+			}
+			batchResidualFFN(layer, bs, rs, nPos, dim, cfg, pool)
+			continue
+		}
+
 		// Batch norm — parallelize across positions
 		pool.ParallelFor(nPos, func(p int) {
 			x := bs.XBatch[p*dim : (p+1)*dim]

@@ -87,6 +87,19 @@ func UploadF32(dst Buf, src []float32) error {
 	return nil
 }
 
+// UploadI32 copies int32 data from CPU to GPU.
+func UploadI32(dst Buf, src []int32) error {
+	if len(src) == 0 {
+		return nil
+	}
+	size := len(src) * 4
+	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(size), 0)
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: upload failed (%d)", rc)
+	}
+	return nil
+}
+
 // ZeroFill writes zeros to a GPU buffer.
 func ZeroFill(dst Buf, sizeBytes uint64) {
 	zeros := make([]byte, sizeBytes)
@@ -230,6 +243,31 @@ func KVStore(kCache, vCache, k, v Buf, pos, kvDim int) error {
 		C.GpuBuf(k), C.GpuBuf(v), C.int(pos), C.int(kvDim))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: kv_store failed (%d)", rc)
+	}
+	return nil
+}
+
+// PagedKVStore writes K and V into block pool buffers at the effective position.
+// effectivePos = physical_block * block_size + slot_in_block (computed on CPU).
+func PagedKVStore(kPool, vPool, k, v Buf, effectivePos, kvDim int) error {
+	rc := C.gpu_paged_kv_store(C.GpuBuf(kPool), C.GpuBuf(vPool),
+		C.GpuBuf(k), C.GpuBuf(v), C.int(effectivePos), C.int(kvDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: paged_kv_store failed (%d)", rc)
+	}
+	return nil
+}
+
+// PagedAttention performs multi-head attention with block-table-indexed KV access.
+// blockTableBuf is a GPU buffer of int32 physical block IDs.
+func PagedAttention(out, q, kPool, vPool, blockTable Buf,
+	numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32, blockSize int) error {
+	rc := C.gpu_paged_attention(C.GpuBuf(out), C.GpuBuf(q),
+		C.GpuBuf(kPool), C.GpuBuf(vPool), C.GpuBuf(blockTable),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
+		C.int(seqLen), C.float(scale), C.int(blockSize))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: paged_attention failed (%d)", rc)
 	}
 	return nil
 }

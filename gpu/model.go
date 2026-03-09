@@ -369,6 +369,19 @@ func (gm *GpuModel) FreeAll() {
 		freeTensor(gl.FFNGateShared)
 		freeTensor(gl.FFNUpShared)
 		freeTensor(gl.FFNDownShared)
+
+		// SSM (Gated Delta Net) layer buffers
+		freeTensor(gl.SSMInProj)
+		freeTensor(gl.SSMGate)
+		freeTensor(gl.SSMAlpha)
+		freeTensor(gl.SSMBeta)
+		freeBuf(gl.SSMConv1dW)
+		freeBuf(gl.SSMA)
+		freeBuf(gl.SSMDtBias)
+		freeBuf(gl.SSMNorm)
+		freeTensor(gl.SSMOut)
+		freeBuf(gl.SSMState)
+		freeBuf(gl.SSMConvBuf)
 	}
 }
 
@@ -391,6 +404,17 @@ func (rs *GpuRunState) FreeAll() {
 	freeBuf(rs.Hidden)
 	freeBuf(rs.FFNOut)
 	freeBuf(rs.Logits)
+
+	// SSM scratch buffers
+	freeBuf(rs.SSMQKV)
+	freeBuf(rs.SSMZ)
+	freeBuf(rs.SSMAlpha)
+	freeBuf(rs.SSMBeta)
+	freeBuf(rs.SSMY)
+
+	// GatedQ scratch buffers
+	freeBuf(rs.QFull)
+	freeBuf(rs.QGate)
 }
 
 // FreeAll releases all GPU buffers held by a GpuKVCache.

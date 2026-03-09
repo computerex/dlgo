@@ -1,0 +1,122 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+struct block_tq1_0 {
+    uint8_t qs[48];
+    uint8_t qh[4];
+    float16_t d;
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer Weights { block_tq1_0 blocks[]; };
+layout(set = 0, binding = 2) readonly buffer X { float x_data[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+const uint pow3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+
+    uint ncols = uint(cols);
+    uint num_sb = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    uint pos_id = gl_WorkGroupID.y;
+    uint pos_x_off = pos_id * ncols;
+
+    uint lane = tid & 31u;
+    uint sb_group = tid >> 5;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint b = sb_group; b < num_sb; b += 4u) {
+        uint x_block = b * 256u;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint bi = (first_row + n) * num_sb + b;
+            float d = float(blocks[bi].d);
+
+            float acc = 0.0;
+
+            // Chunk 1: qs[0..31], 5 trits per byte → 160 values
+            // All 32 threads active, each handles one byte
+            {
+                uint q = uint(blocks[bi].qs[lane]);
+                [[unroll]] for (int nn = 0; nn < 5; nn++) {
+                    uint xi = (q * pow3[nn]) & 0xFFu;
+                    xi = (xi * 3u) >> 8u;
+                    float val = float(int(xi) - 1) * d;
+                    acc += val * x_data[pos_x_off + x_block + uint(nn) * 32u + lane];
+                }
+            }
+
+            // Chunk 2: qs[32..47], 5 trits per byte → 80 values
+            // Only threads 0-15 active
+            if (lane < 16u) {
+                uint q = uint(blocks[bi].qs[32u + lane]);
+                [[unroll]] for (int nn = 0; nn < 5; nn++) {
+                    uint xi = (q * pow3[nn]) & 0xFFu;
+                    xi = (xi * 3u) >> 8u;
+                    float val = float(int(xi) - 1) * d;
+                    acc += val * x_data[pos_x_off + x_block + 160u + uint(nn) * 16u + lane];
+                }
+            }
+
+            // Chunk 3: qh[0..3], 4 trits per byte → 16 values
+            // Only threads 0-3 active
+            if (lane < 4u) {
+                uint q = uint(blocks[bi].qh[lane]);
+                [[unroll]] for (int nn = 0; nn < 4; nn++) {
+                    uint xi = (q * pow3[nn]) & 0xFFu;
+                    xi = (xi * 3u) >> 8u;
+                    float val = float(int(xi) - 1) * d;
+                    acc += val * x_data[pos_x_off + x_block + 240u + uint(nn) * 4u + lane];
+                }
+            }
+
+            temp[n] += acc;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[pos_id * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

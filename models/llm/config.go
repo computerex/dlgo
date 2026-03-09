@@ -39,10 +39,21 @@ type ModelConfig struct {
 	SSMGroupCount         int
 
 	// MoE (Mixture of Experts)
-	ExpertCount          int // 0 = dense (no MoE); >0 = number of experts per layer
-	ExpertUsedCount      int // top-K experts selected per token
-	ExpertFFNDim         int // hidden dim per expert
-	SharedExpertFFNDim   int // hidden dim for shared expert (0 = no shared expert)
+	ExpertCount          int     // 0 = dense (no MoE); >0 = number of experts per layer
+	ExpertUsedCount      int     // top-K experts selected per token
+	ExpertFFNDim         int     // hidden dim per expert
+	SharedExpertFFNDim   int     // hidden dim for shared expert (0 = no shared expert)
+	ExpertGatingFunc     int     // 0=none, 1=softmax, 2=sigmoid
+	ExpertWeightsNorm    bool    // normalize selected expert weights by sum
+	ExpertWeightsScale   float32 // scale factor for expert weights (0 = no scaling)
+
+	// MLA (Multi-head Latent Attention) — DeepSeek-V2/GLM-4
+	QLORARank         int // Q compression rank (attn_q_a output dim)
+	KVLORARank        int // KV compression rank (compressed KV without rope)
+	QKNopeDim         int // Non-positional K dim per head (k_b output per head)
+	QKRopeDim         int // Positional (RoPE) K dim per head
+	VHeadDim          int // V dim per head (v_b output per head)
+	LeadingDenseCount int // Number of initial dense layers before MoE
 }
 
 // parseConfig extracts a ModelConfig from GGUF metadata.
@@ -97,6 +108,15 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		ExpertUsedCount:    metaInt(md, arch+".expert_used_count", 0),
 		ExpertFFNDim:       metaInt(md, arch+".expert_feed_forward_length", 0),
 		SharedExpertFFNDim: metaInt(md, arch+".expert_shared_feed_forward_length", 0),
+		ExpertGatingFunc:   metaInt(md, arch+".expert_gating_func", 1),
+		ExpertWeightsNorm:  metaBool(md, arch+".expert_weights_norm", false),
+		ExpertWeightsScale: metaFloat(md, arch+".expert_weights_scale", 0),
+
+		QLORARank:         metaInt(md, arch+".attention.q_lora_rank", 0),
+		KVLORARank:        metaInt(md, arch+".attention.kv_lora_rank", 0),
+		QKNopeDim:         metaInt(md, arch+".attention.key_length_mla", 0),
+		VHeadDim:          metaInt(md, arch+".attention.value_length_mla", 0),
+		LeadingDenseCount: metaInt(md, arch+".leading_dense_block_count", 0),
 	}
 
 	if c.EmbeddingDim == 0 {
@@ -115,6 +135,14 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		c.HeadDim = c.EmbeddingDim / c.NumHeads
 	}
 	c.RopeDim = metaInt(md, arch+".rope.dimension_count", 0)
+	if c.QLORARank > 0 {
+		c.QKRopeDim = c.RopeDim
+		// key_length_mla is the TOTAL per-head Q/K dim (nope + rope);
+		// derive the non-positional portion by subtracting the rope dim.
+		if c.QKNopeDim > c.QKRopeDim {
+			c.QKNopeDim -= c.QKRopeDim
+		}
+	}
 	if c.RopeDim == 0 || c.RopeDim > c.HeadDim {
 		c.RopeDim = c.HeadDim
 	}
@@ -221,6 +249,8 @@ func inferChatTemplate(md map[string]interface{}, arch string) string {
 			return "gemma"
 		case strings.Contains(lower, "<|end|>"):
 			return "phi"
+		case strings.Contains(lower, "<|return|>"):
+			return "chatml"
 		case strings.Contains(lower, "<|assistant|>"):
 			return "llama2"
 		}

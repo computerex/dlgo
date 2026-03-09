@@ -34,6 +34,13 @@ extern "C" {
 #define QTYPE_Q4_K  12
 #define QTYPE_Q5_K  13
 #define QTYPE_Q6_K  14
+#define QTYPE_IQ2_XXS 16
+#define QTYPE_IQ1_S   19
+#define QTYPE_IQ3_XXS 18
+#define QTYPE_IQ2_S   22
+#define QTYPE_IQ3_S   21
+#define QTYPE_IQ1_M   29
+#define QTYPE_TQ1_0   34
 
 // Shader pipeline IDs
 typedef enum {
@@ -79,6 +86,15 @@ typedef enum {
     PIPE_SSM_NORM_GATE,
     PIPE_DEINTERLEAVE_QGATE,
     PIPE_SIGMOID_GATE,
+    PIPE_PAGED_ATTENTION,
+    PIPE_MATVEC_Q2_K,
+    PIPE_MATVEC_IQ1_S,
+    PIPE_MATVEC_IQ1_M,
+    PIPE_MATVEC_TQ1_0,
+    PIPE_MATVEC_IQ2_XXS,
+    PIPE_MATVEC_IQ2_S,
+    PIPE_MATVEC_IQ3_XXS,
+    PIPE_MATVEC_IQ3_S,
     PIPE_COUNT
 } PipelineID;
 
@@ -138,6 +154,20 @@ int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cac
 int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                  GpuBuf k_buf, GpuBuf v_buf,
                  int pos, int kv_dim);
+
+// Paged KV store: write K/V into block pool at computed block offset.
+// effective_pos = physical_block * block_size + slot_in_block (computed on CPU)
+int gpu_paged_kv_store(GpuBuf k_pool, GpuBuf v_pool,
+                       GpuBuf k_buf, GpuBuf v_buf,
+                       int effective_pos, int kv_dim);
+
+// Paged attention: block-table-indexed KV access for PagedAttention.
+// block_table_buf contains int32 physical block IDs.
+int gpu_paged_attention(GpuBuf out_buf, GpuBuf q_buf,
+                        GpuBuf k_pool_buf, GpuBuf v_pool_buf,
+                        GpuBuf block_table_buf,
+                        int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                        int seq_len, float scale, int block_size);
 
 // Dequantize a buffer from quantized format to float32
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype);
@@ -225,6 +255,13 @@ int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
 int gpu_deinterleave_qgate(GpuBuf qfull, GpuBuf q, GpuBuf qgate,
                            int num_heads, int head_dim);
 int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n);
+
+// IQ lookup table management for I-quant GPU matvec.
+// Call once after gpu_init to register grid table buffers.
+// iq1s_buf: iq1s_grid[2048] as uint32[4096]
+// iq2xxs_buf: iq2xxs_grid[256] as uint32[512] + ksigns[128] as uint32[32]
+// iq2s_buf: iq2s_grid[1024] as uint32[2048]
+int gpu_set_iq_tables(GpuBuf iq1s_buf, GpuBuf iq2xxs_buf, GpuBuf iq2s_buf, GpuBuf iq3xxs_buf, GpuBuf iq3s_buf);
 
 #ifdef __cplusplus
 }

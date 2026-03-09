@@ -3,6 +3,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
@@ -72,6 +73,22 @@ func LoadModel(path string) (*Model, error) {
 		}
 	}
 
+	// Validate all tensor quant types have zero-alloc dequantize paths.
+	// Types that fall through to the allocating default are dangerous when
+	// GC is suppressed during inference.
+	{
+		unsupported := map[uint32]bool{}
+		for _, ti := range gf.Tensors {
+			if !isNormOrBias(ti.Name) && !quant.HasZeroAllocDequantize(uint32(ti.Type)) {
+				unsupported[uint32(ti.Type)] = true
+			}
+		}
+		for t := range unsupported {
+			fmt.Fprintf(os.Stderr, "[dlgo] WARNING: model uses quant type %d which lacks a zero-alloc "+
+				"dequantizer — inference may use excessive memory\n", t)
+		}
+	}
+
 	// Weight tying: if output projection is nil, share with token embeddings
 	if m.Output == nil {
 		m.Output = m.TokenEmbed
@@ -98,6 +115,8 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 
 	if isSSMLayer(layerIdx, cfg) && l.SSMInProj != nil {
 		s.Core = CoreSSM
+	} else if l.WqA != nil && l.WqB != nil {
+		s.Core = CoreMLA
 	} else {
 		s.Core = CoreAttention
 	}
@@ -145,6 +164,11 @@ func PinLayerToRAM(l *Layer) {
 	pinTensor(l.Wv)
 	pinTensor(l.Wo)
 	pinTensor(l.AttnGate)
+	pinTensor(l.WqA)
+	pinTensor(l.WqB)
+	pinTensor(l.WkvA)
+	pinTensor(l.WkB)
+	pinTensor(l.WvB)
 	pinTensor(l.FFNGate)
 	pinTensor(l.FFNUp)
 	pinTensor(l.FFNDown)
@@ -174,6 +198,11 @@ func EstimateLayerBytes(l *Layer) int64 {
 	add(l.Wv)
 	add(l.Wo)
 	add(l.AttnGate)
+	add(l.WqA)
+	add(l.WqB)
+	add(l.WkvA)
+	add(l.WkB)
+	add(l.WvB)
 	add(l.FFNGate)
 	add(l.FFNUp)
 	add(l.FFNDown)
@@ -258,6 +287,10 @@ func mapTensorF32(m *Model, name string, data []float32) {
 				l.AttnQNorm = data
 			case "attn_k_norm.weight":
 				l.AttnKNorm = data
+			case "attn_q_a_norm.weight":
+				l.WqANorm = data
+			case "attn_kv_a_norm.weight":
+				l.WkvANorm = data
 			case "post_attention_norm.weight":
 				l.PostAttnNorm = data
 			case "post_ffw_norm.weight":
@@ -276,6 +309,8 @@ func mapTensorF32(m *Model, name string, data []float32) {
 			l.SSMConv1dW = data
 		case "ffn_gate_inp_shexp.weight":
 			l.FFNRouterShared = data
+		case "exp_probs_b.bias":
+			l.FFNRouterBias = data
 		}
 		}
 	}
@@ -309,6 +344,16 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 				splitFusedFFNUp(l, qt, cfg.FFNDim, cfg.EmbeddingDim)
 			case "ffn_down.weight":
 				l.FFNDown = qt
+		case "attn_q_a.weight":
+			l.WqA = qt
+		case "attn_q_b.weight":
+			l.WqB = qt
+		case "attn_kv_a_mqa.weight":
+			l.WkvA = qt
+		case "attn_k_b.weight":
+			l.WkB = qt
+		case "attn_v_b.weight":
+			l.WvB = qt
 		case "ssm_alpha.weight":
 			l.SSMAlpha = qt
 		case "ssm_beta.weight":

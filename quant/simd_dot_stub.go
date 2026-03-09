@@ -125,7 +125,7 @@ func HasCausalAttn() bool { return false }
 
 func HasSIMDDot(ggmlType uint32) bool {
 	switch ggmlType {
-	case 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 18, 23:
+	case 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23, 34, 35, 39:
 		return true
 	default:
 		return false

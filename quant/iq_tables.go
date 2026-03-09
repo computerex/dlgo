@@ -1090,3 +1090,10 @@ var iq3s_grid = [512]uint32{
 	0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 }
 
+func IQ1sGrid() []uint64    { return iq1s_grid[:] }
+func IQ2xxsGrid() []uint64  { return iq2xxs_grid[:] }
+func IQ2sGrid() []uint64    { return iq2s_grid[:] }
+func KSignsIQ2xs() []uint8  { return ksigns_iq2xs[:] }
+func IQ3xxsGrid() []uint32  { return iq3xxs_grid[:] }
+func IQ3sGrid() []uint32    { return iq3s_grid[:] }
+

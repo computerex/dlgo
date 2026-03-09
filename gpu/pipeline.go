@@ -345,6 +345,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	if err := Init(); err != nil {
 		return nil, err
 	}
+	if err := InitIQTables(); err != nil {
+		return nil, fmt.Errorf("gpu: IQ table upload failed: %w", err)
+	}
 
 	m := cpuPipeline.Model
 	cfg := m.Config

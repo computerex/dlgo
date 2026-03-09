@@ -23,6 +23,7 @@ type CoreKind uint8
 const (
 	CoreAttention CoreKind = iota // Standard grouped-query attention
 	CoreSSM                       // Gated Delta Network (Qwen3.5 linear attention)
+	CoreMLA                       // Multi-head Latent Attention (DeepSeek-V2/GLM-4)
 )
 
 // ResKind selects the residual connection + FFN-norm wiring.
@@ -93,6 +94,16 @@ type Layer struct {
 	FFNUpShared     *core.QuantizedTensor // [sharedFFNDim × dim] shared expert up
 	FFNDownShared   *core.QuantizedTensor // [dim × sharedFFNDim] shared expert down
 	FFNRouterShared []float32             // [dim] shared expert gate weight (sigmoid of dot product)
+	FFNRouterBias   []float32             // [expertCount] router logit bias (DeepSeek-V2/GLM-4)
+
+	// MLA (Multi-head Latent Attention) — DeepSeek-V2/GLM-4
+	WqA      *core.QuantizedTensor // [qLORARank × dim] Q down-projection
+	WqANorm  []float32            // [qLORARank] norm between Q projections
+	WqB      *core.QuantizedTensor // [numHeads*(qkNope+qkRope) × qLORARank] Q up-projection
+	WkvA     *core.QuantizedTensor // [kvLORARank+qkRope × dim] KV down-projection (includes rope keys)
+	WkvANorm []float32            // [kvLORARank] norm for KV compressed
+	WkB      *core.QuantizedTensor // [numHeads*qkNope × kvLORARank] K up-projection (3D packed per head)
+	WvB      *core.QuantizedTensor // [numHeads*vHeadDim × kvLORARank] V up-projection (3D packed per head)
 
 	// Gated Delta Net weights — only for Qwen3.5 linear attention layers
 	SSMInProj  *core.QuantizedTensor // [dim × qkvDim] fused QKV in-projection (stored via attn_qkv when not standard attention)

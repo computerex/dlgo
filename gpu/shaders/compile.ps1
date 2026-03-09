@@ -31,7 +31,16 @@ $shaders = @(
     @{name="ssm_delta_rule"; file="ssm_delta_rule.comp"},
     @{name="ssm_norm_gate"; file="ssm_norm_gate.comp"},
     @{name="deinterleave_qgate"; file="deinterleave_qgate.comp"},
-    @{name="sigmoid_gate"; file="sigmoid_gate.comp"}
+    @{name="sigmoid_gate"; file="sigmoid_gate.comp"},
+    @{name="paged_attention"; file="paged_attention.comp"},
+    @{name="matvec_q2_k"; file="matvec_q2_k.comp"},
+    @{name="matvec_iq1_s"; file="matvec_iq1_s.comp"},
+    @{name="matvec_iq1_m"; file="matvec_iq1_m.comp"},
+    @{name="matvec_tq1_0"; file="matvec_tq1_0.comp"},
+    @{name="matvec_iq2_xxs"; file="matvec_iq2_xxs.comp"},
+    @{name="matvec_iq2_s"; file="matvec_iq2_s.comp"},
+    @{name="matvec_iq3_xxs"; file="matvec_iq3_xxs.comp"},
+    @{name="matvec_iq3_s"; file="matvec_iq3_s.comp"}
 )
 
 $header = @"
@@ -118,6 +127,15 @@ static const ShaderInfo shader_registry[] = {
     {"ssm_norm_gate",   spv_ssm_norm_gate,   spv_ssm_norm_gate_size,   3, 8},   // PIPE_SSM_NORM_GATE
     {"deinterleave_qgate", spv_deinterleave_qgate, spv_deinterleave_qgate_size, 3, 8}, // PIPE_DEINTERLEAVE_QGATE
     {"sigmoid_gate",    spv_sigmoid_gate,    spv_sigmoid_gate_size,    2, 4},   // PIPE_SIGMOID_GATE
+    {"paged_attention", spv_paged_attention, spv_paged_attention_size, 5, 28},  // PIPE_PAGED_ATTENTION
+    {"matvec_q2_k",    spv_matvec_q2_k,    spv_matvec_q2_k_size,    3, 8},   // PIPE_MATVEC_Q2_K
+    {"matvec_iq1_s",   spv_matvec_iq1_s,   spv_matvec_iq1_s_size,   4, 8},   // PIPE_MATVEC_IQ1_S
+    {"matvec_iq1_m",   spv_matvec_iq1_m,   spv_matvec_iq1_m_size,   4, 8},   // PIPE_MATVEC_IQ1_M
+    {"matvec_tq1_0",   spv_matvec_tq1_0,   spv_matvec_tq1_0_size,   3, 8},   // PIPE_MATVEC_TQ1_0
+    {"matvec_iq2_xxs", spv_matvec_iq2_xxs, spv_matvec_iq2_xxs_size, 4, 8},   // PIPE_MATVEC_IQ2_XXS
+    {"matvec_iq2_s",   spv_matvec_iq2_s,   spv_matvec_iq2_s_size,   4, 8},   // PIPE_MATVEC_IQ2_S
+    {"matvec_iq3_xxs", spv_matvec_iq3_xxs, spv_matvec_iq3_xxs_size, 4, 8},   // PIPE_MATVEC_IQ3_XXS
+    {"matvec_iq3_s",   spv_matvec_iq3_s,   spv_matvec_iq3_s_size,   4, 8},   // PIPE_MATVEC_IQ3_S
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

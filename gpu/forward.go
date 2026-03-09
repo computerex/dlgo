@@ -36,7 +36,7 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache
 		lc.SetScratch(rs.X, rs.XNorm, rs.Q, rs.K, rs.V, rs.AttnOut, rs.AttnProj,
 			rs.FFNNorm, rs.FFNIn, rs.Gate, rs.Up, rs.Hidden, rs.FFNOut)
 
-		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ {
+		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ || layer.Spec.Core == llm.CoreMLA {
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
@@ -396,7 +396,7 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *Gpu
 		lc.SetScratch(bs.X, bs.XNorm, bs.Q, bs.K, bs.V, bs.AttnOut, bs.AttnProj,
 			bs.FFNNorm, bs.FFNIn, bs.Gate, bs.Up, bs.Hidden, bs.FFNOut)
 
-		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ {
+		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ || layer.Spec.Core == llm.CoreMLA {
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
@@ -1021,7 +1021,9 @@ func gpuForwardFFN(layer *llm.Layer, gl *GpuLayer, rs *GpuRunState, input Buf, d
 
 func supportsGPUQType(qtype uint32) bool {
 	switch qtype {
-	case 0, 1, 2, 6, 8, 11, 12, 13, 14:
+	case 0, 1, 2, 6, 8, 11, 12, 13, 14: // F32, F16, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
+		return true
+	case 10, 16, 18, 19, 21, 22, 29, 34: // Q2_K, IQ2_XXS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ1_M, TQ1_0
 		return true
 	default:
 		return false

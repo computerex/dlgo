@@ -13,6 +13,7 @@
 
 #include <immintrin.h>
 #include <stdint.h>
+#include "iq_tables_c.h"
 #include <string.h>
 #include <math.h>
 
@@ -1071,6 +1072,429 @@ void vec_dot_iq3_xxs_batch(const uint8_t* data, const float* x, int n,
     }
 }
 
+// ── IQ4_NL: 32 values per 18-byte block ────────────────────────
+// Layout: d:f16(2) + qs[16] (nibble pairs indexing kvalues_iq4nl)
+// Same as IQ4_XS but without per-sub-block scales.
+float vec_dot_iq4_nl(const uint8_t* data, const float* x, int n) {
+    int nb = n / 32;
+    __m256 acc = _mm256_setzero_ps();
+
+    __m128i lut = _mm_loadu_si128((const __m128i*)kvalues_iq4nl_c);
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 18;
+        float d = f16_to_f32(*(const uint16_t*)block);
+        const float* xp = x + b * 32;
+        __m256 vd = _mm256_set1_ps(d);
+
+        __m128i qbytes = _mm_loadu_si128((const __m128i*)(block + 2));
+
+        __m128i lo_nibbles = _mm_and_si128(qbytes, lo_mask);
+        __m128i lo_vals = _mm_shuffle_epi8(lut, lo_nibbles);
+        __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(qbytes, 4), lo_mask);
+        __m128i hi_vals = _mm_shuffle_epi8(lut, hi_nibbles);
+
+        // Low nibbles: values 0-7
+        __m128i lo_0 = _mm_cvtepi8_epi32(lo_vals);
+        __m128i lo_1 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 4));
+        __m256 flo_0 = _mm256_cvtepi32_ps(_mm256_set_m128i(lo_1, lo_0));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, flo_0), _mm256_loadu_ps(xp), acc);
+
+        // Low nibbles: values 8-15
+        __m128i lo_2 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 8));
+        __m128i lo_3 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 12));
+        __m256 flo_1 = _mm256_cvtepi32_ps(_mm256_set_m128i(lo_3, lo_2));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, flo_1), _mm256_loadu_ps(xp + 8), acc);
+
+        // High nibbles: values 16-23
+        __m128i hi_0 = _mm_cvtepi8_epi32(hi_vals);
+        __m128i hi_1 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 4));
+        __m256 fhi_0 = _mm256_cvtepi32_ps(_mm256_set_m128i(hi_1, hi_0));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, fhi_0), _mm256_loadu_ps(xp + 16), acc);
+
+        // High nibbles: values 24-31
+        __m128i hi_2 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 8));
+        __m128i hi_3 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 12));
+        __m256 fhi_1 = _mm256_cvtepi32_ps(_mm256_set_m128i(hi_3, hi_2));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, fhi_1), _mm256_loadu_ps(xp + 24), acc);
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_iq4_nl_batch(const uint8_t* data, const float* x, int n,
+                           float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_iq4_nl(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── IQ3_S: 256 values per 110-byte block ────────────────────────
+// Layout: d:f16(2) + qs[64] + qh[8] + signs[32] + scales[4]
+// Grid: iq3s_grid_c[512] (9-bit index) → uint32 with 4 packed values
+float vec_dot_iq3_s(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    __m256 acc = _mm256_setzero_ps();
+
+    const __m256i bitmask = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i sign_flip = _mm256_set1_epi32(0x80000000);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 110;
+        float d = f16_to_f32(*(const uint16_t*)block);
+        const uint8_t* qs = block + 2;
+        const uint8_t* qh = block + 2 + 64;
+        const uint8_t* signs = block + 2 + 64 + 8;
+        const uint8_t* sc = block + 2 + 64 + 8 + 32;
+        const float* xp = x + b * 256;
+
+        int qsOff = 0;
+        int signsOff = 0;
+
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            uint8_t scByte = sc[ib32 / 2];
+            float db1 = d * (float)(1 + 2 * (int)(scByte & 0xf));
+            float db2 = d * (float)(1 + 2 * (int)(scByte >> 4));
+            __m256 vdb1 = _mm256_set1_ps(db1);
+            __m256 vdb2 = _mm256_set1_ps(db2);
+
+            uint8_t qh0 = qh[ib32];
+            uint8_t qh1 = qh[ib32 + 1];
+
+            // First group of 32 values
+            for (int l = 0; l < 4; l++) {
+                uint16_t gi1 = (uint16_t)qs[qsOff + 2*l] | (((uint16_t)qh0 << (8 - 2*l)) & 256);
+                uint16_t gi2 = (uint16_t)qs[qsOff + 2*l + 1] | (((uint16_t)qh0 << (7 - 2*l)) & 256);
+                uint32_t g1 = iq3s_grid_c[gi1];
+                uint32_t g2 = iq3s_grid_c[gi2];
+                uint8_t signByte = signs[signsOff + l];
+
+                uint64_t g12;
+                memcpy(&g12, &g1, 4);
+                memcpy((char*)&g12 + 4, &g2, 4);
+                __m128i vg_bytes = _mm_set_epi64x(0, g12);
+                __m128i vg_lo = _mm_cvtepu8_epi32(vg_bytes);
+                __m128i vg_hi = _mm_cvtepu8_epi32(_mm_srli_si128(vg_bytes, 4));
+                __m256i vg = _mm256_set_m128i(vg_hi, vg_lo);
+                __m256 vgf = _mm256_cvtepi32_ps(vg);
+
+                __m256i vsigns = _mm256_set1_epi32(signByte);
+                __m256i vflags = _mm256_and_si256(vsigns, bitmask);
+                __m256i vcmp = _mm256_cmpeq_epi32(vflags, bitmask);
+                __m256i vxor = _mm256_and_si256(vcmp, sign_flip);
+                __m256 vvals = _mm256_castsi256_ps(
+                    _mm256_xor_si256(_mm256_castps_si256(vgf), vxor));
+
+                __m256 vx = _mm256_loadu_ps(xp + ib32*32 + l*8);
+                acc = _mm256_fmadd_ps(_mm256_mul_ps(vdb1, vvals), vx, acc);
+            }
+            qsOff += 8;
+            signsOff += 4;
+
+            // Second group of 32 values
+            for (int l = 0; l < 4; l++) {
+                uint16_t gi1 = (uint16_t)qs[qsOff + 2*l] | (((uint16_t)qh1 << (8 - 2*l)) & 256);
+                uint16_t gi2 = (uint16_t)qs[qsOff + 2*l + 1] | (((uint16_t)qh1 << (7 - 2*l)) & 256);
+                uint32_t g1 = iq3s_grid_c[gi1];
+                uint32_t g2 = iq3s_grid_c[gi2];
+                uint8_t signByte = signs[signsOff + l];
+
+                uint64_t g12;
+                memcpy(&g12, &g1, 4);
+                memcpy((char*)&g12 + 4, &g2, 4);
+                __m128i vg_bytes = _mm_set_epi64x(0, g12);
+                __m128i vg_lo = _mm_cvtepu8_epi32(vg_bytes);
+                __m128i vg_hi = _mm_cvtepu8_epi32(_mm_srli_si128(vg_bytes, 4));
+                __m256i vg = _mm256_set_m128i(vg_hi, vg_lo);
+                __m256 vgf = _mm256_cvtepi32_ps(vg);
+
+                __m256i vsigns = _mm256_set1_epi32(signByte);
+                __m256i vflags = _mm256_and_si256(vsigns, bitmask);
+                __m256i vcmp = _mm256_cmpeq_epi32(vflags, bitmask);
+                __m256i vxor = _mm256_and_si256(vcmp, sign_flip);
+                __m256 vvals = _mm256_castsi256_ps(
+                    _mm256_xor_si256(_mm256_castps_si256(vgf), vxor));
+
+                __m256 vx = _mm256_loadu_ps(xp + (ib32+1)*32 + l*8);
+                acc = _mm256_fmadd_ps(_mm256_mul_ps(vdb2, vvals), vx, acc);
+            }
+            qsOff += 8;
+            signsOff += 4;
+        }
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_iq3_s_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_iq3_s(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── IQ2_XXS: 256 values per 66-byte block ──────────────────────
+// Layout: d:f16(2) + qs[64] (8 groups × 8 bytes each)
+// Grid: iq2xxs_grid_c[256] → uint64 with 8 packed values
+float vec_dot_iq2_xxs(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    __m256 acc = _mm256_setzero_ps();
+
+    const __m256i bitmask = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i sign_flip = _mm256_set1_epi32(0x80000000);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 66;
+        float d = f16_to_f32(*(const uint16_t*)block);
+        const uint8_t* qs = block + 2;
+        const float* xp = x + b * 256;
+
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            const uint8_t* grp = qs + ib32 * 8;
+            uint32_t aux1;
+            memcpy(&aux1, grp + 4, 4);
+
+            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+            __m256 vdb = _mm256_set1_ps(db);
+
+            for (int l = 0; l < 4; l++) {
+                uint8_t gridIdx = grp[l];
+                uint64_t grid = iq2xxs_grid_c[gridIdx];
+
+                uint8_t signIdx = (aux1 >> (7 * l)) & 127;
+                uint8_t signs8 = ksigns_c[signIdx];
+
+                __m128i vg_bytes = _mm_set_epi64x(0, grid);
+                __m128i vg_lo = _mm_cvtepu8_epi32(vg_bytes);
+                __m128i vg_hi = _mm_cvtepu8_epi32(_mm_srli_si128(vg_bytes, 4));
+                __m256i vg = _mm256_set_m128i(vg_hi, vg_lo);
+                __m256 vgf = _mm256_cvtepi32_ps(vg);
+
+                __m256i vsigns = _mm256_set1_epi32(signs8);
+                __m256i vflags = _mm256_and_si256(vsigns, bitmask);
+                __m256i vcmp = _mm256_cmpeq_epi32(vflags, bitmask);
+                __m256i vxor = _mm256_and_si256(vcmp, sign_flip);
+                __m256 vvals = _mm256_castsi256_ps(
+                    _mm256_xor_si256(_mm256_castps_si256(vgf), vxor));
+
+                __m256 vx = _mm256_loadu_ps(xp + ib32*32 + l*8);
+                acc = _mm256_fmadd_ps(_mm256_mul_ps(vdb, vvals), vx, acc);
+            }
+        }
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_iq2_xxs_batch(const uint8_t* data, const float* x, int n,
+                             float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_iq2_xxs(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── IQ1_S: 256 values per 50-byte block ────────────────────────
+// Layout: d:f16(2) + qs[32] + qh[16] (8×uint16)
+// Grid: iq1s_grid_c[2048] → uint64 with 8 packed signed int8 {-1,0,+1}
+// Delta: ±0.125 applied to all grid values in a sub-group
+float vec_dot_iq1_s(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 50;
+        float d = f16_to_f32(*(const uint16_t*)block);
+        const uint8_t* qs = block + 2;
+        const uint8_t* qhp = block + 2 + 32;
+        const float* xp = x + b * 256;
+
+        int qsOff = 0;
+
+        for (int ib = 0; ib < 8; ib++) {
+            uint16_t qh = (uint16_t)qhp[ib*2] | ((uint16_t)qhp[ib*2+1] << 8);
+
+            float dl = d * (float)(2 * (int)((qh >> 12) & 7) + 1);
+            float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+            __m256 vdl = _mm256_set1_ps(dl);
+            __m256 vdelta = _mm256_set1_ps(dl * delta);
+
+            for (int l = 0; l < 4; l++) {
+                uint16_t gridIdx = (uint16_t)qs[qsOff + l] |
+                                   (((qh >> (3*l)) & 7) << 8);
+                uint64_t grid = iq1s_grid_c[gridIdx];
+
+                __m128i vg_bytes = _mm_set_epi64x(0, grid);
+                __m128i vg_lo_i8 = _mm_cvtepi8_epi32(vg_bytes);
+                __m128i vg_hi_i8 = _mm_cvtepi8_epi32(_mm_srli_si128(vg_bytes, 4));
+                __m256i vg = _mm256_set_m128i(vg_hi_i8, vg_lo_i8);
+                __m256 vgf = _mm256_cvtepi32_ps(vg);
+
+                // val = dl * (gridVal + delta) = dl*gridVal + dl*delta
+                __m256 vx = _mm256_loadu_ps(xp + ib*32 + l*8);
+                __m256 vdlg = _mm256_fmadd_ps(vdl, vgf, vdelta);
+                acc = _mm256_fmadd_ps(vdlg, vx, acc);
+            }
+            qsOff += 4;
+        }
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_iq1_s_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_iq1_s(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── IQ2_S: 256 values per 82-byte block ─────────────────────────
+// Layout: d:f16(2) + qs[32](grid low) + signs[32] + qh[8] + scales[8]
+// Grid: iq2s_grid_c[1024] (10-bit index) → uint64 with 8 packed values
+float vec_dot_iq2_s(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    __m256 acc = _mm256_setzero_ps();
+
+    const __m256i bitmask = _mm256_set_epi32(0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m256i sign_flip = _mm256_set1_epi32(0x80000000);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 82;
+        float d = f16_to_f32(*(const uint16_t*)block);
+        const uint8_t* gridLow = block + 2;
+        const uint8_t* signBytes = block + 2 + 32;
+        const uint8_t* qhp = block + 2 + 64;
+        const uint8_t* scp = block + 2 + 64 + 8;
+        const float* xp = x + b * 256;
+
+        int glOff = 0;
+        int sOff = 0;
+
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            uint8_t scByte = scp[ib32];
+            float db0 = d * (0.5f + (float)(scByte & 0xf)) * 0.25f;
+            float db1 = d * (0.5f + (float)(scByte >> 4)) * 0.25f;
+            uint8_t qhByte = qhp[ib32];
+
+            for (int l = 0; l < 4; l++) {
+                uint16_t lowByte = gridLow[glOff];
+                uint16_t highBits = ((uint16_t)qhByte << (8 - 2*l)) & 0x300;
+                uint16_t gridIdx = lowByte | highBits;
+                uint64_t grid = iq2s_grid_c[gridIdx];
+                uint8_t signs8 = signBytes[sOff];
+
+                float db = (l < 2) ? db0 : db1;
+
+                __m128i vg_bytes = _mm_set_epi64x(0, grid);
+                __m128i vg_lo = _mm_cvtepu8_epi32(vg_bytes);
+                __m128i vg_hi = _mm_cvtepu8_epi32(_mm_srli_si128(vg_bytes, 4));
+                __m256i vg = _mm256_set_m128i(vg_hi, vg_lo);
+                __m256 vgf = _mm256_cvtepi32_ps(vg);
+
+                __m256i vsigns = _mm256_set1_epi32(signs8);
+                __m256i vflags = _mm256_and_si256(vsigns, bitmask);
+                __m256i vcmp = _mm256_cmpeq_epi32(vflags, bitmask);
+                __m256i vxor = _mm256_and_si256(vcmp, sign_flip);
+                __m256 vvals = _mm256_castsi256_ps(
+                    _mm256_xor_si256(_mm256_castps_si256(vgf), vxor));
+
+                __m256 vdb = _mm256_set1_ps(db);
+                __m256 vx = _mm256_loadu_ps(xp + ib32*32 + l*8);
+                acc = _mm256_fmadd_ps(_mm256_mul_ps(vdb, vvals), vx, acc);
+
+                glOff++;
+                sOff++;
+            }
+        }
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_iq2_s_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_iq2_s(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── MXFP4: 32 values per 17-byte block ─────────────────────────
+// Layout: e:E8M0(1) + qs[16] (nibble pairs indexing kvalues_mxfp4)
+// Low nibbles → values[0..15], high nibbles → values[16..31]
+static const int8_t kvalues_mxfp4_c[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+static inline float e8m0_to_fp32_half(uint8_t e) {
+    uint32_t bits;
+    if (e < 2) {
+        bits = 0x00200000u << e;
+    } else {
+        bits = (uint32_t)(e - 1) << 23;
+    }
+    float result;
+    memcpy(&result, &bits, 4);
+    return result;
+}
+
+float vec_dot_mxfp4(const uint8_t* data, const float* x, int n) {
+    int nb = n / 32;
+    __m256 acc = _mm256_setzero_ps();
+
+    __m128i lut = _mm_loadu_si128((const __m128i*)kvalues_mxfp4_c);
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* block = data + b * 17;
+        float d = e8m0_to_fp32_half(block[0]);
+        const float* xp = x + b * 32;
+        __m256 vd = _mm256_set1_ps(d);
+
+        __m128i qbytes = _mm_loadu_si128((const __m128i*)(block + 1));
+
+        __m128i lo_nibbles = _mm_and_si128(qbytes, lo_mask);
+        __m128i lo_vals = _mm_shuffle_epi8(lut, lo_nibbles);
+        __m128i hi_nibbles = _mm_and_si128(_mm_srli_epi16(qbytes, 4), lo_mask);
+        __m128i hi_vals = _mm_shuffle_epi8(lut, hi_nibbles);
+
+        __m128i lo_0 = _mm_cvtepi8_epi32(lo_vals);
+        __m128i lo_1 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 4));
+        __m256 flo_0 = _mm256_cvtepi32_ps(_mm256_set_m128i(lo_1, lo_0));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, flo_0), _mm256_loadu_ps(xp), acc);
+
+        __m128i lo_2 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 8));
+        __m128i lo_3 = _mm_cvtepi8_epi32(_mm_srli_si128(lo_vals, 12));
+        __m256 flo_1 = _mm256_cvtepi32_ps(_mm256_set_m128i(lo_3, lo_2));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, flo_1), _mm256_loadu_ps(xp + 8), acc);
+
+        __m128i hi_0 = _mm_cvtepi8_epi32(hi_vals);
+        __m128i hi_1 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 4));
+        __m256 fhi_0 = _mm256_cvtepi32_ps(_mm256_set_m128i(hi_1, hi_0));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, fhi_0), _mm256_loadu_ps(xp + 16), acc);
+
+        __m128i hi_2 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 8));
+        __m128i hi_3 = _mm_cvtepi8_epi32(_mm_srli_si128(hi_vals, 12));
+        __m256 fhi_1 = _mm256_cvtepi32_ps(_mm256_set_m128i(hi_3, hi_2));
+        acc = _mm256_fmadd_ps(_mm256_mul_ps(vd, fhi_1), _mm256_loadu_ps(xp + 24), acc);
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_mxfp4_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_mxfp4(data + (size_t)r * bpr, x, n);
+    }
+}
+
 #define DEFINE_DOT_MANY(name) \
 void name##_many(const uint8_t* data, const float* x_flat, int n, float* out, int nvecs) { \
     for (int v = 0; v < nvecs; v++) { \
@@ -1445,6 +1869,147 @@ void vec_dot_f32_batch(const float* a_flat, const float* x, int cols,
                        float* out, int nrows) {
     for (int r = 0; r < nrows; r++) {
         out[r] = vec_dot_f32(a_flat + r * cols, x, cols);
+    }
+}
+
+// ── TQ1_0: 256 values per 54-byte block (ternary 1.6875 bpw) ──
+// Layout: qs[48] base-3 encoded (5 trits/byte) + qh[4] (4 trits/byte) + f16 scale
+// Values are {-1, 0, +1} * d
+//
+// Optimized: uses integer SIMD for trit extraction instead of scalar loops.
+// For each group of 8 bytes: cvtepu8→epi32, multiply by pow3 (mod 256),
+// extract trit via (q*3)>>8, subtract 1, convert to float, FMA with x.
+
+static inline void tq1_extract_and_fma_8(
+    const uint8_t* src, int p3, const float* xp, __m256* acc
+) {
+    __m128i bytes8 = _mm_loadl_epi64((const __m128i*)src);
+    __m256i vals = _mm256_cvtepu8_epi32(bytes8);
+    __m256i vp3 = _mm256_set1_epi32(p3);
+    __m256i mask8 = _mm256_set1_epi32(0xFF);
+    __m256i three = _mm256_set1_epi32(3);
+    __m256i one = _mm256_set1_epi32(1);
+
+    vals = _mm256_mullo_epi32(vals, vp3);
+    vals = _mm256_and_si256(vals, mask8);
+    vals = _mm256_mullo_epi32(vals, three);
+    vals = _mm256_srli_epi32(vals, 8);
+    vals = _mm256_sub_epi32(vals, one);
+
+    __m256 trits = _mm256_cvtepi32_ps(vals);
+    __m256 xv = _mm256_loadu_ps(xp);
+    *acc = _mm256_fmadd_ps(trits, xv, *acc);
+}
+
+float vec_dot_tq1_0(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    static const int pow3[5] = {1, 3, 9, 27, 81};
+    __m256 acc = _mm256_setzero_ps();
+    float scalar_acc = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* qs = data + b * 54;
+        float d = f16_to_f32(*(const uint16_t*)(qs + 52));
+        const float* xp = x + b * 256;
+
+        __m256 block_acc = _mm256_setzero_ps();
+        int outIdx = 0;
+
+        // 32-byte chunk: 5 digit passes × 4 groups of 8 = 160 values
+        for (int nn = 0; nn < 5; nn++) {
+            int p3 = pow3[nn];
+            for (int m = 0; m < 32; m += 8) {
+                tq1_extract_and_fma_8(qs + m, p3, xp + outIdx, &block_acc);
+                outIdx += 8;
+            }
+        }
+
+        // 16-byte chunk: 5 digit passes × 2 groups of 8 = 80 values
+        for (int nn = 0; nn < 5; nn++) {
+            int p3 = pow3[nn];
+            for (int m = 0; m < 16; m += 8) {
+                tq1_extract_and_fma_8(qs + 32 + m, p3, xp + outIdx, &block_acc);
+                outIdx += 8;
+            }
+        }
+
+        // qh: 4 bytes × 4 digit passes = 16 values (scalar, small)
+        const uint8_t* qh = qs + 48;
+        float block_tail = 0.0f;
+        for (int nn = 0; nn < 4; nn++) {
+            int p3 = pow3[nn];
+            for (int j = 0; j < 4; j++) {
+                uint8_t q = (uint8_t)((uint16_t)qh[j] * p3);
+                int xi = ((uint16_t)q * 3) >> 8;
+                block_tail += (float)(xi - 1) * xp[outIdx];
+                outIdx++;
+            }
+        }
+
+        __m256 vd = _mm256_set1_ps(d);
+        acc = _mm256_fmadd_ps(vd, block_acc, acc);
+        scalar_acc += d * block_tail;
+    }
+    return hsum256_ps(acc) + scalar_acc;
+}
+
+void vec_dot_tq1_0_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_tq1_0(data + (size_t)r * bpr, x, n);
+    }
+}
+
+// ── TQ2_0: 256 values per 66-byte block (ternary 2.0625 bpw) ──
+// Layout: qs[64] 2 bits per value (4 per byte) + f16 scale
+// Values are {-1, 0, +1} * d, stored as {0, 1, 2} mapped to {-1, 0, +1}
+//
+// Optimized: uses integer SIMD for 2-bit extraction instead of scalar loops.
+float vec_dot_tq2_0(const uint8_t* data, const float* x, int n) {
+    int nb = n / 256;
+    __m256 acc = _mm256_setzero_ps();
+    __m256i mask2 = _mm256_set1_epi32(3);
+    __m256i one = _mm256_set1_epi32(1);
+
+    for (int b = 0; b < nb; b++) {
+        const uint8_t* qs = data + b * 66;
+        float d = f16_to_f32(*(const uint16_t*)(qs + 64));
+        const float* xp = x + b * 256;
+
+        __m256 block_acc = _mm256_setzero_ps();
+        int outIdx = 0;
+
+        for (int j = 0; j < 64; j += 32) {
+            for (int shift = 0; shift < 4; shift++) {
+                int s2 = shift * 2;
+                for (int m = 0; m < 32; m += 8) {
+                    __m128i bytes8 = _mm_loadl_epi64((const __m128i*)(qs + j + m));
+                    __m256i vals = _mm256_cvtepu8_epi32(bytes8);
+                    vals = _mm256_srli_epi32(vals, s2);
+                    vals = _mm256_and_si256(vals, mask2);
+                    vals = _mm256_sub_epi32(vals, one);
+
+                    __m256 trits = _mm256_cvtepi32_ps(vals);
+                    __m256 xv = _mm256_loadu_ps(xp + outIdx);
+                    block_acc = _mm256_fmadd_ps(trits, xv, block_acc);
+                    outIdx += 8;
+                }
+            }
+        }
+        __m256 vd = _mm256_set1_ps(d);
+        acc = _mm256_fmadd_ps(vd, block_acc, acc);
+    }
+    return hsum256_ps(acc);
+}
+
+void vec_dot_tq2_0_batch(const uint8_t* data, const float* x, int n,
+                          float* out, int nrows, int bpr) {
+    for (int r = 0; r < nrows; r++) {
+        if (r + 1 < nrows)
+            _mm_prefetch((const char*)(data + (size_t)(r+1) * bpr), _MM_HINT_T0);
+        out[r] = vec_dot_tq2_0(data + (size_t)r * bpr, x, n);
     }
 }
 

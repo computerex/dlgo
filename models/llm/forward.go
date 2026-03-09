@@ -55,6 +55,11 @@ type RunState struct {
 	MoEShHidden   []float32   // [sharedFFNDim] shared expert hidden
 	MoEShOut      []float32   // [dim] shared expert output
 
+	// MLA (Multi-head Latent Attention) scratch buffers
+	MLAQComp    []float32 // [qLORARank] compressed Q intermediate
+	MLAQAbsorbed []float32 // [numHeads * kvLORARank] absorbed key vectors per head
+	MLAAttnKV   []float32 // [numHeads * kvLORARank] weighted KV sum per head
+
 	// Worker pool for parallel matmul
 	Pool *blas.Pool
 }
@@ -120,6 +125,13 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		rs.MoEShUp = make([]float32, shDim)
 		rs.MoEShHidden = make([]float32, shDim)
 		rs.MoEShOut = make([]float32, dim)
+	}
+
+	if cfg.QLORARank > 0 {
+		rs.MLAQComp = make([]float32, cfg.QLORARank)
+		rs.MLAQAbsorbed = make([]float32, cfg.NumHeads*cfg.KVLORARank)
+		rs.MLAAttnKV = make([]float32, cfg.NumHeads*cfg.KVLORARank)
+		rs.PrecomputeRoPE(maxSeqLen, cfg.QKRopeDim, cfg.QKRopeDim, cfg.RopeFreqBase)
 	}
 
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
@@ -205,6 +217,8 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 		switch spec.Core {
 		case CoreSSM:
 			ForwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
+		case CoreMLA:
+			ForwardMLA(layer, rs, kv, l, pos, cfg, pool)
 		case CoreAttention:
 			ForwardAttention(layer, rs, kv, l, pos, numHeads, numKVHeads, headDim, kvMul, cfg, pool)
 		}
@@ -348,6 +362,107 @@ func ForwardAttention(
 	}
 }
 
+// ForwardMLA runs one Multi-head Latent Attention layer (DeepSeek-V2/GLM-4).
+// Uses absorbed key/value approach to avoid expanding K for every cached position.
+func ForwardMLA(
+	layer *Layer, rs *RunState, kv *memory.MultiLayerKVCache,
+	l, pos int, cfg ModelConfig, pool *blas.Pool,
+) {
+	numHeads := cfg.NumHeads
+	qkNope := cfg.QKNopeDim
+	qkRope := cfg.QKRopeDim
+	kvLORARank := cfg.KVLORARank
+	vHeadDim := cfg.VHeadDim
+	qPerHead := qkNope + qkRope
+	kvCompDim := kvLORARank + qkRope
+
+	// === Q path: x → WqA → norm → WqB → Q ===
+	blas.QMatVecMulParallel(rs.MLAQComp, layer.WqA, rs.XNorm, pool)
+	ops.RMSNormInPlace(rs.MLAQComp, layer.WqANorm, cfg.RMSNormEps)
+
+	mlaQDim := numHeads * qPerHead
+	qFull := rs.Q[:mlaQDim]
+	blas.QMatVecMulParallel(qFull, layer.WqB, rs.MLAQComp, pool)
+
+	// Apply RoPE to rope portion of each head's Q
+	for h := 0; h < numHeads; h++ {
+		qRope := qFull[h*qPerHead+qkNope : (h+1)*qPerHead]
+		rs.ApplyRoPEFastDim(qRope, pos, qkRope)
+	}
+
+	// === KV path: x → WkvA → split → norm → store ===
+	kvFull := rs.K[:kvCompDim]
+	blas.QMatVecMulParallel(kvFull, layer.WkvA, rs.XNorm, pool)
+
+	kvComp := kvFull[:kvLORARank]
+	kRope := kvFull[kvLORARank:]
+
+	ops.RMSNormInPlace(kvComp, layer.WkvANorm, cfg.RMSNormEps)
+	rs.ApplyRoPEFastDim(kRope, pos, qkRope)
+
+	// Store compressed KV in cache K slot
+	kv.Layers[l].Store(pos, kvFull[:kvCompDim], kvFull[:kvCompDim])
+
+	seqLen := pos + 1
+	scale := float32(1.0 / math.Sqrt(float64(qPerHead)))
+
+	// === Absorbed attention (per head) ===
+	pool.ParallelFor(numHeads, func(h int) {
+		qNope := qFull[h*qPerHead : h*qPerHead+qkNope]
+		qRopeH := qFull[h*qPerHead+qkNope : (h+1)*qPerHead]
+
+		// Absorbed key: q_absorbed = WkB_h @ q_nope → [kvLORARank]
+		wkbH := mlaHeadView(layer.WkB, h, kvLORARank, qkNope)
+		qAbsorbed := rs.MLAQAbsorbed[h*kvLORARank : (h+1)*kvLORARank]
+		blas.QMatVecMul(qAbsorbed, wkbH, qNope)
+
+		scores := rs.HeadScores[h][:seqLen]
+
+		// Score computation
+		for t := 0; t < seqLen; t++ {
+			cached := kv.Layers[l].Keys[t]
+			kvCompT := cached[:kvLORARank]
+			kRopeT := cached[kvLORARank:kvCompDim]
+
+			scoreNope := ops.DotProduct(qAbsorbed, kvCompT, kvLORARank)
+			scoreRope := ops.DotProduct(qRopeH, kRopeT, qkRope)
+			scores[t] = (scoreNope + scoreRope) * scale
+		}
+		quant.SIMDSoftmax(scores)
+
+		// Weighted sum of compressed KV
+		attnKV := rs.MLAAttnKV[h*kvLORARank : (h+1)*kvLORARank]
+		ops.Clear(attnKV)
+		for t := 0; t < seqLen; t++ {
+			cached := kv.Layers[l].Keys[t]
+			kvCompT := cached[:kvLORARank]
+			ops.AddScaled(attnKV, scores[t], kvCompT, kvLORARank)
+		}
+
+		// Expand V: v_h = WvB_h @ attn_kv → [vHeadDim]
+		wvbH := mlaHeadView(layer.WvB, h, vHeadDim, kvLORARank)
+		headOut := rs.AttnOut[h*vHeadDim : (h+1)*vHeadDim]
+		blas.QMatVecMul(headOut, wvbH, attnKV)
+	})
+
+	// Output projection
+	blas.QMatVecMulParallel(rs.AttnProj, layer.Wo, rs.AttnOut[:numHeads*vHeadDim], pool)
+}
+
+// mlaHeadView returns a zero-copy view into a 3D packed per-head tensor.
+// The 3D tensor is stored as [numHeads][rowsPerHead][colsPerHead] in memory.
+func mlaHeadView(packed *core.QuantizedTensor, headIdx, rowsPerHead, colsPerHead int) *core.QuantizedTensor {
+	bytesPerRow := quant.BytesForN(packed.Type, colsPerHead)
+	offset := headIdx * rowsPerHead * bytesPerRow
+	size := rowsPerHead * bytesPerRow
+	return &core.QuantizedTensor{
+		Data: packed.Data[offset : offset+size],
+		Type: packed.Type,
+		Rows: rowsPerHead,
+		Cols: colsPerHead,
+	}
+}
+
 // expertView returns a zero-copy view into a packed expert tensor for one expert.
 func expertView(packed *core.QuantizedTensor, expertIdx, expertRows int) *core.QuantizedTensor {
 	bytesPerRow := quant.BytesForN(packed.Type, packed.Cols)
@@ -394,24 +509,40 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 	expDim := cfg.ExpertFFNDim
 	nUsed := cfg.ExpertUsedCount
 
-	// Router: compute softmax probabilities over all experts
+	// Router: compute gated probabilities over all experts
 	blas.QMatVecMulParallel(rs.MoELogits, layer.FFNRouter, input, pool)
-	quant.SIMDSoftmax(rs.MoELogits)
+	if layer.FFNRouterBias != nil {
+		ops.AddBias(rs.MoELogits, layer.FFNRouterBias)
+	}
+	if cfg.ExpertGatingFunc == 2 {
+		for i := range rs.MoELogits {
+			rs.MoELogits[i] = ops.Sigmoid(rs.MoELogits[i])
+		}
+	} else {
+		quant.SIMDSoftmax(rs.MoELogits)
+	}
 
 	// Select top-K experts
 	indices, weights := topKIndices(rs.MoELogits, nUsed)
 
 	// Normalize selected weights
-	var wSum float32
-	for _, w := range weights {
-		wSum += w
+	if cfg.ExpertWeightsNorm {
+		var wSum float32
+		for _, w := range weights {
+			wSum += w
+		}
+		if wSum < 1e-12 {
+			wSum = 1e-12
+		}
+		invSum := 1.0 / wSum
+		for i := range weights {
+			weights[i] *= invSum
+		}
 	}
-	if wSum < 1e-12 {
-		wSum = 1e-12
-	}
-	invSum := 1.0 / wSum
-	for i := range weights {
-		weights[i] *= invSum
+	if cfg.ExpertWeightsScale > 0 {
+		for i := range weights {
+			weights[i] *= cfg.ExpertWeightsScale
+		}
 	}
 
 	// Build expert slices for batched dispatch

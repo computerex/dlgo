@@ -213,3 +213,36 @@ func (rs *RunState) ApplyRoPEFast(vec []float32, pos int) {
 		}
 	}
 }
+
+// ApplyRoPEFastDim applies RoPE to a vector of exactly ropeDim elements
+// (e.g. the rope portion of MLA Q/K heads).
+func (rs *RunState) ApplyRoPEFastDim(vec []float32, pos, ropeDim int) {
+	if rs.ropeCos == nil || rs.ropeSin == nil || len(vec) < ropeDim {
+		return
+	}
+	half := ropeDim / 2
+	base := pos * half
+	if base+half > len(rs.ropeCos) {
+		return
+	}
+
+	if rs.ropeNeox {
+		for i := 0; i < half; i++ {
+			cos := rs.ropeCos[base+i]
+			sin := rs.ropeSin[base+i]
+			x0 := vec[i]
+			x1 := vec[i+half]
+			vec[i] = x0*cos - x1*sin
+			vec[i+half] = x0*sin + x1*cos
+		}
+	} else {
+		for i := 0; i < half; i++ {
+			cos := rs.ropeCos[base+i]
+			sin := rs.ropeSin[base+i]
+			x0 := vec[2*i]
+			x1 := vec[2*i+1]
+			vec[2*i] = x0*cos - x1*sin
+			vec[2*i+1] = x0*sin + x1*cos
+		}
+	}
+}
