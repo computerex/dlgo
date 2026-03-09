@@ -161,6 +161,19 @@ func isSSMLayer(l int, cfg ModelConfig) bool {
 
 // Forward performs a single-token forward pass through the model.
 func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
+	return ForwardRange(m, token, pos, 0, m.Config.NumLayers, kv, rs)
+}
+
+// ForwardFromLayer resumes forward pass from a given layer.
+// rs.X must already contain the hidden state from the previous layer.
+func ForwardFromLayer(m *Model, startLayer, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
+	return ForwardRange(m, -1, pos, startLayer, m.Config.NumLayers, kv, rs)
+}
+
+// ForwardRange performs a forward pass through layers [startLayer, endLayer).
+// If startLayer == 0, token embedding is done. If endLayer == numLayers,
+// the final norm and output projection are included.
+func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
 	headDim := cfg.HeadDim
@@ -169,12 +182,14 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 	kvMul := numHeads / numKVHeads
 	pool := rs.Pool
 
-	_ = m.TokenEmbed.DequantizeRow(int(token), rs.X)
-	if cfg.EmbedScale != 0 {
-		ops.Scale(rs.X, cfg.EmbedScale)
+	if startLayer == 0 {
+		_ = m.TokenEmbed.DequantizeRow(int(token), rs.X)
+		if cfg.EmbedScale != 0 {
+			ops.Scale(rs.X, cfg.EmbedScale)
+		}
 	}
 
-	for l := 0; l < cfg.NumLayers; l++ {
+	for l := startLayer; l < endLayer; l++ {
 		layer := &m.Layers[l]
 		spec := &layer.Spec
 
@@ -220,6 +235,10 @@ func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *R
 				rs.X[i] = rs.X[i] + rs.AttnProj[i] + rs.FFNOut[i]
 			}
 		}
+	}
+
+	if endLayer < cfg.NumLayers {
+		return rs.X
 	}
 
 	// Final norm

@@ -3,12 +3,12 @@ package llm
 import (
 	"fmt"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 
 	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/format/gguf"
+	"github.com/computerex/dlgo/mmap"
 	"github.com/computerex/dlgo/quant"
 )
 
@@ -34,26 +34,28 @@ func LoadModel(path string) (*Model, error) {
 		Layers: make([]Layer, cfg.NumLayers),
 	}
 
-	f, err := os.Open(path)
+	// Memory-map the GGUF file so tensor data is backed by the OS page cache.
+	// Weights are accessed directly from the mmap'd region — no heap copies.
+	// Models larger than physical RAM work transparently via demand paging.
+	mf, err := mmap.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mmap: %w", err)
 	}
-	defer f.Close()
+	m.MmapFile = mf
 
 	// Precompute derived dimensions for fused QKV splitting
 	qDim := cfg.NumHeads * cfg.HeadDim
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 
 	for _, ti := range gf.Tensors {
-		data, err := readTensorData(f, gf.DataOffset, ti)
-		if err != nil {
-			return nil, fmt.Errorf("read tensor %s: %w", ti.Name, err)
-		}
-
 		totalElements := int64(1)
 		for _, d := range ti.Dimensions {
 			totalElements *= d
 		}
+		nbytes := int64(quant.BytesForN(uint32(ti.Type), int(totalElements)))
+		offset := gf.DataOffset + int64(ti.Offset)
+		data := mf.Slice(offset, nbytes)
+
 		rows, cols := inferRowsCols(ti.Dimensions)
 
 		if isNormOrBias(ti.Name) {
@@ -126,19 +128,67 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 	return s
 }
 
-func readTensorData(f *os.File, dataOffset int64, ti gguf.TensorInfo) ([]byte, error) {
-	totalElements := int64(1)
-	for _, d := range ti.Dimensions {
-		totalElements *= d
+// PinLayerToRAM copies a layer's weight data from the mmap'd region
+// into heap-allocated slices, ensuring the layer stays in physical RAM
+// and avoids page faults during inference.
+func PinLayerToRAM(l *Layer) {
+	pinTensor := func(qt *core.QuantizedTensor) {
+		if qt == nil || len(qt.Data) == 0 {
+			return
+		}
+		pinned := make([]byte, len(qt.Data))
+		copy(pinned, qt.Data)
+		qt.Data = pinned
 	}
-	nbytes := int64(quant.BytesForN(uint32(ti.Type), int(totalElements)))
-	data := make([]byte, nbytes)
+	pinTensor(l.Wq)
+	pinTensor(l.Wk)
+	pinTensor(l.Wv)
+	pinTensor(l.Wo)
+	pinTensor(l.AttnGate)
+	pinTensor(l.FFNGate)
+	pinTensor(l.FFNUp)
+	pinTensor(l.FFNDown)
+	pinTensor(l.SSMInProj)
+	pinTensor(l.SSMAlpha)
+	pinTensor(l.SSMBeta)
+	pinTensor(l.SSMOut)
+	pinTensor(l.FFNRouter)
+	pinTensor(l.FFNGateExps)
+	pinTensor(l.FFNUpExps)
+	pinTensor(l.FFNDownExps)
+	pinTensor(l.FFNGateShared)
+	pinTensor(l.FFNUpShared)
+	pinTensor(l.FFNDownShared)
+}
 
-	offset := dataOffset + int64(ti.Offset)
-	if _, err := f.ReadAt(data, offset); err != nil {
-		return nil, err
+// EstimateLayerBytes returns the approximate size in bytes of a layer's weight data.
+func EstimateLayerBytes(l *Layer) int64 {
+	var total int64
+	add := func(qt *core.QuantizedTensor) {
+		if qt != nil {
+			total += int64(len(qt.Data))
+		}
 	}
-	return data, nil
+	add(l.Wq)
+	add(l.Wk)
+	add(l.Wv)
+	add(l.Wo)
+	add(l.AttnGate)
+	add(l.FFNGate)
+	add(l.FFNUp)
+	add(l.FFNDown)
+	add(l.SSMInProj)
+	add(l.SSMAlpha)
+	add(l.SSMBeta)
+	add(l.SSMOut)
+	add(l.FFNRouter)
+	add(l.FFNGateExps)
+	add(l.FFNUpExps)
+	add(l.FFNDownExps)
+	add(l.FFNGateShared)
+	add(l.FFNUpShared)
+	add(l.FFNDownShared)
+	return total
 }
 
 func inferRowsCols(dims []int64) (int, int) {

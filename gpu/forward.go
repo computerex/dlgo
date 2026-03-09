@@ -25,6 +25,12 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache
 	for l := 0; l < cfg.NumLayers; l++ {
 		layer := &m.Layers[l]
 		gl := &gm.Layers[l]
+
+		if !gl.OnGPU {
+			confs[l] = nil
+			continue
+		}
+
 		lc := NewLayerConf()
 
 		lc.SetScratch(rs.X, rs.XNorm, rs.Q, rs.K, rs.V, rs.AttnOut, rs.AttnProj,
@@ -234,6 +240,137 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 	DownloadF32(rs.Logits, logitsBuf)
 }
 
+// GpuForwardPartial performs a single-token forward pass where only the first
+// NumGPULayers are on GPU. Remaining layers run on CPU. Handles the GPU->CPU
+// activation transfer at the boundary.
+func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
+	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, layerConfs []*LayerConf,
+	pipe *GpuPipeline) {
+
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	numHeads := cfg.NumHeads
+	numKVHeads := cfg.NumKVHeads
+	kvDim := numKVHeads * headDim
+	numGPU := pipe.NumGPULayers
+
+	// --- Phase 1: GPU layers (same as fused path, but only up to numGPU) ---
+	xCPU := make([]float32, dim)
+	_ = m.TokenEmbed.DequantizeRow(int(token), xCPU)
+	if cfg.EmbedScale != 0 {
+		for i := range xCPU {
+			xCPU[i] *= cfg.EmbedScale
+		}
+	}
+	seqLen := pos + 1
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+
+	var ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, ssmQKVDim, ssmConvK int
+	if pipe.HasSSM {
+		ssmNumHeads = cfg.SSMTimeStepRank
+		ssmHeadVDim = cfg.SSMInnerSize / ssmNumHeads
+		ssmHeadKDim = cfg.SSMStateSize
+		ssmKVGroups := cfg.SSMGroupCount
+		if ssmKVGroups <= 0 {
+			ssmKVGroups = ssmNumHeads
+		}
+		ssmKeyDim = ssmKVGroups * ssmHeadKDim
+		ssmQKVDim = ssmKeyDim*2 + ssmNumHeads*ssmHeadVDim
+		ssmConvK = cfg.SSMConvKernel
+	}
+
+	BeginBatch()
+	UploadF32(rs.X, xCPU)
+
+	if m.Layers[0].Spec.Norm == llm.NormRMS {
+		Barrier()
+		RMSNorm(rs.XNorm, rs.X, gm.Layers[0].AttnNorm, dim, cfg.RMSNormEps)
+	}
+
+	for l := 0; l < numGPU; l++ {
+		layer := &m.Layers[l]
+		gl := &gm.Layers[l]
+
+		if layer.Spec.Core == llm.CoreSSM && pipe.HasSSM {
+			Barrier()
+			MatVec(rs.SSMQKV, gl.SSMInProj.Buf, rs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, gl.SSMInProj.Type)
+			MatVec(rs.SSMZ, gl.SSMGate.Buf, rs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, gl.SSMGate.Type)
+			MatVec(rs.SSMAlpha, gl.SSMAlpha.Buf, rs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, gl.SSMAlpha.Type)
+			MatVec(rs.SSMBeta, gl.SSMBeta.Buf, rs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, gl.SSMBeta.Type)
+			Barrier()
+			SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
+			Barrier()
+			SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
+				ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, gl.SSMDtBias != 0)
+			Barrier()
+			SSMDeltaRule(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMY,
+				ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+			Barrier()
+			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
+			Barrier()
+			MatVec(rs.AttnProj, gl.SSMOut.Buf, rs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, gl.SSMOut.Type)
+		} else if layer.Spec.GatedQ && pipe.HasGatedQ {
+			Barrier()
+			MatVec(rs.QFull, gl.Wq.Buf, rs.XNorm, gl.Wq.Rows, gl.Wq.Cols, gl.Wq.Type)
+			MatVec(rs.K, gl.Wk.Buf, rs.XNorm, gl.Wk.Rows, gl.Wk.Cols, gl.Wk.Type)
+			MatVec(rs.V, gl.Wv.Buf, rs.XNorm, gl.Wv.Rows, gl.Wv.Cols, gl.Wv.Type)
+			Barrier()
+			DeinterleaveQGate(rs.QFull, rs.Q, rs.QGate, numHeads, headDim)
+			if gl.Bq != 0 { Add(rs.Q, rs.Q, gl.Bq, numHeads*headDim) }
+			if gl.Bk != 0 { Add(rs.K, rs.K, gl.Bk, kvDim) }
+			if gl.Bv != 0 { Add(rs.V, rs.V, gl.Bv, kvDim) }
+			if layer.Spec.QKNorm {
+				Barrier()
+				RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps)
+				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
+			}
+			Barrier()
+			RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox)
+			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			Barrier()
+			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+			Barrier()
+			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
+			Barrier()
+			MatVec(rs.AttnProj, gl.Wo.Buf, rs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, gl.Wo.Type)
+		}
+
+		var nextAttnNorm Buf
+		if l < numGPU-1 {
+			nextAttnNorm = gm.Layers[l+1].AttnNorm
+		}
+		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
+
+		if gl.IsMoE && pipe.HasMoE {
+			Sync()
+			cpuRS := pipe.CPURunState
+			DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
+			llm.ForwardMoEFFN(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+			BeginBatch()
+			UploadF32(rs.FFNOut, cpuRS.FFNOut)
+			Barrier()
+			if nextAttnNorm != 0 {
+				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+			} else {
+				Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+			}
+		}
+	}
+
+	// --- Phase 2: GPU -> CPU transition ---
+	EndBatch()
+	Sync()
+	DownloadF32(rs.X, pipe.CPURunState.X)
+
+	// --- Phase 3: CPU layers ---
+	llm.ForwardFromLayer(m, numGPU, pos, pipe.CPUKVCache, pipe.CPURunState)
+
+	// Logits are now in CPURunState.Logits — copy to output buffer
+	copy(logitsBuf, pipe.CPURunState.Logits)
+}
+
 // BuildBatchLayerConfs creates layer configs that point to batch-sized scratch
 // buffers while sharing the same weight/norm buffers as single-token configs.
 func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *GpuKVCache) []*LayerConf {
@@ -248,6 +385,12 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *Gpu
 	for l := 0; l < cfg.NumLayers; l++ {
 		layer := &m.Layers[l]
 		gl := &gm.Layers[l]
+
+		if !gl.OnGPU {
+			confs[l] = nil
+			continue
+		}
+
 		lc := NewLayerConf()
 
 		lc.SetScratch(bs.X, bs.XNorm, bs.Q, bs.K, bs.V, bs.AttnOut, bs.AttnProj,

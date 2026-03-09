@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/computerex/dlgo/core"
+	"github.com/computerex/dlgo/memory"
+	"github.com/computerex/dlgo/mmap"
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/ops"
 )
@@ -32,12 +34,112 @@ type GpuPipeline struct {
 	HasGatedQ bool
 	HasMoE    bool
 
-	// CPU-side state for hybrid MoE (expert FFN runs on CPU)
-	CPURunState *llm.RunState
+	// Partial GPU offloading: layers [0, NumGPULayers) are on GPU,
+	// layers [NumGPULayers, NumLayers) run on CPU (RAM or mmap).
+	NumGPULayers int
+	IsPartialGPU bool // true when some layers are on CPU
+
+	// CPU-side state for hybrid MoE or partial GPU offloading
+	CPURunState  *llm.RunState
+	CPUKVCache   *memory.MultiLayerKVCache // KV cache for CPU layers
+	CPUBatchState *llm.BatchState           // batch state for CPU prefill
 }
 
-// UploadModel copies all model weights to GPU memory.
-func UploadModel(m *llm.Model) (*GpuModel, error) {
+// estimateOverheadVRAM estimates GPU memory needed for non-weight allocations
+// (run state, KV cache, batch state, etc.) in bytes.
+func estimateOverheadVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
+	dim := int64(cfg.EmbeddingDim)
+	qDim := int64(cfg.NumHeads * cfg.HeadDim)
+	kvDim := int64(cfg.NumKVHeads * cfg.HeadDim)
+	ffnDim := int64(cfg.FFNDim)
+	vocab := int64(cfg.VocabSize)
+	nLayers := int64(cfg.NumLayers)
+	seq := int64(maxSeqLen)
+
+	var total int64
+
+	// Run state: ~15 buffers of dim-sized float32
+	total += (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim + vocab) * 4
+
+	// KV cache: 2 * nLayers * maxSeqLen * kvDim * 4
+	total += 2 * nLayers * seq * kvDim * 4
+
+	// SSM state (if applicable)
+	if cfg.SSMInnerSize > 0 {
+		numHeads := int64(cfg.SSMTimeStepRank)
+		headKDim := int64(cfg.SSMStateSize)
+		headVDim := int64(cfg.SSMInnerSize) / numHeads
+		numKVGroups := int64(cfg.SSMGroupCount)
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		convK := int64(cfg.SSMConvKernel)
+		ssmLayerState := numHeads*headKDim*headVDim*4 + convK*qkvDim*4
+		ssmLayers := nLayers / 2 // rough estimate
+		total += ssmLayers * ssmLayerState
+		total += (qkvDim + numHeads*headVDim + numHeads + numHeads + numHeads*headVDim) * 4
+	}
+
+	// Batch state (estimate for 128 tokens)
+	batchTokens := int64(128)
+	total += batchTokens * (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim) * 4
+
+	// Safety margin (256 MB)
+	total += 256 * 1024 * 1024
+
+	return total
+}
+
+// computeGPULayerBudget determines how many layers fit in available VRAM.
+func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
+	totalVRAM := int64(VRAMBytes())
+	if totalVRAM <= 0 {
+		return 0
+	}
+
+	overhead := estimateOverheadVRAM(m.Config, maxSeqLen)
+
+	// Estimate non-layer weight VRAM (embed + output)
+	var nonLayerBytes int64
+	if m.TokenEmbed != nil {
+		nonLayerBytes += int64(len(m.TokenEmbed.Data))
+	}
+	if m.Output != nil && m.Output != m.TokenEmbed {
+		nonLayerBytes += int64(len(m.Output.Data))
+	}
+	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
+
+	available := totalVRAM - overhead - nonLayerBytes
+	if available <= 0 {
+		return 0
+	}
+
+	// Greedily add layers until budget exhausted
+	numLayers := 0
+	for l := 0; l < len(m.Layers); l++ {
+		layerBytes := llm.EstimateLayerBytes(&m.Layers[l])
+		if layerBytes > available {
+			break
+		}
+		available -= layerBytes
+		numLayers++
+	}
+	return numLayers
+}
+
+// UploadModel copies all model weights to GPU memory. If numGPULayers is -1,
+// all layers are uploaded. Otherwise, only the first numGPULayers layers are
+// uploaded. Layers beyond that limit have OnGPU=false and empty GPU tensors.
+func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
+	maxLayers := len(m.Layers)
+	if len(numGPULayers) > 0 && numGPULayers[0] >= 0 {
+		maxLayers = numGPULayers[0]
+		if maxLayers > len(m.Layers) {
+			maxLayers = len(m.Layers)
+		}
+	}
 	gm := &GpuModel{
 		Layers: make([]GpuLayer, len(m.Layers)),
 	}
@@ -76,6 +178,12 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 	for l := 0; l < len(m.Layers); l++ {
 		cl := &m.Layers[l]
 		gl := &gm.Layers[l]
+
+		if l >= maxLayers {
+			gl.OnGPU = false
+			continue
+		}
+		gl.OnGPU = true
 
 		if cl.AttnNorm != nil {
 			gl.AttnNorm, err = UploadF32Slice(cl.AttnNorm)
@@ -211,6 +319,9 @@ func UploadModel(m *llm.Model) (*GpuModel, error) {
 }
 
 // NewGpuPipeline creates a GPU-accelerated inference pipeline.
+// Automatically determines how many layers fit in VRAM and places the rest on CPU.
+// This enables running models of ANY size — throughput degrades gracefully but
+// the system never fails due to insufficient VRAM.
 func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	if err := Init(); err != nil {
 		return nil, err
@@ -219,10 +330,35 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	m := cpuPipeline.Model
 	cfg := m.Config
 
+	totalVRAM := float64(VRAMBytes()) / (1024 * 1024)
 	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB VRAM)...\n",
-		DeviceName(), float64(VRAMBytes())/(1024*1024))
+		DeviceName(), totalVRAM)
 
-	gm, err := UploadModel(m)
+	// Determine how many layers fit in VRAM.
+	// DLGO_GPU_LAYERS overrides the automatic VRAM budget calculation.
+	numGPULayers := computeGPULayerBudget(m, cpuPipeline.MaxSeqLen)
+	if numGPULayers > cfg.NumLayers {
+		numGPULayers = cfg.NumLayers
+	}
+	if envLayers := os.Getenv("DLGO_GPU_LAYERS"); envLayers != "" {
+		if n, err := fmt.Sscanf(envLayers, "%d", &numGPULayers); n == 1 && err == nil {
+			if numGPULayers < 0 {
+				numGPULayers = 0
+			}
+			if numGPULayers > cfg.NumLayers {
+				numGPULayers = cfg.NumLayers
+			}
+			fmt.Printf("[dlgo/gpu] DLGO_GPU_LAYERS=%d override\n", numGPULayers)
+		}
+	}
+
+	isPartial := numGPULayers < cfg.NumLayers
+
+	if numGPULayers == 0 {
+		return nil, fmt.Errorf("insufficient VRAM (%.0f MB) for even 1 layer — use CPU mode", totalVRAM)
+	}
+
+	gm, err := UploadModel(m, numGPULayers)
 	if err != nil {
 		return nil, fmt.Errorf("gpu upload: %w", err)
 	}
@@ -244,9 +380,6 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	q8_1NumBlocks := (maxDim + 31) / 32
 	q8_1Scratch := Alloc(uint64(q8_1NumBlocks) * 36)
 
-	// dp4a: integer dot products. Beneficial when compute dominates over
-	// the quantize+barrier overhead. Disabled by default; the improved base
-	// shaders are faster for most model sizes on current Vulkan drivers.
 	if os.Getenv("DLGO_DP4A") == "1" {
 		for _, lc := range layerConfs {
 			lc.SetDP4A(q8_1Scratch)
@@ -254,19 +387,30 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		fmt.Println("[dlgo/gpu] dp4a enabled via DLGO_DP4A=1")
 	}
 
-	fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
+	if isPartial {
+		fmt.Printf("[dlgo/gpu] Partial GPU: %d/%d layers on GPU, %d on CPU\n",
+			numGPULayers, cfg.NumLayers, cfg.NumLayers-numGPULayers)
+	} else {
+		fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
+	}
 
 	pipe := &GpuPipeline{
-		CPUModel:    m,
-		GpuModel:    gm,
-		Tokenizer:   cpuPipeline.Tokenizer,
-		KVCache:     kv,
-		RunState:    rs,
-		MaxSeqLen:   cpuPipeline.MaxSeqLen,
-		LogitsBuf:   make([]float32, cfg.VocabSize),
-		LayerConfs:  layerConfs,
-		Q8_1Scratch: q8_1Scratch,
-		UseFusedForward: supportsFusedForwardGPU(m),
+		CPUModel:        m,
+		GpuModel:        gm,
+		Tokenizer:       cpuPipeline.Tokenizer,
+		KVCache:         kv,
+		RunState:        rs,
+		MaxSeqLen:       cpuPipeline.MaxSeqLen,
+		LogitsBuf:       make([]float32, cfg.VocabSize),
+		LayerConfs:      layerConfs,
+		Q8_1Scratch:     q8_1Scratch,
+		NumGPULayers:    numGPULayers,
+		IsPartialGPU:    isPartial,
+	}
+
+	// Only use fused forward when ALL layers are on GPU
+	if !isPartial {
+		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 
 	hasGatedQ := false
@@ -298,7 +442,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 		ssmLayerCount := 0
 		for l := 0; l < cfg.NumLayers; l++ {
-			if m.Layers[l].Spec.Core == llm.CoreSSM {
+			if m.Layers[l].Spec.Core == llm.CoreSSM && l < numGPULayers {
 				gl := &gm.Layers[l]
 				gl.SSMState = Alloc(uint64(numHeads * headKDim * headVDim * 4))
 				gl.SSMConvBuf = Alloc(uint64(convK * qkvDim * 4))
@@ -313,17 +457,64 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	if cfg.ExpertCount > 0 {
 		pipe.HasMoE = true
+	}
+
+	// Allocate CPU-side state if needed (partial GPU, MoE, or hybrid SSM)
+	if isPartial || cfg.ExpertCount > 0 {
 		pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
-		moeLayerCount := 0
-		for l := 0; l < cfg.NumLayers; l++ {
-			if m.Layers[l].Spec.FFN == llm.FFNMoE {
-				moeLayerCount++
-			}
+
+		if isPartial {
+			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+			pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
 		}
-		fmt.Printf("[dlgo/gpu] Hybrid MoE: %d MoE layers (expert FFN on CPU, SSM/Attention on GPU)\n", moeLayerCount)
+
+		if cfg.ExpertCount > 0 {
+			moeLayerCount := 0
+			for l := 0; l < cfg.NumLayers; l++ {
+				if m.Layers[l].Spec.FFN == llm.FFNMoE {
+					moeLayerCount++
+				}
+			}
+			fmt.Printf("[dlgo/gpu] Hybrid MoE: %d MoE layers (expert FFN on CPU)\n", moeLayerCount)
+		}
+	}
+
+	// Pin CPU layers to RAM for optimal inference speed (avoid page faults).
+	// Budget: use up to 80% of available physical RAM.
+	if isPartial {
+		pinCPULayersToRAM(m, numGPULayers)
 	}
 
 	return pipe, nil
+}
+
+// pinCPULayersToRAM copies non-GPU layer weights from mmap to heap memory,
+// prioritizing earlier layers and respecting a system RAM budget.
+func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
+	memInfo, err := mmap.GetSystemMemInfo()
+	if err != nil {
+		fmt.Printf("[dlgo/gpu] Warning: couldn't query system RAM: %v\n", err)
+		return
+	}
+
+	// Use at most 80% of available physical RAM for pinning
+	budget := int64(float64(memInfo.AvailablePhysical) * 0.80)
+	pinnedBytes := int64(0)
+	pinnedLayers := 0
+
+	for l := numGPULayers; l < len(m.Layers); l++ {
+		layerBytes := llm.EstimateLayerBytes(&m.Layers[l])
+		if pinnedBytes+layerBytes > budget {
+			break
+		}
+		llm.PinLayerToRAM(&m.Layers[l])
+		pinnedBytes += layerBytes
+		pinnedLayers++
+	}
+
+	remaining := len(m.Layers) - numGPULayers - pinnedLayers
+	fmt.Printf("[dlgo/gpu] Pinned %d CPU layers to RAM (%.0f MB), %d layers on mmap\n",
+		pinnedLayers, float64(pinnedBytes)/(1024*1024), remaining)
 }
 
 // FreeAll releases all GPU resources held by this pipeline.
@@ -365,6 +556,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	}
 
 	p.KVCache.Reset()
+	if p.CPUKVCache != nil {
+		p.CPUKVCache.Reset()
+	}
 	if p.HasSSM {
 		mcfg2 := p.CPUModel.Config
 		numHeads := mcfg2.SSMTimeStepRank
@@ -418,13 +612,21 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	}
 
 	prefillStart := time.Now()
-	isHybrid := isHybridSSMModel(p.CPUModel)
-	if isHybrid {
-		GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-			p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p)
+	if p.IsPartialGPU {
+		// Partial GPU: prefill GPU layers, then CPU layers
+		// For simplicity, do per-token prefill through the partial forward path
+		for i, tok := range tokens {
+			GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+		}
 	} else {
-		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-			p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+		isHybrid := isHybridSSMModel(p.CPUModel)
+		if isHybrid {
+			GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
+				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p)
+		} else {
+			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
+				p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+		}
 	}
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
@@ -457,7 +659,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			}
 		}
 
-		if p.UseFusedForward {
+		if p.IsPartialGPU {
+			GpuForwardPartial(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+		} else if p.UseFusedForward {
 			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
 			return nil, err

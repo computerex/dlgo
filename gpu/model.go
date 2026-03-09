@@ -104,6 +104,8 @@ type GpuLayer struct {
 	FFNDownShared *GpuTensor // [dim × sharedFFNDim]
 	IsMoE         bool
 
+	OnGPU bool // true if this layer's weights are on GPU
+
 	// SSM (Gated Delta Net) weights and per-layer state on GPU
 	SSMInProj  *GpuTensor // [qkvDim × dim]
 	SSMGate    *GpuTensor // [valueDim × dim] (AttnGate)

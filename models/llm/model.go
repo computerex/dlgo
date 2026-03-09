@@ -2,6 +2,7 @@ package llm
 
 import (
 	"github.com/computerex/dlgo/core"
+	"github.com/computerex/dlgo/mmap"
 )
 
 // ---------------------------------------------------------------------------
@@ -113,4 +114,15 @@ type Model struct {
 	Output       *core.QuantizedTensor // [vocabSize × dim] (may tie with TokenEmbed)
 	OutputBias   []float32            // [vocabSize] optional
 	Layers       []Layer
+
+	MmapFile     *mmap.MappedFile     // underlying mmap'd GGUF file (nil if loaded via ReadAt)
+}
+
+// Close releases the memory-mapped file backing the model weights.
+// Must be called when the model is no longer needed.
+func (m *Model) Close() {
+	if m.MmapFile != nil {
+		m.MmapFile.Close()
+		m.MmapFile = nil
+	}
 }
