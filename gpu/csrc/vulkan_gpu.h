@@ -102,6 +102,9 @@ typedef enum {
     PIPE_ATTENTION_SINKS,
     PIPE_SWIGLU_OAI,
     PIPE_ADD_OFFSET,
+    PIPE_SCALE_ADD,
+    PIPE_SWIGLU_OAI_BIAS,
+    PIPE_MOE_TOPK,
     PIPE_COUNT
 } PipelineID;
 
@@ -147,6 +150,13 @@ int gpu_swiglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_swiglu_oai(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n, float alpha, float limit);
 int gpu_geglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
 int gpu_add_offset(GpuBuf out_buf, GpuBuf bias_buf, int n, int offset);
+int gpu_scale_add(GpuBuf out_buf, GpuBuf in_buf, int n, float scale);
+int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                        GpuBuf gate_bias_buf, GpuBuf up_bias_buf,
+                        int n, float alpha, float limit,
+                        int gate_bias_offset, int up_bias_offset);
+int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
+                 int n_experts, int k, int gating_func);
 int gpu_gelu(GpuBuf buf, int n);
 int gpu_add(GpuBuf out_buf, GpuBuf a_buf, GpuBuf b_buf, int n);
 int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,

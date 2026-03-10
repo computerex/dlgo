@@ -1,0 +1,20 @@
+#version 450
+
+// Fused ScaleAdd: out[i] += scale * in[i]
+// Replaces separate Scale + Barrier + Add in MoE expert accumulation.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer In { float in_data[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    float scale;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n) return;
+    out_data[idx] += scale * in_data[idx];
+}

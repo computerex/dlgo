@@ -1,0 +1,92 @@
+#version 450
+
+// MoE Top-K: find the top-K expert indices and weights from router logits.
+// Supports three gating functions via push constant:
+//   gating_func=0: softmax over all logits, then top-K
+//   gating_func=2: sigmoid per logit, then top-K
+//   gating_func=3: top-K on raw logits, then softmax on selected
+//
+// Input:  logits[n_experts] (router output, may include bias)
+// Output: out_indices[k] (int as float), out_weights[k]
+//
+// Runs as a single workgroup (1 invocation) since n_experts is small (32-512).
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) buffer Logits { float logits[]; };
+layout(set = 0, binding = 1) buffer OutIndices { float out_indices[]; };
+layout(set = 0, binding = 2) buffer OutWeights { float out_weights[]; };
+
+layout(push_constant) uniform Params {
+    int n_experts;
+    int k;
+    int gating_func;
+};
+
+void main() {
+    // Apply gating function
+    float vals[512]; // max experts
+    int ne = min(n_experts, 512);
+
+    if (gating_func == 2) {
+        // Sigmoid
+        for (int i = 0; i < ne; i++) {
+            float x = logits[i];
+            vals[i] = 1.0 / (1.0 + exp(-x));
+        }
+    } else if (gating_func == 3) {
+        // SOFTMAX_WEIGHT: top-K on raw logits first, softmax on selected after
+        for (int i = 0; i < ne; i++) {
+            vals[i] = logits[i];
+        }
+    } else {
+        // Default: softmax over all
+        float maxV = logits[0];
+        for (int i = 1; i < ne; i++) {
+            maxV = max(maxV, logits[i]);
+        }
+        float sum = 0.0;
+        for (int i = 0; i < ne; i++) {
+            vals[i] = exp(logits[i] - maxV);
+            sum += vals[i];
+        }
+        for (int i = 0; i < ne; i++) {
+            vals[i] /= sum;
+        }
+    }
+
+    // Top-K selection (selection sort, K is small)
+    int topK = min(k, ne);
+    bool used[512];
+    for (int i = 0; i < ne; i++) used[i] = false;
+
+    for (int t = 0; t < topK; t++) {
+        int bestIdx = -1;
+        float bestVal = -1e30;
+        for (int i = 0; i < ne; i++) {
+            if (!used[i] && vals[i] > bestVal) {
+                bestVal = vals[i];
+                bestIdx = i;
+            }
+        }
+        out_indices[t] = float(bestIdx);
+        out_weights[t] = bestVal;
+        if (bestIdx >= 0) used[bestIdx] = true;
+    }
+
+    // For SOFTMAX_WEIGHT: apply softmax on the selected weights
+    if (gating_func == 3 && topK > 0) {
+        float maxW = out_weights[0];
+        for (int t = 1; t < topK; t++) {
+            maxW = max(maxW, out_weights[t]);
+        }
+        float sum = 0.0;
+        for (int t = 0; t < topK; t++) {
+            out_weights[t] = exp(out_weights[t] - maxW);
+            sum += out_weights[t];
+        }
+        for (int t = 0; t < topK; t++) {
+            out_weights[t] /= sum;
+        }
+    }
+}

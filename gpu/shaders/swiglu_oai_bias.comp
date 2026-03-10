@@ -1,0 +1,40 @@
+#version 450
+
+// Fused SwiGLU_OAI with bias addition:
+//   gate = gate_data[i] + gate_bias[gate_bias_offset + i]
+//   up   = up_data[i]   + up_bias[up_bias_offset + i]
+//   x = min(gate, limit)
+//   y = clamp(up, -limit, limit)
+//   out = x * sigmoid(alpha * x) * (y + 1)
+//
+// Replaces: AddOffset(gate_bias) + AddOffset(up_bias) + Barrier + SwiGLU_OAI
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Gate { float gate_data[]; };
+layout(set = 0, binding = 2) buffer Up { float up_data[]; };
+layout(set = 0, binding = 3) buffer GateBias { float gate_bias[]; };
+layout(set = 0, binding = 4) buffer UpBias { float up_bias[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    float alpha;
+    float limit;
+    int gate_bias_offset;
+    int up_bias_offset;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n) return;
+
+    float g = gate_data[idx] + gate_bias[gate_bias_offset + idx];
+    float u = up_data[idx] + up_bias[up_bias_offset + idx];
+
+    g = min(g, limit);
+    u = clamp(u, -limit, limit);
+
+    float silu = g / (1.0 + exp(-alpha * g));
+    out_data[idx] = silu * (u + 1.0);
+}

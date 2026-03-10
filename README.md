@@ -14,11 +14,12 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Speech-to-text** — Whisper transcription from WAV files
 - **Voice activity detection** — Silero VAD
 - **GGUF format** — loads quantized models directly, no conversion needed
-- **Mixture of Experts (MoE)** — full MoE support with optimized expert-parallel dispatch (up to 512 experts), multiple gating functions (softmax, sigmoid, softmax-weight), shared experts
+- **Mixture of Experts (MoE)** — full MoE support with batched expert-parallel dispatch (up to 512 experts), fused GPU shaders (ScaleAdd, SwiGLU-OAI-Bias, GPU-side top-K routing), multiple gating functions (softmax, sigmoid, softmax-weight), shared experts
 - **Hybrid SSM+Attention** — Gated Delta Net (GDN) recurrent layers with interleaved full attention, supporting Qwen3-Coder-Next, Qwen3.5, and Qwen3.5 MoE architectures
 - **Multi-head Latent Attention (MLA)** — compressed KV cache with absorbed key projection for DeepSeek-V2 / GLM-4.7 architectures
 - **Attention Sinks** — learned "trash bin" logits for OpenAI gpt-oss models, absorbing unneeded attention mass
-- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU/SwiGLU-OAI, RMSNorm, MoE expert dispatch (fully on-GPU with bias addition and offset shaders), custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU/SwiGLU-OAI-Bias, RMSNorm, GPU-side MoE top-K routing, batched expert dispatch with fused ScaleAdd, custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
+- **Never-OOM GPU pipeline** — automatic VRAM budget with retry-on-failure; if a model exceeds VRAM, the pipeline reduces GPU layers until it fits, gracefully falling back to partial GPU + CPU
 - **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, fused IQ3_XXS/IQ4_XS SIMD kernels, batch prefill GEMM, parallel worker pools (**beats Ollama on Qwen3.5 models**, within 0–18% for most others)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), MXFP4, F16, BF16, F32
 - **Zero-overhead diagnostics** — flag-enabled GPU/CPU forward pass instrumentation via `DLGO_GPU_DIAG`/`DLGO_CPU_DIAG` env vars with layer/position filtering and verbosity levels
@@ -29,14 +30,14 @@ fmt.Println(response) // "The capital of France is Paris."
 |---|---|---|---|
 | LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–65 | 314–422 |
 | Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 60–98 | 241–411 |
-| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~5.1 | ~42 |
-| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~2.9 | ~7.7 (partial) |
-| Qwen3.5 | Qwen3.5 0.8B, 2B (hybrid GDN+attention) | 23–34 | 192 |
-| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.4–7.4 | 21–62 |
-| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~3.9 | partial offload |
-| Qwen3.5 MoE (large) | Qwen3.5 122B-A10B (IQ3_XXS) | ~1.4 | ~2.0 (partial) |
-| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.5 | ~16 (partial) |
-| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.6–5.7 | 34–37 |
+| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~5.2 | ~40 |
+| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~2.7 | ~5.4 (partial 27/48) |
+| Qwen3.5 | Qwen3.5 0.8B, 2B (hybrid GDN+attention) | 24–34 | 171–193 |
+| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.4–7.9 | 19–61 |
+| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~4.1 | ~11 (partial 39/40) |
+| Qwen3.5 MoE (large) | Qwen3.5 122B-A10B (IQ3_XXS) | ~1.4 | ~2.0 (partial 16/48) |
+| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.6 | ~15 (partial 43/47) |
+| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.5–5.6 | 33–36 |
 | Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 44–154 | 249–530 |
 | SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 42–96 | 177–411 |
 | Phi | Phi-2, Phi-4-mini | 9–20 | ~125 |
@@ -79,21 +80,23 @@ with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU
 
 | Model | Quant | Size | Active Params | Architecture | CPU gen | GPU gen |
 |---|---|---|---|---|---|---|
-| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 2.9 tok/s | 7.7 tok/s (partial) |
-| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 5.1 tok/s | 41.7 tok/s |
-| Qwen3.5-122B-A10B | IQ3_XXS | 45 GB | ~10B | Hybrid GDN+MoE, 256 experts | 1.4 tok/s | 2.0 tok/s (partial) |
-| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 5.7 tok/s | 36.5 tok/s |
-| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.6 tok/s | 34.1 tok/s |
-| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.5 tok/s | 16.2 tok/s (partial) |
+| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 2.7 tok/s | 5.4 tok/s (partial 27/48) |
+| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 5.2 tok/s | 40.4 tok/s |
+| Qwen3.5-122B-A10B | IQ3_XXS | 45 GB | ~10B | Hybrid GDN+MoE, 256 experts | 1.4 tok/s | 2.0 tok/s (partial 16/48) |
+| Qwen3.5-35B-A3B MoE | Q3_K_M | 16 GB | ~3B | Hybrid GDN+MoE, 256 experts | 4.1 tok/s | 11.0 tok/s (partial 39/40) |
+| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 5.6 tok/s | 32.6 tok/s |
+| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.5 tok/s | 32.7 tok/s |
+| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.6 tok/s | 15.3 tok/s (partial 43/47) |
 
 **Notes:**
 - **Qwen3.5 models outperform Ollama** on CPU generation: 0.8B (+22%), 9B (+4%), 27B (+4%), and 35B MoE (+7%).
   These use hybrid GDN+attention architectures where dlgo's optimized SSM kernels and fused IQ SIMD dot products give a measurable advantage.
-- **gpt-oss-20b** now runs fully on GPU with a dedicated SwiGLU-OAI Vulkan shader and GPU-resident expert biases. Generation at 34–37 tok/s (7–8x faster than CPU), with correct output on both MXFP4 and Q3_K_M quantizations.
-- **Qwen3-Coder-30B-A3B** runs all 48 MoE layers on GPU at 41.7 tok/s (8x faster than CPU).
+- **gpt-oss-20b** runs fully on GPU with fused SwiGLU-OAI-Bias shader, GPU-side top-K routing, and batched expert dispatch. 33 tok/s (6–7x faster than CPU) with correct output on both MXFP4 and Q3_K_M.
+- **Qwen3-Coder-30B-A3B** runs all 48 MoE layers on GPU at 40.4 tok/s (8x faster than CPU).
+- **Qwen3.5-35B-A3B MoE** now loads successfully with never-OOM pipeline (previously crashed), running at 11 tok/s (partial 39/40 layers).
 - **Qwen3.5-122B-A10B** (45 GB, 256 experts) runs with partial GPU offloading (16/48 layers) due to VRAM constraints, producing coherent output.
-- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing. Partial GPU at 16.2 tok/s.
-- Models exceeding 16 GB VRAM automatically use partial GPU offloading with CPU fallback for remaining layers.
+- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing. Partial GPU at 15.3 tok/s.
+- **Never-OOM**: GPU pipeline automatically retries with fewer layers if VRAM allocation fails. Models of any size can run — throughput degrades gracefully but the system never crashes.
 - Generation is within 11–25% of Ollama for most small models. The gap comes from Go+CGo
   dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge per matmul chunk).
 
@@ -248,8 +251,12 @@ SmolLM2. Prefill is 10–50x faster across all models.
 - Fused Add+RMSNorm kernel reducing barriers per layer
 - Fused multi-head attention kernel (Q·K softmax, V accumulation)
 - Custom SSM/GDN shaders (conv1d+SiLU, delta rule, L2 norm, sigmoid gate) — full Gated Delta Net on GPU
-- SwiGLU-OAI shader with alpha-scaled sigmoid and clamping for OpenAI gpt-oss MoE models
-- GPU-resident MoE expert biases with offset-indexed `add_offset` shader (zero CPU-GPU sync per expert)
+- Fused SwiGLU-OAI-Bias shader (bias + activation in one pass) for OpenAI gpt-oss MoE models
+- GPU-side MoE top-K routing (`moe_topk` shader) — no CPU-GPU sync for expert selection
+- Fused `scale_add` shader for weighted expert accumulation (one dispatch per expert instead of three)
+- Batched expert dispatch — all experts' gate+up, activation, and down projections dispatched in parallel phases
+- GPU-resident MoE expert biases with offset-indexed `add_offset` shader
+- Never-OOM VRAM budget with retry loop (graceful degradation to fewer GPU layers)
 - HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
 - Single command buffer submission per token with batched dispatches
 - Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead

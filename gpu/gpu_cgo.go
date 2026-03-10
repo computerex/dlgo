@@ -221,6 +221,37 @@ func AddOffset(out, bias Buf, n, offset int) error {
 	return nil
 }
 
+// ScaleAdd performs out[i] += scale * in[i] on GPU.
+func ScaleAdd(out, in Buf, n int, scale float32) error {
+	rc := C.gpu_scale_add(C.GpuBuf(out), C.GpuBuf(in), C.int(n), C.float(scale))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: scale_add failed (%d)", rc)
+	}
+	return nil
+}
+
+// SwiGLU_OAI_Bias performs fused bias addition + SwiGLU-OAI activation on GPU.
+func SwiGLU_OAI_Bias(out, gate, up, gateBias, upBias Buf, n int, alpha, limit float32, gateBiasOff, upBiasOff int) error {
+	rc := C.gpu_swiglu_oai_bias(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up),
+		C.GpuBuf(gateBias), C.GpuBuf(upBias),
+		C.int(n), C.float(alpha), C.float(limit),
+		C.int(gateBiasOff), C.int(upBiasOff))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: swiglu_oai_bias failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoETopK performs router gating + top-K selection entirely on GPU.
+func MoETopK(logits, outIndices, outWeights Buf, nExperts, k, gatingFunc int) error {
+	rc := C.gpu_moe_topk(C.GpuBuf(logits), C.GpuBuf(outIndices), C.GpuBuf(outWeights),
+		C.int(nExperts), C.int(k), C.int(gatingFunc))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_topk failed (%d)", rc)
+	}
+	return nil
+}
+
 // GeGLU performs GeGLU activation on GPU.
 func GeGLU(out, gate, up Buf, n int) error {
 	rc := C.gpu_geglu(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up), C.int(n))

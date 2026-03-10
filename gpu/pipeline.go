@@ -52,8 +52,9 @@ type GpuPipeline struct {
 }
 
 // estimateFixedVRAM estimates GPU memory for non-per-layer allocations
-// (run state, batch state, SSM scratch). Does NOT include KV cache or
-// per-layer weights — those are computed per-layer in the budget solver.
+// (run state, batch state, SSM scratch, RoPE tables, q8_1 scratch).
+// Does NOT include KV cache or per-layer weights — those are computed
+// per-layer in the budget solver.
 func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	dim := int64(cfg.EmbeddingDim)
 	qDim := int64(cfg.NumHeads * cfg.HeadDim)
@@ -94,11 +95,23 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	batchTokens := int64(128)
 	total += batchTokens * (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim) * 4
 
-	// Non-layer weight buffers (embed, output, norms)
-	// Accounted separately from per-layer weights.
+	// RoPE cos/sin tables: 2 * maxSeqLen * (ropeDim/2) * 4 bytes each
+	ropeDim := int64(cfg.RopeDim)
+	if ropeDim <= 0 || ropeDim > int64(cfg.HeadDim) {
+		ropeDim = int64(cfg.HeadDim)
+	}
+	total += 2 * int64(maxSeqLen) * (ropeDim / 2) * 4
 
-	// Safety margin (64 MB)
-	total += 64 * 1024 * 1024
+	// q8_1 scratch buffer for dp4a path
+	maxDim := dim
+	if ffnDim > maxDim {
+		maxDim = ffnDim
+	}
+	q8_1Blocks := (maxDim + 31) / 32
+	total += q8_1Blocks * 36
+
+	// Safety margin (128 MB) to account for IQ tables, driver overhead, etc.
+	total += 128 * 1024 * 1024
 
 	return total
 }
@@ -443,68 +456,105 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 	}
 
-	isPartial := numGPULayers < cfg.NumLayers
-
-	if numGPULayers == 0 {
-		return nil, fmt.Errorf("insufficient VRAM (%.0f MB) for even 1 layer — use CPU mode", totalVRAM)
-	}
-
-	gm, err := UploadModel(m, numGPULayers)
-	if err != nil {
-		return nil, fmt.Errorf("gpu upload: %w", err)
-	}
-
 	dim := cfg.EmbeddingDim
 	qDim := cfg.NumHeads * cfg.HeadDim
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 	ffnDim := cfg.FFNDim
 
-	rs := NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
-	kv := NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim)
-
-	// Upload precomputed RoPE cos/sin tables before building layer confs
+	// Retry loop: if GPU allocation fails, reduce layers and retry.
+	// This guarantees the pipeline never fails from OOM.
+	var gm *GpuModel
+	var rs *GpuRunState
+	var kv *GpuKVCache
 	var ropeCosTable, ropeSinTable Buf
-	cosTable, sinTable := cpuPipeline.RunState.RoPETables()
-	if cosTable != nil && sinTable != nil {
-		var err error
-		ropeCosTable, err = UploadF32Slice(cosTable)
-		if err != nil {
-			return nil, fmt.Errorf("gpu: upload RoPE cos table: %w", err)
-		}
-		ropeSinTable, err = UploadF32Slice(sinTable)
-		if err != nil {
-			return nil, fmt.Errorf("gpu: upload RoPE sin table: %w", err)
-		}
-	} else {
-		ropeDim := cfg.RopeDim
-		if ropeDim <= 0 || ropeDim > cfg.HeadDim {
-			ropeDim = cfg.HeadDim
-		}
-		cos, sin := ops.RoPEFrequencyTable(cpuPipeline.MaxSeqLen, ropeDim, cfg.RopeFreqBase)
-		var err error
-		ropeCosTable, err = UploadF32Slice(cos)
-		if err != nil {
-			return nil, fmt.Errorf("gpu: upload RoPE cos table: %w", err)
-		}
-		ropeSinTable, err = UploadF32Slice(sin)
-		if err != nil {
-			return nil, fmt.Errorf("gpu: upload RoPE sin table: %w", err)
-		}
-	}
+	var layerConfs []*LayerConf
+	var q8_1Scratch Buf
+	var isPartial bool
 
-	// Create a temporary pipe struct with RoPE tables for BuildLayerConfs
-	tempPipe := &GpuPipeline{
-		RoPECosTable: ropeCosTable,
-		RoPESinTable: ropeSinTable,
-	}
-	layerConfs := BuildLayerConfs(m, gm, tempPipe, rs, kv)
+	for attempt := 0; ; attempt++ {
+		if numGPULayers <= 0 {
+			return nil, fmt.Errorf("insufficient VRAM (%.0f MB) for even 1 layer — use CPU mode", totalVRAM)
+		}
+		isPartial = numGPULayers < cfg.NumLayers
 
-	maxDim := dim
-	if ffnDim > maxDim {
-		maxDim = ffnDim
+		allocErr := func() error {
+			var err error
+			gm, err = UploadModel(m, numGPULayers)
+			if err != nil {
+				return fmt.Errorf("upload model: %w", err)
+			}
+
+			rs = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
+			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim)
+
+			cosTable, sinTable := cpuPipeline.RunState.RoPETables()
+			if cosTable != nil && sinTable != nil {
+				ropeCosTable, err = UploadF32Slice(cosTable)
+				if err != nil {
+					return fmt.Errorf("upload RoPE cos table: %w", err)
+				}
+				ropeSinTable, err = UploadF32Slice(sinTable)
+				if err != nil {
+					return fmt.Errorf("upload RoPE sin table: %w", err)
+				}
+			} else {
+				ropeDim := cfg.RopeDim
+				if ropeDim <= 0 || ropeDim > cfg.HeadDim {
+					ropeDim = cfg.HeadDim
+				}
+				cos, sin := ops.RoPEFrequencyTable(cpuPipeline.MaxSeqLen, ropeDim, cfg.RopeFreqBase)
+				ropeCosTable, err = UploadF32Slice(cos)
+				if err != nil {
+					return fmt.Errorf("upload RoPE cos table: %w", err)
+				}
+				ropeSinTable, err = UploadF32Slice(sin)
+				if err != nil {
+					return fmt.Errorf("upload RoPE sin table: %w", err)
+				}
+			}
+
+			tempPipe := &GpuPipeline{
+				RoPECosTable: ropeCosTable,
+				RoPESinTable: ropeSinTable,
+			}
+			layerConfs = BuildLayerConfs(m, gm, tempPipe, rs, kv)
+
+			maxDim := dim
+			if ffnDim > maxDim {
+				maxDim = ffnDim
+			}
+			q8_1NumBlocks := (maxDim + 31) / 32
+			q8_1Scratch = Alloc(uint64(q8_1NumBlocks) * 36)
+			if q8_1Scratch == 0 {
+				return fmt.Errorf("alloc q8_1 scratch")
+			}
+			return nil
+		}()
+
+		if allocErr == nil {
+			break
+		}
+
+		// Free everything and retry with fewer layers
+		fmt.Printf("[dlgo/gpu] VRAM alloc failed with %d layers (%v), retrying with %d...\n",
+			numGPULayers, allocErr, numGPULayers-1)
+		if gm != nil {
+			gm.FreeAll()
+		}
+		if rs != nil {
+			rs.FreeAll()
+		}
+		if kv != nil {
+			kv.FreeAll()
+		}
+		freeBuf(ropeCosTable)
+		freeBuf(ropeSinTable)
+		freeBuf(q8_1Scratch)
+		ropeCosTable, ropeSinTable, q8_1Scratch = 0, 0, 0
+		gm, rs, kv = nil, nil, nil
+		layerConfs = nil
+		numGPULayers--
 	}
-	q8_1NumBlocks := (maxDim + 31) / 32
-	q8_1Scratch := Alloc(uint64(q8_1NumBlocks) * 36)
 
 	if os.Getenv("DLGO_DP4A") == "1" {
 		for _, lc := range layerConfs {

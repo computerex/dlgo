@@ -1236,6 +1236,70 @@ int gpu_add_offset(GpuBuf out_buf, GpuBuf bias_buf, int n, int offset) {
     return dispatch_compute(&dp);
 }
 
+int gpu_scale_add(GpuBuf out_buf, GpuBuf in_buf, int n, float scale) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; float scale; } pc = {n, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SCALE_ADD;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = in_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                        GpuBuf gate_bias_buf, GpuBuf up_bias_buf,
+                        int n, float alpha, float limit,
+                        int gate_bias_offset, int up_bias_offset) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; float alpha; float limit; int gate_bias_offset; int up_bias_offset; } pc = {
+        n, alpha, limit, gate_bias_offset, up_bias_offset
+    };
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SWIGLU_OAI_BIAS;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = gate_buf;
+    dp.bufs[2] = up_buf;
+    dp.bufs[3] = gate_bias_buf;
+    dp.bufs[4] = up_bias_buf;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
+                 int n_experts, int k, int gating_func) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n_experts; int k; int gating_func; } pc = {n_experts, k, gating_func};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_MOE_TOPK;
+    dp.bufs[0] = logits_buf;
+    dp.bufs[1] = out_indices_buf;
+    dp.bufs[2] = out_weights_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = 1;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_geglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;

@@ -46,7 +46,10 @@ $shaders = @(
     @{name="matvec_mxfp4"; file="matvec_mxfp4.comp"},
     @{name="attention_sinks"; file="attention_sinks.comp"},
     @{name="swiglu_oai"; file="swiglu_oai.comp"},
-    @{name="add_offset"; file="add_offset.comp"}
+    @{name="add_offset"; file="add_offset.comp"},
+    @{name="scale_add"; file="scale_add.comp"},
+    @{name="swiglu_oai_bias"; file="swiglu_oai_bias.comp"},
+    @{name="moe_topk"; file="moe_topk.comp"}
 )
 
 $header = @"
@@ -148,6 +151,9 @@ static const ShaderInfo shader_registry[] = {
     {"attention_sinks", spv_attention_sinks, spv_attention_sinks_size, 5, 24}, // PIPE_ATTENTION_SINKS
     {"swiglu_oai",     spv_swiglu_oai,     spv_swiglu_oai_size,     3, 12},  // PIPE_SWIGLU_OAI
     {"add_offset",     spv_add_offset,     spv_add_offset_size,     2, 8},   // PIPE_ADD_OFFSET
+    {"scale_add",      spv_scale_add,      spv_scale_add_size,      2, 8},   // PIPE_SCALE_ADD
+    {"swiglu_oai_bias", spv_swiglu_oai_bias, spv_swiglu_oai_bias_size, 5, 20}, // PIPE_SWIGLU_OAI_BIAS
+    {"moe_topk",       spv_moe_topk,       spv_moe_topk_size,       3, 12},  // PIPE_MOE_TOPK
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

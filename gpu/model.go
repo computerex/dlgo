@@ -176,11 +176,14 @@ type GpuRunState struct {
 	QGate Buf // [qDim] attention gate values
 
 	// MoE scratch buffers (allocated on first use)
-	MoELogits   Buf // [expertCount] router logits
-	MoEGate     Buf // [expertFFNDim] expert gate projection
-	MoEUp       Buf // [expertFFNDim] expert up projection
-	MoEHidden   Buf // [expertFFNDim] SwiGLU hidden
-	MoEExpertOut Buf // [dim] per-expert output
+	MoELogits    Buf   // [expertCount] router logits
+	MoETopKIdx   Buf   // [expertUsedCount] top-K indices (float-encoded)
+	MoETopKW     Buf   // [expertUsedCount] top-K weights
+	// Per-expert parallel buffers (one per active expert for batched dispatch)
+	MoEGates     []Buf // [expertUsedCount][expertFFNDim]
+	MoEUps       []Buf // [expertUsedCount][expertFFNDim]
+	MoEHiddens   []Buf // [expertUsedCount][expertFFNDim]
+	MoEOuts      []Buf // [expertUsedCount][dim]
 	MoEShGate   Buf // [sharedFFNDim] shared expert gate
 	MoEShUp     Buf // [sharedFFNDim] shared expert up
 	MoEShHidden Buf // [sharedFFNDim] shared expert hidden
@@ -444,6 +447,27 @@ func (rs *GpuRunState) FreeAll() {
 	// GatedQ scratch buffers
 	freeBuf(rs.QFull)
 	freeBuf(rs.QGate)
+
+	// MoE scratch buffers
+	freeBuf(rs.MoELogits)
+	freeBuf(rs.MoETopKIdx)
+	freeBuf(rs.MoETopKW)
+	for _, b := range rs.MoEGates {
+		freeBuf(b)
+	}
+	for _, b := range rs.MoEUps {
+		freeBuf(b)
+	}
+	for _, b := range rs.MoEHiddens {
+		freeBuf(b)
+	}
+	for _, b := range rs.MoEOuts {
+		freeBuf(b)
+	}
+	freeBuf(rs.MoEShGate)
+	freeBuf(rs.MoEShUp)
+	freeBuf(rs.MoEShHidden)
+	freeBuf(rs.MoEShOut)
 }
 
 // FreeAll releases all GPU buffers held by a GpuKVCache.
