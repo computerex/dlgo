@@ -1,13 +1,17 @@
 #version 450
 
-// Rotary Position Embedding applied to Q and K vectors
+// Rotary Position Embedding using precomputed cos/sin tables.
 // Supports both standard (interleaved) and neox (split-half) modes.
+// Tables encode all RoPE variant details (basic, YaRN, NTK, etc.)
+// so the shader is agnostic to the frequency scheme.
 // One workgroup per head, threads iterate over rotation pairs.
 
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) buffer Q { float q_data[]; };
 layout(set = 0, binding = 1) buffer K { float k_data[]; };
+layout(set = 0, binding = 2) buffer CosTable { float cos_table[]; };
+layout(set = 0, binding = 3) buffer SinTable { float sin_table[]; };
 
 layout(push_constant) uniform Params {
     int num_heads;
@@ -15,7 +19,6 @@ layout(push_constant) uniform Params {
     int head_dim;
     int rope_dim;
     int pos;
-    float freq_base;
     int neox;
 };
 
@@ -32,10 +35,9 @@ void main() {
     uint q_stride = uint(num_heads) * uint(head_dim);
     uint k_stride = uint(num_kv_heads) * uint(head_dim);
 
-    float freq = 1.0 / pow(freq_base, float(tid * 2) / float(rd));
-    float angle = float(actual_pos) * freq;
-    float cos_val = cos(angle);
-    float sin_val = sin(angle);
+    int table_base = actual_pos * half_dim + int(tid);
+    float cos_val = cos_table[table_base];
+    float sin_val = sin_table[table_base];
 
     if (neox != 0) {
         if (head < num_heads) {

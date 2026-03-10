@@ -15,7 +15,7 @@ import (
 
 // BuildLayerConfs creates reusable fused-layer configurations from the model,
 // run state, and KV cache. Call once after model upload; reuse for every token.
-func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache) []*LayerConf {
+func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunState, kv *GpuKVCache) []*LayerConf {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
 	headDim := cfg.HeadDim
@@ -89,7 +89,8 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache
 		}
 
 		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
-			cfg.RMSNormEps, cfg.RopeFreqBase, cfg.RopeDim, cfg.RopeNeox,
+			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
+			pipe.RoPECosTable, pipe.RoPESinTable,
 			ffnType, resType)
 
 		confs[l] = lc
@@ -99,9 +100,9 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, rs *GpuRunState, kv *GpuKVCache
 
 // GpuForwardFused performs a single-token forward pass using pre-built layer
 // configurations. One CGo call per layer instead of ~20+.
-func GpuForwardFused(m *llm.Model, gm *GpuModel, token int32, pos int,
+func GpuForwardFused(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, token int32, pos int,
 	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, layerConfs []*LayerConf) {
-	GpuForwardFusedSSM(m, gm, token, pos, kv, rs, logitsBuf, layerConfs, nil)
+	GpuForwardFusedSSM(m, gm, token, pos, kv, rs, logitsBuf, layerConfs, pipe)
 }
 
 func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
@@ -115,7 +116,7 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 	kvDim := numKVHeads * headDim
 
 	if layerConfs == nil {
-		layerConfs = BuildLayerConfs(m, gm, rs, kv)
+		layerConfs = BuildLayerConfs(m, gm, pipe, rs, kv)
 	}
 
 	xCPU := make([]float32, dim)
@@ -196,7 +197,7 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox)
+			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
@@ -224,7 +225,7 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 	if gl.IsMoE && pipe != nil && pipe.HasMoE {
 		if gl.MoEOnGPU {
-			GpuForwardMoEFFN(gl, layer, rs, cfg)
+			GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 			Barrier()
 			if nextAttnNorm != 0 {
 				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
@@ -346,7 +347,7 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox)
+			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
@@ -374,7 +375,7 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 		if gl.IsMoE && pipe.HasMoE {
 			if gl.MoEOnGPU {
-				GpuForwardMoEFFN(gl, layer, rs, cfg)
+				GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 				Barrier()
 				if nextAttnNorm != 0 {
 					AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
@@ -413,7 +414,7 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 // BuildBatchLayerConfs creates layer configs that point to batch-sized scratch
 // buffers while sharing the same weight/norm buffers as single-token configs.
-func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *GpuKVCache) []*LayerConf {
+func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *GpuBatchState, kv *GpuKVCache) []*LayerConf {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
 	headDim := cfg.HeadDim
@@ -485,7 +486,8 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, bs *GpuBatchState, kv *Gpu
 		}
 
 		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
-			cfg.RMSNormEps, cfg.RopeFreqBase, cfg.RopeDim, cfg.RopeNeox,
+			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
+			pipe.RoPECosTable, pipe.RoPESinTable,
 			ffnType, resType)
 
 		confs[l] = lc
@@ -654,8 +656,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 				RMSNormHeads(bs.K, gl.AttnKNorm, numKVHeads*npos, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			BatchRoPE(bs.Q, bs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, 0,
-				cfg.RopeFreqBase, cfg.RopeNeox, npos)
+			BatchRoPE(bs.Q, bs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, 0,
+				cfg.RopeNeox, npos)
 			BatchKVStore(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, 0, kvDim, npos)
 			BatchAttention(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, 1, scale, npos)
@@ -775,21 +777,33 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 		return nil
 	}
 
+	GpuDiag.Init()
+	diagOn := GpuDiag.Enabled
+
 	BeginBatch()
 	if err := UploadF32(rs.X, xCPU); err != nil {
 		return err
+	}
+
+	if diagOn && GpuDiag.Active(-1, pos) {
+		GpuDiag.LogEmbed("GPU", pos, xCPU)
 	}
 
 	for l := 0; l < cfg.NumLayers; l++ {
 		layer := &m.Layers[l]
 		spec := &layer.Spec
 		gl := &gm.Layers[l]
+		diagL := diagOn && GpuDiag.Active(l, pos)
 
 		Barrier()
 		if spec.Norm == llm.NormRMS {
 			if err := RMSNorm(rs.XNorm, rs.X, gl.AttnNorm, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d attn rmsnorm: %w", l, err)
 			}
+		}
+
+		if diagL {
+			GpuDiag.LogBuf("GPU", l, pos, "XNorm", rs.XNorm, dim)
 		}
 
 		if spec.Core == llm.CoreSSM && p != nil && p.HasSSM {
@@ -813,6 +827,9 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := gpuMatVec(rs.AttnProj, gl.SSMOut, layer.SSMOut, rs.SSMY, rs); err != nil {
 				return fmt.Errorf("layer %d ssm out: %w", l, err)
 			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "SSM AttnProj", rs.AttnProj, dim)
+			}
 		} else if spec.GatedQ && p != nil && p.HasGatedQ {
 			Barrier()
 			if err := gpuMatVec(rs.QFull, gl.Wq, layer.Wq, rs.XNorm, rs); err != nil {
@@ -835,22 +852,43 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if gl.Bv != 0 {
 				Add(rs.V, rs.V, gl.Bv, kvDim)
 			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ Q+bias", rs.Q, numHeads*headDim)
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ K+bias", rs.K, kvDim)
+			}
 			if spec.QKNorm {
 				Barrier()
 				RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps)
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox)
+			RoPE(rs.Q, rs.K, p.RoPECosTable, p.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ Q post-RoPE", rs.Q, numHeads*headDim)
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ K post-RoPE", rs.K, kvDim)
+			}
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
-			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+			if gl.AttnSinks != 0 {
+				if err := AttentionSinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					return fmt.Errorf("layer %d gatedq attention_sinks: %w", l, err)
+				}
+			} else {
+				Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnOut", rs.AttnOut, numHeads*headDim)
+			}
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
+			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnProj", rs.AttnProj, dim)
 			}
 		} else if spec.Core == llm.CoreMLA && p != nil && p.HasMLA {
 			Sync()
@@ -913,6 +951,12 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				}
 			}
 
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "Q+bias", rs.Q, numHeads*headDim)
+				GpuDiag.LogBuf("GPU", l, pos, "K+bias", rs.K, kvDim)
+				GpuDiag.LogBuf("GPU", l, pos, "V+bias", rs.V, kvDim)
+			}
+
 			if spec.QKNorm {
 				Barrier()
 				if err := RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps); err != nil {
@@ -924,8 +968,13 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 
 			Barrier()
-			if err := RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeFreqBase, cfg.RopeNeox); err != nil {
+			if err := RoPE(rs.Q, rs.K, p.RoPECosTable, p.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox); err != nil {
 				return fmt.Errorf("layer %d rope: %w", l, err)
+			}
+
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "Q post-RoPE", rs.Q, numHeads*headDim)
+				GpuDiag.LogBuf("GPU", l, pos, "K post-RoPE", rs.K, kvDim)
 			}
 
 			if err := KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
@@ -933,14 +982,32 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 
 			Barrier()
-			if err := Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
-				return fmt.Errorf("layer %d attention: %w", l, err)
+			if gl.AttnSinks != 0 {
+				if diagL {
+					GpuDiag.LogInfo("GPU", l, pos, "attention_sinks seqLen=%d scale=%.6f", seqLen, scale)
+				}
+				if err := AttentionSinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					return fmt.Errorf("layer %d attention_sinks: %w", l, err)
+				}
+			} else {
+				if err := Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					return fmt.Errorf("layer %d attention: %w", l, err)
+				}
+			}
+
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "AttnOut", rs.AttnOut, numHeads*headDim)
 			}
 
 			Barrier()
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
+			}
+
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "AttnProj", rs.AttnProj, dim)
 			}
 		}
 
@@ -953,9 +1020,16 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, ffnNormW, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d moe add+rmsnorm: %w", l, err)
 			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "FFNNorm(MoE)", rs.FFNNorm, dim)
+				GpuDiag.LogBuf("GPU", l, pos, "FFNIn(MoE)", rs.FFNIn, dim)
+			}
 			if gl.MoEOnGPU {
-				if err := GpuForwardMoEFFN(gl, layer, rs, cfg); err != nil {
+				if err := GpuForwardMoEFFN(gl, layer, rs, cfg, diagL, l, pos); err != nil {
 					return fmt.Errorf("layer %d gpu moe: %w", l, err)
+				}
+				if diagL {
+					GpuDiag.LogBuf("GPU", l, pos, "FFNOut(MoE)", rs.FFNOut, dim)
 				}
 				Barrier()
 				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
@@ -976,6 +1050,9 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				BeginBatch()
 				if err := UploadF32(rs.FFNOut, cpuRS.FFNOut); err != nil {
 					return fmt.Errorf("layer %d moe upload: %w", l, err)
+				}
+				if diagL {
+					GpuDiag.LogSlice("GPU", l, pos, "FFNOut(CPU-MoE)", cpuRS.FFNOut[:dim])
 				}
 				Barrier()
 				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
@@ -1039,11 +1116,19 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 		}
 		} // end else (non-MoE)
+
+		if diagL {
+			GpuDiag.LogBuf("GPU", l, pos, "X(end-of-layer)", rs.X, dim)
+		}
 	}
 
 	Barrier()
 	if err := RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps); err != nil {
 		return fmt.Errorf("output norm: %w", err)
+	}
+
+	if diagOn && GpuDiag.Active(-1, pos) {
+		GpuDiag.LogBuf("GPU", -1, pos, "X(final-norm)", rs.X, dim)
 	}
 	Barrier()
 	output := gm.Output
@@ -1127,6 +1212,10 @@ func supportsGPUQType(qtype uint32) bool {
 		return true
 	case 10, 16, 18, 19, 21, 22, 23, 29, 34: // Q2_K, IQ2_XXS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, TQ1_0
 		return true
+	case 20: // IQ4_NL
+		return true
+	case 39: // MXFP4
+		return true
 	default:
 		return false
 	}
@@ -1164,7 +1253,7 @@ func gpuMatVec(out Buf, gpuW *GpuTensor, cpuW *core.QuantizedTensor, xBuf Buf, r
 // GpuForwardMoEFFN runs the Mixture-of-Experts FFN entirely on GPU.
 // Router logits are downloaded for top-K selection, then expert projections
 // run on GPU using offset matmuls into packed weight tensors.
-func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig) error {
+func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig, diagL bool, diagLayer, diagPos int) error {
 	dim := cfg.EmbeddingDim
 	expDim := cfg.ExpertFFNDim
 	nUsed := cfg.ExpertUsedCount
@@ -1200,13 +1289,20 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	routerLogits := make([]float32, cfg.ExpertCount)
 	DownloadF32(rs.MoELogits, routerLogits)
 
-	// Apply gating function
-	if cfg.ExpertGatingFunc == 2 {
+	// Apply gating function and top-K selection
+	var indices []int
+	var weights []float32
+	switch cfg.ExpertGatingFunc {
+	case 2: // sigmoid
 		for i := range routerLogits {
 			x := routerLogits[i]
 			routerLogits[i] = 1.0 / (1.0 + float32(math.Exp(-float64(x))))
 		}
-	} else {
+		indices, weights = topKIndices(routerLogits, nUsed)
+	case 3: // SOFTMAX_WEIGHT: top-K on raw logits, then softmax on selected
+		indices, weights = topKIndices(routerLogits, nUsed)
+		quant.SIMDSoftmax(weights)
+	default: // softmax over all, then top-K
 		maxV := routerLogits[0]
 		for _, v := range routerLogits[1:] {
 			if v > maxV {
@@ -1221,10 +1317,12 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		for i := range routerLogits {
 			routerLogits[i] /= sum
 		}
+		indices, weights = topKIndices(routerLogits, nUsed)
 	}
 
-	// 3. Top-K selection
-	indices, weights := topKIndices(routerLogits, nUsed)
+	if diagL {
+		GpuDiag.LogMoE("GPU", diagLayer, diagPos, routerLogits, indices, weights, cfg.ExpertGatingFunc)
+	}
 
 	// Normalize weights
 	if cfg.ExpertWeightsNorm {
@@ -1240,7 +1338,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 			weights[i] *= invSum
 		}
 	}
-	if cfg.ExpertWeightsScale > 0 {
+	if cfg.ExpertWeightsScale > 0 && cfg.ExpertWeightsScale != 1.0 {
 		for i := range weights {
 			weights[i] *= cfg.ExpertWeightsScale
 		}
@@ -1287,15 +1385,36 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		MatVecOffset(rs.MoEUp, 0, upGpu.Buf, upOff, rs.FFNNorm,
 			expDim, upGpu.Cols, upGpu.Type)
 
-		// SwiGLU
+		// Activation: apply biases and activation entirely on GPU
 		Barrier()
-		SwiGLU(rs.MoEHidden, rs.MoEGate, rs.MoEUp, expDim)
+		if gl.FFNGateExpsBias != 0 {
+			AddOffset(rs.MoEGate, gl.FFNGateExpsBias, expDim, idx*expDim)
+		}
+		if gl.FFNUpExpsBias != 0 {
+			AddOffset(rs.MoEUp, gl.FFNUpExpsBias, expDim, idx*expDim)
+		}
+		Barrier()
+		if layer.Spec.FFN == llm.FFNMoESwiOAI {
+			SwiGLU_OAI(rs.MoEHidden, rs.MoEGate, rs.MoEUp, expDim, 1.702, 7.0)
+		} else {
+			SwiGLU(rs.MoEHidden, rs.MoEGate, rs.MoEUp, expDim)
+		}
 
 		// Down projection: out = DownExps[idx] @ hidden
 		downOff := idx * dim * downBpr
 		Barrier()
 		MatVecOffset(rs.MoEExpertOut, 0, gl.FFNDownExps.Buf, downOff, rs.MoEHidden,
 			dim, gl.FFNDownExps.Cols, gl.FFNDownExps.Type)
+
+		// Add down bias if present
+		if gl.FFNDownExpsBias != 0 {
+			Barrier()
+			AddOffset(rs.MoEExpertOut, gl.FFNDownExpsBias, dim, idx*dim)
+		}
+
+		if diagL && GpuDiag.Verbosity >= 2 {
+			GpuDiag.LogBuf("GPU", diagLayer, diagPos, fmt.Sprintf("MoE expert[%d] out (w=%.6f)", idx, w), rs.MoEExpertOut, dim)
+		}
 
 		// Weighted accumulate: FFNOut += w * expertOut
 		Barrier()

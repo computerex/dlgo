@@ -22,6 +22,7 @@ type BatchDecodeRequest struct {
 func GpuForwardBatchDecode(
 	m *llm.Model,
 	gm *GpuModel,
+	pipe *GpuPipeline,
 	pool *PagedKVPool,
 	rs *GpuRunState,
 	bs *GpuBatchState,
@@ -34,7 +35,7 @@ func GpuForwardBatchDecode(
 
 	// Single sequence: fall through to optimized single path
 	if len(reqs) == 1 {
-		return gpuForwardPagedSingle(m, gm, pool, rs, reqs[0], logitsBufs[0])
+		return gpuForwardPagedSingle(m, gm, pipe, pool, rs, reqs[0], logitsBufs[0])
 	}
 
 	cfg := m.Config
@@ -94,8 +95,8 @@ func GpuForwardBatchDecode(
 			kOff := Buf(uint64(i) * uint64(kvDim) * 4)
 
 			// RoPE on per-sequence Q and K (using batch buffer offsets)
-			RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim,
-				req.Position, cfg.RopeFreqBase, cfg.RopeNeox)
+			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim,
+				req.Position, cfg.RopeNeox)
 			_ = qOff
 			_ = kOff
 
@@ -161,6 +162,7 @@ func GpuForwardBatchDecode(
 func gpuForwardPagedSingle(
 	m *llm.Model,
 	gm *GpuModel,
+	pipe *GpuPipeline,
 	pool *PagedKVPool,
 	rs *GpuRunState,
 	req BatchDecodeRequest,
@@ -224,8 +226,8 @@ func gpuForwardPagedSingle(
 
 		// RoPE
 		Barrier()
-		RoPE(rs.Q, rs.K, numHeads, numKVHeads, headDim, cfg.RopeDim,
-			req.Position, cfg.RopeFreqBase, cfg.RopeNeox)
+		RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim,
+			req.Position, cfg.RopeNeox)
 
 		// Paged KV store
 		pool.StoreKV(l, rs.K, rs.V, req.BlockTable, req.Position)

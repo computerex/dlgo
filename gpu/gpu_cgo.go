@@ -180,14 +180,14 @@ func Softmax(buf Buf, n int) error {
 	return nil
 }
 
-// RoPE applies rotary position embedding on GPU.
-func RoPE(q, k Buf, numHeads, numKVHeads, headDim, ropeDim, pos int, freqBase float32, neox bool) error {
+// RoPE applies rotary position embedding on GPU using precomputed cos/sin tables.
+func RoPE(q, k, cosTable, sinTable Buf, numHeads, numKVHeads, headDim, ropeDim, pos int, neox bool) error {
 	n := 0
 	if neox {
 		n = 1
 	}
-	rc := C.gpu_rope(C.GpuBuf(q), C.GpuBuf(k),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(ropeDim), C.int(pos), C.float(freqBase), C.int(n))
+	rc := C.gpu_rope(C.GpuBuf(q), C.GpuBuf(k), C.GpuBuf(cosTable), C.GpuBuf(sinTable),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(ropeDim), C.int(pos), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: rope failed (%d)", rc)
 	}
@@ -199,6 +199,24 @@ func SwiGLU(out, gate, up Buf, n int) error {
 	rc := C.gpu_swiglu(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: swiglu failed (%d)", rc)
+	}
+	return nil
+}
+
+// SwiGLU_OAI performs OpenAI SwiGLU variant with clamping and alpha-scaled sigmoid on GPU.
+func SwiGLU_OAI(out, gate, up Buf, n int, alpha, limit float32) error {
+	rc := C.gpu_swiglu_oai(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up), C.int(n), C.float(alpha), C.float(limit))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: swiglu_oai failed (%d)", rc)
+	}
+	return nil
+}
+
+// AddOffset performs out[i] += bias[offset + i] on GPU.
+func AddOffset(out, bias Buf, n, offset int) error {
+	rc := C.gpu_add_offset(C.GpuBuf(out), C.GpuBuf(bias), C.int(n), C.int(offset))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: add_offset failed (%d)", rc)
 	}
 	return nil
 }
@@ -245,6 +263,16 @@ func Attention(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim,
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: attention failed (%d)", rc)
+	}
+	return nil
+}
+
+// AttentionSinks performs attention with learned sink logits per KV head.
+func AttentionSinks(out, q, kCache, vCache, sinks Buf, numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32) error {
+	rc := C.gpu_attention_sinks(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.GpuBuf(sinks), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention_sinks failed (%d)", rc)
 	}
 	return nil
 }
@@ -397,7 +425,8 @@ func (lc *LayerConf) SetKV(kCache, vCache Buf) {
 }
 
 func (lc *LayerConf) SetConfig(dim, headDim, numHeads, numKVHeads, kvDim int,
-	rmsEps, ropeFreqBase float32, ropeDim int, ropeNeox bool,
+	rmsEps float32, ropeDim int, ropeNeox bool,
+	ropeCosTable, ropeSinTable Buf,
 	ffnType, residualType int) {
 	lc.c.dim = C.int(dim)
 	lc.c.head_dim = C.int(headDim)
@@ -405,11 +434,12 @@ func (lc *LayerConf) SetConfig(dim, headDim, numHeads, numKVHeads, kvDim int,
 	lc.c.num_kv_heads = C.int(numKVHeads)
 	lc.c.kv_dim = C.int(kvDim)
 	lc.c.rms_eps = C.float(rmsEps)
-	lc.c.rope_freq_base = C.float(ropeFreqBase)
 	lc.c.rope_dim = C.int(ropeDim)
 	if ropeNeox {
 		lc.c.rope_neox = 1
 	}
+	lc.c.rope_cos_table = C.GpuBuf(ropeCosTable)
+	lc.c.rope_sin_table = C.GpuBuf(ropeSinTable)
 	lc.c.ffn_type = C.int(ffnType)
 	lc.c.residual_type = C.int(residualType)
 }
@@ -541,15 +571,15 @@ func SigmoidGate(out, gate Buf, n int) error {
 }
 
 // BatchRoPE applies RoPE to Q and K for npos positions starting at startPos.
-func BatchRoPE(q, k Buf, numHeads, numKVHeads, headDim, ropeDim, startPos int,
-	freqBase float32, neox bool, npos int) error {
+func BatchRoPE(q, k, cosTable, sinTable Buf, numHeads, numKVHeads, headDim, ropeDim, startPos int,
+	neox bool, npos int) error {
 	n := 0
 	if neox {
 		n = 1
 	}
-	rc := C.gpu_batch_rope(C.GpuBuf(q), C.GpuBuf(k),
+	rc := C.gpu_batch_rope(C.GpuBuf(q), C.GpuBuf(k), C.GpuBuf(cosTable), C.GpuBuf(sinTable),
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(ropeDim),
-		C.int(startPos), C.float(freqBase), C.int(n), C.int(npos))
+		C.int(startPos), C.int(n), C.int(npos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_rope failed (%d)", rc)
 	}

@@ -167,7 +167,9 @@ func main() {
 			cpuNorms := make([]float32, len(tokens))
 			var cpuLogits []float32
 			for i, t := range tokens {
+				if i == 0 { llm.DebugForward = true }
 				cpuLogits = llm.Forward(pipe.Model, t, i, pipe.KVCache, rs)
+				llm.DebugForward = false
 				cpuTops[i] = argmax(cpuLogits)
 				cpuNorms[i] = l2norm(cpuLogits)
 			}

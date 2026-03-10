@@ -213,16 +213,27 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 	kvMul := numHeads / numKVHeads
 	pool := rs.Pool
 
+	CPUDiag.Init()
+	diagOn := CPUDiag.Enabled
+
 	if startLayer == 0 {
 		_ = m.TokenEmbed.DequantizeRow(int(token), rs.X)
 		if cfg.EmbedScale != 0 {
 			ops.Scale(rs.X, cfg.EmbedScale)
+		}
+		if diagOn && CPUDiag.Active(-1, pos) {
+			CPUDiag.LogSlice(-1, pos, "Embed", rs.X[:dim])
 		}
 	}
 
 	for l := startLayer; l < endLayer; l++ {
 		layer := &m.Layers[l]
 		spec := &layer.Spec
+		diagL := diagOn && CPUDiag.Active(l, pos)
+		if diagOn {
+			DiagLayer = l
+			DiagPos = pos
+		}
 
 		// Pre-norm
 		switch spec.Norm {
@@ -230,6 +241,10 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 			ops.RMSNorm(rs.XNorm, rs.X, layer.AttnNorm, cfg.RMSNormEps)
 		case NormLayer:
 			ops.LayerNorm(rs.XNorm, rs.X, layer.AttnNorm, layer.AttnNormBias, cfg.RMSNormEps)
+		}
+
+		if diagL {
+			CPUDiag.LogSlice(l, pos, "XNorm", rs.XNorm[:dim])
 		}
 
 		// Layer core
@@ -242,6 +257,10 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 			ForwardAttention(layer, rs, kv, l, pos, numHeads, numKVHeads, headDim, kvMul, cfg, pool)
 		}
 
+		if diagL {
+			CPUDiag.LogSlice(l, pos, "AttnProj", rs.AttnProj[:dim])
+		}
+
 		// Residual wiring + FFN
 		switch spec.Residual {
 		case ResStandard:
@@ -250,23 +269,42 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 			}
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+			if diagL {
+				CPUDiag.LogSlice(l, pos, "FFNNorm", rs.FFNNorm[:dim])
+			}
 			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
 			if layer.PostFFNNorm != nil {
 				ops.RMSNormInPlace(rs.FFNOut, layer.PostFFNNorm, cfg.RMSNormEps)
+			}
+			if diagL {
+				CPUDiag.LogSlice(l, pos, "FFNOut", rs.FFNOut[:dim])
 			}
 			ops.Add(rs.X, rs.FFNIn, rs.FFNOut)
 
 		case ResPostAttnFFN:
 			ops.Add(rs.FFNIn, rs.X, rs.AttnProj)
 			ops.RMSNorm(rs.FFNNorm, rs.FFNIn, layer.PostAttnNorm, cfg.RMSNormEps)
+			if diagL {
+				CPUDiag.LogSlice(l, pos, "FFNNorm", rs.FFNNorm[:dim])
+			}
 			forwardFFN(layer, rs, rs.FFNNorm, cfg, pool)
+			if diagL {
+				CPUDiag.LogSlice(l, pos, "FFNOut", rs.FFNOut[:dim])
+			}
 			ops.Add(rs.X, rs.FFNIn, rs.FFNOut)
 
 		case ResParallel:
 			forwardFFN(layer, rs, rs.XNorm, cfg, pool)
+			if diagL {
+				CPUDiag.LogSlice(l, pos, "FFNOut", rs.FFNOut[:dim])
+			}
 			for i := 0; i < dim; i++ {
 				rs.X[i] = rs.X[i] + rs.AttnProj[i] + rs.FFNOut[i]
 			}
+		}
+
+		if diagL {
+			CPUDiag.LogSlice(l, pos, "X(end-of-layer)", rs.X[:dim])
 		}
 
 		if DebugForward {
@@ -334,6 +372,14 @@ func ForwardAttention(
 		ops.AddBias(rs.V, layer.Bv)
 	}
 
+	kvDim := numKVHeads * headDim
+	diagL := CPUDiag.Active(l, pos)
+	if diagL {
+		CPUDiag.LogSlice(l, pos, "Q+bias", rs.Q[:numHeads*headDim])
+		CPUDiag.LogSlice(l, pos, "K+bias", rs.K[:kvDim])
+		CPUDiag.LogSlice(l, pos, "V+bias", rs.V[:kvDim])
+	}
+
 	if layer.Spec.QKNorm {
 		for h := 0; h < numHeads; h++ {
 			ops.RMSNormInPlace(rs.Q[h*headDim:(h+1)*headDim], layer.AttnQNorm, cfg.RMSNormEps)
@@ -352,6 +398,11 @@ func ForwardAttention(
 		}
 	} else {
 		ops.ApplyRoPEBatch(rs.Q, numHeads, rs.K, numKVHeads, pos, headDim, cfg.RopeFreqBase, cfg.RopeNeox)
+	}
+
+	if diagL {
+		CPUDiag.LogSlice(l, pos, "Q post-RoPE", rs.Q[:numHeads*headDim])
+		CPUDiag.LogSlice(l, pos, "K post-RoPE", rs.K[:kvDim])
 	}
 
 	kv.Layers[l].Store(pos, rs.K, rs.V)
@@ -405,6 +456,10 @@ func ForwardAttention(
 			i++
 		}
 	})
+
+	if diagL {
+		CPUDiag.LogSlice(l, pos, "AttnOut", rs.AttnOut[:numHeads*headDim])
+	}
 
 	if layer.Spec.GatedQ {
 		for i := 0; i < qDim; i++ {
@@ -597,6 +652,10 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
 	}
 
+	if CPUDiag.Active(DiagLayer, DiagPos) {
+		CPUDiag.LogMoE(DiagLayer, DiagPos, rs.MoELogits[:nExperts], indices, weights, cfg.ExpertGatingFunc)
+	}
+
 	// Normalize selected weights
 	if cfg.ExpertWeightsNorm {
 		var wSum float32
@@ -750,6 +809,10 @@ func ForwardMoEFFN_OAI(layer *Layer, rs *RunState, input []float32, cfg ModelCon
 	// SOFTMAX_WEIGHT: top-k on RAW logits, then softmax only on selected
 	indices, rawWeights := topKIndices(rs.MoELogits[:nExperts], nUsed)
 	quant.SIMDSoftmax(rawWeights)
+
+	if CPUDiag.Active(DiagLayer, DiagPos) {
+		CPUDiag.LogMoE(DiagLayer, DiagPos, rs.MoELogits[:nExperts], indices, rawWeights, 3)
+	}
 
 	if cfg.ExpertWeightsScale > 0 && cfg.ExpertWeightsScale != 1.0 {
 		for i := range rawWeights {

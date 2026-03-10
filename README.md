@@ -18,26 +18,28 @@ fmt.Println(response) // "The capital of France is Paris."
 - **Hybrid SSM+Attention** — Gated Delta Net (GDN) recurrent layers with interleaved full attention, supporting Qwen3-Coder-Next, Qwen3.5, and Qwen3.5 MoE architectures
 - **Multi-head Latent Attention (MLA)** — compressed KV cache with absorbed key projection for DeepSeek-V2 / GLM-4.7 architectures
 - **Attention Sinks** — learned "trash bin" logits for OpenAI gpt-oss models, absorbing unneeded attention mass
-- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU, RMSNorm, custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU/SwiGLU-OAI, RMSNorm, MoE expert dispatch (fully on-GPU with bias addition and offset shaders), custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
 - **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, fused IQ3_XXS/IQ4_XS SIMD kernels, batch prefill GEMM, parallel worker pools (**beats Ollama on Qwen3.5 models**, within 0–18% for most others)
 - **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), MXFP4, F16, BF16, F32
+- **Zero-overhead diagnostics** — flag-enabled GPU/CPU forward pass instrumentation via `DLGO_GPU_DIAG`/`DLGO_CPU_DIAG` env vars with layer/position filtering and verbosity levels
 
 ## Supported Architectures
 
 | Architecture | Models Tested | CPU tok/s | GPU tok/s |
 |---|---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–59 | 421–441 |
-| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 59–91 | 367–447 |
-| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~3.4 | — |
-| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~5.8 | — |
-| Qwen3.5 | Qwen3.5 0.8B (hybrid GDN+attention) | ~33 | ~287 |
-| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.5–7.5 | 6.4–70.9 |
-| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~8.1 | — |
-| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.1 | — |
-| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.1–4.4 | — |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 42–132 | 288–550 |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 39–96 | 323–467 |
-| Phi | Phi-2, Phi-4-mini | 9–19 | ~140 |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–65 | 314–422 |
+| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 60–98 | 241–411 |
+| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~5.1 | ~42 |
+| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~2.9 | ~7.7 (partial) |
+| Qwen3.5 | Qwen3.5 0.8B, 2B (hybrid GDN+attention) | 23–34 | 192 |
+| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.4–7.4 | 21–62 |
+| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~3.9 | partial offload |
+| Qwen3.5 MoE (large) | Qwen3.5 122B-A10B (IQ3_XXS) | ~1.4 | ~2.0 (partial) |
+| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.5 | ~16 (partial) |
+| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.6–5.7 | 34–37 |
+| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 44–154 | 249–530 |
+| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 42–96 | 177–411 |
+| Phi | Phi-2, Phi-4-mini | 9–20 | ~125 |
 | Mistral | Mistral (llama-compatible) | — | — |
 | Whisper | Tiny, Base, Small (speech-to-text) | ~1x RT | — |
 
@@ -75,23 +77,25 @@ with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU
 
 ### Frontier models (MoE, hybrid architectures, 20B+ params)
 
-| Model | Quant | Size | Active Params | Architecture | CPU gen |
-|---|---|---|---|---|---|
-| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 5.8 tok/s |
-| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 3.4 tok/s |
-| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 4.4 tok/s |
-| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.1 tok/s |
-| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.1 tok/s |
+| Model | Quant | Size | Active Params | Architecture | CPU gen | GPU gen |
+|---|---|---|---|---|---|---|
+| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 2.9 tok/s | 7.7 tok/s (partial) |
+| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 5.1 tok/s | 41.7 tok/s |
+| Qwen3.5-122B-A10B | IQ3_XXS | 45 GB | ~10B | Hybrid GDN+MoE, 256 experts | 1.4 tok/s | 2.0 tok/s (partial) |
+| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 5.7 tok/s | 36.5 tok/s |
+| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.6 tok/s | 34.1 tok/s |
+| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.5 tok/s | 16.2 tok/s (partial) |
 
 **Notes:**
 - **Qwen3.5 models outperform Ollama** on CPU generation: 0.8B (+22%), 9B (+4%), 27B (+4%), and 35B MoE (+7%).
   These use hybrid GDN+attention architectures where dlgo's optimized SSM kernels and fused IQ SIMD dot products give a measurable advantage.
-- **Qwen3-Coder-Next** uses a novel hybrid architecture combining Gated Delta Net (GDN) SSM layers with full attention every 4th layer, plus MoE with 512 experts (10 active). Despite IQ3_XXS quantization, produces correct and coherent code output.
-- **gpt-oss-20b** is an OpenAI MoE model with attention sinks (learned "trash bin" logits in softmax) and custom SwiGLU-OAI activation. Both MXFP4 (native) and Q3_K_M quantizations produce correct output.
-- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing.
+- **gpt-oss-20b** now runs fully on GPU with a dedicated SwiGLU-OAI Vulkan shader and GPU-resident expert biases. Generation at 34–37 tok/s (7–8x faster than CPU), with correct output on both MXFP4 and Q3_K_M quantizations.
+- **Qwen3-Coder-30B-A3B** runs all 48 MoE layers on GPU at 41.7 tok/s (8x faster than CPU).
+- **Qwen3.5-122B-A10B** (45 GB, 256 experts) runs with partial GPU offloading (16/48 layers) due to VRAM constraints, producing coherent output.
+- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing. Partial GPU at 16.2 tok/s.
+- Models exceeding 16 GB VRAM automatically use partial GPU offloading with CPU fallback for remaining layers.
 - Generation is within 11–25% of Ollama for most small models. The gap comes from Go+CGo
   dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge per matmul chunk).
-- Phi-4-mini (−16%) is a 3.8B parameter model in Q3_K_M — gap scales with model size due to dispatch overhead.
 
 ## Install
 
@@ -244,6 +248,8 @@ SmolLM2. Prefill is 10–50x faster across all models.
 - Fused Add+RMSNorm kernel reducing barriers per layer
 - Fused multi-head attention kernel (Q·K softmax, V accumulation)
 - Custom SSM/GDN shaders (conv1d+SiLU, delta rule, L2 norm, sigmoid gate) — full Gated Delta Net on GPU
+- SwiGLU-OAI shader with alpha-scaled sigmoid and clamping for OpenAI gpt-oss MoE models
+- GPU-resident MoE expert biases with offset-indexed `add_offset` shader (zero CPU-GPU sync per expert)
 - HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
 - Single command buffer submission per token with batched dispatches
 - Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead

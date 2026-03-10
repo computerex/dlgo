@@ -1,0 +1,85 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+// MXFP4 block: 17 bytes per 32 values
+// e: uint8 E8M0 shared exponent (1 byte)
+// qs[16]: 4-bit indices packed in nibble pairs (16 bytes)
+// Low nibbles -> values[0..15], high nibbles -> values[16..31]
+struct block_mxfp4 {
+    uint8_t e;
+    uint8_t qs[16];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_mxfp4 data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+const float kvalues[16] = float[16](
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+    0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0
+);
+
+float e8m0_to_f32(uint e) {
+    if (e < 2u) {
+        return uintBitsToFloat(0x00200000u << e);
+    }
+    return uintBitsToFloat((e - 1u) << 23u);
+}
+
+shared float shared_sums[128];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    if (row >= uint(rows)) return;
+
+    uint ncols = uint(cols);
+    uint bpr = ncols / 32u;
+
+    uint pos_id = gl_WorkGroupID.y;
+    uint x_off = pos_id * ncols;
+    uint out_off = pos_id * uint(rows);
+
+    float acc = 0.0;
+
+    for (uint b = tid; b < bpr; b += 128u) {
+        uint bi = row * bpr + b;
+        float d = e8m0_to_f32(uint(data_a[bi].e));
+        uint base = b * 32u;
+
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0u; j < 16u; j++) {
+            uint qByte = uint(data_a[bi].qs[j]);
+            float v_lo = kvalues[qByte & 0xFu];
+            float v_hi = kvalues[qByte >> 4u];
+            sum += d * v_lo * data_b[x_off + base + j];
+            sum += d * v_hi * data_b[x_off + base + 16u + j];
+        }
+        acc += sum;
+    }
+
+    acc = subgroupAdd(acc);
+
+    if ((tid & 31u) == 0u) {
+        shared_sums[tid / 32u] = acc;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            total += shared_sums[i];
+        }
+        out_data[out_off + row] = total;
+    }
+}

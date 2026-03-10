@@ -41,7 +41,12 @@ $shaders = @(
     @{name="matvec_iq2_s"; file="matvec_iq2_s.comp"},
     @{name="matvec_iq3_xxs"; file="matvec_iq3_xxs.comp"},
     @{name="matvec_iq3_s"; file="matvec_iq3_s.comp"},
-    @{name="matvec_iq4_xs"; file="matvec_iq4_xs.comp"}
+    @{name="matvec_iq4_xs"; file="matvec_iq4_xs.comp"},
+    @{name="matvec_iq4_nl"; file="matvec_iq4_nl.comp"},
+    @{name="matvec_mxfp4"; file="matvec_mxfp4.comp"},
+    @{name="attention_sinks"; file="attention_sinks.comp"},
+    @{name="swiglu_oai"; file="swiglu_oai.comp"},
+    @{name="add_offset"; file="add_offset.comp"}
 )
 
 $header = @"
@@ -102,7 +107,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_q4_0", spv_matvec_q4_0, spv_matvec_q4_0_size, 3, 8},   // PIPE_DEQUANT_Q6_K (placeholder)
     {"rmsnorm",     spv_rmsnorm,     spv_rmsnorm_size,     3, 8},   // PIPE_RMSNORM
     {"softmax",     spv_softmax,     spv_softmax_size,     1, 4},   // PIPE_SOFTMAX
-    {"rope",        spv_rope,        spv_rope_size,        2, 24},  // PIPE_ROPE
+    {"rope",        spv_rope,        spv_rope_size,        4, 24},  // PIPE_ROPE
     {"swiglu",      spv_swiglu,      spv_swiglu_size,      3, 4},   // PIPE_SWIGLU
     {"geglu",       spv_geglu,       spv_geglu_size,       3, 4},   // PIPE_GEGLU
     {"gelu",        spv_gelu,        spv_gelu_size,        1, 4},   // PIPE_GELU
@@ -138,6 +143,11 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_iq3_xxs", spv_matvec_iq3_xxs, spv_matvec_iq3_xxs_size, 4, 8},   // PIPE_MATVEC_IQ3_XXS
     {"matvec_iq3_s",   spv_matvec_iq3_s,   spv_matvec_iq3_s_size,   4, 8},   // PIPE_MATVEC_IQ3_S
     {"matvec_iq4_xs",  spv_matvec_iq4_xs,  spv_matvec_iq4_xs_size,  3, 8},   // PIPE_MATVEC_IQ4_XS
+    {"matvec_iq4_nl",  spv_matvec_iq4_nl,  spv_matvec_iq4_nl_size,  3, 8},   // PIPE_MATVEC_IQ4_NL
+    {"matvec_mxfp4",   spv_matvec_mxfp4,   spv_matvec_mxfp4_size,   3, 8},   // PIPE_MATVEC_MXFP4
+    {"attention_sinks", spv_attention_sinks, spv_attention_sinks_size, 5, 24}, // PIPE_ATTENTION_SINKS
+    {"swiglu_oai",     spv_swiglu_oai,     spv_swiglu_oai_size,     3, 12},  // PIPE_SWIGLU_OAI
+    {"add_offset",     spv_add_offset,     spv_add_offset_size,     2, 8},   // PIPE_ADD_OFFSET
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

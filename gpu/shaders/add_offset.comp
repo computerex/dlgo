@@ -1,0 +1,20 @@
+#version 450
+
+// Element-wise add with offset: out[i] += bias[offset + i]
+// Used for adding packed expert biases from a single contiguous GPU buffer.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Bias { float bias_data[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    int offset;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= n) return;
+    out_data[idx] += bias_data[offset + idx];
+}

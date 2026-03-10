@@ -35,6 +35,9 @@ type GpuPipeline struct {
 	HasMoE    bool
 	HasMLA    bool
 
+	RoPECosTable Buf
+	RoPESinTable Buf
+
 	// Partial GPU offloading: layers [0, NumGPULayers) are on GPU,
 	// layers [NumGPULayers, NumLayers) run on CPU (RAM or mmap).
 	NumGPULayers int
@@ -255,11 +258,8 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			}
 		}
 
-		if cl.Wq != nil && !supportsGPUQType(cl.Wq.Type) {
-			gl.CPUAttn = true
-		}
 		if cl.AttnSinks != nil {
-			gl.CPUAttn = true
+			gl.AttnSinks, _ = UploadF32Slice(cl.AttnSinks)
 		}
 
 		if cl.Bq != nil {
@@ -326,6 +326,15 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 				}
 			}
 			gl.MoEOnGPU = moeUploaded
+			if moeUploaded && cl.FFNGateExpsBias != nil {
+				gl.FFNGateExpsBias, _ = UploadF32Slice(cl.FFNGateExpsBias)
+			}
+			if moeUploaded && cl.FFNUpExpsBias != nil {
+				gl.FFNUpExpsBias, _ = UploadF32Slice(cl.FFNUpExpsBias)
+			}
+			if moeUploaded && cl.FFNDownExpsBias != nil {
+				gl.FFNDownExpsBias, _ = UploadF32Slice(cl.FFNDownExpsBias)
+			}
 			if cl.FFNGateShared != nil {
 				gl.FFNGateShared, _ = UploadTensor(cl.FFNGateShared)
 			}
@@ -453,7 +462,42 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	rs := NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
 	kv := NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim)
 
-	layerConfs := BuildLayerConfs(m, gm, rs, kv)
+	// Upload precomputed RoPE cos/sin tables before building layer confs
+	var ropeCosTable, ropeSinTable Buf
+	cosTable, sinTable := cpuPipeline.RunState.RoPETables()
+	if cosTable != nil && sinTable != nil {
+		var err error
+		ropeCosTable, err = UploadF32Slice(cosTable)
+		if err != nil {
+			return nil, fmt.Errorf("gpu: upload RoPE cos table: %w", err)
+		}
+		ropeSinTable, err = UploadF32Slice(sinTable)
+		if err != nil {
+			return nil, fmt.Errorf("gpu: upload RoPE sin table: %w", err)
+		}
+	} else {
+		ropeDim := cfg.RopeDim
+		if ropeDim <= 0 || ropeDim > cfg.HeadDim {
+			ropeDim = cfg.HeadDim
+		}
+		cos, sin := ops.RoPEFrequencyTable(cpuPipeline.MaxSeqLen, ropeDim, cfg.RopeFreqBase)
+		var err error
+		ropeCosTable, err = UploadF32Slice(cos)
+		if err != nil {
+			return nil, fmt.Errorf("gpu: upload RoPE cos table: %w", err)
+		}
+		ropeSinTable, err = UploadF32Slice(sin)
+		if err != nil {
+			return nil, fmt.Errorf("gpu: upload RoPE sin table: %w", err)
+		}
+	}
+
+	// Create a temporary pipe struct with RoPE tables for BuildLayerConfs
+	tempPipe := &GpuPipeline{
+		RoPECosTable: ropeCosTable,
+		RoPESinTable: ropeSinTable,
+	}
+	layerConfs := BuildLayerConfs(m, gm, tempPipe, rs, kv)
 
 	maxDim := dim
 	if ffnDim > maxDim {
@@ -488,6 +532,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		Q8_1Scratch:     q8_1Scratch,
 		NumGPULayers:    numGPULayers,
 		IsPartialGPU:    isPartial,
+		RoPECosTable:    ropeCosTable,
+		RoPESinTable:    ropeSinTable,
 	}
 
 	// Only use fused forward when ALL layers are on GPU and model has no MoE
@@ -549,6 +595,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			break
 		}
 	}
+
+	// RoPE tables already uploaded above (before BuildLayerConfs)
 
 	// Check if any layer needs CPU attention fallback
 	hasCPUAttn := false
@@ -738,7 +786,7 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
 		ffnDim := mcfg.FFNDim
 		p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
-		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p.BatchState, p.KVCache)
+		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p, p.BatchState, p.KVCache)
 		if p.HasGatedQ {
 			p.BatchState.AllocGatedQBatch(npos, qDim)
 		}

@@ -198,6 +198,11 @@ func (rs *RunState) SetRopeNeox(neox bool) {
 	rs.ropeNeox = neox
 }
 
+// RoPETables returns the precomputed cos/sin tables for GPU upload.
+func (rs *RunState) RoPETables() (cosTable, sinTable []float32) {
+	return rs.ropeCos, rs.ropeSin
+}
+
 // ApplyRoPEFast applies precomputed RoPE to vec in-place.
 // vec must be one head's worth [headDim]; pos is the token position.
 // Only the first ropeDim dimensions are rotated; the rest pass through unchanged.

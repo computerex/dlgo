@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+// IQ4_NL: 18 bytes per block of 32 values
+// Byte 0-1: float16 scale (d)
+// Byte 2-17: packed 4-bit nibble indices
+// Access as raw bytes to avoid struct alignment issues
+layout(binding = 0, scalar) buffer Out { float out_data[]; };
+layout(binding = 1, scalar) buffer Weights { uint8_t weight_bytes[]; };
+layout(binding = 2, scalar) buffer X { float x_data[]; };
+
+const float kvalues[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0
+);
+
+shared float shared_sums[128];
+
+void main() {
+    const uint row_pair = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint num_blocks = uint(cols) / 32u;
+    const uint block_bytes = 18u;
+
+    uint pos_id = gl_WorkGroupID.y;
+    uint x_off = pos_id * uint(cols);
+    uint out_off = pos_id * uint(rows);
+
+    for (uint n = 0u; n < 2u; n++) {
+        uint row = row_pair * 2u + n;
+        if (row >= uint(rows)) {
+            if (n == 0u) out_data[out_off + row] = 0.0;
+            continue;
+        }
+
+        float acc = 0.0;
+
+        for (uint b = tid / 32u; b < num_blocks; b += 4u) {
+            uint bi = row * num_blocks + b;
+            uint byte_off = bi * block_bytes;
+
+            // Read float16 scale as 2 raw bytes (little-endian)
+            uint lo = uint(weight_bytes[byte_off]);
+            uint hi = uint(weight_bytes[byte_off + 1u]);
+            float d = unpackHalf2x16(lo | (hi << 8u)).x;
+
+            uint lane = tid & 31u;
+
+            if (lane < 16u) {
+                uint qByte = uint(weight_bytes[byte_off + 2u + lane]);
+                float v_lo = kvalues[qByte & 0xFu];
+                float v_hi = kvalues[qByte >> 4u];
+                uint base = b * 32u;
+                acc += d * v_lo * x_data[x_off + base + lane]
+                     + d * v_hi * x_data[x_off + base + 16u + lane];
+            }
+        }
+
+        acc = subgroupAdd(acc);
+
+        if ((tid & 31u) == 0u) {
+            shared_sums[tid / 32u] = acc;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += shared_sums[i];
+            }
+            out_data[out_off + row] = total;
+        }
+        barrier();
+    }
+}

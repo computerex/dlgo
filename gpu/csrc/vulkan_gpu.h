@@ -97,6 +97,11 @@ typedef enum {
     PIPE_MATVEC_IQ3_XXS,
     PIPE_MATVEC_IQ3_S,
     PIPE_MATVEC_IQ4_XS,
+    PIPE_MATVEC_IQ4_NL,
+    PIPE_MATVEC_MXFP4,
+    PIPE_ATTENTION_SINKS,
+    PIPE_SWIGLU_OAI,
+    PIPE_ADD_OFFSET,
     PIPE_COUNT
 } PipelineID;
 
@@ -135,10 +140,13 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps);
 int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps);
 int gpu_softmax(GpuBuf buf, int n);
-int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int rope_dim, int pos, float freq_base, int neox);
+int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, GpuBuf cos_table, GpuBuf sin_table,
+             int num_heads, int num_kv_heads, int head_dim, int rope_dim,
+             int pos, int neox);
 int gpu_swiglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
+int gpu_swiglu_oai(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n, float alpha, float limit);
 int gpu_geglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n);
+int gpu_add_offset(GpuBuf out_buf, GpuBuf bias_buf, int n, int offset);
 int gpu_gelu(GpuBuf buf, int n);
 int gpu_add(GpuBuf out_buf, GpuBuf a_buf, GpuBuf b_buf, int n);
 int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
@@ -154,6 +162,9 @@ int gpu_copy_f32(GpuBuf dst, GpuBuf src, int n);
 int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                   int num_heads, int num_kv_heads, int head_dim, int kv_dim,
                   int seq_len, float scale);
+int gpu_attention_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                        GpuBuf sinks_buf, int num_heads, int num_kv_heads, int head_dim,
+                        int kv_dim, int seq_len, float scale);
 
 // KV cache operations
 int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
@@ -218,9 +229,10 @@ typedef struct {
     GpuBuf k_cache, v_cache;
 
     int dim, head_dim, num_heads, num_kv_heads, kv_dim;
-    float rms_eps, rope_freq_base;
+    float rms_eps;
     int rope_dim;
     int rope_neox;
+    GpuBuf rope_cos_table, rope_sin_table;
     int ffn_type;       // 0=swiglu, 1=geglu, 2=plain, 3=moe_skip (CPU handles FFN)
     int residual_type;  // 0=standard, 1=parallel
 

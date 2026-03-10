@@ -1,0 +1,115 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
+layout(set = 0, binding = 0) buffer AttnOutV4 { vec4 attn_v4[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 1) readonly buffer QV4 { vec4 q_v4[]; };
+layout(set = 0, binding = 2) readonly buffer KCache { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer KV4 { vec4 k_v4[]; };
+layout(set = 0, binding = 3) readonly buffer VCache { float v_cache[]; };
+layout(set = 0, binding = 3) readonly buffer VV4 { vec4 v_v4[]; };
+layout(set = 0, binding = 4) readonly buffer Sinks { float sinks[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_len;
+    float scale;
+};
+
+shared float scores[4097];
+shared float reduce[256];
+shared vec4 q_sh[64];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    if (head >= num_heads) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_mul = num_heads / num_kv_heads;
+    uint kv_head = head / kv_mul;
+    uint q_dim = uint(num_heads) * uint(head_dim);
+    uint q_base = pos_id * q_dim + head * uint(head_dim);
+    uint kv_offset = kv_head * uint(head_dim);
+    int actual_seq_len = seq_len + int(pos_id);
+    int total_scores = actual_seq_len + 1;
+    uint head_dim4 = uint(head_dim) >> 2;
+    uint kv_dim4 = uint(kv_dim) >> 2;
+    uint kv_off4 = kv_offset >> 2;
+
+    // Pre-load Q into shared memory as vec4
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
+        q_sh[d4] = q_v4[(q_base >> 2) + d4];
+    }
+    barrier();
+
+    // Phase 1: Q·K scores with vec4 dot products
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
+        float dot_val = 0.0;
+        uint k_base4 = uint(t) * kv_dim4 + kv_off4;
+        for (uint d4 = 0; d4 < head_dim4; d4 += 4u) {
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                if (d4 + j < head_dim4)
+                    dot_val += dot(q_sh[d4 + j], k_v4[k_base4 + d4 + j]);
+            }
+        }
+        scores[t] = dot_val * scale;
+    }
+    // Append learned sink logit as extra softmax column
+    if (tid == 0u) {
+        scores[actual_seq_len] = sinks[head];
+    }
+    barrier();
+
+    // Phase 2: softmax - find max (over total_scores = actual_seq_len + 1)
+    float mx = -1.0e30;
+    for (int t = int(tid); t < total_scores; t += 256) {
+        mx = max(mx, scores[t]);
+    }
+    reduce[tid] = mx;
+    barrier();
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
+        barrier();
+    }
+    float max_val = reduce[0];
+    barrier();
+
+    // Exp and sum
+    float my_sum = 0.0;
+    for (int t = int(tid); t < total_scores; t += 256) {
+        float e = exp(scores[t] - max_val);
+        scores[t] = e;
+        my_sum += e;
+    }
+    reduce[tid] = my_sum;
+    barrier();
+    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        barrier();
+    }
+    float inv_sum = 1.0 / reduce[0];
+    barrier();
+
+    // Normalize (only real positions, not the sink)
+    for (int t = int(tid); t < actual_seq_len; t += 256) {
+        scores[t] *= inv_sum;
+    }
+    barrier();
+
+    // Phase 3: weighted sum of V using vec4 (skip sink column)
+    uint out_base4 = (pos_id * q_dim + head * uint(head_dim)) >> 2;
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
+        vec4 acc = vec4(0.0);
+        for (int t = 0; t < actual_seq_len; t++) {
+            acc += scores[t] * v_v4[uint(t) * kv_dim4 + kv_off4 + d4];
+        }
+        attn_v4[out_base4 + d4] = acc;
+    }
+}

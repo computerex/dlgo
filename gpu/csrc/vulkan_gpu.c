@@ -989,6 +989,8 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
+        case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;  // IQ4_NL
+        case 39:            pipe = PIPE_MATVEC_MXFP4;   break;  // MXFP4
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1001,7 +1003,11 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
         case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
         case QTYPE_IQ4_XS:
+        case 20: // IQ4_NL
             rows_per_wg = 2;
+            break;
+        case 39: // MXFP4: 1 row per WG (128 threads, simple accumulation)
+            rows_per_wg = 1;
             break;
     }
 
@@ -1054,6 +1060,8 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
+        case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;
+        case 39:            pipe = PIPE_MATVEC_MXFP4;   break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1065,7 +1073,11 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
         case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
         case QTYPE_IQ4_XS:
+        case 20:
             rows_per_wg = 2;
+            break;
+        case 39:
+            rows_per_wg = 1;
             break;
     }
 
@@ -1145,18 +1157,21 @@ int gpu_softmax(GpuBuf buf, int n) {
     return dispatch_compute(&dp);
 }
 
-int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, int num_heads, int num_kv_heads,
-             int head_dim, int rope_dim, int pos, float freq_base, int neox) {
+int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, GpuBuf cos_table, GpuBuf sin_table,
+             int num_heads, int num_kv_heads, int head_dim, int rope_dim,
+             int pos, int neox) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int rope_dim; int pos; float freq_base; int neox; } pc =
-        {num_heads, num_kv_heads, head_dim, rope_dim, pos, freq_base, neox};
+    struct { int num_heads; int num_kv_heads; int head_dim; int rope_dim; int pos; int neox; } pc =
+        {num_heads, num_kv_heads, head_dim, rope_dim, pos, neox};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ROPE;
     dp.bufs[0] = q_buf;
     dp.bufs[1] = k_buf;
-    dp.num_bufs = 2;
+    dp.bufs[2] = cos_table;
+    dp.bufs[3] = sin_table;
+    dp.num_bufs = 4;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
@@ -1176,6 +1191,43 @@ int gpu_swiglu(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n) {
     dp.bufs[1] = gate_buf;
     dp.bufs[2] = up_buf;
     dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_swiglu_oai(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf, int n, float alpha, float limit) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; float alpha; float limit; } pc = {n, alpha, limit};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SWIGLU_OAI;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = gate_buf;
+    dp.bufs[2] = up_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_add_offset(GpuBuf out_buf, GpuBuf bias_buf, int n, int offset) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; int offset; } pc = {n, offset};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ADD_OFFSET;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = bias_buf;
+    dp.num_bufs = 2;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = (n + 255) / 256;
@@ -1377,6 +1429,8 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ3XXS]; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
+        case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;
+        case 39:            pipe = PIPE_MATVEC_MXFP4;   break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1388,7 +1442,11 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ2_XXS: case QTYPE_IQ2_S:
         case QTYPE_IQ3_XXS: case QTYPE_IQ3_S:
         case QTYPE_IQ4_XS:
+        case 20:
             rows_per_wg = 2;
+            break;
+        case 39:
+            rows_per_wg = 1;
             break;
     }
 
@@ -1466,6 +1524,30 @@ int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cac
     dp.bufs[2] = k_cache_buf;
     dp.bufs[3] = v_cache_buf;
     dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_attention_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                        GpuBuf sinks_buf, int num_heads, int num_kv_heads, int head_dim,
+                        int kv_dim, int seq_len, float scale) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_SINKS;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.bufs[4] = sinks_buf;
+    dp.num_bufs = 5;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = num_heads;
@@ -1659,16 +1741,17 @@ int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n) {
 // Batch operations exposed for hybrid prefill
 // ---------------------------------------------------------------------------
 
-int gpu_batch_rope(GpuBuf q, GpuBuf k, int num_heads, int num_kv_heads,
-                   int head_dim, int rope_dim, int start_pos, float freq_base,
-                   int neox, int npos) {
+int gpu_batch_rope(GpuBuf q, GpuBuf k, GpuBuf cos_table, GpuBuf sin_table,
+                   int num_heads, int num_kv_heads, int head_dim, int rope_dim,
+                   int start_pos, int neox, int npos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int rd; int pos; float fb; int neox; } pc =
-        {num_heads, num_kv_heads, head_dim, rope_dim, start_pos, freq_base, neox};
+    struct { int nh; int nkv; int hd; int rd; int pos; int neox; } pc =
+        {num_heads, num_kv_heads, head_dim, rope_dim, start_pos, neox};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ROPE;
-    dp.bufs[0] = q; dp.bufs[1] = k; dp.num_bufs = 2;
+    dp.bufs[0] = q; dp.bufs[1] = k; dp.bufs[2] = cos_table; dp.bufs[3] = sin_table;
+    dp.num_bufs = 4;
     dp.push_data = &pc; dp.push_size = sizeof(pc);
     dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
     dp.groups_y = npos; dp.groups_z = 1;
@@ -1769,7 +1852,7 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         }
 
         gpu_barrier();
-        gpu_rope(lc->q, lc->k, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_freq_base, lc->rope_neox);
+        gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
         gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
 
         gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
@@ -2021,11 +2104,13 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
 
     gpu_barrier();
     {
-        struct { int nh; int nkv; int hd; int rd; int pos; float fb; int neox; } pc =
-            {num_heads, num_kv_heads, head_dim, lc->rope_dim, start_pos, lc->rope_freq_base, lc->rope_neox};
+        struct { int nh; int nkv; int hd; int rd; int pos; int neox; } pc =
+            {num_heads, num_kv_heads, head_dim, lc->rope_dim, start_pos, lc->rope_neox};
         DispatchParams dp = {0};
         dp.pipe = PIPE_ROPE;
-        dp.bufs[0] = lc->q; dp.bufs[1] = lc->k; dp.num_bufs = 2;
+        dp.bufs[0] = lc->q; dp.bufs[1] = lc->k;
+        dp.bufs[2] = lc->rope_cos_table; dp.bufs[3] = lc->rope_sin_table;
+        dp.num_bufs = 4;
         dp.push_data = &pc; dp.push_size = sizeof(pc);
         dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
         dp.groups_y = npos; dp.groups_z = 1;

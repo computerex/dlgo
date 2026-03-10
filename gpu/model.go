@@ -105,6 +105,11 @@ type GpuLayer struct {
 	FFNUpExps     *GpuTensor // [expertCount*expertFFNDim × dim] packed up
 	FFNGateUpExps *GpuTensor // [expertCount*2*expertFFNDim × dim] fused gate+up
 	FFNDownExps   *GpuTensor // [expertCount*dim × expertFFNDim] packed down
+	// MoE expert biases (packed float32 on GPU)
+	FFNGateExpsBias Buf // [expertCount*expertFFNDim] packed expert gate bias
+	FFNUpExpsBias   Buf // [expertCount*expertFFNDim] packed expert up bias
+	FFNDownExpsBias Buf // [expertCount*dim] packed expert down bias
+
 	// MoE shared expert weights
 	FFNGateShared *GpuTensor // [sharedFFNDim × dim]
 	FFNUpShared   *GpuTensor // [sharedFFNDim × dim]
@@ -112,6 +117,8 @@ type GpuLayer struct {
 	FFNRouterShared Buf      // [dim] shared expert gate (float32)
 	IsMoE         bool
 	MoEOnGPU      bool       // true if expert weights are on GPU
+
+	AttnSinks Buf // [num_heads] learned sink logits (0 if not used)
 
 	OnGPU   bool // true if this layer's weights are on GPU
 	CPUAttn bool // true if attention matmuls need CPU fallback (unsupported qtype)
@@ -387,6 +394,7 @@ func (gm *GpuModel) FreeAll() {
 		freeBuf(gl.FFNUpBias)
 		freeBuf(gl.FFNDownBias)
 		freeBuf(gl.PostFFNNorm)
+		freeBuf(gl.AttnSinks)
 		freeTensor(gl.FFNGateShared)
 		freeTensor(gl.FFNUpShared)
 		freeTensor(gl.FFNDownShared)
