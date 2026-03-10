@@ -122,11 +122,15 @@ func ForwardSSMLayer(
 	// 10. Delta rule recurrent step + output (GQA-style: K/Q grouped across V heads)
 	// Loop order: outer=i(key), inner=j(value) for sequential cache-friendly access
 	state := ssmState.State
-	headsPerGroup := numHeads / numKVGroups
 	for h := 0; h < numHeads; h++ {
 		decay := float32(math.Exp(float64(ssm.Alpha[h])))
 		lr := ssm.Beta[h]
-		kvGroup := h / headsPerGroup
+		// Tiled V order (Qwen3.5): V head h → K group h%numKVGroups
+		// Grouped V order (Qwen3Next): V head h → K group h/(numHeads/numKVGroups)
+		kvGroup := h % numKVGroups
+		if !cfg.SSMTiledVOrder {
+			kvGroup = h / (numHeads / numKVGroups)
+		}
 		qH := q[kvGroup*headKDim : (kvGroup+1)*headKDim]
 		kH := k[kvGroup*headKDim : (kvGroup+1)*headKDim]
 		vH := v[h*headVDim : (h+1)*headVDim]

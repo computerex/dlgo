@@ -93,6 +93,7 @@ type Layer struct {
 	FFNRouter       *core.QuantizedTensor // [expertCount × dim] router/gating network
 	FFNGateExps     *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert gate
 	FFNUpExps       *core.QuantizedTensor // [expertCount*expertFFNDim × dim] packed expert up
+	FFNGateUpExps   *core.QuantizedTensor // [expertCount*2*expertFFNDim × dim] fused gate+up (interleaved per expert)
 	FFNDownExps     *core.QuantizedTensor // [expertCount*dim × expertFFNDim] packed expert down
 	FFNGateExpsBias []float32             // [expertCount*expertFFNDim] packed expert gate bias
 	FFNUpExpsBias   []float32             // [expertCount*expertFFNDim] packed expert up bias

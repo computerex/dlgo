@@ -300,19 +300,24 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			if cl.FFNRouterBias != nil {
 				gl.FFNRouterBias, _ = UploadF32Slice(cl.FFNRouterBias)
 			}
-			if moeUploaded && cl.FFNGateExps != nil && supportsGPUQType(cl.FFNGateExps.Type) {
+			if moeUploaded && cl.FFNGateUpExps != nil && supportsGPUQType(cl.FFNGateUpExps.Type) {
+				gl.FFNGateUpExps, err = UploadTensor(cl.FFNGateUpExps)
+				if err != nil {
+					moeUploaded = false
+				}
+			} else if moeUploaded && cl.FFNGateExps != nil && supportsGPUQType(cl.FFNGateExps.Type) {
 				gl.FFNGateExps, err = UploadTensor(cl.FFNGateExps)
 				if err != nil {
 					moeUploaded = false
 				}
+				if moeUploaded && cl.FFNUpExps != nil {
+					gl.FFNUpExps, err = UploadTensor(cl.FFNUpExps)
+					if err != nil {
+						moeUploaded = false
+					}
+				}
 			} else {
 				moeUploaded = false
-			}
-			if moeUploaded && cl.FFNUpExps != nil {
-				gl.FFNUpExps, err = UploadTensor(cl.FFNUpExps)
-				if err != nil {
-					moeUploaded = false
-				}
 			}
 			if moeUploaded && cl.FFNDownExps != nil {
 				gl.FFNDownExps, err = UploadTensor(cl.FFNDownExps)
@@ -621,6 +626,37 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	return pipe, nil
 }
 
+// ResetState zeros all caches and SSM state for a fresh inference.
+func (p *GpuPipeline) ResetState() {
+	p.KVCache.Reset()
+	if p.CPUKVCache != nil {
+		p.CPUKVCache.Reset()
+	}
+	if p.HasSSM {
+		mcfg2 := p.CPUModel.Config
+		numHeads := mcfg2.SSMTimeStepRank
+		numKVGroups := mcfg2.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		headVDim := mcfg2.SSMInnerSize / numHeads
+		headKDim := mcfg2.SSMStateSize
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		convK := mcfg2.SSMConvKernel
+		for l := 0; l < mcfg2.NumLayers; l++ {
+			gl := &p.GpuModel.Layers[l]
+			if gl.SSMState != 0 {
+				ZeroFill(gl.SSMState, uint64(numHeads*headKDim*headVDim*4))
+				ZeroFill(gl.SSMConvBuf, uint64(convK*qkvDim*4))
+			}
+		}
+		if p.CPURunState != nil && p.CPURunState.SSMState != nil {
+			p.CPURunState.SSMState.Reset()
+		}
+	}
+}
+
 // pinCPULayersToRAM copies non-GPU layer weights from mmap to heap memory,
 // prioritizing earlier layers and respecting a system RAM budget.
 func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
@@ -688,30 +724,7 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
-	p.KVCache.Reset()
-	if p.CPUKVCache != nil {
-		p.CPUKVCache.Reset()
-	}
-	if p.HasSSM {
-		mcfg2 := p.CPUModel.Config
-		numHeads := mcfg2.SSMTimeStepRank
-		numKVGroups := mcfg2.SSMGroupCount
-		if numKVGroups <= 0 {
-			numKVGroups = numHeads
-		}
-		headVDim := mcfg2.SSMInnerSize / numHeads
-		headKDim := mcfg2.SSMStateSize
-		keyDim := numKVGroups * headKDim
-		qkvDim := keyDim*2 + numHeads*headVDim
-		convK := mcfg2.SSMConvKernel
-		for l := 0; l < mcfg2.NumLayers; l++ {
-			gl := &p.GpuModel.Layers[l]
-			if gl.SSMState != 0 {
-				ZeroFill(gl.SSMState, uint64(numHeads*headKDim*headVDim*4))
-				ZeroFill(gl.SSMConvBuf, uint64(convK*qkvDim*4))
-			}
-		}
-	}
+	p.ResetState()
 
 	mcfg := p.CPUModel.Config
 	npos := len(tokens)

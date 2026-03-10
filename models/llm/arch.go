@@ -68,6 +68,16 @@ func applyArchDefaults(config *ModelConfig) {
 			config.ExpertGatingFunc = 3
 		}
 	}
+	// qwen35moe: llama.cpp hardcodes norm_w=true in build_moe_ffn
+	if config.Architecture == "qwen35moe" && config.ExpertCount > 0 {
+		config.ExpertWeightsNorm = true
+	}
+	// Qwen3.5 GGUF files have V heads reordered from grouped to tiled order
+	// (see _LinearAttentionVReorderBase in convert_hf_to_gguf.py).
+	// GQA mapping for SSM layers: tiled → h % numKVGroups, grouped → h / headsPerGroup.
+	if config.Architecture == "qwen35" || config.Architecture == "qwen35moe" {
+		config.SSMTiledVOrder = true
+	}
 }
 
 // RegisterArchitecture registers or overwrites an architecture descriptor.

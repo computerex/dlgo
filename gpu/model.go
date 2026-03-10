@@ -103,6 +103,7 @@ type GpuLayer struct {
 	FFNRouterBias Buf        // [expertCount] optional bias
 	FFNGateExps   *GpuTensor // [expertCount*expertFFNDim × dim] packed gate
 	FFNUpExps     *GpuTensor // [expertCount*expertFFNDim × dim] packed up
+	FFNGateUpExps *GpuTensor // [expertCount*2*expertFFNDim × dim] fused gate+up
 	FFNDownExps   *GpuTensor // [expertCount*dim × expertFFNDim] packed down
 	// MoE shared expert weights
 	FFNGateShared *GpuTensor // [sharedFFNDim × dim]

@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/computerex/dlgo/blas"
+	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/memory"
 	"github.com/computerex/dlgo/ops"
 	"github.com/computerex/dlgo/quant"
@@ -264,6 +265,9 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 					decay := float32(math.Exp(float64(alpha[h])))
 					lr := beta[h]
 					kvGroup := h % ssmNumKVGroups
+					if !cfg.SSMTiledVOrder {
+						kvGroup = h / (ssmNumHeads / ssmNumKVGroups)
+					}
 					qH := qq[kvGroup*ssmHeadKDim : (kvGroup+1)*ssmHeadKDim]
 					kH := kk[kvGroup*ssmHeadKDim : (kvGroup+1)*ssmHeadKDim]
 					vH := vv[h*ssmHeadVDim : (h+1)*ssmHeadVDim]
@@ -671,9 +675,18 @@ func batchMoEFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int, inpu
 		}
 
 		// Build expert slices for batched gate+up dispatch
-		gateBpr := quant.BytesForN(layer.FFNGateExps.Type, layer.FFNGateExps.Cols)
-		upBpr := quant.BytesForN(layer.FFNUpExps.Type, layer.FFNUpExps.Cols)
 		downBpr := quant.BytesForN(layer.FFNDownExps.Type, layer.FFNDownExps.Cols)
+
+		fused := layer.FFNGateUpExps != nil
+		var gateTensor, upTensor *core.QuantizedTensor
+		if fused {
+			gateTensor = layer.FFNGateUpExps
+			upTensor = layer.FFNGateUpExps
+		} else {
+			gateTensor = layer.FFNGateExps
+			upTensor = layer.FFNUpExps
+		}
+		bpr := quant.BytesForN(gateTensor.Type, gateTensor.Cols)
 
 		gateSlices := make([]blas.ExpertSlice, 0, nUsed)
 		upSlices := make([]blas.ExpertSlice, 0, nUsed)
@@ -685,15 +698,24 @@ func batchMoEFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int, inpu
 				continue
 			}
 			activeExperts = append(activeExperts, e)
-			gateSlices = append(gateSlices, blas.ExpertSlice{
-				Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * gateBpr,
-			})
-			upSlices = append(upSlices, blas.ExpertSlice{
-				Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * upBpr,
-			})
+			if fused {
+				gateSlices = append(gateSlices, blas.ExpertSlice{
+					Out: rs.MoEGates[e], Rows: expDim, Off: idx * 2 * expDim * bpr,
+				})
+				upSlices = append(upSlices, blas.ExpertSlice{
+					Out: rs.MoEUps[e], Rows: expDim, Off: (idx*2 + 1) * expDim * bpr,
+				})
+			} else {
+				gateSlices = append(gateSlices, blas.ExpertSlice{
+					Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * bpr,
+				})
+				upSlices = append(upSlices, blas.ExpertSlice{
+					Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * bpr,
+				})
+			}
 		}
 
-		blas.QDualMultiExpertMatVec(layer.FFNGateExps, layer.FFNUpExps,
+		blas.QDualMultiExpertMatVec(gateTensor, upTensor,
 			gateSlices, upSlices, input, pool)
 
 		for _, e := range activeExperts {

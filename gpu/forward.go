@@ -1247,8 +1247,16 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	}
 
 	// 4. Run expert projections on GPU
-	gateBpr := quant.BytesForN(gl.FFNGateExps.Type, gl.FFNGateExps.Cols)
-	upBpr := quant.BytesForN(gl.FFNUpExps.Type, gl.FFNUpExps.Cols)
+	fused := gl.FFNGateUpExps != nil
+	var gateGpu, upGpu *GpuTensor
+	if fused {
+		gateGpu = gl.FFNGateUpExps
+		upGpu = gl.FFNGateUpExps
+	} else {
+		gateGpu = gl.FFNGateExps
+		upGpu = gl.FFNUpExps
+	}
+	bpr := quant.BytesForN(gateGpu.Type, gateGpu.Cols)
 	downBpr := quant.BytesForN(gl.FFNDownExps.Type, gl.FFNDownExps.Cols)
 
 	// Zero the FFN output
@@ -1263,15 +1271,21 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		w := weights[e]
 
 		// Gate projection: gate = GateExps[idx] @ input
-		gateOff := idx * expDim * gateBpr
+		var gateOff, upOff int
+		if fused {
+			gateOff = idx * 2 * expDim * bpr
+			upOff = (idx*2 + 1) * expDim * bpr
+		} else {
+			gateOff = idx * expDim * bpr
+			upOff = idx * expDim * bpr
+		}
 		Barrier()
-		MatVecOffset(rs.MoEGate, 0, gl.FFNGateExps.Buf, gateOff, rs.FFNNorm,
-			expDim, gl.FFNGateExps.Cols, gl.FFNGateExps.Type)
+		MatVecOffset(rs.MoEGate, 0, gateGpu.Buf, gateOff, rs.FFNNorm,
+			expDim, gateGpu.Cols, gateGpu.Type)
 
 		// Up projection: up = UpExps[idx] @ input
-		upOff := idx * expDim * upBpr
-		MatVecOffset(rs.MoEUp, 0, gl.FFNUpExps.Buf, upOff, rs.FFNNorm,
-			expDim, gl.FFNUpExps.Cols, gl.FFNUpExps.Type)
+		MatVecOffset(rs.MoEUp, 0, upGpu.Buf, upOff, rs.FFNNorm,
+			expDim, upGpu.Cols, upGpu.Type)
 
 		// SwiGLU
 		Barrier()

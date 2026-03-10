@@ -68,6 +68,11 @@ func main() {
 		fmt.Printf("MoE: %d experts, %d active, ExpertFFNDim=%d SharedExpertFFNDim=%d GatingFunc=%d WeightsNorm=%v Scale=%.2f\n",
 			cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNDim, cfg.SharedExpertFFNDim,
 			cfg.ExpertGatingFunc, cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale)
+		l0 := &pipe.Model.Layers[0]
+		fmt.Printf("  L0 MoE: Router=%v GateExps=%v UpExps=%v GateUpExps=%v DownExps=%v GateShared=%v\n",
+			l0.FFNRouter != nil, l0.FFNGateExps != nil, l0.FFNUpExps != nil,
+			l0.FFNGateUpExps != nil, l0.FFNDownExps != nil, l0.FFNGateShared != nil)
+		fmt.Printf("  L0 FFN type: %d\n", l0.Spec.FFN)
 	}
 	if cfg.QLORARank > 0 {
 		fmt.Printf("MLA: qLORARank=%d kvLORARank=%d qkNope=%d qkRope=%d vHeadDim=%d\n",
@@ -187,10 +192,7 @@ func main() {
 			}
 
 			// GPU forward per-token comparison
-			gpuPipe.KVCache.Reset()
-			if gpuPipe.CPUKVCache != nil {
-				gpuPipe.CPUKVCache.Reset()
-			}
+			gpuPipe.ResetState()
 			gpuLogits := make([]float32, pipe.Model.Config.VocabSize)
 			divergeAt := -1
 			for i, t := range tokens {
@@ -249,7 +251,10 @@ func main() {
 	} else {
 		fmt.Printf("\n=== CPU Inference (%d max tokens) ===\n", maxTokens)
 		tokens := pipe.Tokenizer.Encode(prompt)
-		fmt.Printf("Prompt tokens: %d\n", len(tokens))
+		fmt.Printf("Prompt tokens (%d): %v\n", len(tokens), tokens)
+		for i, t := range tokens {
+			fmt.Printf("  tok[%d] = %d %q\n", i, t, pipe.Tokenizer.DecodeToken(t))
+		}
 
 		rs := pipe.RunState
 		pipe.KVCache.Reset()
@@ -257,7 +262,11 @@ func main() {
 		prefillStart := time.Now()
 		var logits []float32
 		for i, t := range tokens {
+			if i == 0 {
+				llm.DebugForward = true
+			}
 			logits = llm.Forward(pipe.Model, t, i, pipe.KVCache, rs)
+			llm.DebugForward = false
 		}
 		prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 		fmt.Printf("Prefill: %.1fms (%d tokens, %.1f tok/s)\n",
@@ -268,6 +277,21 @@ func main() {
 		genStart := time.Now()
 		for g := 0; g < maxTokens && pos < pipe.MaxSeqLen; g++ {
 			maxIdx := argmax(logits)
+			if g < 5 {
+				top5idx := make([]int, 5)
+				top5val := make([]float32, 5)
+				for i := range top5idx { top5idx[i] = -1; top5val[i] = -1e30 }
+				for i, v := range logits {
+					mi := 0
+					for j := 1; j < 5; j++ { if top5val[j] < top5val[mi] { mi = j } }
+					if v > top5val[mi] { top5val[mi] = v; top5idx[mi] = i }
+				}
+				fmt.Printf("[GEN %d] top=%d %q logit=%.4f | ", g, maxIdx, pipe.Tokenizer.DecodeToken(int32(maxIdx)), logits[maxIdx])
+				for i := 0; i < 5; i++ {
+					fmt.Printf("%d(%q %.2f) ", top5idx[i], pipe.Tokenizer.DecodeToken(int32(top5idx[i])), top5val[i])
+				}
+				fmt.Println()
+			}
 			if maxIdx == int(pipe.Tokenizer.EOS) {
 				break
 			}

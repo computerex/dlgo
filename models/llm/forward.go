@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/computerex/dlgo/blas"
@@ -9,6 +10,14 @@ import (
 	"github.com/computerex/dlgo/ops"
 	"github.com/computerex/dlgo/quant"
 )
+
+func vecNorm(v []float32) float32 {
+	var s float64
+	for _, x := range v {
+		s += float64(x) * float64(x)
+	}
+	return float32(math.Sqrt(s))
+}
 
 // RunState holds pre-allocated buffers for inference, avoiding per-token allocations.
 type RunState struct {
@@ -170,6 +179,9 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 	return rs
 }
 
+// DebugForward enables per-layer norm prints for the current forward pass.
+var DebugForward bool
+
 // isSSMLayer returns true if layer l uses the SSM/delta-net path instead of attention.
 func isSSMLayer(l int, cfg ModelConfig) bool {
 	if cfg.FullAttentionInterval <= 0 {
@@ -257,6 +269,13 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 			}
 		}
 
+		if DebugForward {
+			coreStr := "ATN"
+			if spec.Core == CoreSSM { coreStr = "SSM" }
+			if spec.Core == CoreMLA { coreStr = "MLA" }
+			fmt.Printf("  L%02d [%s] xnorm=%.4f attn=%.4f ffn=%.4f x=%.4f\n",
+				l, coreStr, vecNorm(rs.XNorm), vecNorm(rs.AttnProj), vecNorm(rs.FFNOut), vecNorm(rs.X))
+		}
 	}
 
 	if endLayer < cfg.NumLayers {
@@ -599,13 +618,22 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 	}
 
 	// Build expert slices for batched dispatch
-	gateBpr := quant.BytesForN(layer.FFNGateExps.Type, layer.FFNGateExps.Cols)
-	upBpr := quant.BytesForN(layer.FFNUpExps.Type, layer.FFNUpExps.Cols)
 	downBpr := quant.BytesForN(layer.FFNDownExps.Type, layer.FFNDownExps.Cols)
 
 	gateSlices := make([]blas.ExpertSlice, 0, nUsed)
 	upSlices := make([]blas.ExpertSlice, 0, nUsed)
 	activeExperts := make([]int, 0, nUsed)
+
+	fused := layer.FFNGateUpExps != nil
+	var gateTensor, upTensor *core.QuantizedTensor
+	if fused {
+		gateTensor = layer.FFNGateUpExps
+		upTensor = layer.FFNGateUpExps
+	} else {
+		gateTensor = layer.FFNGateExps
+		upTensor = layer.FFNUpExps
+	}
+	bpr := quant.BytesForN(gateTensor.Type, gateTensor.Cols)
 
 	for e := 0; e < nUsed; e++ {
 		idx := indices[e]
@@ -613,16 +641,26 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 			continue
 		}
 		activeExperts = append(activeExperts, e)
-		gateSlices = append(gateSlices, blas.ExpertSlice{
-			Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * gateBpr,
-		})
-		upSlices = append(upSlices, blas.ExpertSlice{
-			Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * upBpr,
-		})
+		if fused {
+			// Fused layout: per expert [gate_rows, up_rows] interleaved
+			gateSlices = append(gateSlices, blas.ExpertSlice{
+				Out: rs.MoEGates[e], Rows: expDim, Off: idx * 2 * expDim * bpr,
+			})
+			upSlices = append(upSlices, blas.ExpertSlice{
+				Out: rs.MoEUps[e], Rows: expDim, Off: (idx*2 + 1) * expDim * bpr,
+			})
+		} else {
+			gateSlices = append(gateSlices, blas.ExpertSlice{
+				Out: rs.MoEGates[e], Rows: expDim, Off: idx * expDim * bpr,
+			})
+			upSlices = append(upSlices, blas.ExpertSlice{
+				Out: rs.MoEUps[e], Rows: expDim, Off: idx * expDim * bpr,
+			})
+		}
 	}
 
 	// Single dispatch: all experts' gate+up projections
-	blas.QDualMultiExpertMatVec(layer.FFNGateExps, layer.FFNUpExps,
+	blas.QDualMultiExpertMatVec(gateTensor, upTensor,
 		gateSlices, upSlices, input, pool)
 
 	// SwiGLU for all active experts

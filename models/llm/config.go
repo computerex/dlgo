@@ -40,12 +40,13 @@ type ModelConfig struct {
 	ChatTemplate  string   // chat format: "chatml", "llama2", "llama3", "gemma", "phi"
 
 	// Qwen3.5 hybrid Mamba/Attention
-	FullAttentionInterval int // 0 = all attention; N = every Nth layer is attention
+	FullAttentionInterval int  // 0 = all attention; N = every Nth layer is attention
 	SSMConvKernel         int
 	SSMInnerSize          int
 	SSMStateSize          int
 	SSMTimeStepRank       int
 	SSMGroupCount         int
+	SSMTiledVOrder        bool // true = GGUF V heads in tiled order (Qwen3.5); false = grouped (Qwen3Next)
 
 	// MoE (Mixture of Experts)
 	ExpertCount          int     // 0 = dense (no MoE); >0 = number of experts per layer
@@ -166,6 +167,8 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	}
 
 	applyArchDefaults(&c)
+
+	
 
 	// Parse stop tokens from GGUF metadata
 	if eosArr, ok := md["tokenizer.ggml.eos_token_id"].([]interface{}); ok {

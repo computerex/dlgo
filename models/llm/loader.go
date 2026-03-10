@@ -94,6 +94,16 @@ func LoadModel(path string) (*Model, error) {
 		m.Output = m.TokenEmbed
 	}
 
+	// Split fused BA tensors into separate SSMAlpha/SSMBeta for GPU compatibility.
+	// The fused tensor has interleaved columns: [beta_g0..., alpha_g0..., beta_g1..., alpha_g1...]
+	// per KV group. We dequantize and rearrange into two FP32 matrices.
+	for i := range m.Layers {
+		l := &m.Layers[i]
+		if l.SSMFusedBA != nil && l.SSMAlpha == nil && l.SSMBeta == nil {
+			splitSSMFusedBA(l, cfg)
+		}
+	}
+
 	// Resolve per-layer specs from loaded tensor presence
 	for i := range m.Layers {
 		m.Layers[i].Spec = resolveLayerSpec(&m.Layers[i], cfg, i)
@@ -129,7 +139,7 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 		s.Residual = ResParallel
 	}
 
-	if l.FFNRouter != nil && l.FFNGateExps != nil {
+	if l.FFNRouter != nil && (l.FFNGateExps != nil || l.FFNGateUpExps != nil) {
 		if cfg.Architecture == "gpt-oss" {
 			s.FFN = FFNMoESwiOAI
 		} else {
@@ -196,6 +206,7 @@ func PinLayerToRAM(l *Layer) {
 	pinTensor(l.FFNRouter)
 	pinTensor(l.FFNGateExps)
 	pinTensor(l.FFNUpExps)
+	pinTensor(l.FFNGateUpExps)
 	pinTensor(l.FFNDownExps)
 	pinTensor(l.FFNGateShared)
 	pinTensor(l.FFNUpShared)
@@ -230,6 +241,7 @@ func EstimateLayerBytes(l *Layer) int64 {
 	add(l.FFNRouter)
 	add(l.FFNGateExps)
 	add(l.FFNUpExps)
+	add(l.FFNGateUpExps)
 	add(l.FFNDownExps)
 	add(l.FFNGateShared)
 	add(l.FFNUpShared)
@@ -397,6 +409,8 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 			l.FFNGateExps = qt
 		case "ffn_up_exps.weight":
 			l.FFNUpExps = qt
+		case "ffn_gate_up_exps.weight":
+			l.FFNGateUpExps = qt
 		case "ffn_down_exps.weight":
 			l.FFNDownExps = qt
 		case "ffn_gate_shexp.weight":
@@ -449,6 +463,43 @@ func splitFusedFFNUp(l *Layer, qt *core.QuantizedTensor, ffnDim, cols int) {
 	} else {
 		l.FFNUp = qt
 	}
+}
+
+// splitSSMFusedBA dequantizes the fused BA weight matrix and splits it into
+// separate SSMAlpha and SSMBeta FP32 matrices. The fused tensor's columns are
+// interleaved per KV group: [beta_g0_v0..vN, alpha_g0_v0..vN, beta_g1_..., ...]
+func splitSSMFusedBA(l *Layer, cfg ModelConfig) {
+	fused := l.SSMFusedBA
+	dim := fused.Cols // input dimension
+	numHeads := cfg.SSMTimeStepRank
+	numKVGroups := cfg.SSMGroupCount
+	if numKVGroups <= 0 {
+		numKVGroups = numHeads
+	}
+	vPerGroup := numHeads / numKVGroups
+
+	alphaData := make([]float32, numHeads*dim)
+	betaData := make([]float32, numHeads*dim)
+	rowBuf := make([]float32, fused.Cols)
+
+	for row := 0; row < fused.Rows; row++ {
+		_ = fused.DequantizeRow(row, rowBuf)
+		// Row layout: [beta_g0_v0..vN, alpha_g0_v0..vN, beta_g1_..., ...]
+		// Determine which output head/type this row maps to
+		g := row / (vPerGroup * 2)
+		posInGroup := row % (vPerGroup * 2)
+		if posInGroup < vPerGroup {
+			headIdx := g*vPerGroup + posInGroup
+			copy(betaData[headIdx*dim:(headIdx+1)*dim], rowBuf)
+		} else {
+			headIdx := g*vPerGroup + (posInGroup - vPerGroup)
+			copy(alphaData[headIdx*dim:(headIdx+1)*dim], rowBuf)
+		}
+	}
+
+	l.SSMAlpha = &core.QuantizedTensor{FP32Data: alphaData, Type: 0, Rows: numHeads, Cols: dim}
+	l.SSMBeta = &core.QuantizedTensor{FP32Data: betaData, Type: 0, Rows: numHeads, Cols: dim}
+	l.SSMFusedBA = nil
 }
 
 // parseLayerName extracts layer index and field name from "blk.{i}.{field}" patterns.
