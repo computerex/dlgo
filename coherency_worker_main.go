@@ -64,7 +64,7 @@ func main() {
 	prompt := llm.FormatChat(cfg, "You are a helpful assistant.", "Write a Python function that checks if a number is prime. Include docstring and examples.")
 
 	genCfg := llm.DefaultGenerateConfig()
-	genCfg.MaxTokens = 128
+	genCfg.MaxTokens = 256
 	genCfg.Seed = 42
 	genCfg.Sampler.Temperature = 0
 

@@ -115,6 +115,8 @@ typedef enum {
     PIPE_MATVEC_Q5_K_DP4A_MOE,
     PIPE_MATVEC_MXFP4_DP4A_MOE,
     PIPE_MOE_ACCUMULATE,
+    PIPE_SWIGLU_OAI_BIAS_MOE,
+    PIPE_MOE_BIAS_ADD,
     PIPE_COUNT
 } PipelineID;
 
@@ -143,6 +145,13 @@ int gpu_moe_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf,
 int gpu_moe_accumulate(GpuBuf out_buf, GpuBuf exp_outs_buf, GpuBuf weights_buf,
                        GpuBuf bias_buf, GpuBuf indices_buf,
                        int dim, int n_used, int has_bias);
+
+int gpu_swiglu_oai_bias_moe(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                            GpuBuf gate_bias_buf, GpuBuf up_bias_buf, GpuBuf indices_buf,
+                            int total_n, float alpha, float limit, int exp_dim);
+
+int gpu_moe_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf indices_buf,
+                     int exp_dim, int n_used);
 
 int gpu_swiglu_at(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
                   int out_off, int gate_off, int up_off, int n);
@@ -281,6 +290,7 @@ typedef struct {
     GpuBuf q8_1_scratch; // Q8_1 scratch buffer (reused for each quantize step)
     int use_dp4a;        // 1 to use dp4a path, 0 for float path
     int core_type;       // 0=attention, 1=SSM (skip attn, Go fills attn_proj)
+    GpuBuf attn_sinks;   // learned sink logits per head (0 if not used)
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.

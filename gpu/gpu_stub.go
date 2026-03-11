@@ -37,6 +37,8 @@ func QuantizeQ8_1(q, f Buf, n int) error     { return errNoGPU }
 func MatVecOffsetDp4a(o Buf, oo int, w Buf, wo int, q Buf, r, c int, t uint32) error { return errNoGPU }
 func MoEMatVecDp4a(o, w, q, i Buf, r, c int, t uint32, es, bo, si, nu int) error    { return errNoGPU }
 func MoEAccumulate(o, e, w, b, i Buf, d, n int, h bool) error                      { return errNoGPU }
+func SwiGLU_OAI_Bias_MoE(o, g, u, gb, ub, i Buf, tn int, a, l float32, ed int) error { return errNoGPU }
+func MoEBiasAdd(d, b, i Buf, ed, nu int) error                                    { return errNoGPU }
 func SwiGLUAt(o, g, u Buf, oo, go_, uo, n int) error                               { return errNoGPU }
 func SwiGLU_OAI_At(o, g, u Buf, oo, go_, uo, n int, a, l float32) error            { return errNoGPU }
 func QuantizeQ8_1At(q Buf, qo int, f Buf, fo, n int) error                         { return errNoGPU }
@@ -50,6 +52,7 @@ type LayerConf struct{}
 func NewLayerConf() *LayerConf                                            { return nil }
 func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf) {}
 func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, qn, kn Buf) {}
+func (lc *LayerConf) SetAttnSinks(s Buf) {}
 func (lc *LayerConf) SetFFN(fn Buf, gate, up, down *GpuTensor, pan, pfn Buf) {}
 func (lc *LayerConf) SetFFNMoE(fn Buf, pan Buf)                          {}
 func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}

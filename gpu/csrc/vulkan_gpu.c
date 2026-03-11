@@ -1131,7 +1131,7 @@ int gpu_matvec_offset_dp4a(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
-        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; rows_per_wg = 1; break;
+        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; break;
         default:
             return gpu_matvec_offset(out_buf, out_offset_bytes, weights_buf,
                                      weights_offset_bytes, q8_1_buf, rows, cols, qtype);
@@ -1215,6 +1215,53 @@ int gpu_moe_accumulate(GpuBuf out_buf, GpuBuf exp_outs_buf, GpuBuf weights_buf,
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = (dim + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_swiglu_oai_bias_moe(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                            GpuBuf gate_bias_buf, GpuBuf up_bias_buf, GpuBuf indices_buf,
+                            int total_n, float alpha, float limit, int exp_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int total_n; float alpha; float limit; int exp_dim; } pc = {
+        total_n, alpha, limit, exp_dim
+    };
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SWIGLU_OAI_BIAS_MOE;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = gate_buf;
+    dp.bufs[2] = up_buf;
+    dp.bufs[3] = gate_bias_buf;
+    dp.bufs[4] = up_bias_buf;
+    dp.bufs[5] = indices_buf;
+    dp.num_bufs = 6;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total_n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_moe_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf indices_buf,
+                     int exp_dim, int n_used) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int exp_dim; int n_used; } pc = {exp_dim, n_used};
+    int total = n_used * exp_dim;
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_MOE_BIAS_ADD;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = bias_buf;
+    dp.bufs[2] = indices_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total + 255) / 256;
     dp.groups_y = 1;
     dp.groups_z = 1;
     return dispatch_compute(&dp);
@@ -1619,7 +1666,7 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
-        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; rows_per_wg = 1; break;
+        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; break;
         default: return gpu_matvec(out_buf, weights_buf, q8_1_buf, rows, cols, qtype);
     }
 
@@ -2105,8 +2152,13 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
         gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
 
-        gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                      num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
+        if (lc->attn_sinks) {
+            gpu_attention_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
+        } else {
+            gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                          num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
+        }
 
         gpu_barrier();
         if (lc->use_dp4a && lc->q8_1_scratch) {

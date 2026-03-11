@@ -598,8 +598,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		RoPESinTable:    ropeSinTable,
 	}
 
-	// Only use fused forward when ALL layers are on GPU and model has no MoE
-	if !isPartial && cfg.ExpertCount == 0 {
+	// Use fused forward when ALL layers are on GPU (including MoE models).
+	// For MoE: C side handles attention + residual + norm, returns early (ffn_type=3);
+	// Go side then handles MoE FFN dispatch.
+	if !isPartial {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 
@@ -873,9 +875,13 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 		}
 	} else if !p.UseFusedForward {
-		// Per-token prefill using GpuForward (has CPU fallback for unsupported quant types)
 		for i, tok := range tokens {
 			GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
+		}
+	} else if p.HasMoE {
+		// MoE prefill: per-token fused forward (batch prefill not yet supported for MoE)
+		for i, tok := range tokens {
+			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 		}
 	} else {
 		isHybrid := isHybridSSMModel(p.CPUModel)

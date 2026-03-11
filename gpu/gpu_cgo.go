@@ -435,6 +435,29 @@ func MoEAccumulate(out, expOuts, weights, bias, indices Buf,
 	return nil
 }
 
+// SwiGLU_OAI_Bias_MoE performs fused SwiGLU+bias with per-expert bias using GPU-side indices.
+func SwiGLU_OAI_Bias_MoE(out, gate, up, gateBias, upBias, indices Buf,
+	totalN int, alpha, limit float32, expDim int) error {
+	rc := C.gpu_swiglu_oai_bias_moe(
+		C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up),
+		C.GpuBuf(gateBias), C.GpuBuf(upBias), C.GpuBuf(indices),
+		C.int(totalN), C.float(alpha), C.float(limit), C.int(expDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: swiglu_oai_bias_moe failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoEBiasAdd adds per-expert biases to data using GPU-side expert indices.
+func MoEBiasAdd(data, bias, indices Buf, expDim, nUsed int) error {
+	rc := C.gpu_moe_bias_add(C.GpuBuf(data), C.GpuBuf(bias), C.GpuBuf(indices),
+		C.int(expDim), C.int(nUsed))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_bias_add failed (%d)", rc)
+	}
+	return nil
+}
+
 // BeginBatch starts recording GPU operations into a single command buffer.
 // All subsequent GPU calls are batched until EndBatch.
 func BeginBatch() { C.gpu_begin_batch() }
@@ -509,6 +532,10 @@ func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
 	lc.c.bv = C.GpuBuf(bv)
 	lc.c.q_norm_w = C.GpuBuf(qNorm)
 	lc.c.k_norm_w = C.GpuBuf(kNorm)
+}
+
+func (lc *LayerConf) SetAttnSinks(sinks Buf) {
+	lc.c.attn_sinks = C.GpuBuf(sinks)
 }
 
 func (lc *LayerConf) SetFFN(ffnNorm Buf, gate, up, down *GpuTensor,

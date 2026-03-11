@@ -59,7 +59,9 @@ $shaders = @(
     @{name="matvec_q3_k_dp4a_moe"; file="matvec_q3_k_dp4a_moe.comp"},
     @{name="matvec_q5_k_dp4a_moe"; file="matvec_q5_k_dp4a_moe.comp"},
     @{name="matvec_mxfp4_dp4a_moe"; file="matvec_mxfp4_dp4a_moe.comp"},
-    @{name="moe_accumulate"; file="moe_accumulate.comp"}
+    @{name="moe_accumulate"; file="moe_accumulate.comp"},
+    @{name="swiglu_oai_bias_moe"; file="swiglu_oai_bias_moe.comp"},
+    @{name="moe_bias_add"; file="moe_bias_add.comp"}
 )
 
 $header = @"
@@ -174,6 +176,8 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_q5_k_dp4a_moe", spv_matvec_q5_k_dp4a_moe, spv_matvec_q5_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q5_K_DP4A_MOE
     {"matvec_mxfp4_dp4a_moe", spv_matvec_mxfp4_dp4a_moe, spv_matvec_mxfp4_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_MXFP4_DP4A_MOE
     {"moe_accumulate", spv_moe_accumulate, spv_moe_accumulate_size, 5, 12}, // PIPE_MOE_ACCUMULATE
+    {"swiglu_oai_bias_moe", spv_swiglu_oai_bias_moe, spv_swiglu_oai_bias_moe_size, 6, 16}, // PIPE_SWIGLU_OAI_BIAS_MOE
+    {"moe_bias_add", spv_moe_bias_add, spv_moe_bias_add_size, 3, 8}, // PIPE_MOE_BIAS_ADD
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

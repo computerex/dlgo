@@ -15,8 +15,13 @@ struct block_q8_1 {
     int32_t qs[8];
 };
 
+struct block_mxfp4 {
+    uint8_t e;
+    uint8_t qs[16];
+};
+
 layout(set = 0, binding = 0) buffer Out { float out_data[]; };
-layout(scalar, set = 0, binding = 1) readonly buffer A { uint data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_mxfp4 data_a[]; };
 layout(scalar, set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
 
 layout(push_constant) uniform Params {
@@ -29,14 +34,6 @@ const int8_t kvalues_c[16] = int8_t[16](
     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12)
 );
 shared int8_t kvalues[16];
-
-uint load_u32(uint byte_off) {
-    uint word = byte_off >> 2u;
-    uint shift = (byte_off & 3u) << 3u;
-    uint lo = data_a[word];
-    if (shift == 0u) return lo;
-    return (lo >> shift) | (data_a[word + 1u] << (32u - shift));
-}
 
 float e8m0_to_f32(uint e) {
     if (e < 2u) return uintBitsToFloat(0x00200000u << e);
@@ -81,10 +78,15 @@ void main() {
             uint a_blk = row * bpr + (col >> 5u);
             uint b_ib = col >> 5u;
 
-            uint byte_off = a_blk * 17u;
-            float da = e8m0_to_f32(load_u32(byte_off) & 0xFFu);
+            float da = e8m0_to_f32(uint(data_a[a_blk].e));
 
-            uint qs_packed = load_u32(byte_off + 1u + b_qs_idx * 4u);
+            uint qs_off = b_qs_idx * 4u;
+            uint32_t qs_packed = pack32(u8vec4(
+                data_a[a_blk].qs[qs_off],
+                data_a[a_blk].qs[qs_off + 1u],
+                data_a[a_blk].qs[qs_off + 2u],
+                data_a[a_blk].qs[qs_off + 3u]
+            ));
             int32_t a_lo = pack_kvalues(qs_packed & 0x0F0F0F0Fu);
             int32_t a_hi = pack_kvalues((qs_packed >> 4u) & 0x0F0F0F0Fu);
 
@@ -105,10 +107,15 @@ void main() {
         uint a_blk = row * bpr + (col >> 5u);
         uint b_ib = col >> 5u;
 
-        uint byte_off = a_blk * 17u;
-        float da = e8m0_to_f32(load_u32(byte_off) & 0xFFu);
+        float da = e8m0_to_f32(uint(data_a[a_blk].e));
 
-        uint qs_packed = load_u32(byte_off + 1u + b_qs_idx * 4u);
+        uint qs_off = b_qs_idx * 4u;
+        uint32_t qs_packed = pack32(u8vec4(
+            data_a[a_blk].qs[qs_off],
+            data_a[a_blk].qs[qs_off + 1u],
+            data_a[a_blk].qs[qs_off + 2u],
+            data_a[a_blk].qs[qs_off + 3u]
+        ));
         int32_t a_lo = pack_kvalues(qs_packed & 0x0F0F0F0Fu);
         int32_t a_hi = pack_kvalues((qs_packed >> 4u) & 0x0F0F0F0Fu);
 
