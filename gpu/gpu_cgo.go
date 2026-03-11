@@ -346,6 +346,95 @@ func PagedAttention(out, q, kPool, vPool, blockTable Buf,
 // Sync waits for all GPU operations to complete.
 func Sync() { C.gpu_sync() }
 
+// HasDp4a returns true if the GPU supports integer dot product (dp4a) acceleration.
+func HasDp4a() bool { return C.gpu_has_dp4a() != 0 }
+
+// QuantizeQ8_1 quantizes an f32 buffer to Q8_1 format for dp4a operations.
+func QuantizeQ8_1(q8_1Buf, f32Buf Buf, nElements int) error {
+	rc := C.gpu_quantize_q8_1(C.GpuBuf(q8_1Buf), C.GpuBuf(f32Buf), C.int(nElements))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: quantize_q8_1 failed (%d)", rc)
+	}
+	return nil
+}
+
+// MatVecOffsetDp4a performs dp4a integer dot product matvec with byte offsets into packed tensors.
+func MatVecOffsetDp4a(out Buf, outOff int, weights Buf, weightsOff int, q8_1 Buf,
+	rows, cols int, qtype uint32) error {
+	rc := C.gpu_matvec_offset_dp4a(C.GpuBuf(out), C.int(outOff),
+		C.GpuBuf(weights), C.int(weightsOff),
+		C.GpuBuf(q8_1), C.int(rows), C.int(cols), C.int(qtype))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: matvec_offset_dp4a failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoEMatVecDp4a dispatches batched dp4a MoE matvec for all active experts.
+// Expert indices stay on GPU — no CPU download needed.
+// Output is interleaved: out[slot * rows + row] for each expert slot.
+func MoEMatVecDp4a(out, weights, q8_1, indices Buf,
+	rows, cols int, qtype uint32,
+	expertStride, baseOffset, sharedInput, nUsed int) error {
+	rc := C.gpu_moe_matvec_dp4a(
+		C.GpuBuf(out), C.GpuBuf(weights),
+		C.GpuBuf(q8_1), C.GpuBuf(indices),
+		C.int(rows), C.int(cols), C.int(qtype),
+		C.int(expertStride), C.int(baseOffset),
+		C.int(sharedInput), C.int(nUsed))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_matvec_dp4a failed (%d)", rc)
+	}
+	return nil
+}
+
+// SwiGLUAt dispatches SwiGLU with byte offsets into the buffers.
+func SwiGLUAt(out, gate, up Buf, outOff, gateOff, upOff, n int) error {
+	rc := C.gpu_swiglu_at(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up),
+		C.int(outOff), C.int(gateOff), C.int(upOff), C.int(n))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: swiglu_at failed (%d)", rc)
+	}
+	return nil
+}
+
+// SwiGLU_OAI_At dispatches SwiGLU_OAI with byte offsets.
+func SwiGLU_OAI_At(out, gate, up Buf, outOff, gateOff, upOff, n int, alpha, limit float32) error {
+	rc := C.gpu_swiglu_oai_at(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up),
+		C.int(outOff), C.int(gateOff), C.int(upOff),
+		C.int(n), C.float(alpha), C.float(limit))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: swiglu_oai_at failed (%d)", rc)
+	}
+	return nil
+}
+
+// QuantizeQ8_1At quantizes f32 to Q8_1 with byte offsets for packed MoE buffers.
+func QuantizeQ8_1At(q8Buf Buf, q8Off int, f32Buf Buf, f32Off, nElements int) error {
+	rc := C.gpu_quantize_q8_1_at(C.GpuBuf(q8Buf), C.int(q8Off), C.GpuBuf(f32Buf), C.int(f32Off), C.int(nElements))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: quantize_q8_1_at failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoEAccumulate performs weighted accumulation of expert outputs using GPU-side weights and indices.
+func MoEAccumulate(out, expOuts, weights, bias, indices Buf,
+	dim, nUsed int, hasBias bool) error {
+	hb := 0
+	if hasBias {
+		hb = 1
+	}
+	rc := C.gpu_moe_accumulate(
+		C.GpuBuf(out), C.GpuBuf(expOuts), C.GpuBuf(weights),
+		C.GpuBuf(bias), C.GpuBuf(indices),
+		C.int(dim), C.int(nUsed), C.int(hb))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_accumulate failed (%d)", rc)
+	}
+	return nil
+}
+
 // BeginBatch starts recording GPU operations into a single command buffer.
 // All subsequent GPU calls are batched until EndBatch.
 func BeginBatch() { C.gpu_begin_batch() }

@@ -189,6 +189,19 @@ type GpuRunState struct {
 	MoEShHidden Buf // [sharedFFNDim] shared expert hidden
 	MoEShOut    Buf // [dim] shared expert output
 
+	// dp4a acceleration for MoE expert projections
+	MoEQ8_1Scratch      Buf    // Q8_1 quantized input (dim) for dp4a gate/up projections
+	MoEQ8_1DownPacked   Buf    // packed Q8_1 buffer [nUsed * q8_blocks(expDim) * 36]
+	MoEQ8_1DownBufs     []Buf  // per-expert Q8_1 scratch (expDim) for dp4a down projections (fallback)
+	MoEUseDp4a          bool   // true if dp4a should be used for MoE expert projections
+
+	// Fused MoE dp4a buffers (interleaved [nUsed * dim/expDim])
+	MoEGateScratch   Buf // [nUsed * expDim] interleaved gate outputs
+	MoEUpScratch     Buf // [nUsed * expDim] interleaved up outputs
+	MoEHiddenScratch Buf // [nUsed * expDim] interleaved hidden outputs
+	MoEOutScratch    Buf // [nUsed * dim] interleaved down outputs
+	MoEWeightsBuf    Buf // [nUsed] weights for accumulation
+
 	// CPU scratch buffers used for correctness fallbacks when a quant type
 	// has no GPU kernel yet (for example Q3_K on Vulkan).
 	ScratchIn  []float32

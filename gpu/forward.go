@@ -1222,6 +1222,15 @@ func supportsGPUQType(qtype uint32) bool {
 }
 
 
+func hasDp4aQType(qtype uint32) bool {
+	switch qtype {
+	case 2, 6, 8, 10, 12, 13, 14, 39: // Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4
+		return true
+	default:
+		return false
+	}
+}
+
 func ensureScratch(buf []float32, n int) []float32 {
 	if cap(buf) < n {
 		return make([]float32, n)
@@ -1281,8 +1290,52 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		rs.MoEShUp = Alloc(uint64(shDim * 4))
 		rs.MoEShHidden = Alloc(uint64(shDim * 4))
 		rs.MoEShOut = Alloc(uint64(dim * 4))
+
+		if rs.MoEUseDp4a {
+			q8BlocksDim := (dim + 31) / 32
+			rs.MoEQ8_1Scratch = Alloc(uint64(q8BlocksDim) * 36)
+
+			q8BlocksExp := (expDim + 31) / 32
+			rs.MoEQ8_1DownPacked = Alloc(uint64(nUsed) * uint64(q8BlocksExp) * 36)
+			rs.MoEQ8_1DownBufs = make([]Buf, nUsed)
+			for e := 0; e < nUsed; e++ {
+				rs.MoEQ8_1DownBufs[e] = Alloc(uint64(q8BlocksExp) * 36)
+			}
+
+			rs.MoEGateScratch = Alloc(uint64(nUsed * expDim * 4))
+			rs.MoEUpScratch = Alloc(uint64(nUsed * expDim * 4))
+			rs.MoEHiddenScratch = Alloc(uint64(nUsed * expDim * 4))
+			rs.MoEOutScratch = Alloc(uint64(nUsed * dim * 4))
+			rs.MoEWeightsBuf = Alloc(uint64(nUsed * 4))
+		}
 	}
 
+	fused := gl.FFNGateUpExps != nil
+	var gateGpu, upGpu *GpuTensor
+	if fused {
+		gateGpu = gl.FFNGateUpExps
+		upGpu = gl.FFNGateUpExps
+	} else {
+		gateGpu = gl.FFNGateExps
+		upGpu = gl.FFNUpExps
+	}
+	bpr := quant.BytesForN(gateGpu.Type, gateGpu.Cols)
+	downBpr := quant.BytesForN(gl.FFNDownExps.Type, gl.FFNDownExps.Cols)
+
+	hasBias := gl.FFNGateExpsBias != 0 && gl.FFNUpExpsBias != 0
+	isOAI := layer.Spec.FFN == llm.FFNMoESwiOAI
+
+	useFusedDp4a := rs.MoEUseDp4a && rs.MoEQ8_1Scratch != 0 &&
+		rs.MoEGateScratch != 0 &&
+		hasDp4aQType(gateGpu.Type) && hasDp4aQType(uint32(gl.FFNDownExps.Type)) &&
+		!hasBias && !diagL
+
+	if useFusedDp4a {
+		return gpuForwardMoEFFNFused(gl, layer, rs, cfg, dim, expDim, nUsed,
+			gateGpu, upGpu, bpr, downBpr, fused, isOAI)
+	}
+
+	// Fallback: per-expert dispatch with Sync for top-K indices
 	// 1. Router + top-K entirely on GPU
 	Barrier()
 	MatVec(rs.MoELogits, gl.FFNRouter.Buf, rs.FFNNorm,
@@ -1295,7 +1348,6 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	MoETopK(rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
 		cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc)
 
-	// Download only top-K results (K indices + K weights = tiny)
 	Sync()
 	idxBuf := make([]float32, nUsed)
 	weights := make([]float32, nUsed)
@@ -1303,12 +1355,8 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	DownloadF32(rs.MoETopKW, weights)
 
 	indices := make([]int, nUsed)
-	activeCount := 0
 	for i := range idxBuf {
 		indices[i] = int(idxBuf[i])
-		if indices[i] >= 0 {
-			activeCount++
-		}
 	}
 
 	if diagL {
@@ -1336,26 +1384,15 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		}
 	}
 
-	// 2. Batched expert projections — all experts in parallel between barriers
-	fused := gl.FFNGateUpExps != nil
-	var gateGpu, upGpu *GpuTensor
-	if fused {
-		gateGpu = gl.FFNGateUpExps
-		upGpu = gl.FFNGateUpExps
-	} else {
-		gateGpu = gl.FFNGateExps
-		upGpu = gl.FFNUpExps
-	}
-	bpr := quant.BytesForN(gateGpu.Type, gateGpu.Cols)
-	downBpr := quant.BytesForN(gl.FFNDownExps.Type, gl.FFNDownExps.Cols)
-
-	hasBias := gl.FFNGateExpsBias != 0 && gl.FFNUpExpsBias != 0
-	isOAI := layer.Spec.FFN == llm.FFNMoESwiOAI
+	useDp4a := rs.MoEUseDp4a && rs.MoEQ8_1Scratch != 0 &&
+		hasDp4aQType(gateGpu.Type) && hasDp4aQType(uint32(gl.FFNDownExps.Type))
 
 	BeginBatch()
 	ZeroFill(rs.FFNOut, uint64(dim*4))
 
-	// Phase A: dispatch ALL experts' gate + up projections in one batch
+	if useDp4a {
+		QuantizeQ8_1(rs.MoEQ8_1Scratch, rs.FFNNorm, dim)
+	}
 	Barrier()
 	for e := 0; e < nUsed; e++ {
 		idx := indices[e]
@@ -1370,13 +1407,19 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 			gateOff = idx * expDim * bpr
 			upOff = idx * expDim * bpr
 		}
-		MatVecOffset(rs.MoEGates[e], 0, gateGpu.Buf, gateOff, rs.FFNNorm,
-			expDim, gateGpu.Cols, gateGpu.Type)
-		MatVecOffset(rs.MoEUps[e], 0, upGpu.Buf, upOff, rs.FFNNorm,
-			expDim, upGpu.Cols, upGpu.Type)
+		if useDp4a {
+			MatVecOffsetDp4a(rs.MoEGates[e], 0, gateGpu.Buf, gateOff, rs.MoEQ8_1Scratch,
+				expDim, gateGpu.Cols, gateGpu.Type)
+			MatVecOffsetDp4a(rs.MoEUps[e], 0, upGpu.Buf, upOff, rs.MoEQ8_1Scratch,
+				expDim, upGpu.Cols, upGpu.Type)
+		} else {
+			MatVecOffset(rs.MoEGates[e], 0, gateGpu.Buf, gateOff, rs.FFNNorm,
+				expDim, gateGpu.Cols, gateGpu.Type)
+			MatVecOffset(rs.MoEUps[e], 0, upGpu.Buf, upOff, rs.FFNNorm,
+				expDim, upGpu.Cols, upGpu.Type)
+		}
 	}
 
-	// Phase B: dispatch ALL experts' activations in one batch
 	Barrier()
 	for e := 0; e < nUsed; e++ {
 		idx := indices[e]
@@ -1394,7 +1437,6 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		}
 	}
 
-	// Phase C: dispatch ALL experts' down projections in one batch
 	Barrier()
 	for e := 0; e < nUsed; e++ {
 		idx := indices[e]
@@ -1402,11 +1444,18 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 			continue
 		}
 		downOff := idx * dim * downBpr
-		MatVecOffset(rs.MoEOuts[e], 0, gl.FFNDownExps.Buf, downOff, rs.MoEHiddens[e],
-			dim, gl.FFNDownExps.Cols, gl.FFNDownExps.Type)
+		if useDp4a {
+			QuantizeQ8_1(rs.MoEQ8_1DownBufs[e], rs.MoEHiddens[e], expDim)
+			Barrier()
+			MatVecOffsetDp4a(rs.MoEOuts[e], 0, gl.FFNDownExps.Buf, downOff, rs.MoEQ8_1DownBufs[e],
+				dim, gl.FFNDownExps.Cols, uint32(gl.FFNDownExps.Type))
+			Barrier()
+		} else {
+			MatVecOffset(rs.MoEOuts[e], 0, gl.FFNDownExps.Buf, downOff, rs.MoEHiddens[e],
+				dim, gl.FFNDownExps.Cols, gl.FFNDownExps.Type)
+		}
 	}
 
-	// Phase D: down biases (if present)
 	if gl.FFNDownExpsBias != 0 {
 		Barrier()
 		for e := 0; e < nUsed; e++ {
@@ -1418,24 +1467,12 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		}
 	}
 
-	// Phase E: accumulate expert outputs into FFNOut (serialized to avoid WAW hazard)
 	for e := 0; e < nUsed; e++ {
 		if indices[e] < 0 {
 			continue
 		}
 		Barrier()
 		ScaleAdd(rs.FFNOut, rs.MoEOuts[e], dim, weights[e])
-	}
-
-	if diagL {
-		for e := 0; e < nUsed; e++ {
-			if indices[e] < 0 {
-				continue
-			}
-			if GpuDiag.Verbosity >= 2 {
-				GpuDiag.LogBuf("GPU", diagLayer, diagPos, fmt.Sprintf("MoE expert[%d] out (w=%.6f)", indices[e], weights[e]), rs.MoEOuts[e], dim)
-			}
-		}
 	}
 
 	// 3. Shared expert (if present)
@@ -1473,6 +1510,121 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	return nil
 }
 
+// gpuForwardMoEFFNFused runs the MoE FFN entirely on GPU using dp4a MoE shader variants.
+// No Sync() or CPU round-trip for expert indices — everything stays on GPU.
+func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig,
+	dim, expDim, nUsed int, gateGpu, upGpu *GpuTensor, bpr, downBpr int, fused, isOAI bool) error {
+
+	// Expert stride in uint32 words (for MoE shader: expert_stride in push constants)
+	gateStride := expDim * bpr / 4
+	downStride := dim * downBpr / 4
+
+	gateBaseOff := 0
+	upBaseOff := 0
+	if fused {
+		gateStride = 2 * expDim * bpr / 4
+		upBaseOff = expDim * bpr / 4
+	}
+
+	// 1. Router + top-K (all on GPU, no download)
+	Barrier()
+	MatVec(rs.MoELogits, gl.FFNRouter.Buf, rs.FFNNorm,
+		gl.FFNRouter.Rows, gl.FFNRouter.Cols, gl.FFNRouter.Type)
+	if gl.FFNRouterBias != 0 {
+		Barrier()
+		Add(rs.MoELogits, rs.MoELogits, gl.FFNRouterBias, cfg.ExpertCount)
+	}
+	Barrier()
+	MoETopK(rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
+		cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc)
+
+	// 2. Quantize input to Q8_1 (shared across all experts for gate/up)
+	Barrier()
+	QuantizeQ8_1(rs.MoEQ8_1Scratch, rs.FFNNorm, dim)
+
+	// 3. Gate + Up projections (single dispatch per projection, all experts via Y-dim)
+	Barrier()
+	MoEMatVecDp4a(rs.MoEGateScratch, gateGpu.Buf, rs.MoEQ8_1Scratch, rs.MoETopKIdx,
+		expDim, gateGpu.Cols, gateGpu.Type,
+		gateStride, gateBaseOff, 1, nUsed)
+	MoEMatVecDp4a(rs.MoEUpScratch, upGpu.Buf, rs.MoEQ8_1Scratch, rs.MoETopKIdx,
+		expDim, upGpu.Cols, upGpu.Type,
+		gateStride, upBaseOff, 1, nUsed)
+
+	// 4. SwiGLU activation per expert slot (using byte offsets into interleaved buffers)
+	Barrier()
+	hiddenBuf := rs.MoEHiddenScratch
+	if isOAI {
+		hiddenBuf = rs.MoEGateScratch
+	}
+	for e := 0; e < nUsed; e++ {
+		byteOff := e * expDim * 4
+		if isOAI {
+			SwiGLU_OAI_At(rs.MoEGateScratch, rs.MoEGateScratch, rs.MoEUpScratch,
+				byteOff, byteOff, byteOff, expDim, 1.702, 7.0)
+		} else {
+			SwiGLUAt(rs.MoEHiddenScratch, rs.MoEGateScratch, rs.MoEUpScratch,
+				byteOff, byteOff, byteOff, expDim)
+		}
+	}
+
+	// 5. Quantize hidden states into packed Q8_1 buffer
+	q8BlocksExp := (expDim + 31) / 32
+	q8BytesPerSlot := q8BlocksExp * 36
+	Barrier()
+	for e := 0; e < nUsed; e++ {
+		QuantizeQ8_1At(rs.MoEQ8_1DownPacked, e*q8BytesPerSlot,
+			hiddenBuf, e*expDim*4, expDim)
+	}
+
+	// 6. Down projections using MoE shader with shared_input=0
+	Barrier()
+	MoEMatVecDp4a(rs.MoEOutScratch, gl.FFNDownExps.Buf, rs.MoEQ8_1DownPacked, rs.MoETopKIdx,
+		dim, gl.FFNDownExps.Cols, uint32(gl.FFNDownExps.Type),
+		downStride, 0, 0, nUsed)
+
+	// 7. Weighted accumulation with GPU-side weights
+	Barrier()
+	ZeroFill(rs.FFNOut, uint64(dim*4))
+	hasDownBias := gl.FFNDownExpsBias != 0
+	MoEAccumulate(rs.FFNOut, rs.MoEOutScratch, rs.MoETopKW,
+		gl.FFNDownExpsBias, rs.MoETopKIdx,
+		dim, nUsed, hasDownBias)
+
+	// 8. Shared expert (if present)
+	if gl.FFNGateShared != nil {
+		Barrier()
+		MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
+			gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
+		MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
+			gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
+		Barrier()
+		shDim := gl.FFNGateShared.Rows
+		SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
+		Barrier()
+		MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
+			gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
+
+		if gl.FFNRouterShared != 0 {
+			Sync()
+			shInput := make([]float32, dim)
+			DownloadF32(rs.FFNNorm, shInput)
+			shGateW := make([]float32, dim)
+			DownloadF32(gl.FFNRouterShared, shGateW)
+			var dot float32
+			for i := 0; i < dim; i++ {
+				dot += shGateW[i] * shInput[i]
+			}
+			gate := float32(1.0 / (1.0 + math.Exp(-float64(dot))))
+			BeginBatch()
+			Scale(rs.MoEShOut, gate, dim)
+		}
+		Barrier()
+		Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
+	}
+
+	return nil
+}
 
 // topKIndices returns the indices and values of the top-K elements.
 func topKIndices(logits []float32, k int) ([]int, []float32) {

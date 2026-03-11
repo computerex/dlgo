@@ -49,7 +49,17 @@ $shaders = @(
     @{name="add_offset"; file="add_offset.comp"},
     @{name="scale_add"; file="scale_add.comp"},
     @{name="swiglu_oai_bias"; file="swiglu_oai_bias.comp"},
-    @{name="moe_topk"; file="moe_topk.comp"}
+    @{name="moe_topk"; file="moe_topk.comp"},
+    @{name="matvec_mxfp4_dp4a"; file="matvec_mxfp4_dp4a.comp"},
+    @{name="matvec_q4_0_dp4a_moe"; file="matvec_q4_0_dp4a_moe.comp"},
+    @{name="matvec_q5_0_dp4a_moe"; file="matvec_q5_0_dp4a_moe.comp"},
+    @{name="matvec_q8_0_dp4a_moe"; file="matvec_q8_0_dp4a_moe.comp"},
+    @{name="matvec_q4_k_dp4a_moe"; file="matvec_q4_k_dp4a_moe.comp"},
+    @{name="matvec_q6_k_dp4a_moe"; file="matvec_q6_k_dp4a_moe.comp"},
+    @{name="matvec_q3_k_dp4a_moe"; file="matvec_q3_k_dp4a_moe.comp"},
+    @{name="matvec_q5_k_dp4a_moe"; file="matvec_q5_k_dp4a_moe.comp"},
+    @{name="matvec_mxfp4_dp4a_moe"; file="matvec_mxfp4_dp4a_moe.comp"},
+    @{name="moe_accumulate"; file="moe_accumulate.comp"}
 )
 
 $header = @"
@@ -154,6 +164,16 @@ static const ShaderInfo shader_registry[] = {
     {"scale_add",      spv_scale_add,      spv_scale_add_size,      2, 8},   // PIPE_SCALE_ADD
     {"swiglu_oai_bias", spv_swiglu_oai_bias, spv_swiglu_oai_bias_size, 5, 20}, // PIPE_SWIGLU_OAI_BIAS
     {"moe_topk",       spv_moe_topk,       spv_moe_topk_size,       3, 12},  // PIPE_MOE_TOPK
+    {"matvec_mxfp4_dp4a", spv_matvec_mxfp4_dp4a, spv_matvec_mxfp4_dp4a_size, 3, 8}, // PIPE_MATVEC_MXFP4_DP4A
+    {"matvec_q4_0_dp4a_moe", spv_matvec_q4_0_dp4a_moe, spv_matvec_q4_0_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q4_0_DP4A_MOE
+    {"matvec_q5_0_dp4a_moe", spv_matvec_q5_0_dp4a_moe, spv_matvec_q5_0_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q5_0_DP4A_MOE
+    {"matvec_q8_0_dp4a_moe", spv_matvec_q8_0_dp4a_moe, spv_matvec_q8_0_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q8_0_DP4A_MOE
+    {"matvec_q4_k_dp4a_moe", spv_matvec_q4_k_dp4a_moe, spv_matvec_q4_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q4_K_DP4A_MOE
+    {"matvec_q6_k_dp4a_moe", spv_matvec_q6_k_dp4a_moe, spv_matvec_q6_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q6_K_DP4A_MOE
+    {"matvec_q3_k_dp4a_moe", spv_matvec_q3_k_dp4a_moe, spv_matvec_q3_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q3_K_DP4A_MOE
+    {"matvec_q5_k_dp4a_moe", spv_matvec_q5_k_dp4a_moe, spv_matvec_q5_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q5_K_DP4A_MOE
+    {"matvec_mxfp4_dp4a_moe", spv_matvec_mxfp4_dp4a_moe, spv_matvec_mxfp4_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_MXFP4_DP4A_MOE
+    {"moe_accumulate", spv_moe_accumulate, spv_moe_accumulate_size, 5, 12}, // PIPE_MOE_ACCUMULATE
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

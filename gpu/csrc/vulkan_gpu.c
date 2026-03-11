@@ -144,6 +144,9 @@ static struct {
     int recording; // 1 = batching dispatches, 0 = immediate submit
     int dispatch_count; // number of dispatches in current batch
     int need_barrier; // 1 = insert barrier before next dispatch
+
+    // dp4a capability (VK_KHR_shader_integer_dot_product)
+    int has_dp4a;
 } g = {0};
 
 // ---------------------------------------------------------------------------
@@ -475,13 +478,19 @@ int gpu_init(void) {
     VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features2.pNext = &vk11;
 
-    const char* device_extensions[2];
+    int dp4a_ext = has_device_extension(g.physical_device, "VK_KHR_shader_integer_dot_product");
+    g.has_dp4a = dp4a_ext;
+
+    const char* device_extensions[4];
     uint32_t device_extension_count = 0;
     if (has_device_extension(g.physical_device, "VK_KHR_push_descriptor")) {
         device_extensions[device_extension_count++] = "VK_KHR_push_descriptor";
     }
     if (has_device_extension(g.physical_device, "VK_KHR_portability_subset")) {
         device_extensions[device_extension_count++] = "VK_KHR_portability_subset";
+    }
+    if (dp4a_ext) {
+        device_extensions[device_extension_count++] = "VK_KHR_shader_integer_dot_product";
     }
 
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -622,6 +631,7 @@ uint64_t gpu_vram_bytes(void) {
 }
 
 int gpu_is_initialized(void) { return g.initialized; }
+int gpu_has_dp4a(void) { return g.has_dp4a; }
 
 // ---------------------------------------------------------------------------
 // Buffer management
@@ -1103,6 +1113,113 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
     return dispatch_compute(&dp);
 }
 
+// gpu_matvec_offset_dp4a: dp4a integer dot product path for MoE expert projections.
+// Input is pre-quantized Q8_1 buffer. Weights at byte offset within packed expert tensor.
+int gpu_matvec_offset_dp4a(GpuBuf out_buf, int out_offset_bytes,
+                           GpuBuf weights_buf, int weights_offset_bytes,
+                           GpuBuf q8_1_buf, int rows, int cols, int qtype) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    PipelineID pipe;
+    int rows_per_wg = 4;
+    switch (qtype) {
+        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; break;
+        case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A; break;
+        case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
+        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
+        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; rows_per_wg = 1; break;
+        default:
+            return gpu_matvec_offset(out_buf, out_offset_bytes, weights_buf,
+                                     weights_offset_bytes, q8_1_buf, rows, cols, qtype);
+    }
+
+    struct { int rows; int cols; } pc = {rows, cols};
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = q8_1_buf;
+    dp.buf_offsets[0] = out_offset_bytes;
+    dp.buf_offsets[1] = weights_offset_bytes;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// gpu_moe_matvec_dp4a: batched dp4a MoE matvec for all active experts.
+// Expert indices come from GPU buffer (no CPU download needed).
+// Output is interleaved: out[slot * rows + row] for each expert slot.
+int gpu_moe_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf,
+                        GpuBuf q8_1_buf, GpuBuf indices_buf,
+                        int rows, int cols, int qtype,
+                        int expert_stride, int base_offset,
+                        int shared_input, int n_used) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    PipelineID pipe;
+    int rows_per_wg = 4;
+    switch (qtype) {
+        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A_MOE; break;
+        case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A_MOE; break;
+        case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A_MOE; break;
+        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A_MOE; rows_per_wg = 2; break;
+        case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A_MOE; rows_per_wg = 2; break;
+        case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A_MOE; rows_per_wg = 2; break;
+        case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A_MOE; rows_per_wg = 2; break;
+        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A_MOE; rows_per_wg = 4; break;
+        default: return GPU_ERR_DISPATCH;
+    }
+
+    struct { int rows; int cols; int expert_stride; int base_offset; int shared_input; } pc = {
+        rows, cols, expert_stride, base_offset, shared_input
+    };
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = q8_1_buf;
+    dp.bufs[3] = indices_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = n_used;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_moe_accumulate(GpuBuf out_buf, GpuBuf exp_outs_buf, GpuBuf weights_buf,
+                       GpuBuf bias_buf, GpuBuf indices_buf,
+                       int dim, int n_used, int has_bias) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int dim; int n_used; int has_bias; } pc = {dim, n_used, has_bias};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_MOE_ACCUMULATE;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = exp_outs_buf;
+    dp.bufs[2] = weights_buf;
+    dp.bufs[3] = bias_buf ? bias_buf : out_buf;
+    dp.bufs[4] = indices_buf;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (dim + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
@@ -1175,6 +1292,74 @@ int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, GpuBuf cos_table, GpuBuf sin_table,
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = (num_heads > num_kv_heads ? num_heads : num_kv_heads);
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_swiglu_at(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                  int out_off, int gate_off, int up_off, int n) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; } pc = {n};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SWIGLU;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = gate_buf;
+    dp.bufs[2] = up_buf;
+    dp.buf_offsets[0] = out_off;
+    dp.buf_offsets[1] = gate_off;
+    dp.buf_offsets[2] = up_off;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_swiglu_oai_at(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                      int out_off, int gate_off, int up_off,
+                      int n, float alpha, float limit) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; float alpha; float limit; } pc = {n, alpha, limit};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SWIGLU_OAI;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = gate_buf;
+    dp.bufs[2] = up_buf;
+    dp.buf_offsets[0] = out_off;
+    dp.buf_offsets[1] = gate_off;
+    dp.buf_offsets[2] = up_off;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_quantize_q8_1_at(GpuBuf q8_1_buf, int q8_off, GpuBuf f32_buf, int f32_off, int n_elements) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n_elements; } pc = {n_elements};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_QUANTIZE_Q8_1;
+    dp.bufs[0] = f32_buf;
+    dp.bufs[1] = q8_1_buf;
+    dp.buf_offsets[0] = f32_off;
+    dp.buf_offsets[1] = q8_off;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    int n_blocks = (n_elements + 31) / 32;
+    dp.groups_x = (n_blocks + 3) / 4;
     dp.groups_y = 1;
     dp.groups_z = 1;
     return dispatch_compute(&dp);
@@ -1434,6 +1619,7 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
+        case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; rows_per_wg = 1; break;
         default: return gpu_matvec(out_buf, weights_buf, q8_1_buf, rows, cols, qtype);
     }
 

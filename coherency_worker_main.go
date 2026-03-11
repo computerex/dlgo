@@ -58,13 +58,13 @@ func main() {
 	defer gpuPipe.FreeAll()
 
 	res.GPULayers = gpuPipe.NumGPULayers
-	// res.Dp4a = gpu.HasDp4a() // not in committed code
+	res.Dp4a = gpu.HasDp4a()
 
 	cfg := pipe.Model.Config
-	prompt := llm.FormatChat(cfg, "You are a helpful assistant.", "Explain what a computer is in one sentence.")
+	prompt := llm.FormatChat(cfg, "You are a helpful assistant.", "Write a Python function that checks if a number is prime. Include docstring and examples.")
 
 	genCfg := llm.DefaultGenerateConfig()
-	genCfg.MaxTokens = 32
+	genCfg.MaxTokens = 128
 	genCfg.Seed = 42
 	genCfg.Sampler.Temperature = 0
 
@@ -82,8 +82,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  %s: %.1f tok/s gpu=%d dp4a=%v pass=%v\n",
 		name, res.TokS, res.GPULayers, res.Dp4a, res.Pass)
 	preview := strings.TrimSpace(strings.ReplaceAll(result.Text, "\n", " "))
-	if len(preview) > 100 {
-		preview = preview[:100] + "..."
+	if len(preview) > 300 {
+		preview = preview[:300] + "..."
 	}
 	fmt.Fprintf(os.Stderr, "  Output: %s\n", preview)
 }

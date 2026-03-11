@@ -105,6 +105,16 @@ typedef enum {
     PIPE_SCALE_ADD,
     PIPE_SWIGLU_OAI_BIAS,
     PIPE_MOE_TOPK,
+    PIPE_MATVEC_MXFP4_DP4A,
+    PIPE_MATVEC_Q4_0_DP4A_MOE,
+    PIPE_MATVEC_Q5_0_DP4A_MOE,
+    PIPE_MATVEC_Q8_0_DP4A_MOE,
+    PIPE_MATVEC_Q4_K_DP4A_MOE,
+    PIPE_MATVEC_Q6_K_DP4A_MOE,
+    PIPE_MATVEC_Q3_K_DP4A_MOE,
+    PIPE_MATVEC_Q5_K_DP4A_MOE,
+    PIPE_MATVEC_MXFP4_DP4A_MOE,
+    PIPE_MOE_ACCUMULATE,
     PIPE_COUNT
 } PipelineID;
 
@@ -118,6 +128,28 @@ void gpu_shutdown(void);
 const char* gpu_device_name(void);
 uint64_t gpu_vram_bytes(void);
 int gpu_is_initialized(void);
+int gpu_has_dp4a(void);
+
+int gpu_matvec_offset_dp4a(GpuBuf out_buf, int out_offset_bytes,
+                           GpuBuf weights_buf, int weights_offset_bytes,
+                           GpuBuf q8_1_buf, int rows, int cols, int qtype);
+
+int gpu_moe_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf,
+                        GpuBuf q8_1_buf, GpuBuf indices_buf,
+                        int rows, int cols, int qtype,
+                        int expert_stride, int base_offset,
+                        int shared_input, int n_used);
+
+int gpu_moe_accumulate(GpuBuf out_buf, GpuBuf exp_outs_buf, GpuBuf weights_buf,
+                       GpuBuf bias_buf, GpuBuf indices_buf,
+                       int dim, int n_used, int has_bias);
+
+int gpu_swiglu_at(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                  int out_off, int gate_off, int up_off, int n);
+int gpu_swiglu_oai_at(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
+                      int out_off, int gate_off, int up_off,
+                      int n, float alpha, float limit);
+int gpu_quantize_q8_1_at(GpuBuf q8_1_buf, int q8_off, GpuBuf f32_buf, int f32_off, int n_elements);
 
 // Buffer management
 GpuBuf gpu_alloc(uint64_t size_bytes, int usage);
