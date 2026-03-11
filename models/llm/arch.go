@@ -202,10 +202,22 @@ func formatLlamaMessages(messages []Message) string {
 }
 
 // formatGemmaMessages formats messages using Gemma template.
+// Gemma only supports "user" and "model" roles, so system messages are
+// prepended to the first user message.
 // Format: <start_of_turn>user\ncontent<end_of_turn>\n<start_of_turn>model\n
 func formatGemmaMessages(messages []Message) string {
-	var b strings.Builder
+	var systemText string
+	var filtered []Message
 	for _, m := range messages {
+		if m.Role == "system" {
+			systemText = m.Content
+		} else {
+			filtered = append(filtered, m)
+		}
+	}
+
+	var b strings.Builder
+	for i, m := range filtered {
 		role := m.Role
 		if role == "assistant" {
 			role = "model"
@@ -213,6 +225,10 @@ func formatGemmaMessages(messages []Message) string {
 		b.WriteString("<start_of_turn>")
 		b.WriteString(role)
 		b.WriteString("\n")
+		if i == 0 && systemText != "" && role == "user" {
+			b.WriteString(systemText)
+			b.WriteString("\n\n")
+		}
 		b.WriteString(m.Content)
 		b.WriteString("<end_of_turn>\n")
 	}

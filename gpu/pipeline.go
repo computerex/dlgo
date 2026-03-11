@@ -565,17 +565,12 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	dp4aAvail := HasDp4a()
 	dp4aDisabled := os.Getenv("DLGO_NO_DP4A") == "1"
-	dp4aAttn := os.Getenv("DLGO_DP4A_ATTN") == "1"
 	if dp4aAvail && !dp4aDisabled {
-		if dp4aAttn {
-			for _, lc := range layerConfs {
-				lc.SetDP4A(q8_1Scratch)
-			}
-			fmt.Println("[dlgo/gpu] dp4a auto-detected: attention + MoE enabled")
-		} else {
-			fmt.Println("[dlgo/gpu] dp4a auto-detected: MoE enabled (attention opt-in via DLGO_DP4A_ATTN=1)")
+		for _, lc := range layerConfs {
+			lc.SetDP4A(q8_1Scratch)
 		}
 		rs.MoEUseDp4a = true
+		fmt.Println("[dlgo/gpu] dp4a enabled for attention + FFN + MoE (per-tensor safe types)")
 	} else if dp4aDisabled {
 		fmt.Println("[dlgo/gpu] dp4a disabled via DLGO_NO_DP4A=1")
 	} else {

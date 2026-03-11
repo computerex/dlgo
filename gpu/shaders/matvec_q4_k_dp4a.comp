@@ -8,8 +8,9 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // Q4_K weights × Q8_1 input using dotPacked4x8EXT (dp4a).
-// 128 threads, 2 rows per workgroup. K_PER_ITER=16, 4 dp4a per iteration.
-// Q4_K super-blocks: 256 elements, sub-block scales.
+// 128 threads = 4 subgroups, each subgroup handles one row.
+// Each thread handles one sub-block (32 elements = 8 dp4a calls) per iteration.
+// 32 threads per subgroup, 8 sub-blocks per super-block → 4 super-blocks per iter.
 
 layout(local_size_x = 128) in;
 
@@ -42,120 +43,70 @@ layout(push_constant) uniform Params {
     int cols;
 };
 
-#define NUM_ROWS 2
-shared float tmpsh[NUM_ROWS][4];
-
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint sub_id = tid >> 5;       // subgroup 0-3
+    uint sub_tid = tid & 31u;     // thread within subgroup
+    uint row = gl_WorkGroupID.x * 4u + sub_id;
+
+    if (row >= uint(rows)) return;
 
     uint ncols = uint(cols);
-    uint num_super_blocks = ncols >> 8;
+    uint num_sb = ncols >> 8;     // super-blocks per row
 
-    uint num_rows = uint(NUM_ROWS);
-    if (first_row + num_rows > uint(rows)) {
-        num_rows = uint(rows) - first_row;
-        if (first_row >= uint(rows)) return;
-    }
+    // Each thread processes one sub-block per super-block.
+    // sub_tid 0-7 → sub-blocks of super-block 0, sub_tid 8-15 → SB 1, etc.
+    // 32 threads = 4 super-blocks per iteration, stride 4.
+    uint sb_local = sub_tid & 7u;   // sub-block within super-block (0-7)
+    uint sb_stride = sub_tid >> 3;  // super-block offset (0-3)
 
-    // 128 threads: each thread handles 16 elements per iteration (K_PER_ITER=16).
-    // 128 * 16 = 2048 elements per iteration = 8 super-blocks.
-    // Within a super-block (256 elements), threads are mapped to sub-blocks.
-    uint it_size = 128u / 16u;  // 8 threads per super-block
-    uint ix = tid >> 4;          // which super-block this thread works on (0-7)
-    uint il = tid & 15u;         // position within super-block's 16 sub-positions
+    // Q4_K memory layout: qs[128] = 32 uint32 per super-block.
+    // Sub-block pairs share the same 32 qs bytes:
+    //   Sub-block 0: qs_u32[0..7] low nibble (shift=0)
+    //   Sub-block 1: qs_u32[0..7] high nibble (shift=4)
+    //   Sub-block 2: qs_u32[8..15] low nibble
+    //   Sub-block 3: qs_u32[8..15] high nibble
+    //   Sub-block 4-7: qs_u32[16..31] same pattern
+    uint qs_base = (sb_local >> 1) * 8u;
+    uint shift = (sb_local & 1u) * 4u;
 
-    // Map to Q8_1-block-level indices within the super-block
-    // Each super-block = 8 Q8_1 blocks of 32 elements each
-    uint iqs = il;  // sub-block index within the super-block (0-15)
-    // iqs maps to: Q8_1 block = iqs/2, within-block half = iqs%2
+    float acc = 0.0;
 
-    float temp[NUM_ROWS];
-    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+    for (uint i = sb_stride; i < num_sb; i += 4u) {
+        uint b_ib = i * 8u + sb_local;
+        float d_b = float(data_b[b_ib].d);
+        float s_b = float(data_b[b_ib].s);
 
-    for (uint i = ix; i < num_super_blocks; i += it_size) {
-        // Q8_1 block index for this thread's 16 elements
-        uint b_block_base = i * 8u;  // 8 Q8_1 blocks per super-block
-        uint b_ib = b_block_base + (iqs >> 1);
-        uint b_half = iqs & 1u;
+        int32_t bqs[8];
+        [[unroll]] for (uint j = 0; j < 8u; j++)
+            bqs[j] = data_b[b_ib].qs[j];
 
-        // Load Q8_1 data: 4 packed int32 for 16 elements
-        int32_t cache_b[4];
-        cache_b[0] = data_b[b_ib].qs[b_half * 4];
-        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
-        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
-        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
-        vec2 cache_dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+        uint ib = row * num_sb + i;
 
-        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            uint ib_k = (first_row + n) * num_super_blocks + i;
+        float d_val = float(data_a[ib].d);
+        float dmin_val = float(data_a[ib].dmin);
 
-            float d_val = float(data_a[ib_k].d);
-            float dmin_val = float(data_a[ib_k].dmin);
-
-            // Decode sub-block scale and min
-            uint is_idx = iqs >> 1;  // sub-block scale index (0-7)
-            uint sc, m;
-            if (is_idx < 4u) {
-                sc = uint(data_a[ib_k].scales[is_idx]) & 0x3Fu;
-                m = uint(data_a[ib_k].scales[is_idx + 4u]) & 0x3Fu;
-            } else {
-                uint s_hi = uint(data_a[ib_k].scales[is_idx + 4u]);
-                uint s_lo_0 = uint(data_a[ib_k].scales[is_idx - 4u]);
-                uint s_lo_4 = uint(data_a[ib_k].scales[is_idx]);
-                sc = (s_hi & 0xFu) | ((s_lo_0 & 0xC0u) >> 2);
-                m  = (s_hi >> 4)   | ((s_lo_4 & 0xC0u) >> 2);
-            }
-
-            float d_sc = d_val * float(sc);
-            float dm_m = dmin_val * float(m);
-
-            // Read 4 packed uint32 of Q4_K nibbles for 16 elements
-            uint qs_base = (iqs >> 1) * 4u + (b_half << 1);  // 4 uint32 per sub-block half
-            uint qs_shift = b_half * 4u;
-
-            // For Q4_K: qs layout within super-block:
-            // Low half (elements 0-127): qs[0..31], nibble low
-            // High half (elements 128-255): qs[0..31], nibble high
-            uint half_off = (iqs >= 8u) ? 16u : 0u;
-            uint local_iqs = iqs & 7u;
-            uint qs_idx = half_off + local_iqs * 2u;
-            uint shift = (iqs >= 8u) ? 4u : 0u;
-
-            uint32_t qs0 = (data_a_p32[ib_k].qs[qs_idx] >> shift) & 0x0F0F0F0Fu;
-            uint32_t qs1 = (data_a_p32[ib_k].qs[qs_idx + 1u] >> shift) & 0x0F0F0F0Fu;
-            uint32_t qs2 = (data_a_p32[ib_k].qs[qs_idx + 16u] >> shift) & 0x0F0F0F0Fu;
-            uint32_t qs3 = (data_a_p32[ib_k].qs[qs_idx + 17u] >> shift) & 0x0F0F0F0Fu;
-
-            i32vec4 a_qs = i32vec4(qs0, qs1, qs2, qs3);
-
-            int32_t q_sum = dotPacked4x8EXT(a_qs.x, cache_b[0])
-                          + dotPacked4x8EXT(a_qs.y, cache_b[1])
-                          + dotPacked4x8EXT(a_qs.z, cache_b[2])
-                          + dotPacked4x8EXT(a_qs.w, cache_b[3]);
-
-            temp[n] += d_sc * float(q_sum) * cache_dsb.x - dm_m * cache_dsb.y * 0.5;
+        uint sc, m;
+        if (sb_local < 4u) {
+            sc = uint(data_a[ib].scales[sb_local]) & 0x3Fu;
+            m = uint(data_a[ib].scales[sb_local + 4u]) & 0x3Fu;
+        } else {
+            uint s_hi = uint(data_a[ib].scales[sb_local + 4u]);
+            uint s_lo_0 = uint(data_a[ib].scales[sb_local - 4u]);
+            uint s_lo_4 = uint(data_a[ib].scales[sb_local]);
+            sc = (s_hi & 0xFu) | ((s_lo_0 & 0xC0u) >> 2);
+            m  = (s_hi >> 4)   | ((s_lo_4 & 0xC0u) >> 2);
         }
-    }
 
-    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
-        temp[r] = subgroupAdd(temp[r]);
-    }
-
-    if (gl_SubgroupInvocationID == 0u) {
-        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
-            tmpsh[r][gl_SubgroupID] = temp[r];
+        int dp_sum = 0;
+        [[unroll]] for (uint j = 0; j < 8u; j++) {
+            int32_t a_val = int32_t((data_a_p32[ib].qs[qs_base + j] >> shift) & 0x0F0F0F0Fu);
+            dp_sum += dotPacked4x8EXT(a_val, bqs[j]);
         }
-    }
-    barrier();
 
-    if (tid == 0u) {
-        [[unroll]] for (uint n = 0; n < num_rows; n++) {
-            float sum = 0.0;
-            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
-                sum += tmpsh[n][s];
-            }
-            out_data[first_row + n] = sum;
-        }
+        acc += d_val * float(sc) * float(dp_sum) * d_b - dmin_val * float(m) * s_b;
     }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) out_data[row] = acc;
 }

@@ -8,8 +8,12 @@
 #extension GL_EXT_control_flow_attributes : enable
 
 // Q6_K weights × Q8_1 input using dotPacked4x8EXT (dp4a).
-// 128 threads, 2 rows per workgroup. K_PER_ITER=16, 4 dp4a per iteration.
-// Q6_K super-blocks: 256 elements, per-16-element scales.
+// 128 threads, 2 rows per workgroup. 16 threads per super-block.
+// Each thread handles 16 elements (one scale group = 4 dp4a calls).
+//
+// IMPORTANT: Q6_K blocks are 210 bytes (not divisible by 4).
+// We MUST use uint16_t arrays (alignment 2) for the aliased struct,
+// NOT uint32_t (alignment 4 would give stride 212, misaligning blocks).
 
 layout(local_size_x = 128) in;
 
@@ -45,12 +49,20 @@ layout(push_constant) uniform Params {
 #define NUM_ROWS 2
 shared float tmpsh[NUM_ROWS][4];
 
+uint load_u32_ql(uint ib, uint u16_idx) {
+    return uint(data_a_p16[ib].ql[u16_idx]) | (uint(data_a_p16[ib].ql[u16_idx + 1u]) << 16);
+}
+
+uint load_u32_qh(uint ib, uint u16_idx) {
+    return uint(data_a_p16[ib].qh[u16_idx]) | (uint(data_a_p16[ib].qh[u16_idx + 1u]) << 16);
+}
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
 
     uint ncols = uint(cols);
-    uint num_super_blocks = ncols >> 8;
+    uint num_sb = ncols >> 8;
 
     uint num_rows = uint(NUM_ROWS);
     if (first_row + num_rows > uint(rows)) {
@@ -58,95 +70,54 @@ void main() {
         if (first_row >= uint(rows)) return;
     }
 
-    uint it_size = 8u;
+    uint sg = tid & 15u;
     uint ix = tid >> 4;
-    uint iqs = tid & 15u;
+
+    uint v_im = sg >> 3;
+    uint pair = sg & 7u;
+    uint q_block = pair >> 1;
+    uint is_odd = pair & 1u;
+
+    // ql uint16 index: v_im*32 + (q_block&1)*16 + is_odd*8
+    // (each uint16 = 2 bytes, so divide byte offsets by 2)
+    uint ql_u16_base = v_im * 32u + (q_block & 1u) * 16u + is_odd * 8u;
+    uint ql_shift = (q_block >= 2u) ? 4u : 0u;
+
+    // qh uint16 index: v_im*16 + is_odd*8
+    uint qh_u16_base = v_im * 16u + is_odd * 8u;
+    uint qh_shift = q_block * 2u;
+
+    uint b_block_off = sg >> 1;
+    uint b_half = sg & 1u;
 
     float temp[NUM_ROWS];
     [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
 
-    for (uint i = ix; i < num_super_blocks; i += it_size) {
-        // Map iqs to Q8_1 block within the super-block
-        uint b_block_base = i * 8u;
-        uint b_ib = b_block_base + (iqs >> 1);
-        uint b_half = iqs & 1u;
-
+    for (uint i = ix; i < num_sb; i += 8u) {
+        uint b_ib = i * 8u + b_block_off;
         int32_t cache_b[4];
-        cache_b[0] = data_b[b_ib].qs[b_half * 4];
-        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
-        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
-        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
-        vec2 cache_dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+        cache_b[0] = data_b[b_ib].qs[b_half * 4u];
+        cache_b[1] = data_b[b_ib].qs[b_half * 4u + 1u];
+        cache_b[2] = data_b[b_ib].qs[b_half * 4u + 2u];
+        cache_b[3] = data_b[b_ib].qs[b_half * 4u + 3u];
+        float d_b = float(data_b[b_ib].d);
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
-            uint ib_k = (first_row + n) * num_super_blocks + i;
+            uint ib = (first_row + n) * num_sb + i;
 
-            float d_val = float(data_a[ib_k].d);
-            float d_scale = d_val * float(data_a[ib_k].scales[iqs]);
+            float d_val = float(data_a[ib].d);
+            float d_scale = d_val * float(data_a[ib].scales[sg]);
 
-            // Q6_K unpacking: 6-bit values = 4-bit low + 2-bit high
-            // Map iqs (0-15) to ql/qh offsets within the super-block
-            uint v_im = iqs >> 3;       // 0 or 1 (half of super-block)
-            uint v_in = iqs & 7u;
-            uint l0 = 4u * v_in;
+            int q_sum = 0;
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                uint ql_v = (load_u32_ql(ib, ql_u16_base + j * 2u) >> ql_shift) & 0x0F0F0F0Fu;
+                uint qh_v = (load_u32_qh(ib, qh_u16_base + j * 2u) >> qh_shift) & 0x03030303u;
+                i32vec4 vals = i32vec4(unpack8(ql_v | (qh_v << 4))) - 32;
+                int32_t packed = pack32(i8vec4(vals));
+                q_sum += dotPacked4x8EXT(packed, cache_b[j]);
+            }
 
-            uint ql_offset = 64u * v_im + l0;
-            uint qh_offset = 32u * v_im + l0;
-            uint ql_shift = ((iqs & 8u) != 0u) ? 4u : 0u;
-            uint qh_shift = ((iqs & 4u) != 0u) ? 4u : 0u;
-            qh_shift += ((iqs & 8u) != 0u) ? 2u : 0u;
-
-            // Read ql as packed u16, build u32
-            uint ql0 = uint(data_a_p16[ib_k].ql[ql_offset >> 1])
-                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 1u]) << 16);
-            uint ql1 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 16u])
-                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 17u]) << 16);
-
-            uint qh0 = uint(data_a_p16[ib_k].qh[qh_offset >> 1])
-                     | (uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 1u]) << 16);
-
-            // Extract 4-bit low nibbles
-            uint ql0_4 = (ql0 >> ql_shift) & 0x0F0F0F0Fu;
-            uint ql1_4 = (ql1 >> ql_shift) & 0x0F0F0F0Fu;
-
-            // Extract 2-bit high bits
-            uint qh_mask = 0x03030303u;
-            uint qh0_2 = ((qh0 >> qh_shift) & qh_mask) << 4;
-            uint qh1_2 = ((qh0 >> (qh_shift + 2u)) & qh_mask) << 4;
-
-            // Combine: 6-bit value = ql_4 | (qh_2 << 4), then subtract 32
-            i32vec4 vals0 = i32vec4(unpack8(ql0_4 | qh0_2)) - 32;
-            i32vec4 vals1 = i32vec4(unpack8(ql1_4 | qh1_2)) - 32;
-
-            // Repack as int32 for dp4a
-            int32_t a0 = pack32(i8vec4(vals0));
-            int32_t a1 = pack32(i8vec4(vals1));
-
-            // Need 4 packed values for 16 elements, but we have 2 × 4-element packs
-            // Read more data for the other 8 elements
-            uint ql2 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 2u])
-                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 3u]) << 16);
-            uint ql3 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 18u])
-                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 19u]) << 16);
-            uint qh1_raw = uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 2u])
-                         | (uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 3u]) << 16);
-
-            uint ql2_4 = (ql2 >> ql_shift) & 0x0F0F0F0Fu;
-            uint ql3_4 = (ql3 >> ql_shift) & 0x0F0F0F0Fu;
-            uint qh2_2 = ((qh1_raw >> qh_shift) & qh_mask) << 4;
-            uint qh3_2 = ((qh1_raw >> (qh_shift + 2u)) & qh_mask) << 4;
-
-            i32vec4 vals2 = i32vec4(unpack8(ql2_4 | qh2_2)) - 32;
-            i32vec4 vals3 = i32vec4(unpack8(ql3_4 | qh3_2)) - 32;
-            int32_t a2 = pack32(i8vec4(vals2));
-            int32_t a3 = pack32(i8vec4(vals3));
-
-            int32_t q_sum = dotPacked4x8EXT(a0, cache_b[0])
-                          + dotPacked4x8EXT(a1, cache_b[1])
-                          + dotPacked4x8EXT(a2, cache_b[2])
-                          + dotPacked4x8EXT(a3, cache_b[3]);
-
-            temp[n] += d_scale * float(q_sum) * cache_dsb.x;
+            temp[n] += d_scale * float(q_sum) * d_b;
         }
     }
 

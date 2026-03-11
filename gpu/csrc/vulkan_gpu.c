@@ -1127,7 +1127,7 @@ int gpu_matvec_offset_dp4a(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A; break;
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
-        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
@@ -1767,7 +1767,7 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
         case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A; break;
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
-        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; rows_per_wg = 2; break;
+        case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; break;
         case QTYPE_Q6_K: pipe = PIPE_MATVEC_Q6_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q3_K: pipe = PIPE_MATVEC_Q3_K_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
@@ -2213,6 +2213,27 @@ int gpu_batch_add_bias2(GpuBuf dst, GpuBuf bias, GpuBuf scratch,
     return gpu_batch_add_bias_expand(dst, bias, scratch, elems_per_pos, npos);
 }
 
+// dp4a_safe_type: returns 1 if the quantization type has a correct dp4a shader.
+static int dp4a_safe_type(int qtype) {
+    switch (qtype) {
+    case QTYPE_Q4_0: case QTYPE_Q5_0: case QTYPE_Q8_0:
+    case QTYPE_Q3_K: case QTYPE_Q4_K: case QTYPE_Q5_K: case QTYPE_Q6_K:
+    case 39: /* MXFP4 */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// smart_matvec: uses dp4a when the tensor type supports it, else float.
+static int smart_matvec(GpuBuf out, GpuBuf weights,
+                        int dp4a_ok, GpuBuf q8_input, GpuBuf float_input,
+                        int rows, int cols, int qtype) {
+    if (dp4a_ok && dp4a_safe_type(qtype))
+        return gpu_matvec_dp4a(out, weights, q8_input, rows, cols, qtype);
+    return gpu_matvec(out, weights, float_input, rows, cols, qtype);
+}
+
 // ---------------------------------------------------------------------------
 // Fused layer forward — all dispatches for one transformer layer in a single
 // C call, eliminating per-operation CGo overhead.
@@ -2226,20 +2247,21 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
     int kv_dim = lc->kv_dim;
 
     // core_type 1 = SSM: Go side already filled attn_proj, skip to residual+FFN
+    int dp4a_ok = lc->use_dp4a && lc->q8_1_scratch;
+
     if (lc->core_type == 0) {
-        // Q/K/V MatVecs (write to independent buffers, can run without barriers between them)
+        // Q/K/V MatVecs — per-tensor dp4a: quantize once, each matvec picks dp4a or float
         gpu_barrier();
-        if (lc->use_dp4a && lc->q8_1_scratch) {
+        int any_qkv_dp4a = dp4a_ok && (dp4a_safe_type(lc->wq_type) ||
+                                         dp4a_safe_type(lc->wk_type) ||
+                                         dp4a_safe_type(lc->wv_type));
+        if (any_qkv_dp4a) {
             gpu_quantize_q8_1(lc->q8_1_scratch, lc->x_norm, dim);
             gpu_barrier();
-            gpu_matvec_dp4a(lc->q, lc->wq, lc->q8_1_scratch, lc->wq_rows, lc->wq_cols, lc->wq_type);
-            gpu_matvec_dp4a(lc->k, lc->wk, lc->q8_1_scratch, lc->wk_rows, lc->wk_cols, lc->wk_type);
-            gpu_matvec_dp4a(lc->v, lc->wv, lc->q8_1_scratch, lc->wv_rows, lc->wv_cols, lc->wv_type);
-        } else {
-            gpu_matvec(lc->q, lc->wq, lc->x_norm, lc->wq_rows, lc->wq_cols, lc->wq_type);
-            gpu_matvec(lc->k, lc->wk, lc->x_norm, lc->wk_rows, lc->wk_cols, lc->wk_type);
-            gpu_matvec(lc->v, lc->wv, lc->x_norm, lc->wv_rows, lc->wv_cols, lc->wv_type);
         }
+        smart_matvec(lc->q, lc->wq, dp4a_ok, lc->q8_1_scratch, lc->x_norm, lc->wq_rows, lc->wq_cols, lc->wq_type);
+        smart_matvec(lc->k, lc->wk, dp4a_ok, lc->q8_1_scratch, lc->x_norm, lc->wk_rows, lc->wk_cols, lc->wk_type);
+        smart_matvec(lc->v, lc->wv, dp4a_ok, lc->q8_1_scratch, lc->x_norm, lc->wv_rows, lc->wv_cols, lc->wv_type);
 
         if (lc->bq || lc->bk || lc->bv || lc->q_norm_w) {
             gpu_barrier();
@@ -2266,7 +2288,7 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         }
 
         gpu_barrier();
-        if (lc->use_dp4a && lc->q8_1_scratch) {
+        if (dp4a_ok && dp4a_safe_type(lc->wo_type)) {
             gpu_quantize_q8_1(lc->q8_1_scratch, lc->attn_out, num_heads * head_dim);
             gpu_barrier();
             gpu_matvec_dp4a(lc->attn_proj, lc->wo, lc->q8_1_scratch, lc->wo_rows, lc->wo_cols, lc->wo_type);
@@ -2289,62 +2311,41 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
             return GPU_OK;
         }
 
+        // FFN — per-tensor dp4a for gate/up input
         gpu_barrier();
-        if (lc->use_dp4a && lc->q8_1_scratch) {
+        int any_ffn_dp4a = dp4a_ok && (dp4a_safe_type(lc->gate_type) ||
+                                        dp4a_safe_type(lc->up_type));
+        if (any_ffn_dp4a) {
             gpu_quantize_q8_1(lc->q8_1_scratch, lc->ffn_norm, dim);
             gpu_barrier();
-            if (lc->ffn_type == 0) {
-                gpu_matvec_dp4a(lc->gate, lc->ffn_gate_w, lc->q8_1_scratch, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                int hidden_dim = lc->gate_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->hidden, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            } else if (lc->ffn_type == 1) {
-                gpu_matvec_dp4a(lc->gate, lc->ffn_gate_w, lc->q8_1_scratch, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                int hidden_dim = lc->gate_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->hidden, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            } else {
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_gelu(lc->up, lc->up_rows);
-                gpu_barrier();
-                int hidden_dim = lc->up_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->up, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            }
+        }
+
+        if (lc->ffn_type == 0) {
+            smart_matvec(lc->gate, lc->ffn_gate_w, dp4a_ok, lc->q8_1_scratch, lc->ffn_norm, lc->gate_rows, lc->gate_cols, lc->gate_type);
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
+        } else if (lc->ffn_type == 1) {
+            smart_matvec(lc->gate, lc->ffn_gate_w, dp4a_ok, lc->q8_1_scratch, lc->ffn_norm, lc->gate_rows, lc->gate_cols, lc->gate_type);
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
         } else {
-            if (lc->ffn_type == 0) {
-                gpu_matvec(lc->gate, lc->ffn_gate_w, lc->ffn_norm, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, lc->down_type);
-            } else if (lc->ffn_type == 1) {
-                gpu_matvec(lc->gate, lc->ffn_gate_w, lc->ffn_norm, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, lc->down_type);
-            } else {
-                gpu_matvec(lc->up, lc->ffn_up_w, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_gelu(lc->up, lc->up_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->up, lc->down_rows, lc->down_cols, lc->down_type);
-            }
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, lc->ffn_norm, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_gelu(lc->up, lc->up_rows);
+        }
+
+        // FFN down projection
+        gpu_barrier();
+        GpuBuf hidden_buf = (lc->ffn_type == 2) ? lc->up : lc->hidden;
+        int hidden_dim = (lc->ffn_type == 2) ? lc->up_rows : lc->gate_rows;
+        if (dp4a_ok && dp4a_safe_type(lc->down_type)) {
+            gpu_quantize_q8_1(lc->q8_1_scratch, hidden_buf, hidden_dim);
+            gpu_barrier();
+            gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
+        } else {
+            gpu_matvec(lc->ffn_out, lc->ffn_down_w, hidden_buf, lc->down_rows, lc->down_cols, lc->down_type);
         }
 
         gpu_barrier();
@@ -2359,65 +2360,41 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         }
     } else {
         // Parallel residual: attn and FFN share the same input (x_norm)
-        // dp4a q8_1_scratch already contains quantized x_norm from attn path
         gpu_barrier();
         GpuBuf ffn_input = lc->x_norm;
-        if (lc->use_dp4a && lc->q8_1_scratch) {
-            // Re-quantize since O-proj overwrote q8_1_scratch
+        int any_par_dp4a = dp4a_ok && (dp4a_safe_type(lc->gate_type) ||
+                                        dp4a_safe_type(lc->up_type));
+        if (any_par_dp4a) {
             gpu_quantize_q8_1(lc->q8_1_scratch, ffn_input, dim);
             gpu_barrier();
-            if (lc->ffn_type == 0) {
-                gpu_matvec_dp4a(lc->gate, lc->ffn_gate_w, lc->q8_1_scratch, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                int hidden_dim = lc->gate_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->hidden, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            } else if (lc->ffn_type == 1) {
-                gpu_matvec_dp4a(lc->gate, lc->ffn_gate_w, lc->q8_1_scratch, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                int hidden_dim = lc->gate_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->hidden, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            } else {
-                gpu_matvec_dp4a(lc->up, lc->ffn_up_w, lc->q8_1_scratch, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_gelu(lc->up, lc->up_rows);
-                gpu_barrier();
-                int hidden_dim = lc->up_rows;
-                gpu_quantize_q8_1(lc->q8_1_scratch, lc->up, hidden_dim);
-                gpu_barrier();
-                gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
-            }
+        }
+
+        if (lc->ffn_type == 0) {
+            smart_matvec(lc->gate, lc->ffn_gate_w, dp4a_ok, lc->q8_1_scratch, ffn_input, lc->gate_rows, lc->gate_cols, lc->gate_type);
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
+        } else if (lc->ffn_type == 1) {
+            smart_matvec(lc->gate, lc->ffn_gate_w, dp4a_ok, lc->q8_1_scratch, ffn_input, lc->gate_rows, lc->gate_cols, lc->gate_type);
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
         } else {
-            if (lc->ffn_type == 0) {
-                gpu_matvec(lc->gate, lc->ffn_gate_w, ffn_input, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_swiglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, lc->down_type);
-            } else if (lc->ffn_type == 1) {
-                gpu_matvec(lc->gate, lc->ffn_gate_w, ffn_input, lc->gate_rows, lc->gate_cols, lc->gate_type);
-                gpu_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_geglu(lc->hidden, lc->gate, lc->up, lc->gate_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->hidden, lc->down_rows, lc->down_cols, lc->down_type);
-            } else {
-                gpu_matvec(lc->up, lc->ffn_up_w, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
-                gpu_barrier();
-                gpu_gelu(lc->up, lc->up_rows);
-                gpu_barrier();
-                gpu_matvec(lc->ffn_out, lc->ffn_down_w, lc->up, lc->down_rows, lc->down_cols, lc->down_type);
-            }
+            smart_matvec(lc->up, lc->ffn_up_w, dp4a_ok, lc->q8_1_scratch, ffn_input, lc->up_rows, lc->up_cols, lc->up_type);
+            gpu_barrier();
+            gpu_gelu(lc->up, lc->up_rows);
+        }
+
+        // FFN down projection (parallel path)
+        gpu_barrier();
+        GpuBuf par_hidden = (lc->ffn_type == 2) ? lc->up : lc->hidden;
+        int par_hidden_dim = (lc->ffn_type == 2) ? lc->up_rows : lc->gate_rows;
+        if (dp4a_ok && dp4a_safe_type(lc->down_type)) {
+            gpu_quantize_q8_1(lc->q8_1_scratch, par_hidden, par_hidden_dim);
+            gpu_barrier();
+            gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
+        } else {
+            gpu_matvec(lc->ffn_out, lc->ffn_down_w, par_hidden, lc->down_rows, lc->down_cols, lc->down_type);
         }
         gpu_barrier();
         gpu_add(lc->x, lc->x, lc->attn_proj, dim);

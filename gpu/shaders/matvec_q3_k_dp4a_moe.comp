@@ -9,7 +9,9 @@
 
 // Q3_K dp4a MoE variant: processes n_used experts in one dispatch.
 // gl_WorkGroupID.y = expert slot (0..n_used-1).
-// Reads expert index from indices buffer, computes weight offset in-shader.
+//
+// IMPORTANT: Q3_K blocks are 110 bytes (not divisible by 4).
+// We MUST use uint16_t arrays (alignment 2) for the aliased struct.
 
 layout(local_size_x = 128) in;
 
@@ -20,9 +22,9 @@ struct block_q3_k {
     float16_t d;
 };
 
-struct block_q3_k_p32 {
-    uint32_t hmask[8];
-    uint32_t qs[16];
+struct block_q3_k_p16 {
+    uint16_t hmask[16];
+    uint16_t qs[32];
     uint8_t scales[12];
     float16_t d;
 };
@@ -35,7 +37,7 @@ struct block_q8_1 {
 
 layout(set = 0, binding = 0) buffer Out { float out_data[]; };
 layout(scalar, set = 0, binding = 1) readonly buffer A { block_q3_k data_a[]; };
-layout(scalar, set = 0, binding = 1) readonly buffer AP32 { block_q3_k_p32 data_a_p32[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP16 { block_q3_k_p16 data_a_p16[]; };
 layout(scalar, set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
 layout(set = 0, binding = 3) readonly buffer Indices { float expert_indices[]; };
 
@@ -49,6 +51,14 @@ layout(push_constant) uniform Params {
 
 #define NUM_ROWS 2
 shared float tmpsh[NUM_ROWS][4];
+
+uint load_u32_qs(uint ib, uint u16_idx) {
+    return uint(data_a_p16[ib].qs[u16_idx]) | (uint(data_a_p16[ib].qs[u16_idx + 1u]) << 16);
+}
+
+uint load_u32_hm(uint ib, uint u16_idx) {
+    return uint(data_a_p16[ib].hmask[u16_idx]) | (uint(data_a_p16[ib].hmask[u16_idx + 1u]) << 16);
+}
 
 int unpack_scale(uint i0, uint i1, uint t, int idx) {
     if (idx < 4) {
@@ -100,11 +110,16 @@ void main() {
     uint h = iqs >> 3;
     uint g_idx = (iqs & 7u) >> 1;
     uint p_half = iqs & 1u;
-    uint p_base = p_half * 16u;
 
-    uint qs_off = h * 32u + p_base;
+    // qs: 16 bytes at offset h*32 + p_half*16, shift = g_idx*2
+    // uint16 index = byte_offset / 2
+    uint qs_u16_base = (h * 32u + p_half * 16u) >> 1;
     uint qs_shift = g_idx * 2u;
+
+    // hmask: 16 bytes at offset p_half*16
+    uint hm_u16_base = (p_half * 16u) >> 1;
     uint hm_bit = h * 4u + g_idx;
+
     int scale_idx = int(h * 8u + g_idx * 2u + p_half);
 
     uint elem_off = h * 128u + g_idx * 32u + p_half * 16u;
@@ -118,10 +133,10 @@ void main() {
         uint b_base = q8_off + i * 8u;
         uint b_ib = b_base + b_block_off;
         int32_t cache_b[4];
-        cache_b[0] = data_b[b_ib].qs[b_half * 4];
-        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
-        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
-        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
+        cache_b[0] = data_b[b_ib].qs[b_half * 4u];
+        cache_b[1] = data_b[b_ib].qs[b_half * 4u + 1u];
+        cache_b[2] = data_b[b_ib].qs[b_half * 4u + 2u];
+        cache_b[3] = data_b[b_ib].qs[b_half * 4u + 3u];
         float d_b = float(data_b[b_ib].d);
 
         [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
@@ -137,30 +152,14 @@ void main() {
 
             float dl = d_all * float(unpack_scale(si0, si1, st, scale_idx) - 32);
 
-            uint32_t q0 = (data_a_p32[ib].qs[qs_off >> 2] >> qs_shift) & 0x03030303u;
-            uint32_t q1 = (data_a_p32[ib].qs[(qs_off >> 2) + 1u] >> qs_shift) & 0x03030303u;
-            uint32_t q2 = (data_a_p32[ib].qs[(qs_off >> 2) + 2u] >> qs_shift) & 0x03030303u;
-            uint32_t q3 = (data_a_p32[ib].qs[(qs_off >> 2) + 3u] >> qs_shift) & 0x03030303u;
-
-            uint32_t hm0 = (data_a_p32[ib].hmask[p_base >> 2] >> hm_bit) & 0x01010101u;
-            uint32_t hm1 = (data_a_p32[ib].hmask[(p_base >> 2) + 1u] >> hm_bit) & 0x01010101u;
-            uint32_t hm2 = (data_a_p32[ib].hmask[(p_base >> 2) + 2u] >> hm_bit) & 0x01010101u;
-            uint32_t hm3 = (data_a_p32[ib].hmask[(p_base >> 2) + 3u] >> hm_bit) & 0x01010101u;
-
-            i32vec4 v0 = i32vec4(unpack8(q0 | (hm0 << 2))) - 4;
-            i32vec4 v1 = i32vec4(unpack8(q1 | (hm1 << 2))) - 4;
-            i32vec4 v2 = i32vec4(unpack8(q2 | (hm2 << 2))) - 4;
-            i32vec4 v3 = i32vec4(unpack8(q3 | (hm3 << 2))) - 4;
-
-            int32_t a0 = pack32(i8vec4(v0));
-            int32_t a1 = pack32(i8vec4(v1));
-            int32_t a2 = pack32(i8vec4(v2));
-            int32_t a3 = pack32(i8vec4(v3));
-
-            int32_t q_sum = dotPacked4x8EXT(a0, cache_b[0])
-                          + dotPacked4x8EXT(a1, cache_b[1])
-                          + dotPacked4x8EXT(a2, cache_b[2])
-                          + dotPacked4x8EXT(a3, cache_b[3]);
+            int q_sum = 0;
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                uint q2 = (load_u32_qs(ib, qs_u16_base + j * 2u) >> qs_shift) & 0x03030303u;
+                uint hm = (load_u32_hm(ib, hm_u16_base + j * 2u) >> hm_bit) & 0x01010101u;
+                i32vec4 v = i32vec4(unpack8(q2 | (hm << 2))) - 4;
+                int32_t packed = pack32(i8vec4(v));
+                q_sum += dotPacked4x8EXT(packed, cache_b[j]);
+            }
 
             temp[n] += dl * float(q_sum) * d_b;
         }
