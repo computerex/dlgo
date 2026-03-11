@@ -567,6 +567,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	dp4aDisabled := os.Getenv("DLGO_NO_DP4A") == "1"
 	if dp4aAvail && !dp4aDisabled {
 		for _, lc := range layerConfs {
+			if lc == nil {
+				continue
+			}
 			lc.SetDP4A(q8_1Scratch)
 		}
 		rs.MoEUseDp4a = true
