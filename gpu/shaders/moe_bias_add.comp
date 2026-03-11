@@ -1,0 +1,27 @@
+#version 450
+
+// Per-expert bias addition for MoE: reads expert indices from GPU buffer.
+// Adds bias[expert_id * stride + (i % exp_dim)] to data[i] for each slot.
+// data layout: [n_used][exp_dim], bias layout: [n_experts][exp_dim]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+layout(set = 0, binding = 1) buffer Bias { float bias[]; };
+layout(set = 0, binding = 2) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int exp_dim;
+    int n_used;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = uint(n_used) * uint(exp_dim);
+    if (i >= total) return;
+
+    uint slot = i / uint(exp_dim);
+    uint local_i = i % uint(exp_dim);
+    int eidx = int(expert_indices[slot]);
+    data[i] += bias[uint(eidx) * uint(exp_dim) + local_i];
+}

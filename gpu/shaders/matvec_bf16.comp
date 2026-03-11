@@ -1,0 +1,150 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer A { uint data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { vec4 data_b_v4[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sub_id = tid >> 5;
+    uint sub_tid = tid & 31u;
+
+    uint row0 = gl_WorkGroupID.x * 8u + sub_id * 2u;
+    if (row0 >= uint(rows)) return;
+    uint row1 = min(row0 + 1u, uint(rows) - 1u);
+
+    uint ncols = uint(cols);
+    uint pos_id = gl_WorkGroupID.y;
+    uint x_off = pos_id * (ncols >> 2);
+    uint out_off = pos_id * uint(rows);
+    uint r0_off = row0 * (ncols >> 1);
+    uint r1_off = row1 * (ncols >> 1);
+
+    uint num_iters = ncols / 256u;
+    if (num_iters * 256u + 8u * sub_tid < ncols) num_iters++;
+    uint unrolled = num_iters & ~1u;
+
+    float r0_acc0 = 0.0, r0_acc1 = 0.0;
+    float r1_acc0 = 0.0, r1_acc1 = 0.0;
+    uint i = 0;
+
+    while (i < unrolled) {
+        [[unroll]] for (uint k = 0; k < 2u; k++) {
+            uint col = (i + k) * 256u + 8u * sub_tid;
+            uint x_idx = x_off + (col >> 2);
+
+            vec4 xv0 = data_b_v4[x_idx];
+            vec4 xv1 = data_b_v4[x_idx + 1u];
+
+            uint w0_idx = r0_off + (col >> 1);
+            uint w0_p0 = data_a[w0_idx];
+            uint w0_p1 = data_a[w0_idx + 1u];
+            uint w0_p2 = data_a[w0_idx + 2u];
+            uint w0_p3 = data_a[w0_idx + 3u];
+
+            uint w1_idx = r1_off + (col >> 1);
+            uint w1_p0 = data_a[w1_idx];
+            uint w1_p1 = data_a[w1_idx + 1u];
+            uint w1_p2 = data_a[w1_idx + 2u];
+            uint w1_p3 = data_a[w1_idx + 3u];
+
+            vec4 wv0_a = vec4(
+                uintBitsToFloat((w0_p0 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w0_p0 & 0xFFFF0000u),
+                uintBitsToFloat((w0_p1 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w0_p1 & 0xFFFF0000u)
+            );
+            vec4 wv0_b = vec4(
+                uintBitsToFloat((w0_p2 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w0_p2 & 0xFFFF0000u),
+                uintBitsToFloat((w0_p3 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w0_p3 & 0xFFFF0000u)
+            );
+
+            vec4 wv1_a = vec4(
+                uintBitsToFloat((w1_p0 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w1_p0 & 0xFFFF0000u),
+                uintBitsToFloat((w1_p1 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w1_p1 & 0xFFFF0000u)
+            );
+            vec4 wv1_b = vec4(
+                uintBitsToFloat((w1_p2 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w1_p2 & 0xFFFF0000u),
+                uintBitsToFloat((w1_p3 & 0xFFFFu) << 16u),
+                uintBitsToFloat(w1_p3 & 0xFFFF0000u)
+            );
+
+            float r0_r = dot(xv0, wv0_a) + dot(xv1, wv0_b);
+            float r1_r = dot(xv0, wv1_a) + dot(xv1, wv1_b);
+
+            if (k == 0u) { r0_acc0 += r0_r; r1_acc0 += r1_r; }
+            else         { r0_acc1 += r0_r; r1_acc1 += r1_r; }
+        }
+        i += 2u;
+    }
+    while (i < num_iters) {
+        uint col = i * 256u + 8u * sub_tid;
+        uint x_idx = x_off + (col >> 2);
+
+        vec4 xv0 = data_b_v4[x_idx];
+        vec4 xv1 = data_b_v4[x_idx + 1u];
+
+        uint w0_idx = r0_off + (col >> 1);
+        uint w0_p0 = data_a[w0_idx];
+        uint w0_p1 = data_a[w0_idx + 1u];
+        uint w0_p2 = data_a[w0_idx + 2u];
+        uint w0_p3 = data_a[w0_idx + 3u];
+
+        uint w1_idx = r1_off + (col >> 1);
+        uint w1_p0 = data_a[w1_idx];
+        uint w1_p1 = data_a[w1_idx + 1u];
+        uint w1_p2 = data_a[w1_idx + 2u];
+        uint w1_p3 = data_a[w1_idx + 3u];
+
+        vec4 wv0_a = vec4(
+            uintBitsToFloat((w0_p0 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w0_p0 & 0xFFFF0000u),
+            uintBitsToFloat((w0_p1 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w0_p1 & 0xFFFF0000u)
+        );
+        vec4 wv0_b = vec4(
+            uintBitsToFloat((w0_p2 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w0_p2 & 0xFFFF0000u),
+            uintBitsToFloat((w0_p3 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w0_p3 & 0xFFFF0000u)
+        );
+
+        vec4 wv1_a = vec4(
+            uintBitsToFloat((w1_p0 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w1_p0 & 0xFFFF0000u),
+            uintBitsToFloat((w1_p1 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w1_p1 & 0xFFFF0000u)
+        );
+        vec4 wv1_b = vec4(
+            uintBitsToFloat((w1_p2 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w1_p2 & 0xFFFF0000u),
+            uintBitsToFloat((w1_p3 & 0xFFFFu) << 16u),
+            uintBitsToFloat(w1_p3 & 0xFFFF0000u)
+        );
+
+        r0_acc0 += dot(xv0, wv0_a) + dot(xv1, wv0_b);
+        r1_acc0 += dot(xv0, wv1_a) + dot(xv1, wv1_b);
+        i++;
+    }
+
+    float r0 = subgroupAdd(r0_acc0 + r0_acc1);
+    float r1 = subgroupAdd(r1_acc0 + r1_acc1);
+    if (sub_tid == 0u) {
+        out_data[out_off + row0] = r0;
+        if (row1 != row0) out_data[out_off + row1] = r1;
+    }
+}

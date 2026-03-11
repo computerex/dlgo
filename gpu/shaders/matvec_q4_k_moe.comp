@@ -1,0 +1,161 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q4_K MoE variant: processes n_used experts in one dispatch.
+
+layout(local_size_x = 128) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+struct block_q4_k_p16 {
+    float16_t d;
+    float16_t dmin;
+    uint16_t scales[6];
+    uint8_t qs[128];
+};
+
+struct block_q4_k_p32 {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint32_t qs[32];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) buffer A { block_q4_k data_a[]; };
+layout(scalar, set = 0, binding = 1) buffer AP16 { block_q4_k_p16 data_a_p16[]; };
+layout(scalar, set = 0, binding = 1) buffer AP32 { block_q4_k_p32 data_a_p32[]; };
+layout(set = 0, binding = 2) buffer B { vec4 data_b_v4[]; };
+layout(set = 0, binding = 3) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+#define NUM_ROWS 2
+
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_blocks_per_row = ncols >> 8;
+    uint it_size = 128u / 16u;
+    uint itid = tid & 15u;
+    uint ix = tid >> 4;
+
+    uint il = itid >> 2;
+    uint ir = itid & 3u;
+    uint v_im = il >> 1;
+    uint v_in = il & 1u;
+    uint l0 = 4u * (2u * ir + v_in);
+    uint q_offset = 32u * v_im + l0;
+    uint y_offset = 64u * v_im + l0;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint x_base = (shared_input != 0) ? 0u : (slot * ncols);
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        uint y1_idx = x_base + i * 256u + y_offset;
+        uint y2_idx = y1_idx + 128u;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint ib0 = expert_offset + (first_row + n) * num_blocks_per_row;
+
+            float d_val = float(data_a[ib0 + i].d);
+            float dm_val = float(data_a[ib0 + i].dmin);
+
+            uint scale0_u32 = uint(data_a_p16[ib0 + i].scales[v_im]);
+            uint scale4_u32 = uint(data_a_p16[ib0 + i].scales[v_im + 2u]);
+            uint scale8_u32 = uint(data_a_p16[ib0 + i].scales[v_im + 4u]);
+
+            uint scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
+            uint scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0u) >> 2;
+            u8vec4 sc_lo_bytes = unpack8(scale_0_4_l & 0x3F3F3F3Fu);
+            u8vec4 sc_hi_bytes = unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h);
+
+            float sc0 = float(sc_lo_bytes.x);
+            float sc1 = float(sc_lo_bytes.y);
+            float sc2 = float(sc_lo_bytes.z);
+            float sc3 = float(sc_lo_bytes.w);
+            float sc4 = float(sc_hi_bytes.x);
+            float sc5 = float(sc_hi_bytes.y);
+            float sc6 = float(sc_hi_bytes.z);
+            float sc7 = float(sc_hi_bytes.w);
+
+            uint qs0_u32 = data_a_p32[ib0 + i].qs[q_offset >> 2];
+            uint qs64_u32 = data_a_p32[ib0 + i].qs[(q_offset >> 2) + 16u];
+
+            u8vec4 qs0_lo = unpack8(qs0_u32 & 0x0F0F0F0Fu);
+            u8vec4 qs0_hi = unpack8((qs0_u32 >> 4) & 0x0F0F0F0Fu);
+            u8vec4 qs64_lo = unpack8(qs64_u32 & 0x0F0F0F0Fu);
+            u8vec4 qs64_hi = unpack8((qs64_u32 >> 4) & 0x0F0F0F0Fu);
+
+            vec4 by10 = data_b_v4[y1_idx >> 2];
+            vec4 by132 = data_b_v4[(y1_idx >> 2) + 8u];
+            vec4 by20 = data_b_v4[y2_idx >> 2];
+            vec4 by232 = data_b_v4[(y2_idx >> 2) + 8u];
+
+            float sx = fma(by10.x, float(qs0_lo.x), fma(by10.y, float(qs0_lo.y), fma(by10.z, float(qs0_lo.z), by10.w * float(qs0_lo.w))));
+            float sy = fma(by132.x, float(qs0_hi.x), fma(by132.y, float(qs0_hi.y), fma(by132.z, float(qs0_hi.z), by132.w * float(qs0_hi.w))));
+            float sz = fma(by20.x, float(qs64_lo.x), fma(by20.y, float(qs64_lo.y), fma(by20.z, float(qs64_lo.z), by20.w * float(qs64_lo.w))));
+            float sw = fma(by232.x, float(qs64_hi.x), fma(by232.y, float(qs64_hi.y), fma(by232.z, float(qs64_hi.z), by232.w * float(qs64_hi.w))));
+
+            float smin =
+                fma(by10.x, sc2, fma(by132.x, sc3, fma(by20.x, sc6, fma(by232.x, sc7,
+                fma(by10.y, sc2, fma(by132.y, sc3, fma(by20.y, sc6, fma(by232.y, sc7,
+                fma(by10.z, sc2, fma(by132.z, sc3, fma(by20.z, sc6, fma(by232.z, sc7,
+                fma(by10.w, sc2, fma(by132.w, sc3, fma(by20.w, sc6, by232.w * sc7)))))))))))))));
+
+            temp[n] = fma(d_val, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm_val, smin, temp[n]));
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

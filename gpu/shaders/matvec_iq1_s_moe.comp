@@ -1,0 +1,117 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// IQ1_S MoE variant: tables at binding 3, expert_indices at binding 4.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+struct block_iq1_s {
+    float16_t d;
+    uint8_t qs[32];
+    uint8_t qh[16];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer Weights { block_iq1_s blocks[]; };
+layout(set = 0, binding = 2) readonly buffer X { float x_data[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint table_data[]; };
+layout(set = 0, binding = 4) buffer Indices { float expert_indices[]; };
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_sb = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint pos_x_off = (shared_input != 0) ? 0u : (slot * ncols);
+
+    uint lane = tid & 31u;
+    uint sb_group = tid >> 5;
+    uint s = lane >> 3u;
+    uint j = lane & 7u;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint b = sb_group; b < num_sb; b += 4u) {
+        uint x_block = b * 256u;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint bi = expert_offset + (first_row + n) * num_sb + b;
+            float d = float(blocks[bi].d);
+
+            float acc = 0.0;
+
+            [[unroll]] for (uint ib = 0u; ib < 8u; ib++) {
+                uint qh_lo = uint(blocks[bi].qh[ib * 2u]);
+                uint qh_hi = uint(blocks[bi].qh[ib * 2u + 1u]);
+                uint qh = qh_lo | (qh_hi << 8u);
+
+                float dl = d * float(2u * ((qh >> 12u) & 7u) + 1u);
+                float delta = ((qh & 0x8000u) != 0u) ? -0.125 : 0.125;
+
+                uint qs_off = ib * 4u;
+                uint grid_idx = uint(blocks[bi].qs[qs_off + s])
+                              | (((qh >> (3u * s)) & 7u) << 8u);
+
+                uint glo = table_data[grid_idx * 2u];
+                uint ghi = table_data[grid_idx * 2u + 1u];
+                uint grid_byte = j < 4u
+                    ? (glo >> (j * 8u)) & 0xFFu
+                    : (ghi >> ((j - 4u) * 8u)) & 0xFFu;
+                float grid_val = float(int(grid_byte << 24) >> 24);
+
+                acc += dl * (grid_val + delta) * x_data[pos_x_off + x_block + ib * 32u + lane];
+            }
+
+            temp[n] += acc;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint sv = 0; sv < gl_NumSubgroups; sv++) {
+                sum += tmpsh[n][sv];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

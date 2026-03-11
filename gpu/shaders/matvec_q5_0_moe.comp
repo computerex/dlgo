@@ -1,0 +1,123 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+struct block_q5_0 {
+    float16_t d;
+    uint16_t qh[2];
+    uint8_t qs[16];
+};
+struct block_q5_0_p16 {
+    float16_t d;
+    uint16_t qh[2];
+    uint16_t qs[8];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q5_0 data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP16 { block_q5_0_p16 data_a_p16[]; };
+layout(set = 0, binding = 2) readonly buffer B { vec4 data_b_v4[]; };
+layout(set = 0, binding = 3) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sub_id = tid >> 5;
+    uint sub_tid = tid & 31u;
+    uint row = gl_WorkGroupID.x * 4u + sub_id;
+
+    if (row >= uint(rows)) return;
+
+    uint ncols = uint(cols);
+    uint bpr = ncols >> 5;
+
+    uint num_iters = ncols / 256u;
+    if (num_iters * 256u + 8u * sub_tid < ncols) num_iters++;
+    uint unrolled = num_iters & ~3u;
+
+    uint slot = gl_WorkGroupID.y;
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint x_off = (shared_input != 0) ? 0u : slot * (ncols >> 2);
+    uint out_off = slot * uint(rows);
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    uint i = 0;
+
+    while (i < unrolled) {
+            [[unroll]] for (uint k = 0; k < 4u; k++) {
+                uint col = (i + k) * 256u + 8u * sub_tid;
+                uint ib = expert_offset + row * bpr + (col >> 5);
+                uint iqs = (col & 31u) >> 1;
+                float d = float(data_a[ib].d);
+                uint uint_qh = uint(data_a_p16[ib].qh[1]) << 16 | uint(data_a_p16[ib].qh[0]);
+
+                ivec2 qh0 = ivec2(((uint_qh >> iqs) << 4) & 0x10, (uint_qh >> (iqs + 12)) & 0x10);
+                ivec2 qh1 = ivec2(((uint_qh >> (iqs + 1)) << 4) & 0x10, (uint_qh >> (iqs + 13)) & 0x10);
+                uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
+                vec4 v0 = vec4((vui0 & 0xFu) | uint(qh0.x), ((vui0 >> 4) & 0xFu) | uint(qh0.y),
+                               ((vui0 >> 8) & 0xFu) | uint(qh1.x), (vui0 >> 12) | uint(qh1.y)) - 16.0;
+
+                ivec2 qh2 = ivec2(((uint_qh >> (iqs + 2)) << 4) & 0x10, (uint_qh >> (iqs + 14)) & 0x10);
+                ivec2 qh3 = ivec2(((uint_qh >> (iqs + 3)) << 4) & 0x10, (uint_qh >> (iqs + 15)) & 0x10);
+                uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
+                vec4 v1 = vec4((vui1 & 0xFu) | uint(qh2.x), ((vui1 >> 4) & 0xFu) | uint(qh2.y),
+                               ((vui1 >> 8) & 0xFu) | uint(qh3.x), (vui1 >> 12) | uint(qh3.y)) - 16.0;
+
+                uint b_base = col - (col & 31u);
+                vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
+                vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
+                vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
+                vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
+
+                float r = d * (dot(bv0, v0) + dot(bv1, v1));
+                if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
+                else if (k == 2u) acc2 += r; else acc3 += r;
+            }
+            i += 4u;
+        }
+        while (i < num_iters) {
+            uint col = i * 256u + 8u * sub_tid;
+            uint ib = expert_offset + row * bpr + (col >> 5);
+            uint iqs = (col & 31u) >> 1;
+            float d = float(data_a[ib].d);
+            uint uint_qh = uint(data_a_p16[ib].qh[1]) << 16 | uint(data_a_p16[ib].qh[0]);
+
+            ivec2 qh0 = ivec2(((uint_qh >> iqs) << 4) & 0x10, (uint_qh >> (iqs + 12)) & 0x10);
+            ivec2 qh1 = ivec2(((uint_qh >> (iqs + 1)) << 4) & 0x10, (uint_qh >> (iqs + 13)) & 0x10);
+            uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
+            vec4 v0 = vec4((vui0 & 0xFu) | uint(qh0.x), ((vui0 >> 4) & 0xFu) | uint(qh0.y),
+                           ((vui0 >> 8) & 0xFu) | uint(qh1.x), (vui0 >> 12) | uint(qh1.y)) - 16.0;
+
+            ivec2 qh2 = ivec2(((uint_qh >> (iqs + 2)) << 4) & 0x10, (uint_qh >> (iqs + 14)) & 0x10);
+            ivec2 qh3 = ivec2(((uint_qh >> (iqs + 3)) << 4) & 0x10, (uint_qh >> (iqs + 15)) & 0x10);
+            uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
+            vec4 v1 = vec4((vui1 & 0xFu) | uint(qh2.x), ((vui1 >> 4) & 0xFu) | uint(qh2.y),
+                           ((vui1 >> 8) & 0xFu) | uint(qh3.x), (vui1 >> 12) | uint(qh3.y)) - 16.0;
+
+            uint b_base = col - (col & 31u);
+            vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
+            vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
+            vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
+            vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
+
+        acc0 += d * (dot(bv0, v0) + dot(bv1, v1));
+        i++;
+    }
+
+    float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
+    if (sub_tid == 0u) out_data[out_off + row] = acc;
+}

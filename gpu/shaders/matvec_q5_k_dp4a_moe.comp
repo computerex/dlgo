@@ -1,0 +1,208 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q5_K dp4a MoE variant: weights × Q8_1 input using dotPacked4x8EXT (dp4a).
+// 128 threads, 2 rows per workgroup. gl_WorkGroupID.y = expert slot (0..n_used-1).
+
+layout(local_size_x = 128) in;
+
+struct block_q5_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+};
+
+struct block_q5_k_p32 {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint32_t qh[8];
+    uint32_t qs[32];
+};
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q5_k data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP32 { block_q5_k_p32 data_a_p32[]; };
+layout(scalar, set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
+layout(set = 0, binding = 3) readonly buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+int unpack_scale(uint i0, uint i1, uint t, int idx) {
+    if (idx < 4) {
+        return int((i0 >> (idx * 8)) & 0x3Fu);
+    }
+    int j = idx - 4;
+    uint lo4 = ((t >> (j * 8)) & 0xFFu) & 0x0Fu;
+    uint hi2 = (((i0 >> (j * 8)) & 0xFFu) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
+}
+
+int unpack_min(uint i0, uint i1, uint t, int idx) {
+    if (idx < 4) {
+        return int((i1 >> (idx * 8)) & 0x3Fu);
+    }
+    int j = idx - 4;
+    uint lo4 = (((t >> (j * 8)) & 0xFFu) >> 4) & 0x0Fu;
+    uint hi2 = (((i1 >> (j * 8)) & 0xFFu) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_sb = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint num_q8_blocks = ncols >> 5;
+    uint q8_off = (shared_input != 0) ? 0u : (slot * num_q8_blocks);
+
+    uint it_size = 8u;
+    uint ix = tid >> 4;
+    uint iqs = tid & 15u;
+
+    // Q5_K element mapping: 4 groups × 64 elements.
+    // Each group: 32 low-nibble elements + 32 high-nibble elements.
+    // 16 threads per SB: thread handles 16 elements.
+    // iqs 0-3: group 0 (64 elems), thread handles 16 contiguous qs entries
+    // iqs 4-7: group 1, etc.
+    //
+    // Within each group of 4 threads:
+    //   t=0: low-nib of qs[0..15]  → elements grp*64 + 0..15,  scale grp*2
+    //   t=1: low-nib of qs[16..31] → elements grp*64 + 16..31, scale grp*2
+    //   t=2: hi-nib of qs[0..15]   → elements grp*64 + 32..47, scale grp*2+1
+    //   t=3: hi-nib of qs[16..31]  → elements grp*64 + 48..63, scale grp*2+1
+
+    uint grp = iqs >> 2;           // group 0-3
+    uint t_in_grp = iqs & 3u;     // 0-3 within group
+    uint qs_half = t_in_grp >> 1;  // 0=low nibble, 1=high nibble
+    uint qs_16 = t_in_grp & 1u;   // which 16-byte chunk (0 or 1)
+
+    uint qs_byte_off = grp * 32u + qs_16 * 16u;  // byte offset into qs[]
+    uint nibble_shift = qs_half * 4u;              // 0 for low, 4 for high
+    int scale_idx = int(grp * 2u + qs_half);
+
+    // qh bit position for this group
+    uint qh_bit_lo = grp * 2u;      // for low-nibble elements
+    uint qh_bit_hi = grp * 2u + 1u; // for high-nibble elements
+    uint qh_bit = (qs_half == 0u) ? qh_bit_lo : qh_bit_hi;
+    uint qh_byte_off = qs_16 * 16u; // hmask offset matches qs position
+
+    // Element offset within SB for x_data
+    uint elem_off = grp * 64u + qs_half * 32u + qs_16 * 16u;
+
+    // Q8_1 block mapping
+    uint b_block_off = elem_off >> 5;
+    uint b_half = (elem_off >> 4) & 1u;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint i = ix; i < num_sb; i += it_size) {
+        uint b_base = q8_off + i * 8u;
+        uint b_ib = b_base + b_block_off;
+        int32_t cache_b[4];
+        cache_b[0] = data_b[b_ib].qs[b_half * 4];
+        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
+        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
+        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
+        vec2 cache_dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint ib = expert_offset + (first_row + n) * num_sb + i;
+
+            float d_val = float(data_a[ib].d);
+            float dmin_val = float(data_a[ib].dmin);
+
+            uint si0 = uint(data_a[ib].scales[0]) | (uint(data_a[ib].scales[1]) << 8) |
+                (uint(data_a[ib].scales[2]) << 16) | (uint(data_a[ib].scales[3]) << 24);
+            uint si1 = uint(data_a[ib].scales[4]) | (uint(data_a[ib].scales[5]) << 8) |
+                (uint(data_a[ib].scales[6]) << 16) | (uint(data_a[ib].scales[7]) << 24);
+            uint st = uint(data_a[ib].scales[8]) | (uint(data_a[ib].scales[9]) << 8) |
+                (uint(data_a[ib].scales[10]) << 16) | (uint(data_a[ib].scales[11]) << 24);
+
+            float sc = d_val * float(unpack_scale(si0, si1, st, scale_idx));
+            float dm = dmin_val * float(unpack_min(si0, si1, st, scale_idx));
+
+            // Read 16 qs bytes as 4 uint32, extract the correct nibble
+            uint32_t qs0 = (data_a_p32[ib].qs[qs_byte_off >> 2] >> nibble_shift) & 0x0F0F0F0Fu;
+            uint32_t qs1 = (data_a_p32[ib].qs[(qs_byte_off >> 2) + 1u] >> nibble_shift) & 0x0F0F0F0Fu;
+            uint32_t qs2 = (data_a_p32[ib].qs[(qs_byte_off >> 2) + 2u] >> nibble_shift) & 0x0F0F0F0Fu;
+            uint32_t qs3 = (data_a_p32[ib].qs[(qs_byte_off >> 2) + 3u] >> nibble_shift) & 0x0F0F0F0Fu;
+
+            // Read qh: 16 bytes, extract the bit at qh_bit
+            uint32_t qh0 = (data_a_p32[ib].qh[qh_byte_off >> 2] >> qh_bit) & 0x01010101u;
+            uint32_t qh1 = (data_a_p32[ib].qh[(qh_byte_off >> 2) + 1u] >> qh_bit) & 0x01010101u;
+            uint32_t qh2 = (data_a_p32[ib].qh[(qh_byte_off >> 2) + 2u] >> qh_bit) & 0x01010101u;
+            uint32_t qh3 = (data_a_p32[ib].qh[(qh_byte_off >> 2) + 3u] >> qh_bit) & 0x01010101u;
+
+            // 5-bit value = qs_4bit | (qh_1bit << 4), range 0-31
+            // For dp4a: pack as unsigned, use q_sum * sc - dm * sum_b for min correction
+            i32vec4 a_qs0 = i32vec4(unpack8(qs0 | (qh0 << 4)));
+            i32vec4 a_qs1 = i32vec4(unpack8(qs1 | (qh1 << 4)));
+            i32vec4 a_qs2 = i32vec4(unpack8(qs2 | (qh2 << 4)));
+            i32vec4 a_qs3 = i32vec4(unpack8(qs3 | (qh3 << 4)));
+
+            int32_t q_sum = dotPacked4x8EXT(uint32_t(pack32(u8vec4(a_qs0))), cache_b[0])
+                          + dotPacked4x8EXT(uint32_t(pack32(u8vec4(a_qs1))), cache_b[1])
+                          + dotPacked4x8EXT(uint32_t(pack32(u8vec4(a_qs2))), cache_b[2])
+                          + dotPacked4x8EXT(uint32_t(pack32(u8vec4(a_qs3))), cache_b[3]);
+
+            temp[n] += sc * float(q_sum) * cache_dsb.x - dm * cache_dsb.y * 0.5;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

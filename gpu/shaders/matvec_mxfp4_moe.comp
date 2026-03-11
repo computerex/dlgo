@@ -1,0 +1,135 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { uint data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { vec4 data_b_v4[]; };
+layout(set = 0, binding = 3) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+const float kvalues[16] = float[16](
+    0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+    0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0
+);
+
+float e8m0_to_f32(uint e) {
+    if (e < 2u) return uintBitsToFloat(0x00200000u << e);
+    return uintBitsToFloat((e - 1u) << 23u);
+}
+
+uint load_u32(uint byte_off) {
+    uint word = byte_off >> 2u;
+    uint shift = (byte_off & 3u) << 3u;
+    uint lo = data_a[word];
+    if (shift == 0u) return lo;
+    return (lo >> shift) | (data_a[word + 1u] << (32u - shift));
+}
+
+shared vec4 x_sh[1024];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ncols = uint(cols);
+
+    uint slot = gl_WorkGroupID.y;
+    int eidx = int(expert_indices[slot]);
+    uint expert_blk = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint x_off_v4 = (shared_input != 0) ? 0u : (slot * (ncols >> 2u));
+    uint out_off = slot * uint(rows);
+
+    uint nvec4 = ncols >> 2u;
+    for (uint i = tid; i < nvec4; i += 128u) {
+        x_sh[i] = data_b_v4[x_off_v4 + i];
+    }
+    barrier();
+
+    uint sub_id = tid >> 5u;
+    uint sub_tid = tid & 31u;
+    uint bpr = ncols / 32u;
+
+    uint row0 = gl_WorkGroupID.x * 8u + sub_id * 2u;
+    if (row0 >= uint(rows)) return;
+    bool has_r1 = (row0 + 1u < uint(rows));
+
+    uint blk_base0 = expert_blk + row0 * bpr;
+    uint blk_base1 = expert_blk + (row0 + 1u) * bpr;
+
+    float acc0 = 0.0, acc1 = 0.0;
+
+    for (uint b = sub_tid; b < bpr; b += 32u) {
+        uint byte0 = (blk_base0 + b) * 17u;
+        uint byte1 = (blk_base1 + b) * 17u;
+
+        uint s0 = load_u32(byte0);
+        uint r0p[4];
+        r0p[0] = load_u32(byte0 + 1u);
+        r0p[1] = load_u32(byte0 + 5u);
+        r0p[2] = load_u32(byte0 + 9u);
+        r0p[3] = load_u32(byte0 + 13u);
+
+        uint s1 = 0u;
+        uint r1p[4];
+        r1p[0] = 0u; r1p[1] = 0u; r1p[2] = 0u; r1p[3] = 0u;
+        if (has_r1) {
+            s1 = load_u32(byte1);
+            r1p[0] = load_u32(byte1 + 1u);
+            r1p[1] = load_u32(byte1 + 5u);
+            r1p[2] = load_u32(byte1 + 9u);
+            r1p[3] = load_u32(byte1 + 13u);
+        }
+
+        float d0 = e8m0_to_f32(s0 & 0xFFu);
+        float d1 = e8m0_to_f32(s1 & 0xFFu);
+        float sum0 = 0.0, sum1 = 0.0;
+
+        uint xb = b << 3u;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            vec4 bv_lo = x_sh[xb + j];
+            vec4 bv_hi = x_sh[xb + j + 4u];
+
+            uint p0 = r0p[j];
+            sum0 += dot(bv_lo, vec4(kvalues[p0 & 0xFu],
+                                     kvalues[(p0 >> 8u) & 0xFu],
+                                     kvalues[(p0 >> 16u) & 0xFu],
+                                     kvalues[(p0 >> 24u) & 0xFu]))
+                  + dot(bv_hi, vec4(kvalues[(p0 >> 4u) & 0xFu],
+                                     kvalues[(p0 >> 12u) & 0xFu],
+                                     kvalues[(p0 >> 20u) & 0xFu],
+                                     kvalues[(p0 >> 28u) & 0xFu]));
+
+            if (has_r1) {
+                uint p1 = r1p[j];
+                sum1 += dot(bv_lo, vec4(kvalues[p1 & 0xFu],
+                                         kvalues[(p1 >> 8u) & 0xFu],
+                                         kvalues[(p1 >> 16u) & 0xFu],
+                                         kvalues[(p1 >> 24u) & 0xFu]))
+                      + dot(bv_hi, vec4(kvalues[(p1 >> 4u) & 0xFu],
+                                         kvalues[(p1 >> 12u) & 0xFu],
+                                         kvalues[(p1 >> 20u) & 0xFu],
+                                         kvalues[(p1 >> 28u) & 0xFu]));
+            }
+        }
+        acc0 += d0 * sum0;
+        acc1 += d1 * sum1;
+    }
+
+    acc0 = subgroupAdd(acc0);
+    acc1 = subgroupAdd(acc1);
+
+    if (sub_tid == 0u) {
+        out_data[out_off + row0] = acc0;
+        if (has_r1)
+            out_data[out_off + row0 + 1u] = acc1;
+    }
+}

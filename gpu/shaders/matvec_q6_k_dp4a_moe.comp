@@ -1,0 +1,182 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q6_K dp4a MoE variant: weights × Q8_1 input using dotPacked4x8EXT (dp4a).
+// 128 threads, 2 rows per workgroup. gl_WorkGroupID.y = expert slot (0..n_used-1).
+
+layout(local_size_x = 128) in;
+
+struct block_q6_k {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    float16_t d;
+};
+struct block_q6_k_p16 {
+    uint16_t ql[64];
+    uint16_t qh[32];
+    int8_t scales[16];
+    float16_t d;
+};
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q6_k data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP16 { block_q6_k_p16 data_a_p16[]; };
+layout(scalar, set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
+layout(set = 0, binding = 3) readonly buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_super_blocks = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint num_q8_blocks = ncols >> 5;
+    uint q8_off = (shared_input != 0) ? 0u : (slot * num_q8_blocks);
+
+    uint it_size = 8u;
+    uint ix = tid >> 4;
+    uint iqs = tid & 15u;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint i = ix; i < num_super_blocks; i += it_size) {
+        // Map iqs to Q8_1 block within the super-block
+        uint b_block_base = q8_off + i * 8u;
+        uint b_ib = b_block_base + (iqs >> 1);
+        uint b_half = iqs & 1u;
+
+        int32_t cache_b[4];
+        cache_b[0] = data_b[b_ib].qs[b_half * 4];
+        cache_b[1] = data_b[b_ib].qs[b_half * 4 + 1];
+        cache_b[2] = data_b[b_ib].qs[b_half * 4 + 2];
+        cache_b[3] = data_b[b_ib].qs[b_half * 4 + 3];
+        vec2 cache_dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint ib_k = expert_offset + (first_row + n) * num_super_blocks + i;
+
+            float d_val = float(data_a[ib_k].d);
+            float d_scale = d_val * float(data_a[ib_k].scales[iqs]);
+
+            // Q6_K unpacking: 6-bit values = 4-bit low + 2-bit high
+            // Map iqs (0-15) to ql/qh offsets within the super-block
+            uint v_im = iqs >> 3;       // 0 or 1 (half of super-block)
+            uint v_in = iqs & 7u;
+            uint l0 = 4u * v_in;
+
+            uint ql_offset = 64u * v_im + l0;
+            uint qh_offset = 32u * v_im + l0;
+            uint ql_shift = ((iqs & 8u) != 0u) ? 4u : 0u;
+            uint qh_shift = ((iqs & 4u) != 0u) ? 4u : 0u;
+            qh_shift += ((iqs & 8u) != 0u) ? 2u : 0u;
+
+            // Read ql as packed u16, build u32
+            uint ql0 = uint(data_a_p16[ib_k].ql[ql_offset >> 1])
+                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 1u]) << 16);
+            uint ql1 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 16u])
+                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 17u]) << 16);
+
+            uint qh0 = uint(data_a_p16[ib_k].qh[qh_offset >> 1])
+                     | (uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 1u]) << 16);
+
+            // Extract 4-bit low nibbles
+            uint ql0_4 = (ql0 >> ql_shift) & 0x0F0F0F0Fu;
+            uint ql1_4 = (ql1 >> ql_shift) & 0x0F0F0F0Fu;
+
+            // Extract 2-bit high bits
+            uint qh_mask = 0x03030303u;
+            uint qh0_2 = ((qh0 >> qh_shift) & qh_mask) << 4;
+            uint qh1_2 = ((qh0 >> (qh_shift + 2u)) & qh_mask) << 4;
+
+            // Combine: 6-bit value = ql_4 | (qh_2 << 4), then subtract 32
+            i32vec4 vals0 = i32vec4(unpack8(ql0_4 | qh0_2)) - 32;
+            i32vec4 vals1 = i32vec4(unpack8(ql1_4 | qh1_2)) - 32;
+
+            // Repack as int32 for dp4a
+            int32_t a0 = pack32(i8vec4(vals0));
+            int32_t a1 = pack32(i8vec4(vals1));
+
+            // Need 4 packed values for 16 elements, but we have 2 × 4-element packs
+            // Read more data for the other 8 elements
+            uint ql2 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 2u])
+                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 3u]) << 16);
+            uint ql3 = uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 18u])
+                     | (uint(data_a_p16[ib_k].ql[(ql_offset >> 1) + 19u]) << 16);
+            uint qh1_raw = uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 2u])
+                         | (uint(data_a_p16[ib_k].qh[(qh_offset >> 1) + 3u]) << 16);
+
+            uint ql2_4 = (ql2 >> ql_shift) & 0x0F0F0F0Fu;
+            uint ql3_4 = (ql3 >> ql_shift) & 0x0F0F0F0Fu;
+            uint qh2_2 = ((qh1_raw >> qh_shift) & qh_mask) << 4;
+            uint qh3_2 = ((qh1_raw >> (qh_shift + 2u)) & qh_mask) << 4;
+
+            i32vec4 vals2 = i32vec4(unpack8(ql2_4 | qh2_2)) - 32;
+            i32vec4 vals3 = i32vec4(unpack8(ql3_4 | qh3_2)) - 32;
+            int32_t a2 = pack32(i8vec4(vals2));
+            int32_t a3 = pack32(i8vec4(vals3));
+
+            int32_t q_sum = dotPacked4x8EXT(a0, cache_b[0])
+                          + dotPacked4x8EXT(a1, cache_b[1])
+                          + dotPacked4x8EXT(a2, cache_b[2])
+                          + dotPacked4x8EXT(a3, cache_b[3]);
+
+            temp[n] += d_scale * float(q_sum) * cache_dsb.x;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

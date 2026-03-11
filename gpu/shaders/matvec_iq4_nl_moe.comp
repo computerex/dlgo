@@ -1,0 +1,90 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// IQ4_NL MoE variant: no tables, expert_indices at binding 3.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+// IQ4_NL: 18 bytes per block of 32 values
+layout(binding = 0, scalar) buffer Out { float out_data[]; };
+layout(binding = 1, scalar) buffer Weights { uint8_t weight_bytes[]; };
+layout(binding = 2, scalar) buffer X { float x_data[]; };
+layout(binding = 3, scalar) buffer Indices { float expert_indices[]; };
+
+const float kvalues[16] = float[16](
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+    1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0
+);
+
+shared float shared_sums[128];
+
+void main() {
+    const uint row_pair = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint num_blocks = uint(cols) / 32u;
+    const uint block_bytes = 18u;
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint x_off = (shared_input != 0) ? 0u : (slot * uint(cols));
+    uint out_off = slot * uint(rows);
+
+    for (uint n = 0u; n < 2u; n++) {
+        uint row = row_pair * 2u + n;
+        if (row >= uint(rows)) {
+            if (n == 0u) out_data[out_off + row] = 0.0;
+            continue;
+        }
+
+        float acc = 0.0;
+
+        for (uint b = tid / 32u; b < num_blocks; b += 4u) {
+            uint bi = expert_offset + row * num_blocks + b;
+            uint byte_off = bi * block_bytes;
+
+            uint lo = uint(weight_bytes[byte_off]);
+            uint hi = uint(weight_bytes[byte_off + 1u]);
+            float d = unpackHalf2x16(lo | (hi << 8u)).x;
+
+            uint lane = tid & 31u;
+
+            if (lane < 16u) {
+                uint qByte = uint(weight_bytes[byte_off + 2u + lane]);
+                float v_lo = kvalues[qByte & 0xFu];
+                float v_hi = kvalues[qByte >> 4u];
+                uint base = b * 32u;
+                acc += d * v_lo * x_data[x_off + base + lane]
+                     + d * v_hi * x_data[x_off + base + 16u + lane];
+            }
+        }
+
+        acc = subgroupAdd(acc);
+
+        if ((tid & 31u) == 0u) {
+            shared_sums[tid / 32u] = acc;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += shared_sums[i];
+            }
+            out_data[out_off + row] = total;
+        }
+        barrier();
+    }
+}

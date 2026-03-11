@@ -1,0 +1,130 @@
+const API_BASE = '/v1';
+
+export interface Message {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+export interface ChatCompletionRequest {
+  model: string;
+  messages: Message[];
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  max_tokens?: number;
+  stream?: boolean;
+}
+
+export interface ModelObject {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+  architecture?: string;
+  quantization?: string;
+  parameters?: string;
+}
+
+export interface LoadModelRequest {
+  id?: string;
+  path: string;
+  gpu?: boolean;
+  context?: number;
+}
+
+export async function listModels(): Promise<ModelObject[]> {
+  const res = await fetch(`${API_BASE}/models`);
+  if (!res.ok) throw new Error(`Failed to list models: ${res.statusText}`);
+  const data = await res.json();
+  return data.data || [];
+}
+
+export async function loadModel(req: LoadModelRequest): Promise<void> {
+  const res = await fetch(`${API_BASE}/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
+    throw new Error(err.error?.message || 'Failed to load model');
+  }
+}
+
+export async function unloadModel(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/models`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
+    throw new Error(err.error?.message || 'Failed to unload model');
+  }
+}
+
+export interface StreamCallbacks {
+  onToken: (token: string) => void;
+  onDone: (finishReason: string) => void;
+  onError: (error: string) => void;
+}
+
+export async function chatCompletion(
+  req: ChatCompletionRequest,
+  callbacks: StreamCallbacks,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...req, stream: true }),
+    signal,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: { message: res.statusText } }));
+    callbacks.onError(err.error?.message || `HTTP ${res.status}`);
+    return;
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    callbacks.onError('No response body');
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') {
+        callbacks.onDone('stop');
+        return;
+      }
+      try {
+        const chunk = JSON.parse(data);
+        const choice = chunk.choices?.[0];
+        if (choice?.delta?.content) {
+          callbacks.onToken(choice.delta.content);
+        }
+        if (choice?.finish_reason) {
+          callbacks.onDone(choice.finish_reason);
+          return;
+        }
+      } catch {
+        // skip malformed chunks
+      }
+    }
+  }
+  callbacks.onDone('stop');
+}

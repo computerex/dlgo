@@ -1,0 +1,109 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// IQ3_S MoE variant: tables at binding 3, expert_indices at binding 4.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+struct block_iq3_s {
+    float16_t d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t signs[32];
+    uint8_t scales[4];
+};
+
+layout(binding = 0, scalar) buffer Out     { float   out_data[]; };
+layout(binding = 1, scalar) buffer Weights { block_iq3_s blocks[]; };
+layout(binding = 2, scalar) buffer X       { float   x_data[];  };
+layout(binding = 3, scalar) buffer Tables  { uint    table_data[]; };
+layout(binding = 4, scalar) buffer Indices { float   expert_indices[]; };
+
+shared float shared_sums[128];
+
+void main() {
+    const uint row_pair = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint num_sb = uint(cols) / 256u;
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint pos_x_off = (shared_input != 0) ? 0u : (slot * uint(cols));
+
+    for (uint n = 0u; n < 2u; n++) {
+        uint first_row = row_pair * 2u + n;
+        if (first_row >= uint(rows)) {
+            if (n == 0u) out_data[slot * uint(rows) + first_row] = 0.0;
+            continue;
+        }
+
+        float acc = 0.0;
+
+        for (uint b = tid / 32u; b < num_sb; b += 4u) {
+            uint bi = expert_offset + first_row * num_sb + b;
+            float d = float(blocks[bi].d);
+            uint lane = tid & 31u;
+
+            uint x_block = b * 256u;
+
+            uint ib32_pair = lane / 8u;
+            uint sub_in_pair = lane & 7u;
+            uint grp_half = sub_in_pair / 4u;
+            uint il = sub_in_pair & 3u;
+            uint ib32 = ib32_pair * 2u + grp_half;
+
+            uint sc_byte = uint(blocks[bi].scales[ib32_pair]);
+            float db = d * float(1u + 2u * ((grp_half == 0u) ? (sc_byte & 0xFu) : (sc_byte >> 4u)));
+
+            uint qh = uint(blocks[bi].qh[ib32]);
+
+            uint qs_off = ib32 * 8u;
+            uint gridIdx1 = uint(blocks[bi].qs[qs_off + 2u * il])     | ((qh << (8u - 2u * il)) & 256u);
+            uint gridIdx2 = uint(blocks[bi].qs[qs_off + 2u * il + 1u]) | ((qh << (7u - 2u * il)) & 256u);
+
+            uint grid1 = table_data[gridIdx1];
+            uint grid2 = table_data[gridIdx2];
+
+            uint sign_byte = uint(blocks[bi].signs[ib32 * 4u + il]);
+
+            float sum = 0.0;
+            uint x_off = x_block + ib32 * 32u + il * 8u;
+            for (uint j = 0u; j < 4u; j++) {
+                float gv1 = float((grid1 >> (8u * j)) & 0xFFu);
+                float gv2 = float((grid2 >> (8u * j)) & 0xFFu);
+                float v1 = ((sign_byte & (1u << j)) != 0u) ? -db * gv1 : db * gv1;
+                float v2 = ((sign_byte & (1u << (j + 4u))) != 0u) ? -db * gv2 : db * gv2;
+                sum += v1 * x_data[pos_x_off + x_off + j] + v2 * x_data[pos_x_off + x_off + 4u + j];
+            }
+
+            acc += sum;
+        }
+
+        acc = subgroupAdd(acc);
+
+        if ((tid & 31u) == 0u) {
+            shared_sums[tid / 32u] = acc;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += shared_sums[i];
+            }
+            out_data[slot * uint(rows) + first_row] = total;
+        }
+        barrier();
+    }
+}

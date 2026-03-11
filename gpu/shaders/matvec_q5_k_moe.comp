@@ -1,0 +1,146 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q5_K MoE variant: processes n_used experts in one dispatch.
+
+layout(local_size_x = 128) in;
+
+struct block_q5_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer Weights { block_q5_k blocks[]; };
+layout(set = 0, binding = 2) readonly buffer X { float x_data[]; };
+layout(set = 0, binding = 3) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+int unpack_scale(uint i0, uint i1, uint t, int idx) {
+    if (idx < 4) {
+        return int((i0 >> (idx * 8)) & 0x3Fu);
+    }
+    int j = idx - 4;
+    uint lo4 = ((t >> (j * 8)) & 0xFFu) & 0x0Fu;
+    uint hi2 = (((i0 >> (j * 8)) & 0xFFu) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
+}
+
+int unpack_min(uint i0, uint i1, uint t, int idx) {
+    if (idx < 4) {
+        return int((i1 >> (idx * 8)) & 0x3Fu);
+    }
+    int j = idx - 4;
+    uint lo4 = (((t >> (j * 8)) & 0xFFu) >> 4) & 0x0Fu;
+    uint hi2 = (((i1 >> (j * 8)) & 0xFFu) >> 6) & 0x03u;
+    return int(lo4 | (hi2 << 4));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_sb = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint x_base = (shared_input != 0) ? 0u : (slot * ncols);
+
+    uint lane = tid & 31u;
+    uint sb_group = tid >> 5;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint i = sb_group; i < num_sb; i += 4u) {
+        uint x_block = x_base + i * 256u;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint ib = expert_offset + (first_row + n) * num_sb + i;
+            float d = float(blocks[ib].d);
+            float dmin = float(blocks[ib].dmin);
+
+            uint i0 = uint(blocks[ib].scales[0]) | (uint(blocks[ib].scales[1]) << 8) |
+                (uint(blocks[ib].scales[2]) << 16) | (uint(blocks[ib].scales[3]) << 24);
+            uint i1 = uint(blocks[ib].scales[4]) | (uint(blocks[ib].scales[5]) << 8) |
+                (uint(blocks[ib].scales[6]) << 16) | (uint(blocks[ib].scales[7]) << 24);
+            uint t = uint(blocks[ib].scales[8]) | (uint(blocks[ib].scales[9]) << 8) |
+                (uint(blocks[ib].scales[10]) << 16) | (uint(blocks[ib].scales[11]) << 24);
+
+            float acc = 0.0;
+            uint u1 = 1u;
+            uint u2 = 2u;
+
+            [[unroll]] for (int grp = 0; grp < 4; grp++) {
+                float sc1 = d * float(unpack_scale(i0, i1, t, grp * 2));
+                float mn1 = dmin * float(unpack_min(i0, i1, t, grp * 2));
+                float sc2 = d * float(unpack_scale(i0, i1, t, grp * 2 + 1));
+                float mn2 = dmin * float(unpack_min(i0, i1, t, grp * 2 + 1));
+
+                uint qbyte = uint(blocks[ib].qs[grp * 32 + int(lane)]);
+                uint qh = uint(blocks[ib].qh[int(lane)]);
+
+                int q1 = int(qbyte & 0x0Fu);
+                if ((qh & u1) != 0u) q1 |= 16;
+                int q2 = int((qbyte >> 4) & 0x0Fu);
+                if ((qh & u2) != 0u) q2 |= 16;
+
+                uint x1_idx = x_block + grp * 64 + lane;
+                uint x2_idx = x1_idx + 32u;
+                acc += (float(q1) * sc1 - mn1) * x_data[x1_idx];
+                acc += (float(q2) * sc2 - mn2) * x_data[x2_idx];
+
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            temp[n] += acc;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

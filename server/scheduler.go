@@ -1,0 +1,286 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/computerex/dlgo/models/llm"
+	"github.com/computerex/dlgo/ops"
+)
+
+// EventType identifies the kind of streaming event.
+type EventType int
+
+const (
+	EventToken EventType = iota
+	EventDone
+	EventError
+)
+
+// StreamEvent is a single event sent from the scheduler to the HTTP handler.
+type StreamEvent struct {
+	Type         EventType
+	Token        string
+	FinishReason string
+	PromptTokens int
+	Error        string
+}
+
+// RequestStatus tracks where a request is in the pipeline.
+type RequestStatus int
+
+const (
+	StatusWaiting    RequestStatus = iota
+	StatusPrefilling
+	StatusDecoding
+	StatusDone
+	StatusError
+)
+
+// InferenceRequest represents a single chat completion request in flight.
+type InferenceRequest struct {
+	ID        string
+	Messages  []llm.Message
+	Config    llm.GenerateConfig
+	Tokens    []int32       // prompt tokens after formatting
+	Generated []int32       // output tokens so far
+	Position  int           // current sequence position
+	Status    RequestStatus
+	Output    chan StreamEvent
+	Ctx       context.Context
+	Cancel    context.CancelFunc
+}
+
+// Scheduler manages the inference loop for a single loaded model.
+// It processes requests sequentially for now, with the framework
+// ready for continuous batching in the future.
+type Scheduler struct {
+	mu       sync.Mutex
+	model    *LoadedModel
+	submit   chan *InferenceRequest
+	stop     chan struct{}
+	wg       sync.WaitGroup
+}
+
+// NewScheduler creates and starts a scheduler for the given model.
+func NewScheduler(model *LoadedModel) *Scheduler {
+	s := &Scheduler{
+		model:  model,
+		submit: make(chan *InferenceRequest, 64),
+		stop:   make(chan struct{}),
+	}
+	s.wg.Add(1)
+	go s.loop()
+	return s
+}
+
+// Submit enqueues a request for processing.
+func (s *Scheduler) Submit(req *InferenceRequest) error {
+	select {
+	case s.submit <- req:
+		return nil
+	default:
+		return fmt.Errorf("request queue full")
+	}
+}
+
+// Stop shuts down the scheduler.
+func (s *Scheduler) Stop() {
+	close(s.stop)
+	s.wg.Wait()
+}
+
+func (s *Scheduler) loop() {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case req := <-s.submit:
+			s.processRequest(req)
+		}
+	}
+}
+
+func (s *Scheduler) processRequest(req *InferenceRequest) {
+	defer close(req.Output)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	m := s.model
+
+	// Format messages into a prompt
+	prompt := llm.FormatMessages(m.CPUPipeline.Model.Config, req.Messages)
+
+	// Tokenize
+	tokens := m.CPUPipeline.Tokenizer.Encode(prompt)
+	if len(tokens) == 0 {
+		req.Output <- StreamEvent{Type: EventError, Error: "tokenizer produced no tokens"}
+		return
+	}
+	req.Tokens = tokens
+	promptTokens := len(tokens)
+
+	if promptTokens >= m.CPUPipeline.MaxSeqLen {
+		req.Output <- StreamEvent{Type: EventError, Error: fmt.Sprintf("prompt too long: %d tokens (max %d)", promptTokens, m.CPUPipeline.MaxSeqLen)}
+		return
+	}
+
+	rng := rand.New(rand.NewSource(req.Config.Seed))
+	if req.Config.Seed < 0 {
+		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
+	// Use GPU pipeline if available, otherwise CPU
+	if m.GpuPipeline != nil {
+		s.processGPU(req, rng, promptTokens)
+	} else {
+		s.processCPU(req, rng, promptTokens)
+	}
+}
+
+func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
+	pipe := s.model.CPUPipeline
+
+	// Reset KV cache
+	pipe.KVCache.Reset()
+	if pipe.RunState.SSMState != nil {
+		pipe.RunState.SSMState.Reset()
+	}
+
+	// Prefill
+	llm.ForwardBatch(pipe.Model, req.Tokens, 0, pipe.KVCache, pipe.RunState, pipe.BatchState)
+
+	pos := len(req.Tokens)
+	var recentTokens []int32
+
+	nextToken := int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
+
+	if isStopToken(nextToken, pipe.Model.Config) {
+		req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
+		return
+	}
+
+	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
+	req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+	req.Generated = append(req.Generated, nextToken)
+	recentTokens = append(recentTokens, nextToken)
+
+	var genText strings.Builder
+	genText.WriteString(tokenText)
+	stopStrings := collectStopStrings(pipe.Model.Config)
+
+	for step := 1; step < req.Config.MaxTokens; step++ {
+		if req.Ctx.Err() != nil {
+			req.Output <- StreamEvent{Type: EventDone, FinishReason: "cancelled", PromptTokens: promptTokens}
+			return
+		}
+		if pos >= pipe.MaxSeqLen-1 {
+			break
+		}
+
+		if isStopToken(nextToken, pipe.Model.Config) {
+			break
+		}
+
+		llm.Forward(pipe.Model, nextToken, pos, pipe.KVCache, pipe.RunState)
+		pos++
+
+		nextToken = int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
+
+		if isStopToken(nextToken, pipe.Model.Config) {
+			break
+		}
+
+		tokenText = pipe.Tokenizer.DecodeToken(nextToken)
+		req.Generated = append(req.Generated, nextToken)
+		recentTokens = append(recentTokens, nextToken)
+		if len(recentTokens) > 64 {
+			recentTokens = recentTokens[1:]
+		}
+
+		genText.WriteString(tokenText)
+		if checkTextStop(genText.String(), stopStrings) {
+			break
+		}
+
+		req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+	}
+
+	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
+}
+
+func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
+	pipe := s.model.GpuPipeline
+
+	// Use GenerateDetailed with streaming callback
+	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages)
+
+	cfg := req.Config
+	cfg.Stream = func(token string) {
+		if req.Ctx.Err() != nil {
+			return
+		}
+		req.Output <- StreamEvent{Type: EventToken, Token: token}
+	}
+
+	result, err := pipe.GenerateDetailed(prompt, cfg)
+	if err != nil {
+		req.Output <- StreamEvent{Type: EventError, Error: err.Error()}
+		return
+	}
+
+	finishReason := "stop"
+	if result.TotalTokens >= cfg.MaxTokens {
+		finishReason = "length"
+	}
+	req.Output <- StreamEvent{
+		Type:         EventDone,
+		FinishReason: finishReason,
+		PromptTokens: result.PromptTokens,
+	}
+}
+
+func isStopToken(token int32, cfg llm.ModelConfig) bool {
+	if token == cfg.EOS {
+		return true
+	}
+	for _, st := range cfg.StopTokens {
+		if token == st {
+			return true
+		}
+	}
+	return false
+}
+
+func collectStopStrings(cfg llm.ModelConfig) []string {
+	return []string{
+		"<end_of_turn><eos>",
+		"<eos>",
+		"<|im_end|>",
+		"<|endoftext|>",
+		"<|end|>",
+		"</s>",
+		"<|assistant|>",
+		"<end_of_turn>",
+		"<|eot_id|>",
+	}
+}
+
+func checkTextStop(text string, stops []string) bool {
+	for _, ss := range stops {
+		if strings.HasSuffix(text, ss) {
+			return true
+		}
+	}
+	return false
+}
+
+// Suppress unused import warning
+var _ = log.Printf

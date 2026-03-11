@@ -1,0 +1,46 @@
+#version 450
+
+// Fused SwiGLU_OAI with per-expert bias for MoE (no CPU sync).
+// Reads expert indices from GPU buffer.
+// For each element i in [n_used * exp_dim]:
+//   slot = i / exp_dim, local = i % exp_dim
+//   eidx = expert_indices[slot]
+//   gate = gate_data[i] + gate_bias[eidx * exp_dim + local]
+//   up   = up_data[i]   + up_bias[eidx * exp_dim + local]
+//   gate = clamp(gate, -inf, limit)
+//   up   = clamp(up, -limit, limit)
+//   out  = gate * sigmoid(alpha * gate) * (up + 1.0)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Gate { float gate_data[]; };
+layout(set = 0, binding = 2) buffer Up { float up_data[]; };
+layout(set = 0, binding = 3) buffer GateBias { float gate_bias[]; };
+layout(set = 0, binding = 4) buffer UpBias { float up_bias[]; };
+layout(set = 0, binding = 5) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int total_n;     // n_used * exp_dim
+    float alpha;
+    float limit;
+    int exp_dim;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(total_n)) return;
+
+    uint slot = idx / uint(exp_dim);
+    uint local_i = idx % uint(exp_dim);
+    int eidx = int(expert_indices[slot]);
+    uint bias_off = uint(eidx) * uint(exp_dim) + local_i;
+
+    float g = gate_data[idx] + gate_bias[bias_off];
+    float u = up_data[idx] + up_bias[bias_off];
+
+    g = min(g, limit);
+    u = clamp(u, -limit, limit);
+
+    out_data[idx] = g * (1.0 / (1.0 + exp(-alpha * g))) * (u + 1.0);
+}

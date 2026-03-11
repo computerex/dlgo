@@ -1,0 +1,155 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Q3_K MoE variant: processes n_used experts in one dispatch.
+// gl_WorkGroupID.y = expert slot (0..n_used-1).
+// Reads expert index from indices buffer, computes weight offset in-shader.
+// Like llama.cpp MMF kernel: one launch handles all active experts.
+
+layout(local_size_x = 128) in;
+
+struct block_q3_k {
+    uint8_t hmask[32];
+    uint8_t qs[64];
+    uint8_t scales[12];
+    float16_t d;
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) buffer Weights { block_q3_k blocks[]; };
+layout(set = 0, binding = 2) buffer X { float x_data[]; };
+layout(set = 0, binding = 3) buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;  // blocks between consecutive experts
+    int base_offset;    // base block offset (for fused gate+up: 0 for gate, rows*bpr for up)
+    int shared_input;   // 1: all slots read same input, 0: per-slot input
+};
+
+#define NUM_ROWS 2
+shared float tmpsh[NUM_ROWS][4];
+
+uint byte_at(uint x, int idx) {
+    return (x >> (idx * 8)) & 0xFFu;
+}
+
+int unpack_scale(uint i0, uint i1, uint t, int idx) {
+    if (idx < 4) {
+        uint b = byte_at(i0, idx);
+        uint tb = byte_at(t, idx);
+        return int((b & 0x0Fu) | ((tb & 0x03u) << 4));
+    }
+    if (idx < 8) {
+        int j = idx - 4;
+        uint b = byte_at(i1, j);
+        uint tb = byte_at(t, j);
+        return int((b & 0x0Fu) | (((tb >> 2) & 0x03u) << 4));
+    }
+    if (idx < 12) {
+        int j = idx - 8;
+        uint b = byte_at(i0, j);
+        uint tb = byte_at(t, j);
+        return int(((b >> 4) & 0x0Fu) | (((tb >> 4) & 0x03u) << 4));
+    }
+    int j = idx - 12;
+    uint b = byte_at(i1, j);
+    uint tb = byte_at(t, j);
+    return int(((b >> 4) & 0x0Fu) | (((tb >> 6) & 0x03u) << 4));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint num_sb = ncols >> 8;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint pos_x_off = (shared_input != 0) ? 0u : (slot * ncols);
+
+    uint lane = tid & 31u;
+    uint sb_group = tid >> 5;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    int lane16 = int(lane & 15u);
+    bool hi = lane >= 16u;
+    int h_idx = lane16 + (hi ? 16 : 0);
+
+    for (uint b = sb_group; b < num_sb; b += 4u) {
+        int x_block = int(b) * 256;
+
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            uint bi = expert_offset + (first_row + n) * num_sb + b;
+            float d_all = float(blocks[bi].d);
+
+            uint i0 = uint(blocks[bi].scales[0]) | (uint(blocks[bi].scales[1]) << 8) |
+                (uint(blocks[bi].scales[2]) << 16) | (uint(blocks[bi].scales[3]) << 24);
+            uint i1 = uint(blocks[bi].scales[4]) | (uint(blocks[bi].scales[5]) << 8) |
+                (uint(blocks[bi].scales[6]) << 16) | (uint(blocks[bi].scales[7]) << 24);
+            uint t = uint(blocks[bi].scales[8]) | (uint(blocks[bi].scales[9]) << 8) |
+                (uint(blocks[bi].scales[10]) << 16) | (uint(blocks[bi].scales[11]) << 24);
+
+            float acc = 0.0;
+            uint m = 1u;
+
+            [[unroll]] for (int n128 = 0; n128 < 2; n128++) {
+                int q_base = n128 * 32;
+                int x_base = x_block + n128 * 128;
+
+                [[unroll]] for (int j = 0; j < 4; j++) {
+                    int scale_idx = n128 * 8 + j * 2 + (hi ? 1 : 0);
+                    float dl = d_all * float(unpack_scale(i0, i1, t, scale_idx) - 32);
+
+                    int q_idx = q_base + h_idx;
+                    int v = int((uint(blocks[bi].qs[q_idx]) >> uint(j * 2)) & 0x03u);
+                    if ((uint(blocks[bi].hmask[h_idx]) & m) == 0u) {
+                        v -= 4;
+                    }
+
+                    int x_idx = int(pos_x_off) + x_base + j * 32 + int(lane);
+                    acc += dl * float(v) * x_data[x_idx];
+                    m <<= 1;
+                }
+            }
+            temp[n] += acc;
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+        temp[r] = subgroupAdd(temp[r]);
+    }
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

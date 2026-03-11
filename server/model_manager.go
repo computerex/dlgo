@@ -1,0 +1,162 @@
+package server
+
+import (
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+
+	"github.com/computerex/dlgo/models/llm"
+)
+
+// LoadedModel holds all state for a single loaded model.
+type LoadedModel struct {
+	ID          string
+	Path        string
+	CPUPipeline *llm.Pipeline
+	GpuPipeline GpuPipelineInterface
+	Scheduler   *Scheduler
+	UseGPU      bool
+	Info        ModelObject
+}
+
+// GpuPipelineInterface abstracts the GPU pipeline to avoid build tag issues.
+// The actual implementation is in model_manager_gpu.go (vulkan build).
+type GpuPipelineInterface interface {
+	GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*llm.GenerateResult, error)
+	Free()
+}
+
+// ModelManager manages multiple loaded models.
+type ModelManager struct {
+	mu     sync.RWMutex
+	models map[string]*LoadedModel
+	gpuInit func() error
+	gpuNewPipeline func(pipe *llm.Pipeline) (GpuPipelineInterface, error)
+}
+
+// NewModelManager creates a new model manager.
+func NewModelManager() *ModelManager {
+	return &ModelManager{
+		models: make(map[string]*LoadedModel),
+	}
+}
+
+// SetGPUFunctions allows the GPU layer to register its init and pipeline creation functions.
+func (mm *ModelManager) SetGPUFunctions(
+	initFn func() error,
+	newPipelineFn func(pipe *llm.Pipeline) (GpuPipelineInterface, error),
+) {
+	mm.gpuInit = initFn
+	mm.gpuNewPipeline = newPipelineFn
+}
+
+// LoadModel loads a GGUF model and optionally sets up GPU acceleration.
+func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) error {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
+	if _, exists := mm.models[id]; exists {
+		return fmt.Errorf("model %q already loaded", id)
+	}
+
+	log.Printf("Loading model %q from %s (gpu=%v, ctx=%d)", id, path, useGPU, contextLen)
+
+	pipe, err := llm.NewPipeline(path, contextLen)
+	if err != nil {
+		return fmt.Errorf("load pipeline: %w", err)
+	}
+
+	loaded := &LoadedModel{
+		ID:          id,
+		Path:        path,
+		CPUPipeline: pipe,
+		UseGPU:      useGPU,
+		Info: ModelObject{
+			ID:      id,
+			Object:  "model",
+			Created: nowUnix(),
+			OwnedBy: "dlgo",
+			Arch:    pipe.Model.Config.Architecture,
+		},
+	}
+
+	if useGPU && mm.gpuNewPipeline != nil {
+		if mm.gpuInit != nil {
+			if err := mm.gpuInit(); err != nil {
+				log.Printf("GPU init failed, falling back to CPU: %v", err)
+				useGPU = false
+			}
+		}
+
+		if useGPU {
+			gpuPipe, err := mm.gpuNewPipeline(pipe)
+			if err != nil {
+				log.Printf("GPU pipeline creation failed, falling back to CPU: %v", err)
+			} else {
+				loaded.GpuPipeline = gpuPipe
+			}
+		}
+	}
+
+	loaded.Scheduler = NewScheduler(loaded)
+	mm.models[id] = loaded
+
+	log.Printf("Model %q loaded successfully (arch=%s, layers=%d, gpu=%v)",
+		id, pipe.Model.Config.Architecture, pipe.Model.Config.NumLayers, loaded.GpuPipeline != nil)
+	return nil
+}
+
+// UnloadModel removes and cleans up a loaded model.
+func (mm *ModelManager) UnloadModel(id string) error {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+
+	m, exists := mm.models[id]
+	if !exists {
+		return fmt.Errorf("model %q not found", id)
+	}
+
+	m.Scheduler.Stop()
+	if m.GpuPipeline != nil {
+		m.GpuPipeline.Free()
+	}
+	if m.CPUPipeline.Model.MmapFile != nil {
+		m.CPUPipeline.Model.Close()
+	}
+
+	delete(mm.models, id)
+	log.Printf("Model %q unloaded", id)
+	return nil
+}
+
+// GetModel returns a loaded model by ID, or nil if not found.
+func (mm *ModelManager) GetModel(id string) *LoadedModel {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	// Exact match first
+	if m, ok := mm.models[id]; ok {
+		return m
+	}
+
+	// Fuzzy match: check if any model ID contains the requested ID
+	for k, m := range mm.models {
+		if strings.Contains(strings.ToLower(k), strings.ToLower(id)) {
+			return m
+		}
+	}
+	return nil
+}
+
+// ListModels returns metadata for all loaded models.
+func (mm *ModelManager) ListModels() []ModelObject {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	result := make([]ModelObject, 0, len(mm.models))
+	for _, m := range mm.models {
+		result = append(result, m.Info)
+	}
+	return result
+}
