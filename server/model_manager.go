@@ -78,6 +78,8 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 			Created: nowUnix(),
 			OwnedBy: "dlgo",
 			Arch:    pipe.Model.Config.Architecture,
+			GPU:     useGPU,
+			Path:    path,
 		},
 	}
 
@@ -99,6 +101,7 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 		}
 	}
 
+	loaded.Info.GPU = loaded.GpuPipeline != nil
 	loaded.Scheduler = NewScheduler(loaded)
 	mm.models[id] = loaded
 

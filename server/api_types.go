@@ -59,6 +59,8 @@ type ModelObject struct {
 	Arch     string `json:"architecture,omitempty"`
 	Quant    string `json:"quantization,omitempty"`
 	ParamStr string `json:"parameters,omitempty"`
+	GPU      bool   `json:"gpu"`
+	Path     string `json:"path,omitempty"`
 }
 
 type ModelListResponse struct {

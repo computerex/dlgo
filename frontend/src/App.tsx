@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { ModelSelector } from './components/ModelSelector';
 import { SettingsPanel } from './components/SettingsPanel';
+import { loadModel, unloadModel, listModels } from './api';
 
 function App() {
   const [model, setModel] = useState('');
@@ -11,6 +12,30 @@ function App() {
   const [maxTokens, setMaxTokens] = useState(512);
   const [systemPrompt, setSystemPrompt] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [useGPU, setUseGPU] = useState(false);
+  const [reloading, setReloading] = useState(false);
+
+  const handleGPUToggle = useCallback(async (gpu: boolean) => {
+    if (gpu === useGPU) return;
+    setUseGPU(gpu);
+
+    // If a model is loaded, reload it with the new backend
+    if (model) {
+      setReloading(true);
+      try {
+        const models = await listModels();
+        const current = models.find(m => m.id === model);
+        if (current?.path) {
+          await unloadModel(model);
+          await loadModel({ id: model, path: current.path, gpu, context: 2048 });
+        }
+      } catch (e) {
+        console.error('Failed to toggle backend:', e);
+      } finally {
+        setReloading(false);
+      }
+    }
+  }, [useGPU, model]);
 
   return (
     <div className="h-screen flex">
@@ -31,7 +56,12 @@ function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          <ModelSelector selectedModel={model} onSelectModel={setModel} />
+          <ModelSelector
+            selectedModel={model}
+            useGPU={useGPU}
+            onSelectModel={setModel}
+            onGPUStatusChange={setUseGPU}
+          />
           <div className="border-t border-[var(--border)] pt-4">
             <SettingsPanel
               temperature={temperature}
@@ -39,11 +69,13 @@ function App() {
               topK={topK}
               maxTokens={maxTokens}
               systemPrompt={systemPrompt}
+              useGPU={useGPU}
               onTemperatureChange={setTemperature}
               onTopPChange={setTopP}
               onTopKChange={setTopK}
               onMaxTokensChange={setMaxTokens}
               onSystemPromptChange={setSystemPrompt}
+              onGPUChange={handleGPUToggle}
             />
           </div>
         </div>
@@ -62,11 +94,23 @@ function App() {
             className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors text-lg"
             title={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
           >
-            {sidebarOpen ? '◀' : '▶'}
+            {sidebarOpen ? '\u25C0' : '\u25B6'}
           </button>
-          <div className="text-sm">
+          <div className="flex items-center gap-2 text-sm">
             {model ? (
-              <span className="text-[var(--text-primary)] font-medium">{model}</span>
+              <>
+                <span className="text-[var(--text-primary)] font-medium">{model}</span>
+                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                  useGPU
+                    ? 'bg-[var(--success)]/20 text-[var(--success)]'
+                    : 'bg-[var(--text-secondary)]/20 text-[var(--text-secondary)]'
+                }`}>
+                  {useGPU ? 'GPU' : 'CPU'}
+                </span>
+                {reloading && (
+                  <span className="text-[var(--text-secondary)] text-xs animate-pulse">switching...</span>
+                )}
+              </>
             ) : (
               <span className="text-[var(--text-secondary)]">No model selected</span>
             )}

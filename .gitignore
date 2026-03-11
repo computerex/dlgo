@@ -40,6 +40,16 @@ desktop.ini
 # Ollama Modelfiles (temp)
 Modelfile*
 
+# Stashed/temp artifacts
+_stash/
+
+# Bench results (JSON outputs)
+bench/results/
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
 # Misc
 *.log
 *.prof

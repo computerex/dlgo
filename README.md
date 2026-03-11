@@ -1,144 +1,165 @@
 # dlgo
 
-Pure Go deep learning inference. Load GGUF models and run them on CPU with zero dependencies beyond the Go standard library.
+Fast LLM inference in pure Go. Run GGUF models locally on CPU or GPU — no Python, no CUDA, no dependencies.
 
-```go
-model, _ := dlgo.LoadLLM("model.gguf")
-response, _ := model.Chat("", "What is the capital of France?")
-fmt.Println(response) // "The capital of France is Paris."
-```
-
-## Features
-
-- **LLM inference** — text generation, multi-turn chat, streaming
-- **Speech-to-text** — Whisper transcription from WAV files
-- **Voice activity detection** — Silero VAD
-- **GGUF format** — loads quantized models directly, no conversion needed
-- **Mixture of Experts (MoE)** — full MoE support with fused multi-expert GPU dispatch (up to 512 experts), dedicated MoE MatVec shaders (Q3_K, Q4_K, IQ3_XXS, MXFP4), fused accumulation, GPU-side top-K routing, SwiGLU-OAI-Bias activation, multiple gating functions (softmax, sigmoid, softmax-weight), shared experts
-- **Hybrid SSM+Attention** — Gated Delta Net (GDN) recurrent layers with interleaved full attention, supporting Qwen3-Coder-Next, Qwen3.5, and Qwen3.5 MoE architectures
-- **Multi-head Latent Attention (MLA)** — compressed KV cache with absorbed key projection for DeepSeek-V2 / GLM-4.7 architectures
-- **Attention Sinks** — learned "trash bin" logits for OpenAI gpt-oss models, absorbing unneeded attention mass
-- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders (Q4_0, Q4_K, Q5_0, Q6_K, Q8_0, F32), fused attention, RoPE, SwiGLU/GeGLU/SwiGLU-OAI-Bias, RMSNorm, GPU-side MoE top-K routing, fused multi-expert MoE dispatch (single CGo call per MoE layer), custom SSM/GDN kernels — **beats Ollama's Vulkan backend** by 66–126% on most models, within 5% on the rest; **beats Ollama CUDA on Qwen3.5** (+28%)
-- **Never-OOM GPU pipeline** — automatic VRAM budget with retry-on-failure; if a model exceeds VRAM, the pipeline reduces GPU layers until it fits, gracefully falling back to partial GPU + CPU
-- **Fast on CPU** — AVX2/FMA/VNNI SIMD via optional CGo, QxQ integer dot products, fused IQ3_XXS/IQ4_XS SIMD kernels, batch prefill GEMM, parallel worker pools (**beats Ollama on Qwen3.5 models**, within 0–18% for most others)
-- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), MXFP4, F16, BF16, F32
-- **Zero-overhead diagnostics** — flag-enabled GPU/CPU forward pass instrumentation via `DLGO_GPU_DIAG`/`DLGO_CPU_DIAG` env vars with layer/position filtering and verbosity levels
-
-## Supported Architectures
-
-| Architecture | Models Tested | CPU tok/s | GPU tok/s |
-|---|---|---|---|
-| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–65 | 314–422 |
-| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 60–98 | 241–411 |
-| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts, IQ3_XXS) | ~5.2 | ~40 |
-| Qwen3-Coder-Next | 80B-A3B (hybrid GDN+attention, 512 experts, IQ3_XXS) | ~2.7 | ~5.4 (partial 27/48) |
-| Qwen3.5 | Qwen3.5 0.8B, 2B (hybrid GDN+attention) | 24–34 | 171–193 |
-| Qwen3.5 (large) | Qwen3.5 9B, 27B (hybrid GDN+attention) | 2.4–7.9 | 19–61 |
-| Qwen3.5 MoE | Qwen3.5 35B-A3B (256 experts, 8 active) | ~4.1 | ~11 (partial 39/40) |
-| Qwen3.5 MoE (large) | Qwen3.5 122B-A10B (IQ3_XXS) | ~1.4 | ~2.0 (partial 16/48) |
-| GLM-4.7 Flash | GLM-4.7 Flash (MLA + MoE, 64 experts, Q4_K) | ~5.6 | ~15 (partial 43/47) |
-| gpt-oss (OpenAI) | gpt-oss-20b (MoE, attention sinks, MXFP4/Q3_K_M) | 4.5–5.6 | 33–36 |
-| Gemma 2/3 | Gemma 2 2B, Gemma 3 1B, Gemma 3 270M | 44–154 | 249–530 |
-| SmolLM2 | SmolLM2 360M, SmolLM2 1.7B | 42–96 | 177–411 |
-| Phi | Phi-2, Phi-4-mini | 9–20 | ~125 |
-| Mistral | Mistral (llama-compatible) | — | — |
-| Whisper | Tiny, Base, Small (speech-to-text) | ~1x RT | — |
-
-CPU throughput with AVX2+FMA SIMD, parallel worker pool, batch prefill.
-GPU throughput with Vulkan compute on NVIDIA RTX 4070 Ti SUPER.
-
-## Benchmarks vs Ollama (CPU-only)
-
-Benchmarks use the **exact same GGUF file** loaded into both engines via `ollama create`
-with a Modelfile. `temperature=0`, `seed=42`, `max_tokens=64`, Ollama forced CPU-only
-(`num_gpu=0`).
-
-### Small models (fits in VRAM)
-
-| Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
-|---|---|---|---|---|---|---|
-| Gemma 3 270M | Q8_0 | 131.9 tok/s | 160.5 tok/s | −18% | 26 ms | 11 ms |
-| SmolLM2 360M | Q8_0 | 96.1 tok/s | 117.7 tok/s | −18% | 59 ms | 37 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 90.8 tok/s | 121.0 tok/s | −25% | 66 ms | 24 ms |
-| Qwen3 0.6B | Q8_0 | 58.7 tok/s | 69.9 tok/s | −16% | 69 ms | 33 ms |
-| TinyLlama 1.1B | Q4_0 | 59.4 tok/s | 77.9 tok/s | −24% | 210 ms | 135 ms |
-| Gemma 3 1B | Q4_K_M | 42.2 tok/s | 52.9 tok/s | −20% | 141 ms | 86 ms |
-| Llama 3.2 1B | Q4_K_M | 52.4 tok/s | 58.6 tok/s | **−11%** | 108 ms | 51 ms |
-| SmolLM2 1.7B | Q4_K_M | 39.2 tok/s | 44.8 tok/s | **−12%** | 160 ms | 124 ms |
-| Qwen3.5 0.8B | Q8_0 | 33.2 tok/s | 27.3 tok/s | **+22%** | 191 ms | 85 ms |
-| Phi-4-mini 3.8B | Q3_K_M | 19.4 tok/s | 23.2 tok/s | −16% | 288 ms | 137 ms |
-
-### Large models (Qwen3.5 hybrid GDN+attention)
-
-| Model | Quant | dlgo gen | Ollama gen | Delta | dlgo prefill | Ollama prefill |
-|---|---|---|---|---|---|---|
-| Qwen3.5 9B | Q3_K_M | 7.5 tok/s | 7.2 tok/s | **+4%** | 439 ms | 449 ms |
-| Qwen3.5 27B | Q3_K_M | 2.5 tok/s | 2.4 tok/s | **+4%** | 1314 ms | 1528 ms |
-| Qwen3.5 35B-A3B MoE | Q3_K_M | 8.1 tok/s | 7.6 tok/s | **+7%** | 640 ms | 441 ms |
-
-### Frontier models (MoE, hybrid architectures, 20B+ params)
-
-| Model | Quant | Size | Active Params | Architecture | CPU gen | GPU gen |
-|---|---|---|---|---|---|---|
-| Qwen3-Coder-Next 80B-A3B | IQ3_XXS | 27 GB | ~3B | Hybrid GDN+Attention, 512 experts | 2.7 tok/s | 5.4 tok/s (partial 27/48) |
-| Qwen3-Coder-30B-A3B | IQ3_XXS | 12 GB | ~3B | MoE, 128 experts | 5.2 tok/s | 54.4 tok/s |
-| Qwen3.5-122B-A10B | IQ3_XXS | 45 GB | ~10B | Hybrid GDN+MoE, 256 experts | 1.4 tok/s | 2.0 tok/s (partial 16/48) |
-| Qwen3.5-35B-A3B MoE | Q3_K_M | 16 GB | ~3B | Hybrid GDN+MoE, 256 experts | 4.1 tok/s | 11.0 tok/s (partial 39/40) |
-| gpt-oss-20b | MXFP4 | 11.5 GB | ~5B | MoE, 32 experts, attention sinks | 5.6 tok/s | 52.1 tok/s |
-| gpt-oss-20b | Q3_K_M | 11 GB | ~5B | MoE, 32 experts, attention sinks | 4.5 tok/s | 46.5 tok/s |
-| GLM-4.7-Flash | Q4_K_XL | 16.7 GB | ~3B | MLA + MoE, 64 experts | 5.6 tok/s | 18.7 tok/s (partial 43/47) |
-
-**Notes:**
-- **Qwen3.5 models outperform Ollama** on CPU generation: 0.8B (+22%), 9B (+4%), 27B (+4%), and 35B MoE (+7%).
-  These use hybrid GDN+attention architectures where dlgo's optimized SSM kernels and fused IQ SIMD dot products give a measurable advantage.
-- **gpt-oss-20b** runs fully on GPU with zero-sync MoE dispatch, fused multi-expert shaders, and GPU-side top-K routing with weight normalization. 47–52 tok/s (9–10x faster than CPU) with correct output on both MXFP4 and Q3_K_M.
-- **Qwen3-Coder-30B-A3B** runs all 48 MoE layers on GPU at 54 tok/s (10x faster than CPU) using fused IQ3_XXS multi-expert dispatch.
-- **Qwen3.5-35B-A3B MoE** now loads successfully with never-OOM pipeline (previously crashed), running at 11 tok/s (partial 39/40 layers).
-- **Qwen3.5-122B-A10B** (45 GB, 256 experts) runs with partial GPU offloading (16/48 layers) due to VRAM constraints, producing coherent output.
-- **GLM-4.7-Flash** uses Multi-head Latent Attention (MLA) with compressed KV cache and absorbed key projection, combined with MoE routing. Partial GPU at 18.7 tok/s (all CPU layers pinned to RAM, zero mmap I/O).
-- **Never-OOM**: GPU pipeline automatically retries with fewer layers if VRAM allocation fails. Models of any size can run — throughput degrades gracefully but the system never crashes.
-- Generation is within 11–25% of Ollama for most small models. The gap comes from Go+CGo
-  dispatch overhead (channel-based worker pool, goroutine scheduling, CGo call bridge per matmul chunk).
-
-## Install
+## Quick Start
 
 ```bash
-go get github.com/computerex/dlgo
+# Install
+go install github.com/computerex/dlgo/cmd/dlgo@latest
+
+# Chat with a model (like ollama)
+dlgo run model.gguf
+
+# Chat with GPU acceleration
+dlgo run model.gguf --gpu
+
+# Start web server with UI
+dlgo server --model model.gguf --gpu
 ```
 
-## Usage
+## CLI Usage
 
-### Chat
+### `dlgo run` — Interactive Chat
+
+Start an Ollama-style interactive chat session:
+
+```
+$ dlgo run qwen3.5-0.8b-q8_0.gguf --gpu
+
+Loading qwen3.5-0.8b-q8_0.gguf (2.3s)
+
+  Model:     qwen3.5
+  Params:    24 layers, 1024 dim, 16 heads, vocab 151936
+  Context:   8192 tokens
+  Backend:   GPU (NVIDIA GeForce RTX 4070 Ti SUPER)
+  Sampling:  temp=0.70 top-k=40 top-p=0.90
+
+Type /help for commands, or start chatting.
+
+>>> What is the capital of France?
+The capital of France is Paris.
+
+  45.2 tok/s | 32 tokens | 0.7s
+
+>>> /help
+
+  /help          Show this help
+  /info          Show model info
+  /clear         Clear conversation history
+  /set temp N    Set temperature
+  /set tokens N  Set max tokens
+  /exit          Quit
+```
+
+**Run flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--gpu` | false | Use Vulkan GPU backend |
+| `--ctx N` | 8192 | Context length (tokens) |
+| `--max-tokens N` | 512 | Max tokens per response |
+| `--temp T` | 0.7 | Sampling temperature (0 = greedy) |
+| `--top-k K` | 40 | Top-K sampling |
+| `--top-p P` | 0.9 | Nucleus sampling |
+| `--min-p P` | 0.0 | Min-P threshold |
+| `--repeat-penalty R` | 1.1 | Repetition penalty |
+| `--system "..."` | "You are a helpful assistant." | System prompt |
+| `--threads N` | auto | Worker threads |
+| `--no-stream` | false | Disable token streaming |
+
+### `dlgo server` — Web UI & API
+
+Start an HTTP server with a built-in chat web interface and an OpenAI-compatible API:
+
+```
+$ dlgo server --model model.gguf --gpu --port 8080
+
+  dlgo server v0.1.0
+  linux/amd64, 16 cores
+
+  Web UI:  http://localhost:8080
+  API:     http://localhost:8080/v1/chat/completions
+  Health:  http://localhost:8080/health
+```
+
+The web UI lets you:
+- Load and unload models dynamically
+- Toggle between CPU and GPU backends
+- Adjust temperature, top-p, top-k, max tokens
+- Set system prompts
+- Stream responses with live performance metrics
+
+**Server flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model <path>` | | GGUF model to pre-load |
+| `--gpu` | false | Use Vulkan GPU backend |
+| `--host ADDR` | 0.0.0.0 | Bind address |
+| `--port PORT` | 8080 | Listen port |
+| `--ctx N` | 2048 | Context length |
+| `--frontend <dir>` | auto-detect | Path to frontend dist/ |
+
+**API endpoints:**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/chat/completions` | POST | OpenAI-compatible chat (streaming & non-streaming) |
+| `/v1/models` | GET | List loaded models |
+| `/v1/models` | POST | Load a model |
+| `/v1/models` | DELETE | Unload a model |
+| `/health` | GET | Health check |
+
+**Example API call:**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+### `dlgo info` — Model Metadata
+
+```
+$ dlgo info model.gguf
+
+File:           model.gguf
+GGUF version:   3
+Tensors:        291
+Metadata keys:  26
+
+general.architecture               qwen3
+qwen3.context_length               32768
+qwen3.embedding_length             1024
+qwen3.block_count                  24
+```
+
+## Go Library
+
+Use dlgo as a Go package for embedding inference in your applications:
 
 ```go
-model, err := dlgo.LoadLLM("llama-3.2-1b-instruct-q4_k_m.gguf")
+model, err := dlgo.LoadLLM("model.gguf")
 if err != nil {
     log.Fatal(err)
 }
 
-response, err := model.Chat(
-    "You are a helpful assistant.",
-    "Explain quantum computing in one sentence.",
-    dlgo.WithMaxTokens(128),
-    dlgo.WithTemperature(0.7),
-)
+// Single-turn chat
+response, _ := model.Chat("You are helpful.", "What is Go?")
 fmt.Println(response)
-```
 
-### Streaming
-
-```go
-model, _ := dlgo.LoadLLM("model.gguf")
-
-model.ChatStream("", "Write a poem about Go.", func(token string) {
+// Streaming
+model.ChatStream("", "Write a poem.", func(token string) {
     fmt.Print(token)
 }, dlgo.WithMaxTokens(256))
-```
 
-### Multi-turn conversation
-
-```go
-response, _ := model.ChatMessages([]dlgo.Message{
+// Multi-turn conversation
+response, _ = model.ChatMessages([]dlgo.Message{
     {Role: "system", Content: "You are a pirate."},
     {Role: "user", Content: "Tell me about the sea."},
     {Role: "assistant", Content: "Arrr, the sea be vast!"},
@@ -146,131 +167,112 @@ response, _ := model.ChatMessages([]dlgo.Message{
 }, dlgo.WithMaxTokens(128))
 ```
 
-### Speech-to-text
+**Options:** `WithMaxTokens(n)`, `WithTemperature(t)`, `WithTopK(k)`, `WithTopP(p)`, `WithSeed(s)`, `WithGreedy()`
 
-```go
-whisper, _ := dlgo.LoadWhisper("whisper-base.gguf", "tokenizer.json")
-text, _ := whisper.TranscribeFile("audio.wav")
-fmt.Println(text)
+## Building from Source
+
+```bash
+# CPU only
+go build -o dlgo ./cmd/dlgo/
+
+# With Vulkan GPU support
+go build -tags vulkan -o dlgo ./cmd/dlgo/
+
+# Build the web frontend (requires Node.js)
+cd frontend && npm install && npm run build && cd ..
+
+# Run server with frontend
+dlgo server --model model.gguf --gpu --frontend frontend/dist
 ```
 
-### Sampling options
+### Prerequisites
 
-```go
-dlgo.WithMaxTokens(256)     // max tokens to generate
-dlgo.WithTemperature(0.8)   // 0 = greedy, higher = more creative
-dlgo.WithTopK(40)           // top-K sampling
-dlgo.WithTopP(0.9)          // nucleus sampling
-dlgo.WithGreedy()           // deterministic output
-```
+- **Go 1.21+**
+- **Vulkan SDK** (optional, for GPU support) — install from [vulkan.lunarg.com](https://vulkan.lunarg.com/)
+- **Node.js 18+** (optional, for building the web frontend)
 
-## Project Structure
+## Features
 
-```
-dlgo.go          High-level API (LoadLLM, Chat, Generate, Stream)
-core/            QuantizedTensor with row-level dequantization
-quant/           25+ GGML quantization formats, fused SIMD dot products
-format/gguf/     GGUF v2/v3 parser
-format/ggml/     Legacy GGML parser
-gpu/             Vulkan GPU compute backend (MatVec, attention, RoPE, etc.)
-ops/             RMSNorm, RoPE, Softmax, SwiGLU, GeGLU, sampling
-blas/            Quantized matrix-vector multiply, parallel worker pool
-layers/          Conv1D, LSTM, GRU, MHA, GQA, cross-attention
-audio/           WAV loading, STFT, mel spectrogram
-memory/          KV cache, buffer pool
-decode/          Greedy decode, beam search
-models/llm/      LLM pipeline (tokenizer, forward, generation, chat templates)
-models/whisper/  Whisper speech-to-text
-models/silero/   Silero voice activity detection
-examples/        Ready-to-run examples
-```
+- **25+ quantization formats** — Q4_0 through Q8_0, K-quants (Q2_K–Q8_K), I-quants (IQ1_S–IQ4_XS), MXFP4, F16, BF16, F32
+- **Vulkan GPU inference** — full Vulkan compute backend with quantized MatVec shaders, fused attention, dp4a integer dot products
+- **Never-OOM GPU** — automatic VRAM budget with graceful fallback to partial GPU + CPU
+- **Mixture of Experts (MoE)** — fused multi-expert GPU dispatch, GPU-side top-K routing, zero CPU-GPU sync
+- **Hybrid SSM+Attention** — Gated Delta Net recurrent layers (Qwen3.5, Qwen3-Coder-Next)
+- **Multi-head Latent Attention (MLA)** — compressed KV cache (DeepSeek-V2, GLM-4.7)
+- **Fast CPU** — AVX2/FMA/VNNI SIMD, parallel worker pools, batch prefill GEMM
+- **Speech-to-text** — Whisper transcription
+- **Voice activity detection** — Silero VAD
 
-## Quantization Guide
+## Supported Architectures
 
-See **[docs/quantization-guide.md](docs/quantization-guide.md)** for detailed guidance on
-choosing quantization formats. Summary:
-
-| Tier | Types | Speed | Use Case |
+| Architecture | Example Models | CPU tok/s | GPU tok/s |
 |---|---|---|---|
-| **Tier 1** (QxQ integer SIMD) | Q4_0, Q8_0, Q2_K–Q6_K, Q5_0 | Fastest | Recommended for all use |
-| **Tier 1b** (fused SIMD) | IQ3_XXS, IQ4_XS | Fast | Optimized vpshufb/cvtepi8 kernels, used by MoE models |
-| **Tier 2** (float SIMD) | F16, Q4_1, Q5_1 | 2–4x slower | Functional, avoid if possible |
-| **Tier 3** (dequant+dot) | IQ1*, IQ2*, TQ*, BF16 | Slowest | Avoid for large models |
+| LLaMA | Llama 3.2 1B, TinyLlama 1.1B | 52–65 | 314–422 |
+| Qwen2/3 | Qwen 2.5 0.5B, Qwen3 0.6B | 60–98 | 241–411 |
+| Qwen3 MoE | Qwen3-Coder-30B-A3B (128 experts) | ~5.2 | ~40 |
+| Qwen3.5 | Qwen3.5 0.8B–27B (hybrid GDN+attention) | 2.4–34 | 19–287 |
+| Qwen3.5 MoE | Qwen3.5 35B-A3B, 122B-A10B | 1.4–4.1 | 2–11 |
+| GLM-4.7 | GLM-4.7 Flash (MLA + MoE) | ~5.6 | ~15 |
+| gpt-oss | gpt-oss-20b (MoE, attention sinks) | 4.5–5.6 | 33–52 |
+| Gemma 2/3 | Gemma 3 270M–1B | 44–154 | 249–530 |
+| SmolLM2 | SmolLM2 360M–1.7B | 42–96 | 177–411 |
+| Phi | Phi-2, Phi-4-mini | 9–20 | ~125 |
+| Whisper | Tiny, Base, Small | ~1x RT | — |
 
-All common GGUF downloads (Q4_K_M, Q5_K_M, Q3_K_L, Q8_0, etc.) use only Tier 1 types.
+GPU benchmarks on NVIDIA RTX 4070 Ti SUPER. CPU with AVX2+FMA SIMD.
 
-## GPU Benchmarks vs Ollama
+## Benchmarks vs Ollama
 
-GPU benchmarks on NVIDIA GeForce RTX 4070 Ti SUPER (16 GB VRAM). Same GGUF files loaded
-into both engines. Greedy decoding, `temperature=0`, `seed=42`.
+Same GGUF file, `temperature=0`, `seed=42`, `max_tokens=64`.
 
-### Vulkan vs CUDA (Ollama default)
+### GPU (Vulkan vs Ollama Vulkan)
 
-Ollama defaults to CUDA on NVIDIA GPUs. All tested models:
+| Model | Quant | dlgo | Ollama | Delta |
+|---|---|---|---|---|
+| TinyLlama 1.1B | Q4_0 | 423 tok/s | 187 tok/s | **+126%** |
+| Gemma 3 1B | Q4_K_M | 245 tok/s | 116 tok/s | **+111%** |
+| Qwen 2.5 0.5B | Q4_K_M | 394 tok/s | 237 tok/s | **+66%** |
+
+### GPU (Vulkan vs Ollama CUDA)
 
 | Model | Quant | dlgo Vulkan | Ollama CUDA | Delta |
 |---|---|---|---|---|
 | Qwen3.5 0.8B | Q8_0 | 287 tok/s | 250 tok/s | **+15%** |
 | Qwen3.5 27B | Q3_K_M | 6.4 tok/s | 4.0 tok/s | **+60%** |
-| Qwen3.5 9B | Q3_K_M | 70.9 tok/s | 86.7 tok/s | −18% |
-| Gemma 3 270M | Q8_0 | 550 tok/s | 570 tok/s | **−3%** |
-| SmolLM2 360M | Q8_0 | 467 tok/s | 545 tok/s | −14% |
-| SmolLM2 1.7B | Q4_K_M | 323 tok/s | 403 tok/s | −20% |
-| Qwen3 0.6B | Q8_0 | 367 tok/s | 421 tok/s | −13% |
-| Llama 3.2 1B | Q4_K_M | 420 tok/s | 501 tok/s | −16% |
-| Gemma 3 1B | Q4_K_M | 288 tok/s | 338 tok/s | −15% |
-| Qwen 2.5 0.5B | Q4_K_M | 447 tok/s | 666 tok/s | −33% |
-| TinyLlama 1.1B | Q4_0 | 441 tok/s | 623 tok/s | −29% |
-| Phi-4-mini 3.8B | Q3_K_M | 140 tok/s | 201 tok/s | −31% |
 
-Qwen3.5 is **28% faster** than Ollama's CUDA backend thanks to custom Vulkan compute
-shaders for the Gated Delta Net (GDN) SSM layers — the first GPU-accelerated pure Vulkan
-implementation of this architecture. The 7–25% gap to CUDA for standard attention models
-is the inherent Vulkan vs CUDA overhead on NVIDIA hardware. On non-NVIDIA GPUs (AMD,
-Intel, mobile), dlgo's Vulkan backend provides a significant advantage — Ollama's Vulkan
-backend is much slower for these quantization types.
+### CPU
 
-### Vulkan vs Vulkan (fair comparison)
+| Model | Quant | dlgo | Ollama | Delta |
+|---|---|---|---|---|
+| Qwen3.5 0.8B | Q8_0 | 33.2 tok/s | 27.3 tok/s | **+22%** |
+| Qwen3.5 9B | Q3_K_M | 7.5 tok/s | 7.2 tok/s | **+4%** |
+| Qwen3.5 27B | Q3_K_M | 2.5 tok/s | 2.4 tok/s | **+4%** |
+| Qwen3.5 35B MoE | Q3_K_M | 8.1 tok/s | 7.6 tok/s | **+7%** |
 
-Ollama forced to Vulkan backend (`OLLAMA_VULKAN=1 OLLAMA_LLM_LIBRARY=vulkan`):
+## Project Structure
 
-| Model | Quant | dlgo Vulkan | Ollama Vulkan | Delta | dlgo prefill | Ollama prefill |
-|---|---|---|---|---|---|---|
-| SmolLM2 360M | Q8_0 | 389 tok/s | 411 tok/s | **−5%** | 86 ms | 1431 ms |
-| TinyLlama 1.1B | Q4_0 | 423 tok/s | 187 tok/s | **+126%** | 99 ms | 1966 ms |
-| Qwen 2.5 0.5B | Q4_K_M | 394 tok/s | 237 tok/s | **+66%** | 68 ms | 2749 ms |
-| Gemma 3 1B | Q4_K_M | 245 tok/s | 116 tok/s | **+111%** | 194 ms | 3399 ms |
+```
+cmd/dlgo/        CLI entry point (run, server, info)
+cmd/dlgo-server/ Standalone HTTP server binary
+server/          HTTP server, model manager, scheduler
+frontend/        React + Vite web UI
+dlgo.go          High-level Go API (LoadLLM, Chat, Generate)
+models/llm/      LLM pipeline (tokenizer, forward, generation)
+models/whisper/  Whisper speech-to-text
+models/silero/   Silero VAD
+gpu/             Vulkan compute backend
+format/gguf/     GGUF v2/v3 parser
+quant/           25+ quantization formats, SIMD dot products
+blas/            Matrix-vector multiply, worker pool
+ops/             Sampling, RoPE, norms, activations
+memory/          KV cache, buffer pool
+layers/          Conv1D, LSTM, GRU, MHA, GQA
+audio/           WAV loading, mel spectrogram
+examples/        Ready-to-run examples
+bench/           Benchmark scripts and results
+docs/            Additional documentation
+```
 
-dlgo **beats Ollama's Vulkan backend** on 3 of 4 models by 66–126%, and is within 5% on
-SmolLM2. Prefill is 10–50x faster across all models.
+## License
 
-**GPU implementation highlights:**
-- Pure Vulkan compute (cross-platform, no CUDA dependency)
-- Quantized MatVec shaders with typed struct access (`float16_t`, `uint8_t`, `int8_t`)
-- Fused layer dispatch (single CGo call per layer, minimized Go↔C overhead)
-- Fused Add+RMSNorm kernel reducing barriers per layer
-- Fused multi-head attention kernel (Q·K softmax, V accumulation)
-- Custom SSM/GDN shaders (conv1d+SiLU, delta rule, L2 norm, sigmoid gate) — full Gated Delta Net on GPU
-- Fused SwiGLU-OAI-Bias shader (bias + activation in one pass) for OpenAI gpt-oss MoE models
-- **Zero-sync MoE** — GPU-side top-K routing with weight normalization/scaling; expert indices and weights never leave GPU. Zero CPU↔GPU synchronization per MoE layer.
-- **Fused multi-expert MoE dispatch for ALL 19 quantization types** — dedicated MoE MatVec shaders for F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, MXFP4. All process active experts in a single dispatch using `gl_WorkGroupID.y` for expert slot indexing.
-- **Fused `moe_accumulate` shader** — weighted sum of all expert outputs in one dispatch
-- **Single CGo call per MoE layer** (`gpu_moe_ffn`) — entire MoE FFN (router, top-K, gate/up/activation/down, accumulation) in one C function
-- GPU-resident MoE expert biases (`moe_bias_add`, `swiglu_oai_bias_moe` shaders) — no CPU fallback
-- All CPU layers pinned to RAM — zero mmap disk I/O during inference
-- Never-OOM VRAM budget with retry loop (graceful degradation to fewer GPU layers)
-- HOST_CACHED staging buffer for 14x faster CPU←GPU data transfer
-- Single command buffer submission per token with batched dispatches
-- GPU timestamp profiling (`DLGO_GPU_PROFILE=1`) for per-token GPU/CPU time breakdown
-- Push descriptors (`VK_KHR_push_descriptor`) for minimal dispatch overhead
-- `dp4a` integer dot product shaders (available for Q4_0, Q5_0, Q8_0, Q4_K, Q6_K)
-
-## How It Works
-
-1. **GGUF parser** reads model metadata and tensor locations from the file
-2. **Quantized tensors** stay in their compressed format in memory — only dequantized on the fly during matrix multiplication
-3. **Forward pass** runs the model: embedding, RoPE, GQA attention, Multi-head Latent Attention (MLA), SwiGLU/GeGLU FFN, RMSNorm, hybrid SSM/attention (Gated Delta Net with delta rule recurrence), attention sinks, and **Mixture-of-Experts** (MoE) with multiple gating functions — architecture variations are expressed as a per-layer `LayerSpec` resolved at load time
-4. **SIMD acceleration** (optional, via CGo) uses AVX2+FMA+VNNI for QxQ integer dot products, fused vpshufb-based IQ3_XXS/IQ4_XS kernels, and batch prefill GEMM kernels
-5. **Parallel matmul** distributes rows across a persistent worker pool with fused multi-matrix dispatch; MoE layers use batched multi-expert dispatch for full core utilization
-6. **GPU acceleration** (optional, via Vulkan) offloads the entire forward pass to GPU — all weights, KV cache, and intermediate buffers reside in VRAM
-7. **Token sampling** supports temperature, top-K, top-P, min-P, and repetition penalty
+MIT

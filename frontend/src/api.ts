@@ -23,6 +23,8 @@ export interface ModelObject {
   architecture?: string;
   quantization?: string;
   parameters?: string;
+  gpu: boolean;
+  path?: string;
 }
 
 export interface LoadModelRequest {

@@ -4,20 +4,54 @@ interface SettingsPanelProps {
   topK: number;
   maxTokens: number;
   systemPrompt: string;
+  useGPU: boolean;
   onTemperatureChange: (v: number) => void;
   onTopPChange: (v: number) => void;
   onTopKChange: (v: number) => void;
   onMaxTokensChange: (v: number) => void;
   onSystemPromptChange: (v: string) => void;
+  onGPUChange: (v: boolean) => void;
 }
 
 export function SettingsPanel({
-  temperature, topP, topK, maxTokens, systemPrompt,
-  onTemperatureChange, onTopPChange, onTopKChange, onMaxTokensChange, onSystemPromptChange,
+  temperature, topP, topK, maxTokens, systemPrompt, useGPU,
+  onTemperatureChange, onTopPChange, onTopKChange, onMaxTokensChange, onSystemPromptChange, onGPUChange,
 }: SettingsPanelProps) {
   return (
     <div className="space-y-5">
       <div className="text-xs font-medium uppercase tracking-wide text-[var(--text-secondary)]">Settings</div>
+
+      {/* Backend Toggle */}
+      <div className="space-y-1.5">
+        <div className="text-xs text-[var(--text-secondary)]">Backend</div>
+        <div className="flex rounded-lg overflow-hidden border border-[var(--border)]">
+          <button
+            onClick={() => onGPUChange(false)}
+            className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+              !useGPU
+                ? 'bg-[var(--accent)] text-white'
+                : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+          >
+            CPU
+          </button>
+          <button
+            onClick={() => onGPUChange(true)}
+            className={`flex-1 px-3 py-2 text-xs font-medium transition-colors ${
+              useGPU
+                ? 'bg-[var(--accent)] text-white'
+                : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+          >
+            GPU (Vulkan)
+          </button>
+        </div>
+        <p className="text-[10px] text-[var(--text-secondary)]">
+          {useGPU
+            ? 'Using Vulkan GPU acceleration'
+            : 'Using CPU inference'}
+        </p>
+      </div>
 
       <SliderSetting
         label="Temperature"
