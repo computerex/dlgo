@@ -1295,7 +1295,8 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
     // 3. TopK + QuantizeQ8_1 (independent, single barrier)
     gpu_barrier();
     rc = gpu_moe_topk(mc->moe_logits, mc->moe_topk_idx, mc->moe_topk_w,
-                      mc->n_experts, n_used, mc->gating_func);
+                      mc->n_experts, n_used, mc->gating_func,
+                      mc->weights_norm, mc->weights_scale);
     if (rc != GPU_OK) return rc;
     rc = gpu_quantize_q8_1(mc->q8_input, mc->ffn_norm, dim);
     if (rc != GPU_OK) return rc;
@@ -1614,11 +1615,14 @@ int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
 }
 
 int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
-                 int n_experts, int k, int gating_func) {
+                 int n_experts, int k, int gating_func,
+                 int weights_norm, float weights_scale) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int n_experts; int k; int gating_func; } pc = {n_experts, k, gating_func};
+    struct { int n_experts; int k; int gating_func; int weights_norm; float weights_scale; } pc = {
+        n_experts, k, gating_func, weights_norm, weights_scale
+    };
     DispatchParams dp = {0};
     dp.pipe = PIPE_MOE_TOPK;
     dp.bufs[0] = logits_buf;

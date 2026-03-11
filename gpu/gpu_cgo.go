@@ -243,9 +243,16 @@ func SwiGLU_OAI_Bias(out, gate, up, gateBias, upBias Buf, n int, alpha, limit fl
 }
 
 // MoETopK performs router gating + top-K selection entirely on GPU.
-func MoETopK(logits, outIndices, outWeights Buf, nExperts, k, gatingFunc int) error {
+// weightsNorm: if true, normalize selected weights by their sum.
+// weightsScale: if non-zero and != 1.0, multiply weights by this factor.
+func MoETopK(logits, outIndices, outWeights Buf, nExperts, k, gatingFunc int, weightsNorm bool, weightsScale float32) error {
+	wn := 0
+	if weightsNorm {
+		wn = 1
+	}
 	rc := C.gpu_moe_topk(C.GpuBuf(logits), C.GpuBuf(outIndices), C.GpuBuf(outWeights),
-		C.int(nExperts), C.int(k), C.int(gatingFunc))
+		C.int(nExperts), C.int(k), C.int(gatingFunc),
+		C.int(wn), C.float(weightsScale))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: moe_topk failed (%d)", rc)
 	}
@@ -510,12 +517,17 @@ func (mc *MoEFFNConf) SetBiases(gateBias, upBias, downBias Buf) {
 }
 
 func (mc *MoEFFNConf) SetConfig(dim, expDim, nExperts, nUsed, gatingFunc int,
+	weightsNorm bool, weightsScale float32,
 	isOAI bool, alpha, limit float32) {
 	mc.c.dim = C.int(dim)
 	mc.c.exp_dim = C.int(expDim)
 	mc.c.n_experts = C.int(nExperts)
 	mc.c.n_used = C.int(nUsed)
 	mc.c.gating_func = C.int(gatingFunc)
+	if weightsNorm {
+		mc.c.weights_norm = 1
+	}
+	mc.c.weights_scale = C.float(weightsScale)
 	if isOAI {
 		mc.c.is_oai = 1
 	}

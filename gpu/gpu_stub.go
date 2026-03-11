@@ -69,5 +69,5 @@ func (mc *MoEFFNConf) SetScratch(fn, fo, ml, ti, tw, q8, gs, us, q8d, os Buf)   
 func (mc *MoEFFNConf) SetRouter(w Buf, r, c, t int, b Buf)                             {}
 func (mc *MoEFFNConf) SetExperts(gw Buf, gt, gs, gb int, uw Buf, ut, us, ub int, dw Buf, dt, ds int) {}
 func (mc *MoEFFNConf) SetBiases(gb, ub, db Buf)                                        {}
-func (mc *MoEFFNConf) SetConfig(d, ed, ne, nu, gf int, oai bool, a, l float32)         {}
+func (mc *MoEFFNConf) SetConfig(d, ed, ne, nu, gf int, wn bool, ws float32, oai bool, a, l float32) {}
 func ForwardMoEFFN_C(mc *MoEFFNConf) error                                             { return errNoGPU }

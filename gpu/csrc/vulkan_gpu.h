@@ -197,7 +197,8 @@ int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
                         int n, float alpha, float limit,
                         int gate_bias_offset, int up_bias_offset);
 int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
-                 int n_experts, int k, int gating_func);
+                 int n_experts, int k, int gating_func,
+                 int weights_norm, float weights_scale);
 int gpu_gelu(GpuBuf buf, int n);
 int gpu_add(GpuBuf out_buf, GpuBuf a_buf, GpuBuf b_buf, int n);
 int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
@@ -358,6 +359,8 @@ typedef struct {
     // Dimensions
     int dim, exp_dim, n_experts, n_used;
     int gating_func;
+    int weights_norm;
+    float weights_scale;
 
     // Activation mode: 0=SwiGLU, 1=SwiGLU_OAI
     int is_oai;

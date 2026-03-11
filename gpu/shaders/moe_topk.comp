@@ -21,6 +21,8 @@ layout(push_constant) uniform Params {
     int n_experts;
     int k;
     int gating_func;
+    int weights_norm;
+    float weights_scale;
 };
 
 void main() {
@@ -87,6 +89,27 @@ void main() {
         }
         for (int t = 0; t < topK; t++) {
             out_weights[t] /= sum;
+        }
+    }
+
+    // Normalize selected weights by their sum (DeepSeek-V2/GLM-4 style)
+    if (weights_norm != 0 && topK > 0) {
+        float wSum = 0.0;
+        for (int t = 0; t < topK; t++) {
+            wSum += out_weights[t];
+        }
+        if (wSum > 1e-12) {
+            float invSum = 1.0 / wSum;
+            for (int t = 0; t < topK; t++) {
+                out_weights[t] *= invSum;
+            }
+        }
+    }
+
+    // Scale weights by a constant factor
+    if (weights_scale != 0.0 && weights_scale != 1.0) {
+        for (int t = 0; t < topK; t++) {
+            out_weights[t] *= weights_scale;
         }
     }
 }

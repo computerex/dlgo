@@ -5,6 +5,8 @@ package gpu
 import (
 	"fmt"
 	"math"
+	"os"
+	"sync"
 
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
@@ -13,7 +15,7 @@ import (
 	"github.com/computerex/dlgo/quant"
 )
 
-var moeDebugOnce int
+var moeDebugOnce sync.Once
 
 // BuildLayerConfs creates reusable fused-layer configurations from the model,
 // run state, and KV cache. Call once after model upload; reuse for every token.
@@ -1229,7 +1231,7 @@ func supportsGPUQType(qtype uint32) bool {
 
 func hasDp4aQType(qtype uint32) bool {
 	switch qtype {
-	case 2, 6, 8, 10, 12, 13, 14, 39: // Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, MXFP4
+	case 2, 6, 8, 10, 39: // Q4_0, Q5_0, Q8_0, Q3_K, MXFP4
 		return true
 	default:
 		return false
@@ -1356,12 +1358,15 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		hasDp4aQType(gateGpu.Type) && hasDp4aQType(uint32(gl.FFNDownExps.Type)) &&
 		!diagL
 
-	if moeDebugOnce == 0 {
-		moeDebugOnce = 1
-		fmt.Printf("[dlgo/gpu] MoE dp4a check: useFused=%v dp4a=%v q8=%v gate=%v gateT=%v downT=%v hasBias=%v diag=%v fused=%v isOAI=%v\n",
+	moeDebugOnce.Do(func() {
+		fmt.Printf("[dlgo/gpu] MoE dp4a check: useFused=%v dp4a=%v q8=%v gate=%v gateT=%v downT=%v hasBias=%v diag=%v fused=%v isOAI=%v weightsNorm=%v weightsScale=%.2f gatingFunc=%d gateType=%d upType=%d downType=%d gateCols=%d dim=%d expDim=%d nExperts=%d nUsed=%d\n",
 			useFusedDp4a, rs.MoEUseDp4a, rs.MoEQ8_1Scratch != 0, rs.MoEGateScratch != 0,
 			hasDp4aQType(gateGpu.Type), hasDp4aQType(uint32(gl.FFNDownExps.Type)),
-			hasBias, diagL, fused, isOAI)
+			hasBias, diagL, fused, isOAI, cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale, cfg.ExpertGatingFunc,
+			gateGpu.Type, upGpu.Type, gl.FFNDownExps.Type, gateGpu.Cols, dim, expDim, cfg.ExpertCount, nUsed)
+	})
+	if os.Getenv("DLGO_NO_FUSED_MOE") == "1" {
+		useFusedDp4a = false
 	}
 	if useFusedDp4a {
 		return gpuForwardMoEFFNFused(gl, layer, rs, cfg, dim, expDim, nUsed,
@@ -1379,7 +1384,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	}
 	Barrier()
 	MoETopK(rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
-		cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc)
+		cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc, false, 0)
 
 	Sync()
 	idxBuf := make([]float32, nUsed)
@@ -1427,6 +1432,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		QuantizeQ8_1(rs.MoEQ8_1Scratch, rs.FFNNorm, dim)
 	}
 	Barrier()
+
 	for e := 0; e < nUsed; e++ {
 		idx := indices[e]
 		if idx < 0 {
@@ -1569,7 +1575,9 @@ func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg 
 		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
 		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
 	mc.SetBiases(gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias)
-	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc, isOAI, 1.702, 7.0)
+	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc,
+		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
+		isOAI, 1.702, 7.0)
 
 	if err := ForwardMoEFFN_C(mc); err != nil {
 		return err

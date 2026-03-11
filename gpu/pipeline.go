@@ -110,8 +110,15 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	q8_1Blocks := (maxDim + 31) / 32
 	total += q8_1Blocks * 36
 
-	// Safety margin (128 MB) to account for IQ tables, driver overhead, etc.
-	total += 128 * 1024 * 1024
+	// Safety margin to account for IQ tables, Vulkan driver overhead,
+	// descriptor sets, command buffers, and runtime fragmentation.
+	// Use max(256 MB, 3% of total VRAM) to prevent near-OOM corruption.
+	vram := int64(VRAMBytes())
+	margin := int64(256 * 1024 * 1024)
+	if pct := vram * 3 / 100; pct > margin {
+		margin = pct
+	}
+	total += margin
 
 	return total
 }

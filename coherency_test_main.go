@@ -34,6 +34,8 @@ var models = []modelSpec{
 	{"GLM-4.7-Flash Q4_K_XL", `C:\Users\mohd\Downloads\GLM-4.7-Flash-UD-Q4_K_XL.gguf`},
 	{"Qwen3.5 35B-A3B MoE Q3_K_M", `C:\projects\gollm\Qwen3.5-35B-A3B-Q3_K_M.gguf`},
 	{"Qwen3-Coder-30B-A3B IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf`},
+	{"Qwen3-Coder-Next IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3-Coder-Next-UD-IQ3_XXS.gguf`},
+	{"Qwen3.5-122B-A10B IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf`},
 }
 
 type CoherencyResult struct {
