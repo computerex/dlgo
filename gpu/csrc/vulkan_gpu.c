@@ -1267,6 +1267,107 @@ int gpu_moe_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf indices_buf,
     return dispatch_compute(&dp);
 }
 
+// ---------------------------------------------------------------------------
+// Fused MoE FFN: all MoE steps in a single CGo call
+// ---------------------------------------------------------------------------
+int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int dim = mc->dim;
+    int exp_dim = mc->exp_dim;
+    int n_used = mc->n_used;
+    int total_exp_dim = n_used * exp_dim;
+
+    // 1. Router matvec
+    gpu_barrier();
+    int rc = gpu_matvec(mc->moe_logits, mc->router_w, mc->ffn_norm,
+                        mc->router_rows, mc->router_cols, mc->router_type);
+    if (rc != GPU_OK) return rc;
+
+    // 2. Router bias (if present)
+    if (mc->router_bias) {
+        gpu_barrier();
+        rc = gpu_add(mc->moe_logits, mc->moe_logits, mc->router_bias, mc->n_experts);
+        if (rc != GPU_OK) return rc;
+    }
+
+    // 3. TopK + QuantizeQ8_1 (independent, single barrier)
+    gpu_barrier();
+    rc = gpu_moe_topk(mc->moe_logits, mc->moe_topk_idx, mc->moe_topk_w,
+                      mc->n_experts, n_used, mc->gating_func);
+    if (rc != GPU_OK) return rc;
+    rc = gpu_quantize_q8_1(mc->q8_input, mc->ffn_norm, dim);
+    if (rc != GPU_OK) return rc;
+
+    // 4. Gate + Up MoE projections (cols = dim = input dimension)
+    gpu_barrier();
+    rc = gpu_moe_matvec_dp4a(mc->gate_scratch, mc->gate_w, mc->q8_input, mc->moe_topk_idx,
+                              exp_dim, dim, mc->gate_type,
+                              mc->gate_stride, mc->gate_base, 1, n_used);
+    if (rc != GPU_OK) return rc;
+    rc = gpu_moe_matvec_dp4a(mc->up_scratch, mc->up_w, mc->q8_input, mc->moe_topk_idx,
+                              exp_dim, dim, mc->up_type,
+                              mc->up_stride, mc->up_base, 1, n_used);
+    if (rc != GPU_OK) return rc;
+
+    // 5. Activation (SwiGLU or SwiGLU_OAI, with optional bias)
+    GpuBuf hidden_buf;
+    gpu_barrier();
+    int has_gate_bias = mc->gate_bias != 0;
+    int has_up_bias = mc->up_bias != 0;
+
+    if (mc->is_oai && has_gate_bias && has_up_bias) {
+        hidden_buf = mc->gate_scratch;
+        rc = gpu_swiglu_oai_bias_moe(mc->gate_scratch, mc->gate_scratch, mc->up_scratch,
+                                     mc->gate_bias, mc->up_bias, mc->moe_topk_idx,
+                                     total_exp_dim, mc->alpha, mc->limit, exp_dim);
+        if (rc != GPU_OK) return rc;
+    } else if (mc->is_oai) {
+        hidden_buf = mc->gate_scratch;
+        rc = gpu_swiglu_oai(mc->gate_scratch, mc->gate_scratch, mc->up_scratch,
+                            total_exp_dim, mc->alpha, mc->limit);
+        if (rc != GPU_OK) return rc;
+    } else {
+        hidden_buf = mc->gate_scratch; // reuse gate_scratch for hidden output
+        if (has_gate_bias) {
+            rc = gpu_moe_bias_add(mc->gate_scratch, mc->gate_bias, mc->moe_topk_idx, exp_dim, n_used);
+            if (rc != GPU_OK) return rc;
+        }
+        if (has_up_bias) {
+            rc = gpu_moe_bias_add(mc->up_scratch, mc->up_bias, mc->moe_topk_idx, exp_dim, n_used);
+            if (rc != GPU_OK) return rc;
+        }
+        if (has_gate_bias || has_up_bias) {
+            gpu_barrier();
+        }
+        rc = gpu_swiglu(mc->gate_scratch, mc->gate_scratch, mc->up_scratch, total_exp_dim);
+        if (rc != GPU_OK) return rc;
+    }
+
+    // 6. Quantize hidden states for down projection
+    gpu_barrier();
+    rc = gpu_quantize_q8_1(mc->q8_down_packed, hidden_buf, total_exp_dim);
+    if (rc != GPU_OK) return rc;
+
+    // 7. Down projections
+    gpu_barrier();
+    rc = gpu_moe_matvec_dp4a(mc->out_scratch, mc->down_w, mc->q8_down_packed, mc->moe_topk_idx,
+                              dim, exp_dim, mc->down_type,
+                              mc->down_stride, 0, 0, n_used);
+    if (rc != GPU_OK) return rc;
+
+    // 8. Weighted accumulation
+    gpu_barrier();
+    int has_down_bias = mc->down_bias != 0;
+    rc = gpu_moe_accumulate(mc->ffn_out, mc->out_scratch, mc->moe_topk_w,
+                            mc->down_bias, mc->moe_topk_idx,
+                            dim, n_used, has_down_bias);
+    if (rc != GPU_OK) return rc;
+
+    return GPU_OK;
+}
+
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;

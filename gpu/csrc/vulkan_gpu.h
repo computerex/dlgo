@@ -325,6 +325,47 @@ int gpu_deinterleave_qgate(GpuBuf qfull, GpuBuf q, GpuBuf qgate,
                            int num_heads, int head_dim);
 int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n);
 
+// Fused MoE FFN: runs entire MoE FFN in a single CGo call.
+// Eliminates ~18 CGo calls per layer → 1 call.
+typedef struct {
+    // Scratch buffers
+    GpuBuf ffn_norm;         // input (RMS-normed hidden state)
+    GpuBuf ffn_out;          // output (weighted expert sum)
+    GpuBuf moe_logits;       // [n_experts] scratch
+    GpuBuf moe_topk_idx;     // [n_used] scratch (float-encoded indices)
+    GpuBuf moe_topk_w;       // [n_used] scratch (softmax weights)
+    GpuBuf q8_input;         // Q8_1 quantized input scratch
+    GpuBuf gate_scratch;     // [n_used * exp_dim] gate projections
+    GpuBuf up_scratch;       // [n_used * exp_dim] up projections
+    GpuBuf q8_down_packed;   // Q8_1 packed hidden for down proj
+    GpuBuf out_scratch;      // [n_used * dim] per-expert outputs
+
+    // Router
+    GpuBuf router_w;
+    int router_rows, router_cols, router_type;
+    GpuBuf router_bias;      // 0 if none
+
+    // Expert weights
+    GpuBuf gate_w, up_w, down_w;
+    int gate_type, up_type, down_type;
+    int gate_stride, gate_base;    // block-unit strides
+    int up_stride, up_base;
+    int down_stride;
+
+    // Expert biases (0 if none)
+    GpuBuf gate_bias, up_bias, down_bias;
+
+    // Dimensions
+    int dim, exp_dim, n_experts, n_used;
+    int gating_func;
+
+    // Activation mode: 0=SwiGLU, 1=SwiGLU_OAI
+    int is_oai;
+    float alpha, limit;
+} GpuMoEConf;
+
+int gpu_forward_moe_ffn(const GpuMoEConf* mc);
+
 // IQ lookup table management for I-quant GPU matvec.
 // Call once after gpu_init to register grid table buffers.
 // iq1s_buf: iq1s_grid[2048] as uint32[4096]

@@ -458,6 +458,80 @@ func MoEBiasAdd(data, bias, indices Buf, expDim, nUsed int) error {
 	return nil
 }
 
+// MoEFFNConf holds all parameters for a fused C-side MoE FFN dispatch.
+type MoEFFNConf struct {
+	c C.GpuMoEConf
+}
+
+func NewMoEFFNConf() *MoEFFNConf { return &MoEFFNConf{} }
+
+func (mc *MoEFFNConf) SetScratch(ffnNorm, ffnOut, moeLogits, topkIdx, topkW,
+	q8Input, gateScratch, upScratch, q8DownPacked, outScratch Buf) {
+	mc.c.ffn_norm = C.GpuBuf(ffnNorm)
+	mc.c.ffn_out = C.GpuBuf(ffnOut)
+	mc.c.moe_logits = C.GpuBuf(moeLogits)
+	mc.c.moe_topk_idx = C.GpuBuf(topkIdx)
+	mc.c.moe_topk_w = C.GpuBuf(topkW)
+	mc.c.q8_input = C.GpuBuf(q8Input)
+	mc.c.gate_scratch = C.GpuBuf(gateScratch)
+	mc.c.up_scratch = C.GpuBuf(upScratch)
+	mc.c.q8_down_packed = C.GpuBuf(q8DownPacked)
+	mc.c.out_scratch = C.GpuBuf(outScratch)
+}
+
+func (mc *MoEFFNConf) SetRouter(w Buf, rows, cols, rtype int, bias Buf) {
+	mc.c.router_w = C.GpuBuf(w)
+	mc.c.router_rows = C.int(rows)
+	mc.c.router_cols = C.int(cols)
+	mc.c.router_type = C.int(rtype)
+	mc.c.router_bias = C.GpuBuf(bias)
+}
+
+func (mc *MoEFFNConf) SetExperts(gateW Buf, gateType, gateStride, gateBase int,
+	upW Buf, upType, upStride, upBase int,
+	downW Buf, downType, downStride int) {
+	mc.c.gate_w = C.GpuBuf(gateW)
+	mc.c.gate_type = C.int(gateType)
+	mc.c.gate_stride = C.int(gateStride)
+	mc.c.gate_base = C.int(gateBase)
+	mc.c.up_w = C.GpuBuf(upW)
+	mc.c.up_type = C.int(upType)
+	mc.c.up_stride = C.int(upStride)
+	mc.c.up_base = C.int(upBase)
+	mc.c.down_w = C.GpuBuf(downW)
+	mc.c.down_type = C.int(downType)
+	mc.c.down_stride = C.int(downStride)
+}
+
+func (mc *MoEFFNConf) SetBiases(gateBias, upBias, downBias Buf) {
+	mc.c.gate_bias = C.GpuBuf(gateBias)
+	mc.c.up_bias = C.GpuBuf(upBias)
+	mc.c.down_bias = C.GpuBuf(downBias)
+}
+
+func (mc *MoEFFNConf) SetConfig(dim, expDim, nExperts, nUsed, gatingFunc int,
+	isOAI bool, alpha, limit float32) {
+	mc.c.dim = C.int(dim)
+	mc.c.exp_dim = C.int(expDim)
+	mc.c.n_experts = C.int(nExperts)
+	mc.c.n_used = C.int(nUsed)
+	mc.c.gating_func = C.int(gatingFunc)
+	if isOAI {
+		mc.c.is_oai = 1
+	}
+	mc.c.alpha = C.float(alpha)
+	mc.c.limit = C.float(limit)
+}
+
+// ForwardMoEFFN_C runs the entire MoE FFN in a single CGo call.
+func ForwardMoEFFN_C(mc *MoEFFNConf) error {
+	rc := C.gpu_forward_moe_ffn(&mc.c)
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: forward_moe_ffn failed (%d)", rc)
+	}
+	return nil
+}
+
 // BeginBatch starts recording GPU operations into a single command buffer.
 // All subsequent GPU calls are batched until EndBatch.
 func BeginBatch() { C.gpu_begin_batch() }

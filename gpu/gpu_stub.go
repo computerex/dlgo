@@ -61,3 +61,13 @@ func (lc *LayerConf) SetAttnNormOnly(an Buf)                             {}
 func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e, f float32, rd int, n bool, ft, rt int) {}
 func (lc *LayerConf) SetDP4A(q Buf) {}
 func ForwardLayer(lc *LayerConf, pos, sl int, s float32, nan Buf) error   { return errNoGPU }
+
+type MoEFFNConf struct{}
+
+func NewMoEFFNConf() *MoEFFNConf                                                       { return nil }
+func (mc *MoEFFNConf) SetScratch(fn, fo, ml, ti, tw, q8, gs, us, q8d, os Buf)          {}
+func (mc *MoEFFNConf) SetRouter(w Buf, r, c, t int, b Buf)                             {}
+func (mc *MoEFFNConf) SetExperts(gw Buf, gt, gs, gb int, uw Buf, ut, us, ub int, dw Buf, dt, ds int) {}
+func (mc *MoEFFNConf) SetBiases(gb, ub, db Buf)                                        {}
+func (mc *MoEFFNConf) SetConfig(d, ed, ne, nu, gf int, oai bool, a, l float32)         {}
+func ForwardMoEFFN_C(mc *MoEFFNConf) error                                             { return errNoGPU }
