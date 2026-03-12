@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/ops"
@@ -58,6 +59,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.TopK != nil {
 		sampler.TopK = *req.TopK
 	}
+	if req.RepetitionPenalty != nil {
+		sampler.RepetitionPenalty = float32(*req.RepetitionPenalty)
+	}
 
 	maxTokens := 512
 	if req.MaxTokens > 0 {
@@ -74,8 +78,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Submit to the scheduler
 	infReq := &InferenceRequest{
-		ID:       newCompletionID(),
-		Messages: msgs,
+		ID:            newCompletionID(),
+		Messages:      msgs,
+		StopSequences: req.Stop,
 		Config: llm.GenerateConfig{
 			MaxTokens: maxTokens,
 			Sampler:   sampler,
@@ -172,6 +177,8 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		}
 	}
 
+	fullText = trimTrailingStopTokens(fullText)
+
 	resp := ChatCompletionResponse{
 		ID:      infReq.ID,
 		Object:  "chat.completion",
@@ -192,3 +199,26 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
+
+func trimTrailingStopTokens(text string) string {
+	stops := []string{
+		"<|end|>", "<|return|>", "<|im_end|>", "<|endoftext|>",
+		"<end_of_turn><eos>", "<end_of_turn>", "<eos>", "</s>",
+		"<|eot_id|>", "<|assistant|>", "<|user|>",
+	}
+	for {
+		trimmed := strings.TrimRight(text, " \t\r\n")
+		changed := false
+		for _, s := range stops {
+			if strings.HasSuffix(trimmed, s) {
+				trimmed = strings.TrimSuffix(trimmed, s)
+				changed = true
+			}
+		}
+		if !changed {
+			return trimmed
+		}
+		text = trimmed
+	}
+}
+

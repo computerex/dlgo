@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import type { Message } from '../api';
+import type { Message, ChatSession, ChatMessage as ApiChatMessage } from '../api';
 import { chatCompletion } from '../api';
 import { MessageBubble } from './MessageBubble';
 import { MetricsBar } from './MetricsBar';
 
 interface ChatPanelProps {
+  chat: ChatSession | null;
   model: string;
   temperature: number;
   topP: number;
@@ -13,20 +14,35 @@ interface ChatPanelProps {
   systemPrompt: string;
 }
 
-interface ChatMessage extends Message {
+interface LocalChatMessage extends Message {
   id: string;
   streaming?: boolean;
   metrics?: { tokPerSec: number; ttft: number; totalMs: number };
 }
 
-export function ChatPanel({ model, temperature, topP, topK, maxTokens, systemPrompt }: ChatPanelProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+export function ChatPanel({ chat, model, temperature, topP, topK, maxTokens, systemPrompt }: ChatPanelProps) {
+  const [messages, setMessages] = useState<LocalChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [generating, setGenerating] = useState(false);
   const [metrics, setMetrics] = useState<{ tokPerSec: number; ttft: number; totalMs: number } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Load messages when chat changes
+  useEffect(() => {
+    if (chat) {
+      const loadedMessages: LocalChatMessage[] = chat.messages.map((m: ApiChatMessage) => ({
+        id: m.id,
+        role: m.role as 'system' | 'user' | 'assistant',
+        content: m.content,
+      }));
+      setMessages(loadedMessages);
+    } else {
+      setMessages([]);
+    }
+    setMetrics(null);
+  }, [chat?.id]);
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -36,10 +52,10 @@ export function ChatPanel({ model, temperature, topP, topK, maxTokens, systemPro
 
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || generating || !model) return;
+    if (!text || generating || !model || !chat) return;
 
-    const userMsg: ChatMessage = { id: crypto.randomUUID(), role: 'user', content: text };
-    const assistantMsg: ChatMessage = { id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true };
+    const userMsg: LocalChatMessage = { id: crypto.randomUUID(), role: 'user', content: text };
+    const assistantMsg: LocalChatMessage = { id: crypto.randomUUID(), role: 'assistant', content: '', streaming: true };
 
     setMessages(prev => [...prev, userMsg, assistantMsg]);
     setInput('');
@@ -125,6 +141,17 @@ export function ChatPanel({ model, temperature, topP, topK, maxTokens, systemPro
     setMessages([]);
     setMetrics(null);
   };
+
+  if (!chat) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-[var(--text-secondary)] text-sm">
+        <div className="text-center">
+          <div className="text-4xl mb-4 opacity-30">💬</div>
+          <p>Select a chat or create a new one</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full">

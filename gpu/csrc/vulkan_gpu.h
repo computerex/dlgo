@@ -163,6 +163,7 @@ int gpu_quantize_q8_1_at(GpuBuf q8_1_buf, int q8_off, GpuBuf f32_buf, int f32_of
 // Buffer management
 GpuBuf gpu_alloc(uint64_t size_bytes, int usage);
 void gpu_free(GpuBuf buf);
+void gpu_reset_buffer_table(void);
 int gpu_upload(GpuBuf dst, const void* src, uint64_t size_bytes, uint64_t offset);
 int gpu_download(void* dst, GpuBuf src, uint64_t size_bytes, uint64_t offset);
 
@@ -268,7 +269,7 @@ typedef struct {
     int wv_rows, wv_cols, wv_type;
     int wo_rows, wo_cols, wo_type;
 
-    GpuBuf bq, bk, bv;
+    GpuBuf bq, bk, bv, bo;
     GpuBuf q_norm_w, k_norm_w;
 
     GpuBuf ffn_norm_w;

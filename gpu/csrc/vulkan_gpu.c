@@ -661,6 +661,18 @@ void gpu_free(GpuBuf id) {
     ba->size = 0;
 }
 
+void gpu_reset_buffer_table(void) {
+    // Compact: if all buffers have been freed, reset the counter so new
+    // allocations reuse slots from the beginning of the table.
+    int highest_live = -1;
+    for (int i = 0; i < g.buf_count; i++) {
+        if (g.buffers[i].buffer != VK_NULL_HANDLE) {
+            highest_live = i;
+        }
+    }
+    g.buf_count = highest_live + 1;
+}
+
 int gpu_upload(GpuBuf dst, const void* src, uint64_t size_bytes, uint64_t offset) {
     BufferAlloc* ba = get_buf(dst);
     if (!ba || !src) return GPU_ERR_DISPATCH;
@@ -2295,6 +2307,10 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         } else {
             gpu_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, lc->wo_type);
         }
+        if (lc->bo) {
+            gpu_barrier();
+            gpu_add(lc->attn_proj, lc->attn_proj, lc->bo, dim);
+        }
     }
 
     if (lc->residual_type == 0) {
@@ -2544,6 +2560,10 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
 
     gpu_barrier();
     gpu_batch_matvec(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols, npos, lc->wo_type);
+    if (lc->bo) {
+        gpu_barrier();
+        gpu_batch_add_bias_expand(lc->attn_proj, lc->bo, lc->attn_out, dim, npos);
+    }
 
     } // end core_type == 0
 

@@ -623,28 +623,38 @@ func (t *Tokenizer) Decode(tokens []int32) string {
 }
 
 func (t *Tokenizer) decodeBPE(tokens []int32) string {
+	var result []byte
 	var raw strings.Builder
+
+	flushRaw := func() {
+		for _, r := range raw.String() {
+			if b, ok := t.unicodeToByte[r]; ok {
+				result = append(result, b)
+			} else {
+				buf := make([]byte, 4)
+				n := utf8.EncodeRune(buf, r)
+				result = append(result, buf[:n]...)
+			}
+		}
+		raw.Reset()
+	}
+
 	for _, token := range tokens {
 		if token < 0 || int(token) >= len(t.Tokens) {
 			continue
 		}
 		s := t.Tokens[token]
 		if len(s) > 0 && s[0] == '<' && s[len(s)-1] == '>' {
+			if t.isInvisibleControl(token, s) {
+				continue
+			}
+			flushRaw()
+			result = append(result, s...)
 			continue
 		}
 		raw.WriteString(s)
 	}
-
-	var result []byte
-	for _, r := range raw.String() {
-		if b, ok := t.unicodeToByte[r]; ok {
-			result = append(result, b)
-		} else {
-			buf := make([]byte, 4)
-			n := utf8.EncodeRune(buf, r)
-			result = append(result, buf[:n]...)
-		}
-	}
+	flushRaw()
 	return string(result)
 }
 
@@ -667,14 +677,31 @@ func (t *Tokenizer) decodeSPM(tokens []int32) string {
 	return result.String()
 }
 
+// isInvisibleControl returns true for tokens that should produce no output text,
+// such as BOS, EOS, padding, and unknown markers.
+func (t *Tokenizer) isInvisibleControl(id int32, s string) bool {
+	if id == t.BOS || id == t.EOS {
+		return true
+	}
+	switch s {
+	case "<s>", "</s>", "<pad>", "<unk>", "<|padding|>":
+		return true
+	}
+	return false
+}
+
 // DecodeToken converts a single token ID to its string representation.
+// Special tokens like thinking markers are preserved as their raw text.
 func (t *Tokenizer) DecodeToken(id int32) string {
 	if id < 0 || int(id) >= len(t.Tokens) {
 		return fmt.Sprintf("<unk_%d>", id)
 	}
 	s := t.Tokens[id]
 	if len(s) > 0 && s[0] == '<' && s[len(s)-1] == '>' {
-		return ""
+		if t.isInvisibleControl(id, s) {
+			return ""
+		}
+		return s
 	}
 	if t.ModelType == "gpt2" && t.unicodeToByte != nil {
 		var result []byte

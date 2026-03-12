@@ -1,8 +1,10 @@
 import { useState, useCallback } from 'react';
 import { ChatPanel } from './components/ChatPanel';
+import { ChatList } from './components/ChatList';
 import { ModelSelector } from './components/ModelSelector';
 import { SettingsPanel } from './components/SettingsPanel';
 import { loadModel, unloadModel, listModels } from './api';
+import type { ChatSession } from './api';
 
 function App() {
   const [model, setModel] = useState('');
@@ -11,15 +13,16 @@ function App() {
   const [topK, setTopK] = useState(40);
   const [maxTokens, setMaxTokens] = useState(512);
   const [systemPrompt, setSystemPrompt] = useState('');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
+  const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [useGPU, setUseGPU] = useState(false);
   const [reloading, setReloading] = useState(false);
+  const [currentChat, setCurrentChat] = useState<ChatSession | null>(null);
 
   const handleGPUToggle = useCallback(async (gpu: boolean) => {
     if (gpu === useGPU) return;
     setUseGPU(gpu);
 
-    // If a model is loaded, reload it with the new backend
     if (model) {
       setReloading(true);
       try {
@@ -37,12 +40,19 @@ function App() {
     }
   }, [useGPU, model]);
 
+  const handleChatSelect = useCallback((chat: ChatSession | null) => {
+    setCurrentChat(chat);
+    if (chat?.model) {
+      setModel(chat.model);
+    }
+  }, []);
+
   return (
     <div className="h-screen flex">
-      {/* Sidebar */}
+      {/* Left Sidebar - Chat List */}
       <div
         className={`
-          ${sidebarOpen ? 'w-72' : 'w-0'}
+          ${leftSidebarOpen ? 'w-64' : 'w-0'}
           transition-all duration-200 overflow-hidden
           bg-[var(--bg-secondary)] border-r border-[var(--border)]
           flex flex-col
@@ -55,6 +65,79 @@ function App() {
           </h1>
         </div>
 
+        <ChatList
+          currentChat={currentChat}
+          onSelectChat={handleChatSelect}
+          currentModel={model}
+        />
+      </div>
+
+      {/* Main chat area */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Top bar */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}
+              className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors text-lg"
+              title={leftSidebarOpen ? 'Close chat list' : 'Open chat list'}
+            >
+              {leftSidebarOpen ? '\u25C0' : '\u25B6'}
+            </button>
+            <div className="flex items-center gap-2 text-sm">
+              {currentChat ? (
+                <>
+                  <span className="text-[var(--text-primary)] font-medium truncate max-w-[200px]">{currentChat.title}</span>
+                  <span className="text-[var(--text-secondary)]">•</span>
+                  <span className="text-[var(--text-secondary)] text-xs">{model || 'No model'}</span>
+                </>
+              ) : (
+                <span className="text-[var(--text-secondary)]">No chat selected</span>
+              )}
+              {model && (
+                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                  useGPU
+                    ? 'bg-[var(--success)]/20 text-[var(--success)]'
+                    : 'bg-[var(--text-secondary)]/20 text-[var(--text-secondary)]'
+                }`}>
+                  {useGPU ? 'GPU' : 'CPU'}
+                </span>
+              )}
+              {reloading && (
+                <span className="text-[var(--text-secondary)] text-xs animate-pulse">switching...</span>
+              )}
+            </div>
+          </div>
+          <button
+            onClick={() => setRightSidebarOpen(!rightSidebarOpen)}
+            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors text-lg"
+            title={rightSidebarOpen ? 'Close settings' : 'Open settings'}
+          >
+            {rightSidebarOpen ? '\u25B6' : '\u25C0'}
+          </button>
+        </div>
+
+        {/* Chat */}
+        <ChatPanel
+          chat={currentChat}
+          model={model}
+          temperature={temperature}
+          topP={topP}
+          topK={topK}
+          maxTokens={maxTokens}
+          systemPrompt={systemPrompt}
+        />
+      </div>
+
+      {/* Right Sidebar - Settings */}
+      <div
+        className={`
+          ${rightSidebarOpen ? 'w-72' : 'w-0'}
+          transition-all duration-200 overflow-hidden
+          bg-[var(--bg-secondary)] border-l border-[var(--border)]
+          flex flex-col
+        `}
+      >
         <div className="flex-1 overflow-y-auto p-4 space-y-6">
           <ModelSelector
             selectedModel={model}
@@ -80,52 +163,9 @@ function App() {
           </div>
         </div>
 
-        <div className="p-4 border-t border-[var(--border)] text-xs text-[var(--text-secondary)]">
-          Built with dlgo inference engine
+        <div className="flex items-center justify-center px-4 py-2 text-xs text-[var(--text-secondary)] border-t border-[var(--border)] bg-[var(--bg-secondary)] h-[33px]">
+          <span>Built with dlgo inference engine</span>
         </div>
-      </div>
-
-      {/* Main chat area */}
-      <div className="flex-1 flex flex-col min-w-0">
-        {/* Top bar */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-[var(--border)] bg-[var(--bg-secondary)]">
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors text-lg"
-            title={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
-          >
-            {sidebarOpen ? '\u25C0' : '\u25B6'}
-          </button>
-          <div className="flex items-center gap-2 text-sm">
-            {model ? (
-              <>
-                <span className="text-[var(--text-primary)] font-medium">{model}</span>
-                <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
-                  useGPU
-                    ? 'bg-[var(--success)]/20 text-[var(--success)]'
-                    : 'bg-[var(--text-secondary)]/20 text-[var(--text-secondary)]'
-                }`}>
-                  {useGPU ? 'GPU' : 'CPU'}
-                </span>
-                {reloading && (
-                  <span className="text-[var(--text-secondary)] text-xs animate-pulse">switching...</span>
-                )}
-              </>
-            ) : (
-              <span className="text-[var(--text-secondary)]">No model selected</span>
-            )}
-          </div>
-        </div>
-
-        {/* Chat */}
-        <ChatPanel
-          model={model}
-          temperature={temperature}
-          topP={topP}
-          topK={topK}
-          maxTokens={maxTokens}
-          systemPrompt={systemPrompt}
-        />
       </div>
     </div>
   );

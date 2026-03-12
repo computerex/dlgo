@@ -3,9 +3,12 @@ package server
 import (
 	"fmt"
 	"log"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 
+	"github.com/computerex/dlgo/mmap"
 	"github.com/computerex/dlgo/models/llm"
 )
 
@@ -27,19 +30,49 @@ type GpuPipelineInterface interface {
 	Free()
 }
 
+// AvailableModel represents a model that can be loaded but isn't yet.
+type AvailableModel struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
 // ModelManager manages multiple loaded models.
 type ModelManager struct {
-	mu     sync.RWMutex
-	models map[string]*LoadedModel
-	gpuInit func() error
+	mu             sync.RWMutex
+	models         map[string]*LoadedModel
+	available      map[string]*AvailableModel
+	gpuInit        func() error
 	gpuNewPipeline func(pipe *llm.Pipeline) (GpuPipelineInterface, error)
 }
 
 // NewModelManager creates a new model manager.
 func NewModelManager() *ModelManager {
 	return &ModelManager{
-		models: make(map[string]*LoadedModel),
+		models:    make(map[string]*LoadedModel),
+		available: make(map[string]*AvailableModel),
 	}
+}
+
+// RegisterAvailableModel registers a model as available to load.
+func (mm *ModelManager) RegisterAvailableModel(id, path string) {
+	mm.mu.Lock()
+	defer mm.mu.Unlock()
+	mm.available[id] = &AvailableModel{ID: id, Path: path}
+}
+
+// ListAvailableModels returns all models that can be loaded.
+func (mm *ModelManager) ListAvailableModels() []AvailableModel {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+
+	result := make([]AvailableModel, 0, len(mm.available))
+	for _, m := range mm.available {
+		// Skip if already loaded
+		if _, loaded := mm.models[m.ID]; !loaded {
+			result = append(result, *m)
+		}
+	}
+	return result
 }
 
 // SetGPUFunctions allows the GPU layer to register its init and pipeline creation functions.
@@ -129,6 +162,14 @@ func (mm *ModelManager) UnloadModel(id string) error {
 	}
 
 	delete(mm.models, id)
+
+	// Aggressively reclaim memory after unload. The GC frees heap objects
+	// (pinned layers, KV cache, run state) and TrimWorkingSet evicts the
+	// mmap page cache so the OS sees the RAM as free before the next load.
+	runtime.GC()
+	debug.FreeOSMemory()
+	mmap.TrimWorkingSet()
+
 	log.Printf("Model %q unloaded", id)
 	return nil
 }

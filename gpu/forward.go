@@ -46,61 +46,59 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
-			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
-				gl.Bq, gl.Bk, gl.Bv, gl.AttnQNorm, gl.AttnKNorm)
-			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
-			if gl.AttnSinks != 0 {
-				lc.SetAttnSinks(gl.AttnSinks)
-			}
+		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+			gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
+		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+		if gl.AttnSinks != 0 {
+			lc.SetAttnSinks(gl.AttnSinks)
 		}
+	}
 
-		if gl.IsMoE {
-			// MoE layer: provide norm weights for pre-FFN residual,
-			// but set ffn_type=3 to skip GPU FFN dispatch
-			ffnNorm := gl.FFNNorm
-			postAttnNorm := gl.PostAttnNorm
-			if layer.Spec.Residual == llm.ResPostAttnFFN {
-				ffnNorm = gl.PostAttnNorm
-				postAttnNorm = 0
-			}
-			lc.SetFFNMoE(ffnNorm, postAttnNorm)
-		} else {
-			var ffnGate *GpuTensor
-			if gl.FFNGate != nil {
-				ffnGate = gl.FFNGate
-			}
-			ffnNorm := gl.FFNNorm
-			postAttnNorm := gl.PostAttnNorm
-			if layer.Spec.Residual == llm.ResPostAttnFFN {
-				ffnNorm = gl.PostAttnNorm
-				postAttnNorm = 0
-			}
-			lc.SetFFN(ffnNorm, ffnGate, gl.FFNUp, gl.FFNDown,
-				postAttnNorm, gl.PostFFNNorm)
+	if gl.IsMoE {
+		ffnNorm := gl.FFNNorm
+		postAttnNorm := gl.PostAttnNorm
+		if layer.Spec.Residual == llm.ResPostAttnFFN {
+			ffnNorm = gl.PostAttnNorm
+			postAttnNorm = 0
 		}
-
-		ffnType := 0
-		switch layer.Spec.FFN {
-		case llm.FFNSwiGLU:
-			ffnType = 0
-		case llm.FFNGeGLU:
-			ffnType = 1
-		case llm.FFNPlain:
-			ffnType = 2
-		case llm.FFNMoE, llm.FFNMoESwiOAI:
-			ffnType = 3
+		lc.SetFFNMoE(ffnNorm, postAttnNorm)
+	} else {
+		var ffnGate *GpuTensor
+		if gl.FFNGate != nil {
+			ffnGate = gl.FFNGate
 		}
-		resType := 0
-		if layer.Spec.Residual == llm.ResParallel {
-			resType = 1
+		ffnNorm := gl.FFNNorm
+		postAttnNorm := gl.PostAttnNorm
+		if layer.Spec.Residual == llm.ResPostAttnFFN {
+			ffnNorm = gl.PostAttnNorm
+			postAttnNorm = 0
 		}
+		lc.SetFFN(ffnNorm, ffnGate, gl.FFNUp, gl.FFNDown,
+			postAttnNorm, gl.PostFFNNorm)
+	}
 
-		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
-			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
-			pipe.RoPECosTable, pipe.RoPESinTable,
-			ffnType, resType)
+	ffnType := 0
+	switch layer.Spec.FFN {
+	case llm.FFNSwiGLU:
+		ffnType = 0
+	case llm.FFNGeGLU:
+		ffnType = 1
+	case llm.FFNPlain:
+		ffnType = 2
+	case llm.FFNMoE, llm.FFNMoESwiOAI:
+		ffnType = 3
+	}
+	resType := 0
+	if layer.Spec.Residual == llm.ResParallel {
+		resType = 1
+	}
 
-		confs[l] = lc
+	lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
+		cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
+		pipe.RoPECosTable, pipe.RoPESinTable,
+		ffnType, resType)
+
+	confs[l] = lc
 	}
 	return confs
 }
@@ -448,17 +446,17 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
-			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
-				gl.Bq, gl.Bk, gl.Bv, gl.AttnQNorm, gl.AttnKNorm)
-			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
-		}
+		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+			gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
+		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+	}
 
-		if gl.IsMoE {
-			ffnNorm := gl.FFNNorm
-			postAttnNorm := gl.PostAttnNorm
-			if layer.Spec.Residual == llm.ResPostAttnFFN {
-				ffnNorm = gl.PostAttnNorm
-				postAttnNorm = 0
+	if gl.IsMoE {
+		ffnNorm := gl.FFNNorm
+		postAttnNorm := gl.PostAttnNorm
+		if layer.Spec.Residual == llm.ResPostAttnFFN {
+			ffnNorm = gl.PostAttnNorm
+			postAttnNorm = 0
 			}
 			lc.SetFFNMoE(ffnNorm, postAttnNorm)
 		} else {

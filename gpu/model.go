@@ -411,9 +411,23 @@ func (gm *GpuModel) FreeAll() {
 		freeBuf(gl.FFNDownBias)
 		freeBuf(gl.PostFFNNorm)
 		freeBuf(gl.AttnSinks)
+
+		// MoE expert weights (packed, multi-GB for large MoE models)
+		freeTensor(gl.FFNRouter)
+		freeBuf(gl.FFNRouterBias)
+		freeTensor(gl.FFNGateExps)
+		freeTensor(gl.FFNUpExps)
+		freeTensor(gl.FFNGateUpExps)
+		freeTensor(gl.FFNDownExps)
+		freeBuf(gl.FFNGateExpsBias)
+		freeBuf(gl.FFNUpExpsBias)
+		freeBuf(gl.FFNDownExpsBias)
+
+		// MoE shared expert weights
 		freeTensor(gl.FFNGateShared)
 		freeTensor(gl.FFNUpShared)
 		freeTensor(gl.FFNDownShared)
+		freeBuf(gl.FFNRouterShared)
 
 		// SSM (Gated Delta Net) layer buffers
 		freeTensor(gl.SSMInProj)
@@ -481,6 +495,20 @@ func (rs *GpuRunState) FreeAll() {
 	freeBuf(rs.MoEShUp)
 	freeBuf(rs.MoEShHidden)
 	freeBuf(rs.MoEShOut)
+
+	// dp4a MoE scratch buffers
+	freeBuf(rs.MoEQ8_1Scratch)
+	freeBuf(rs.MoEQ8_1DownPacked)
+	for _, b := range rs.MoEQ8_1DownBufs {
+		freeBuf(b)
+	}
+
+	// Fused MoE dp4a buffers
+	freeBuf(rs.MoEGateScratch)
+	freeBuf(rs.MoEUpScratch)
+	freeBuf(rs.MoEHiddenScratch)
+	freeBuf(rs.MoEOutScratch)
+	freeBuf(rs.MoEWeightsBuf)
 }
 
 // FreeAll releases all GPU buffers held by a GpuKVCache.

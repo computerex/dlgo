@@ -30,6 +30,7 @@ func cmdServer(args []string) {
 	fs.Parse(args)
 
 	manager := server.NewModelManager()
+	chatManager := server.NewChatManager()
 	registerGPU(manager)
 
 	if *modelPath != "" {
@@ -46,7 +47,7 @@ func cmdServer(args []string) {
 	}
 
 	addr := *host + ":" + *port
-	srv := server.NewServer(addr, manager)
+	srv := server.NewServer(addr, manager, chatManager)
 
 	// Auto-detect frontend directory
 	feDir := *frontendDir

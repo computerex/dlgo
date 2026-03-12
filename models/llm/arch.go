@@ -299,6 +299,6 @@ func formatHarmonyMessages(messages []Message) string {
 			b.WriteString("<|end|>")
 		}
 	}
-	b.WriteString("<|start|>assistant")
+	b.WriteString("<|start|>assistant<|message|>")
 	return b.String()
 }

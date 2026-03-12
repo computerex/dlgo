@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { ModelObject } from '../api';
-import { listModels, loadModel, unloadModel } from '../api';
+import type { ModelObject, AvailableModel } from '../api';
+import { listModels, listAvailableModels, loadModel, unloadModel } from '../api';
 
 interface ModelSelectorProps {
   selectedModel: string;
@@ -10,21 +10,30 @@ interface ModelSelectorProps {
 }
 
 export function ModelSelector({ selectedModel, useGPU, onSelectModel, onGPUStatusChange }: ModelSelectorProps) {
-  const [models, setModels] = useState<ModelObject[]>([]);
-  const [showLoader, setShowLoader] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loadedModels, setLoadedModels] = useState<ModelObject[]>([]);
+  const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+  const [loadingModelId, setLoadingModelId] = useState<string | null>(null);
   const [error, setError] = useState('');
 
   const refreshModels = useCallback(async () => {
     try {
-      const m = await listModels();
-      setModels(m);
-      if (m.length > 0 && !selectedModel) {
-        onSelectModel(m[0].id);
-        onGPUStatusChange(m[0].gpu);
+      const [loaded, available] = await Promise.all([
+        listModels(),
+        listAvailableModels()
+      ]);
+      setLoadedModels(loaded);
+      setAvailableModels(available);
+      
+      // Auto-select first loaded model if none selected
+      if (loaded.length > 0 && !selectedModel) {
+        const firstModel = loaded[0];
+        onSelectModel(firstModel.id);
+        onGPUStatusChange(firstModel.gpu);
       }
+      
+      // Update GPU status for currently selected model
       if (selectedModel) {
-        const current = m.find(x => x.id === selectedModel);
+        const current = loaded.find(m => m.id === selectedModel);
         if (current) {
           onGPUStatusChange(current.gpu);
         }
@@ -40,25 +49,18 @@ export function ModelSelector({ selectedModel, useGPU, onSelectModel, onGPUStatu
     return () => clearInterval(interval);
   }, [refreshModels]);
 
-  const handleSelectModel = (id: string) => {
-    onSelectModel(id);
-    const model = models.find(m => m.id === id);
-    if (model) {
-      onGPUStatusChange(model.gpu);
-    }
-  };
-
-  const handleLoad = async (path: string, gpu: boolean, ctx: number) => {
-    setLoading(true);
+  const handleLoad = async (model: AvailableModel, gpu: boolean, ctx: number) => {
+    setLoadingModelId(model.id);
     setError('');
     try {
-      await loadModel({ path, gpu, context: ctx });
+      await loadModel({ id: model.id, path: model.path, gpu, context: ctx });
       await refreshModels();
-      setShowLoader(false);
+      onSelectModel(model.id);
+      onGPUStatusChange(gpu);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to load model');
     } finally {
-      setLoading(false);
+      setLoadingModelId(null);
     }
   };
 
@@ -72,139 +74,106 @@ export function ModelSelector({ selectedModel, useGPU, onSelectModel, onGPUStatu
     }
   };
 
-  const currentModel = models.find(m => m.id === selectedModel);
+  const currentLoadedModel = loadedModels.find(m => m.id === selectedModel);
 
   return (
     <div className="space-y-3">
       <label className="text-xs font-medium uppercase tracking-wide text-[var(--text-secondary)]">Model</label>
 
-      <select
-        value={selectedModel}
-        onChange={e => handleSelectModel(e.target.value)}
-        className="w-full bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
-      >
-        <option value="">Select a model...</option>
-        {models.map(m => (
-          <option key={m.id} value={m.id}>
-            {m.id} {m.architecture ? `(${m.architecture})` : ''}
-          </option>
-        ))}
-      </select>
+      {/* Loaded Models Section */}
+      {loadedModels.length > 0 && (
+        <>
+          <select
+            value={selectedModel}
+            onChange={e => onSelectModel(e.target.value)}
+            className="w-full bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+          >
+            <option value="">Select a loaded model...</option>
+            {loadedModels.map(m => (
+              <option key={m.id} value={m.id}>
+                {m.id} {m.architecture ? `(${m.architecture})` : ''} • {m.gpu ? 'GPU' : 'CPU'}
+              </option>
+            ))}
+          </select>
 
-      {currentModel && (
-        <div className="flex items-center gap-2 text-xs">
-          <span className={`px-2 py-0.5 rounded-full font-medium ${
-            currentModel.gpu
-              ? 'bg-[var(--success)]/20 text-[var(--success)]'
-              : 'bg-[var(--text-secondary)]/20 text-[var(--text-secondary)]'
-          }`}>
-            {currentModel.gpu ? 'GPU' : 'CPU'}
-          </span>
-          {currentModel.architecture && (
-            <span className="text-[var(--text-secondary)]">{currentModel.architecture}</span>
+          {currentLoadedModel && (
+            <div className="flex items-center gap-2 text-xs">
+              <span className={`px-2 py-0.5 rounded-full font-medium ${
+                currentLoadedModel.gpu
+                  ? 'bg-[var(--success)]/20 text-[var(--success)]'
+                  : 'bg-[var(--text-secondary)]/20 text-[var(--text-secondary)]'
+              }`}>
+                {currentLoadedModel.gpu ? 'GPU' : 'CPU'}
+              </span>
+              {currentLoadedModel.architecture && (
+                <span className="text-[var(--text-secondary)]">{currentLoadedModel.architecture}</span>
+              )}
+            </div>
           )}
-        </div>
+
+          {selectedModel && (
+            <button
+              onClick={() => handleUnload(selectedModel)}
+              className="w-full px-3 py-2 border border-[var(--danger)] text-[var(--danger)] hover:bg-[var(--danger)] hover:text-white rounded-lg text-xs font-medium transition-colors"
+            >
+              Unload {selectedModel}
+            </button>
+          )}
+        </>
       )}
 
-      <div className="flex gap-2">
-        <button
-          onClick={() => setShowLoader(true)}
-          className="flex-1 px-3 py-2 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg text-xs font-medium transition-colors"
-        >
-          Load Model
-        </button>
-        {selectedModel && (
-          <button
-            onClick={() => handleUnload(selectedModel)}
-            className="px-3 py-2 border border-[var(--danger)] text-[var(--danger)] hover:bg-[var(--danger)] hover:text-white rounded-lg text-xs font-medium transition-colors"
-          >
-            Unload
-          </button>
-        )}
-      </div>
+      {/* Available Models Section */}
+      {availableModels.length > 0 && (
+        <div className="border border-[var(--border)] rounded-lg p-3 bg-[var(--bg-tertiary)]">
+          <div className="text-xs font-medium text-[var(--text-secondary)] mb-2 uppercase tracking-wide">
+            Available Models ({availableModels.length})
+          </div>
+          <div className="max-h-48 overflow-y-auto space-y-1">
+            {availableModels.map(m => {
+              const isLoaded = loadedModels.some(lm => lm.id === m.id);
+              const isSelected = selectedModel === m.id;
+              const isLoading = loadingModelId === m.id;
+              return (
+                <div
+                  key={m.id}
+                  className={`flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm ${
+                    isSelected 
+                      ? 'bg-[var(--accent)]/20 border border-[var(--accent)]' 
+                      : 'hover:bg-[var(--bg-primary)]'
+                  }`}
+                >
+                  <span className="flex-1 min-w-0 text-[var(--text-primary)]" title={m.id}>
+                    <span className="block truncate">{m.id}</span>
+                  </span>
+                  {isLoading ? (
+                    <span className="ml-2 px-2 py-0.5 text-[var(--accent)] text-xs animate-pulse">
+                      Loading...
+                    </span>
+                  ) : !isLoaded ? (
+                    <button
+                      onClick={() => handleLoad(m, useGPU, 2048)}
+                      disabled={loadingModelId !== null}
+                      className="ml-2 px-2 py-0.5 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded text-xs transition-colors disabled:opacity-40"
+                    >
+                      Load
+                    </button>
+                  ) : (
+                    <span className="ml-2 px-2 py-0.5 bg-[var(--success)]/20 text-[var(--success)] rounded text-xs">
+                      Loaded
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {error && <p className="text-xs text-[var(--danger)]">{error}</p>}
 
-      {showLoader && (
-        <ModelLoaderDialog
-          onLoad={handleLoad}
-          onClose={() => setShowLoader(false)}
-          loading={loading}
-          defaultGPU={useGPU}
-        />
+      {loadedModels.length === 0 && availableModels.length === 0 && (
+        <p className="text-xs text-[var(--text-secondary)]">No models found. Use --models-dir flag to specify model directories.</p>
       )}
-    </div>
-  );
-}
-
-function ModelLoaderDialog({
-  onLoad,
-  onClose,
-  loading,
-  defaultGPU,
-}: {
-  onLoad: (path: string, gpu: boolean, ctx: number) => void;
-  onClose: () => void;
-  loading: boolean;
-  defaultGPU: boolean;
-}) {
-  const [path, setPath] = useState('');
-  const [gpu, setGpu] = useState(defaultGPU);
-  const [ctx, setCtx] = useState(2048);
-
-  return (
-    <div className="border border-[var(--border)] rounded-lg p-4 bg-[var(--bg-tertiary)] space-y-3">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-medium">Load GGUF Model</span>
-        <button onClick={onClose} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-sm">&#10005;</button>
-      </div>
-      <input
-        type="text"
-        value={path}
-        onChange={e => setPath(e.target.value)}
-        placeholder="/path/to/model.gguf"
-        className="w-full bg-[var(--bg-primary)] border border-[var(--border)] rounded px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
-      />
-      <div className="flex items-center gap-4">
-        <div className="flex rounded-lg overflow-hidden border border-[var(--border)]">
-          <button
-            onClick={() => setGpu(false)}
-            className={`px-3 py-1.5 text-xs font-medium transition-colors ${
-              !gpu
-                ? 'bg-[var(--accent)] text-white'
-                : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-          >
-            CPU
-          </button>
-          <button
-            onClick={() => setGpu(true)}
-            className={`px-3 py-1.5 text-xs font-medium transition-colors ${
-              gpu
-                ? 'bg-[var(--accent)] text-white'
-                : 'bg-[var(--bg-primary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-          >
-            GPU
-          </button>
-        </div>
-        <label className="flex items-center gap-2 text-sm">
-          Context:
-          <input
-            type="number"
-            value={ctx}
-            onChange={e => setCtx(parseInt(e.target.value) || 2048)}
-            className="w-20 bg-[var(--bg-primary)] border border-[var(--border)] rounded px-2 py-1 text-sm text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
-          />
-        </label>
-      </div>
-      <button
-        onClick={() => onLoad(path, gpu, ctx)}
-        disabled={!path || loading}
-        className="w-full px-3 py-2 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-40"
-      >
-        {loading ? 'Loading...' : 'Load'}
-      </button>
     </div>
   );
 }

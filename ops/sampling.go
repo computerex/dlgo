@@ -30,15 +30,16 @@ func DefaultSamplerConfig() SamplerConfig {
 // Pipeline: repetition penalty → temperature → top-k → top-p → min-p → sample.
 // Pass rng=nil for greedy (argmax) decoding regardless of temperature.
 func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng *rand.Rand) int {
-	if cfg.Temperature <= 0 || rng == nil {
-		return Argmax(logits)
-	}
-
 	n := len(logits)
 	work := make([]float32, n)
 	copy(work, logits)
 
 	ApplyRepetitionPenalty(work, recentTokens, cfg.RepetitionPenalty)
+
+	if cfg.Temperature <= 0 || rng == nil {
+		return Argmax(work)
+	}
+
 	ApplyTemperature(work, cfg.Temperature)
 	ApplyTopK(work, cfg.TopK)
 	ApplyTopP(work, cfg.TopP)

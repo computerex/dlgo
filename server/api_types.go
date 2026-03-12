@@ -10,15 +10,16 @@ type Message struct {
 }
 
 type ChatCompletionRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature *float64  `json:"temperature,omitempty"`
-	TopP        *float64  `json:"top_p,omitempty"`
-	TopK        *int      `json:"top_k,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
-	Stop        []string  `json:"stop,omitempty"`
-	Seed        *int64    `json:"seed,omitempty"`
+	Model             string    `json:"model"`
+	Messages          []Message `json:"messages"`
+	Temperature       *float64  `json:"temperature,omitempty"`
+	TopP              *float64  `json:"top_p,omitempty"`
+	TopK              *int      `json:"top_k,omitempty"`
+	MaxTokens         int       `json:"max_tokens,omitempty"`
+	Stream            bool      `json:"stream,omitempty"`
+	Stop              []string  `json:"stop,omitempty"`
+	Seed              *int64    `json:"seed,omitempty"`
+	RepetitionPenalty *float64  `json:"repetition_penalty,omitempty"`
 }
 
 type ChatCompletionChoice struct {
@@ -63,9 +64,15 @@ type ModelObject struct {
 	Path     string `json:"path,omitempty"`
 }
 
+type AvailableModelObject struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
 type ModelListResponse struct {
-	Object string        `json:"object"`
-	Data   []ModelObject `json:"data"`
+	Object    string                 `json:"object"`
+	Data      []ModelObject          `json:"data"`
+	Available []AvailableModelObject `json:"available,omitempty"`
 }
 
 type LoadModelRequest struct {

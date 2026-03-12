@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/computerex/dlgo/core"
@@ -469,7 +470,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	ffnDim := cfg.FFNDim
 
 	// Retry loop: if GPU allocation fails, reduce layers and retry.
-	// This guarantees the pipeline never fails from OOM.
+	// Limited to 3 retries to avoid VRAM fragmentation from repeated
+	// partial allocations. Each retry does a full Sync + buffer table
+	// reset to guarantee VRAM is actually reclaimed.
+	const maxRetries = 3
 	var gm *GpuModel
 	var rs *GpuRunState
 	var kv *GpuKVCache
@@ -478,7 +482,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	var q8_1Scratch Buf
 	var isPartial bool
 
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if numGPULayers <= 0 {
 			return nil, fmt.Errorf("insufficient VRAM (%.0f MB) for even 1 layer — use CPU mode", totalVRAM)
 		}
@@ -542,9 +546,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			break
 		}
 
-		// Free everything and retry with fewer layers
-		fmt.Printf("[dlgo/gpu] VRAM alloc failed with %d layers (%v), retrying with %d...\n",
-			numGPULayers, allocErr, numGPULayers-1)
+		// Free everything, sync GPU, and reset buffer table to guarantee
+		// VRAM is fully reclaimed before retrying with fewer layers.
 		if gm != nil {
 			gm.FreeAll()
 		}
@@ -557,11 +560,30 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		freeBuf(ropeCosTable)
 		freeBuf(ropeSinTable)
 		freeBuf(q8_1Scratch)
+		Sync()
+		ResetBufferTable()
 		ropeCosTable, ropeSinTable, q8_1Scratch = 0, 0, 0
 		gm, rs, kv = nil, nil, nil
 		layerConfs = nil
-		numGPULayers--
+
+		if attempt >= maxRetries {
+			return nil, fmt.Errorf("VRAM alloc failed after %d retries with %d layers: %v — use CPU mode",
+				maxRetries, numGPULayers, allocErr)
+		}
+
+		// Halve layers on each retry instead of decrementing by 1.
+		// This converges faster and avoids VRAM fragmentation from many small retries.
+		prev := numGPULayers
+		numGPULayers = numGPULayers / 2
+		fmt.Printf("[dlgo/gpu] VRAM alloc failed with %d layers (%v), retrying with %d...\n",
+			prev, allocErr, numGPULayers)
 	}
+
+	// Release mmap pages from physical RAM. GPU upload reads the entire model
+	// file through mmap, pulling ~N GB into the page cache. These pages are no
+	// longer needed (data is now in VRAM) and would otherwise compete with the
+	// CPU-side KV cache and run state allocations that follow.
+	mmap.TrimWorkingSet()
 
 	dp4aAvail := HasDp4a()
 	dp4aDisabled := os.Getenv("DLGO_NO_DP4A") == "1"
@@ -696,21 +718,40 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 	}
 
-	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM)
+	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM).
+	// Each allocation is guarded by a RAM check: if system RAM usage would exceed
+	// 85% of total, we skip the allocation and let mmap handle it instead.
 	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn
 	if needCPUState {
-		pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
-
-		if isPartial {
-			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
-			pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
+		if canAllocRAM(int64(llm.EstimateRuntimeBytes(cfg, cpuPipeline.MaxSeqLen))) {
+			pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
+		} else {
+			fmt.Printf("[dlgo/gpu] WARNING: skipping CPU RunState allocation (RAM pressure)\n")
 		}
 
-		// MLA or CPU attention needs a CPU KV cache
+		if isPartial {
+			cpuLayers := cfg.NumLayers - numGPULayers
+			kvCacheBytes := int64(2 * cpuLayers * cpuPipeline.MaxSeqLen * kvDim * 4)
+			if canAllocRAM(kvCacheBytes) {
+				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+			} else {
+				fmt.Printf("[dlgo/gpu] WARNING: skipping CPU KV cache allocation (RAM pressure, need %.0f MB)\n",
+					float64(kvCacheBytes)/(1024*1024))
+			}
+			if pipe.CPURunState != nil {
+				pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
+			}
+		}
+
 		if (pipe.HasMLA || hasCPUAttn) && pipe.CPUKVCache == nil {
-			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
-			if hasCPUAttn {
-				fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
+			kvCacheBytes := int64(2 * cfg.NumLayers * cpuPipeline.MaxSeqLen * kvDim * 4)
+			if canAllocRAM(kvCacheBytes) {
+				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+				if hasCPUAttn {
+					fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
+				}
+			} else {
+				fmt.Printf("[dlgo/gpu] WARNING: skipping CPU KV cache for MLA/attn (RAM pressure)\n")
 			}
 		}
 
@@ -735,9 +776,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	}
 
 	// Pin CPU layers to RAM for optimal inference speed (avoid page faults).
-	// Budget: use up to 80% of available physical RAM.
+	// Budget: never push total system RAM usage past 85%.
 	if isPartial {
 		pinCPULayersToRAM(m, numGPULayers)
+		mmap.TrimWorkingSet()
 	}
 
 	return pipe, nil
@@ -774,8 +816,28 @@ func (p *GpuPipeline) ResetState() {
 	}
 }
 
+// canAllocRAM checks whether allocating nbytes of heap memory would push
+// total system RAM usage past 85% of physical RAM. Returns false if the
+// allocation should be skipped to prevent system instability.
+func canAllocRAM(nbytes int64) bool {
+	memInfo, err := mmap.GetSystemMemInfo()
+	if err != nil {
+		return true // can't check, assume OK
+	}
+	totalRAM := int64(memInfo.TotalPhysical)
+	availRAM := int64(memInfo.AvailablePhysical)
+	usedRAM := totalRAM - availRAM
+	ceiling := int64(float64(totalRAM) * 0.85)
+	return usedRAM+nbytes < ceiling
+}
+
 // pinCPULayersToRAM copies non-GPU layer weights from mmap to heap memory,
 // prioritizing earlier layers and respecting a system RAM budget.
+//
+// Budget is computed against total physical RAM to prevent the system from
+// thrashing: we allow pinning only until total system RAM usage would reach
+// 85% of total physical RAM. Remaining layers stay on mmap and are served
+// via demand paging (the OS page cache handles them transparently).
 func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
 	memInfo, err := mmap.GetSystemMemInfo()
 	if err != nil {
@@ -783,8 +845,23 @@ func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
 		return
 	}
 
-	// Use at most 80% of available physical RAM for pinning
-	budget := int64(float64(memInfo.AvailablePhysical) * 0.80)
+	totalRAM := int64(memInfo.TotalPhysical)
+	availRAM := int64(memInfo.AvailablePhysical)
+	usedRAM := totalRAM - availRAM
+
+	// Use a conservative 70% ceiling for pinning. The remaining 15%
+	// (up to the 85% process limit) is headroom for mmap page cache,
+	// Go runtime/GC overhead, and other system processes.
+	maxUsage := int64(float64(totalRAM) * 0.70)
+	budget := maxUsage - usedRAM
+	if budget < 0 {
+		budget = 0
+	}
+
+	fmt.Printf("[dlgo/gpu] RAM budget: %.0f MB free of %.0f MB total (%.0f%% used), pin budget %.0f MB\n",
+		float64(availRAM)/(1024*1024), float64(totalRAM)/(1024*1024),
+		float64(usedRAM)/float64(totalRAM)*100, float64(budget)/(1024*1024))
+
 	pinnedBytes := int64(0)
 	pinnedLayers := 0
 
@@ -793,26 +870,44 @@ func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
 		if pinnedBytes+layerBytes > budget {
 			break
 		}
+		if !canAllocRAM(layerBytes) {
+			fmt.Printf("[dlgo/gpu] Stopping pin: canAllocRAM rejected %d MB layer\n",
+				layerBytes/(1024*1024))
+			break
+		}
 		llm.PinLayerToRAM(&m.Layers[l])
 		pinnedBytes += layerBytes
 		pinnedLayers++
+
+		// Every 4 layers, trim working set to evict the mmap source pages
+		// that were read during the copy but are no longer needed.
+		if pinnedLayers%4 == 0 {
+			mmap.TrimWorkingSet()
+		}
 	}
 
+	mmap.TrimWorkingSet()
 	remaining := len(m.Layers) - numGPULayers - pinnedLayers
 	fmt.Printf("[dlgo/gpu] Pinned %d CPU layers to RAM (%.0f MB), %d layers on mmap\n",
 		pinnedLayers, float64(pinnedBytes)/(1024*1024), remaining)
 }
 
 // FreeAll releases all GPU resources held by this pipeline.
+// Sync is called first to ensure no in-flight commands reference these buffers,
+// which allows the Vulkan driver to immediately reclaim the device memory.
 func (p *GpuPipeline) FreeAll() {
 	if p == nil {
 		return
 	}
+	Sync()
 	p.GpuModel.FreeAll()
 	p.RunState.FreeAll()
 	p.KVCache.FreeAll()
 	p.BatchState.Free()
 	freeBuf(p.Q8_1Scratch)
+	freeBuf(p.RoPECosTable)
+	freeBuf(p.RoPESinTable)
+	ResetBufferTable()
 }
 
 // GenerateResult holds detailed output from a GPU generation run.
@@ -905,14 +1000,18 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	genStart := time.Now()
 	var generated []int32
 	var recentTokens []int32
+	var genText strings.Builder
+	stopStrings := gpuStopStrings()
 
 	pos := len(tokens)
 	nextToken := ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
 
+	tokenText := p.Tokenizer.DecodeToken(int32(nextToken))
+	genText.WriteString(tokenText)
 	if cfg.Stream != nil {
-		cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
+		cfg.Stream(tokenText)
 	}
 
 	for step := 1; step < cfg.MaxTokens; step++ {
@@ -931,6 +1030,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 		if p.IsPartialGPU {
 			GpuForwardPartial(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			if step%32 == 0 {
+				mmap.TrimWorkingSet()
+			}
 		} else if p.UseFusedForward {
 			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
@@ -941,12 +1043,28 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		nextToken = ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 64 {
+		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
 		}
 
-		if cfg.Stream != nil {
-			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
+		tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
+		genText.WriteString(tokenText)
+
+		if gpuCheckTextStop(genText.String(), stopStrings) {
+			break
+		}
+
+		isStop := int32(nextToken) == p.CPUModel.Config.EOS
+		if !isStop {
+			for _, st := range p.CPUModel.Config.StopTokens {
+				if int32(nextToken) == st {
+					isStop = true
+					break
+				}
+			}
+		}
+		if cfg.Stream != nil && !isStop {
+			cfg.Stream(tokenText)
 		}
 	}
 
@@ -954,7 +1072,7 @@ done:
 	Sync()
 	genMs := float64(time.Since(genStart).Microseconds()) / 1000.0
 
-	text := p.Tokenizer.Decode(generated)
+	text := llm.TrimStopText(p.Tokenizer.Decode(generated), p.CPUModel.Config)
 	var tokPerSec float64
 	if genMs > 0 {
 		tokPerSec = float64(len(generated)) / (genMs / 1000.0)
@@ -1044,4 +1162,30 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 		}
 	}
 	return true
+}
+
+func gpuStopStrings() []string {
+	return []string{
+		"<end_of_turn><eos>",
+		"<eos>",
+		"<|im_end|>",
+		"<|endoftext|>",
+		"<|end|>",
+		"<|return|>",
+		"</s>",
+		"<|assistant|>",
+		"<|user|>",
+		"<|observation|>",
+		"<end_of_turn>",
+		"<|eot_id|>",
+	}
+}
+
+func gpuCheckTextStop(text string, stops []string) bool {
+	for _, ss := range stops {
+		if strings.HasSuffix(text, ss) {
+			return true
+		}
+	}
+	return false
 }

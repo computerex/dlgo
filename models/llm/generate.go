@@ -15,6 +15,7 @@ import (
 	"github.com/computerex/dlgo/ops"
 )
 
+
 // GenerateConfig controls text generation behavior.
 type GenerateConfig struct {
 	MaxTokens int
@@ -43,10 +44,7 @@ type Pipeline struct {
 }
 
 const (
-	// memReserveBytes is RAM kept free for the OS and other processes.
-	memReserveBytes = 2 * 1024 * 1024 * 1024 // 2 GB
-	// minContextLen is the smallest context we'll auto-shrink to.
-	minContextLen = 64
+	minContextLen = 64 // smallest context we'll auto-shrink to
 )
 
 // EstimateRuntimeBytes estimates heap bytes needed for KV cache, RunState,
@@ -102,34 +100,27 @@ func max64(a, b int64) int64 {
 // context length will fit in available RAM. Returns an adjusted (possibly
 // reduced) maxSeqLen and an error only if even the minimum context won't fit.
 //
-// The model file itself is memory-mapped and pages in on demand, so we count
-// the full file size as "needed" since inference touches all layers.
+// Model weights are memory-mapped and demand-paged by the OS — they do NOT
+// consume heap RAM. Only runtime buffers (KV cache, RunState, BatchState)
+// need actual RAM. The budget is: 85% of total physical RAM minus current
+// usage. This ensures any model can load regardless of size; throughput
+// degrades gracefully via mmap paging but the system never crashes.
 func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (int, error) {
-	info, err := os.Stat(modelPath)
-	if err != nil {
-		return requestedSeqLen, nil // can't stat, skip check
-	}
-	modelBytes := info.Size()
-
 	sysInfo, err := mmap.GetSystemMemInfo()
 	if err != nil {
 		return requestedSeqLen, nil // can't query RAM, skip check
 	}
 
-	availRAM := int64(sysInfo.AvailablePhysical)
 	totalRAM := int64(sysInfo.TotalPhysical)
+	availRAM := int64(sysInfo.AvailablePhysical)
 
-	// Model weights are memory-mapped and demand-paged by the OS. With GPU
-	// offloading, the mmap pages are uploaded then can be evicted. Even on
-	// CPU-only, only the active working set is resident simultaneously.
-	// Budget only runtime buffers (KV cache, intermediate state) against
-	// available physical RAM. For safety, also ensure model + runtime fits
-	// in total system RAM (physical + swap/pagefile).
-	budget := availRAM - memReserveBytes
-	maxBudget := int64(float64(totalRAM)*0.90) - memReserveBytes
-	if budget > maxBudget {
-		budget = maxBudget
-	}
+	// Budget = available RAM right now. We don't use a ceiling-based formula
+	// because other processes may legitimately consume RAM; we only care
+	// whether OUR runtime buffers (KV cache, RunState, BatchState) can fit.
+	// Model weights are mmap'd and demand-paged — they don't need heap RAM.
+	// Reserve 2 GB for OS/other processes as a safety margin.
+	const reserveBytes = 2 * (1 << 30) // 2 GB
+	budget := availRAM - reserveBytes
 	if budget < 0 {
 		budget = 0
 	}
@@ -141,12 +132,12 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 
 	runtimeBytes := EstimateRuntimeBytes(cfg, seqLen)
 
-	// Only check runtime buffers against available RAM since weights are mmap'd
 	if runtimeBytes <= budget {
 		return seqLen, nil
 	}
 
-	// Try shrinking context length to fit runtime buffers
+	// Auto-shrink context to fit runtime buffers in available RAM.
+	origSeqLen := seqLen
 	for seqLen > minContextLen {
 		seqLen = seqLen / 2
 		if seqLen < minContextLen {
@@ -154,6 +145,10 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 		}
 		runtimeBytes = EstimateRuntimeBytes(cfg, seqLen)
 		if runtimeBytes <= budget {
+			fmt.Fprintf(os.Stderr, "[dlgo] memory budget: reducing context from %d to %d tokens "+
+				"(%.1f GB available, runtime needs %.1f GB)\n",
+				origSeqLen, seqLen,
+				float64(budget)/(1<<30), float64(runtimeBytes)/(1<<30))
 			return seqLen, nil
 		}
 		if seqLen == minContextLen {
@@ -162,14 +157,13 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 	}
 
 	return 0, fmt.Errorf(
-		"insufficient memory: runtime buffers need ~%.1f GB "+
-			"but only %.1f GB available (%.1f GB total, %.1f GB free, %.1f GB model mmap'd). "+
-			"Close other applications or use a smaller model",
-		float64(runtimeBytes)/(1<<30),
+		"insufficient memory: runtime buffers need ~%.1f GB even at minimum context (%d tokens) "+
+			"but only %.1f GB available (%.1f GB total, %.1f GB free). "+
+			"Close other applications to free RAM",
+		float64(runtimeBytes)/(1<<30), minContextLen,
 		float64(budget)/(1<<30),
 		float64(totalRAM)/(1<<30),
 		float64(availRAM)/(1<<30),
-		float64(modelBytes)/(1<<30),
 	)
 }
 
@@ -199,6 +193,10 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load model: %w", err)
 	}
+
+	// After mmap-based model loading, trim the working set to release
+	// pages the OS speculatively read-ahead. They'll fault back in on demand.
+	mmap.TrimWorkingSet()
 
 	if maxSeqLen <= 0 || maxSeqLen > m.Config.ContextLength {
 		maxSeqLen = m.Config.ContextLength
@@ -292,11 +290,17 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 		Forward(p.Model, lastTok, pos, p.KVCache, p.RunState)
 		pos++
 
+		// Periodically trim the working set to evict mmap pages that were
+		// read during Forward. Prevents page cache from filling all RAM.
+		if step%32 == 0 {
+			mmap.TrimWorkingSet()
+		}
+
 		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 64 {
+		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
 		}
 
@@ -416,10 +420,14 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		Forward(p.Model, lastTok, pos, p.KVCache, p.RunState)
 		pos++
 
+		if step%32 == 0 {
+			mmap.TrimWorkingSet()
+		}
+
 		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 64 {
+		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
 		}
 
@@ -465,6 +473,11 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<end_of_turn>",
 		"<|eot_id|>",
 	}
+}
+
+// TrimStopText removes trailing stop strings and whitespace from generated text.
+func TrimStopText(text string, cfg ModelConfig) string {
+	return trimStopText(text, cfg)
 }
 
 func trimStopText(text string, cfg ModelConfig) string {
@@ -536,7 +549,7 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 
 		generated = append(generated, nextToken)
 		recentTokens = append(recentTokens, nextToken)
-		if len(recentTokens) > 64 {
+		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
 		}
 

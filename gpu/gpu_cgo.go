@@ -62,6 +62,10 @@ func Alloc(sizeBytes uint64) Buf {
 // Free releases a GPU buffer.
 func Free(buf Buf) { C.gpu_free(C.GpuBuf(buf)) }
 
+// ResetBufferTable compacts the buffer ID table after freeing all buffers,
+// allowing new allocations to reuse slots from the beginning.
+func ResetBufferTable() { C.gpu_reset_buffer_table() }
+
 // Upload copies data from CPU to GPU.
 func Upload(dst Buf, src []byte) error {
 	if len(src) == 0 {
@@ -595,7 +599,7 @@ func (lc *LayerConf) SetAttnNormOnly(attnNorm Buf) {
 }
 
 func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
-	bq, bk, bv Buf, qNorm, kNorm Buf) {
+	bq, bk, bv, bo Buf, qNorm, kNorm Buf) {
 	lc.c.attn_norm_w = C.GpuBuf(attnNorm)
 	lc.c.wq = C.GpuBuf(wq.Buf)
 	lc.c.wq_rows = C.int(wq.Rows)
@@ -615,6 +619,7 @@ func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
 	lc.c.wo_type = C.int(wo.Type)
 	lc.c.bq = C.GpuBuf(bq)
 	lc.c.bk = C.GpuBuf(bk)
+	lc.c.bo = C.GpuBuf(bo)
 	lc.c.bv = C.GpuBuf(bv)
 	lc.c.q_norm_w = C.GpuBuf(qNorm)
 	lc.c.k_norm_w = C.GpuBuf(kNorm)

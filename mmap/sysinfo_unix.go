@@ -16,3 +16,13 @@ func GetSystemMemInfo() (SystemMemInfo, error) {
 		AvailablePhysical: uint64(si.Freeram) * unit,
 	}, nil
 }
+
+// TrimWorkingSet is a no-op on Linux; the kernel aggressively reclaims
+// unmapped file pages. On Linux you could use madvise(MADV_DONTNEED) on
+// specific ranges, but the kernel's page cache management is already
+// effective for mmap'd files.
+func TrimWorkingSet() {}
+
+// SetWorkingSetLimit is a no-op on Linux; the kernel manages page cache
+// eviction effectively via its own heuristics.
+func SetWorkingSetLimit(maxBytes uint64) {}

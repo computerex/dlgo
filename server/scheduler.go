@@ -44,16 +44,17 @@ const (
 
 // InferenceRequest represents a single chat completion request in flight.
 type InferenceRequest struct {
-	ID        string
-	Messages  []llm.Message
-	Config    llm.GenerateConfig
-	Tokens    []int32       // prompt tokens after formatting
-	Generated []int32       // output tokens so far
-	Position  int           // current sequence position
-	Status    RequestStatus
-	Output    chan StreamEvent
-	Ctx       context.Context
-	Cancel    context.CancelFunc
+	ID            string
+	Messages      []llm.Message
+	StopSequences []string      // user-provided stop sequences from API
+	Config        llm.GenerateConfig
+	Tokens        []int32       // prompt tokens after formatting
+	Generated     []int32       // output tokens so far
+	Position      int           // current sequence position
+	Status        RequestStatus
+	Output        chan StreamEvent
+	Ctx           context.Context
+	Cancel        context.CancelFunc
 }
 
 // Scheduler manages the inference loop for a single loaded model.
@@ -175,6 +176,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	var genText strings.Builder
 	genText.WriteString(tokenText)
 	stopStrings := collectStopStrings(pipe.Model.Config)
+	stopStrings = append(stopStrings, req.StopSequences...)
 
 	for step := 1; step < req.Config.MaxTokens; step++ {
 		if req.Ctx.Err() != nil {
@@ -201,7 +203,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		tokenText = pipe.Tokenizer.DecodeToken(nextToken)
 		req.Generated = append(req.Generated, nextToken)
 		recentTokens = append(recentTokens, nextToken)
-		if len(recentTokens) > 64 {
+		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
 		}
 
@@ -266,8 +268,11 @@ func collectStopStrings(cfg llm.ModelConfig) []string {
 		"<|im_end|>",
 		"<|endoftext|>",
 		"<|end|>",
+		"<|return|>",
 		"</s>",
 		"<|assistant|>",
+		"<|user|>",
+		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
 	}
