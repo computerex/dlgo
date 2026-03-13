@@ -1,21 +1,20 @@
 package ops
 
 import (
+	"container/heap"
 	"math"
 	"math/rand"
 	"sort"
 )
 
-// SamplerConfig holds parameters for token sampling.
 type SamplerConfig struct {
-	Temperature       float32 // 0 = greedy, 0.7 = creative, 1.0 = original distribution
-	TopK              int     // keep top K candidates (0 = disabled)
-	TopP              float32 // nucleus sampling threshold (1.0 = disabled)
-	MinP              float32 // minimum probability threshold relative to top token (0 = disabled)
-	RepetitionPenalty float32 // penalize repeated tokens (1.0 = off, 1.1 = typical)
+	Temperature       float32
+	TopK              int
+	TopP              float32
+	MinP              float32
+	RepetitionPenalty float32
 }
 
-// DefaultSamplerConfig returns sensible defaults for text generation.
 func DefaultSamplerConfig() SamplerConfig {
 	return SamplerConfig{
 		Temperature:       0.7,
@@ -26,31 +25,133 @@ func DefaultSamplerConfig() SamplerConfig {
 	}
 }
 
-// SampleToken applies the full sampling pipeline and returns a token index.
-// Pipeline: repetition penalty → temperature → top-k → top-p → min-p → sample.
-// Pass rng=nil for greedy (argmax) decoding regardless of temperature.
-func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng *rand.Rand) int {
-	n := len(logits)
-	work := make([]float32, n)
-	copy(work, logits)
-
-	ApplyRepetitionPenalty(work, recentTokens, cfg.RepetitionPenalty)
-
-	if cfg.Temperature <= 0 || rng == nil {
-		return Argmax(work)
-	}
-
-	ApplyTemperature(work, cfg.Temperature)
-	ApplyTopK(work, cfg.TopK)
-	ApplyTopP(work, cfg.TopP)
-	ApplyMinP(work, cfg.MinP)
-
-	return sampleFromLogits(work, rng)
+type tokenProb struct {
+	idx  int
+	logit float32
 }
 
-// ApplyRepetitionPenalty penalizes tokens in recentTokens.
-// Positive logits are divided by penalty; negative logits are multiplied.
-// Matches llama.cpp behavior.
+type minHeap []tokenProb
+
+func (h minHeap) Len() int            { return len(h) }
+func (h minHeap) Less(i, j int) bool   { return h[i].logit < h[j].logit }
+func (h minHeap) Swap(i, j int)        { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x interface{})  { *h = append(*h, x.(tokenProb)) }
+func (h *minHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng *rand.Rand) int {
+	n := len(logits)
+
+	ApplyRepetitionPenalty(logits, recentTokens, cfg.RepetitionPenalty)
+
+	if cfg.Temperature <= 0 || rng == nil {
+		return Argmax(logits)
+	}
+
+	invTemp := float32(1.0) / cfg.Temperature
+	if cfg.Temperature != 1.0 {
+		for i := range logits {
+			logits[i] *= invTemp
+		}
+	}
+
+	k := cfg.TopK
+	if k <= 0 || k > n {
+		k = n
+	}
+
+	candidates := topKHeap(logits, k)
+
+	sort.Slice(candidates, func(a, b int) bool {
+		return candidates[a].logit > candidates[b].logit
+	})
+
+	nc := len(candidates)
+	probs := make([]float32, nc)
+	maxLogit := candidates[0].logit
+	var sum float32
+	for i := 0; i < nc; i++ {
+		probs[i] = fastExpf(candidates[i].logit - maxLogit)
+		sum += probs[i]
+	}
+	invSum := float32(1.0) / sum
+	for i := range probs {
+		probs[i] *= invSum
+	}
+
+	if cfg.MinP > 0 {
+		threshold := cfg.MinP * probs[0]
+		for i := 0; i < nc; i++ {
+			if probs[i] < threshold {
+				nc = i
+				break
+			}
+		}
+		if nc == 0 {
+			nc = 1
+		}
+		probs = probs[:nc]
+		candidates = candidates[:nc]
+	}
+
+	if cfg.TopP > 0 && cfg.TopP < 1.0 {
+		var cumSum float32
+		cutoff := nc
+		for i := 0; i < nc; i++ {
+			cumSum += probs[i]
+			if cumSum >= cfg.TopP {
+				cutoff = i + 1
+				break
+			}
+		}
+		nc = cutoff
+		probs = probs[:nc]
+		candidates = candidates[:nc]
+	}
+
+	pSum := float32(0)
+	for _, p := range probs {
+		pSum += p
+	}
+	invPSum := float32(1.0) / pSum
+
+	r := rng.Float32()
+	var cumSum float32
+	for i, p := range probs {
+		cumSum += p * invPSum
+		if cumSum >= r {
+			return candidates[i].idx
+		}
+	}
+	return candidates[nc-1].idx
+}
+
+func topKHeap(logits []float32, k int) []tokenProb {
+	h := make(minHeap, 0, k+1)
+
+	negInf := float32(math.Inf(-1))
+	for i, v := range logits {
+		if v == negInf {
+			continue
+		}
+		if h.Len() < k {
+			heap.Push(&h, tokenProb{i, v})
+		} else if v > h[0].logit {
+			h[0] = tokenProb{i, v}
+			heap.Fix(&h, 0)
+		}
+	}
+
+	result := make([]tokenProb, len(h))
+	copy(result, h)
+	return result
+}
+
 func ApplyRepetitionPenalty(logits []float32, recentTokens []int32, penalty float32) {
 	if penalty <= 1.0 || len(recentTokens) == 0 {
 		return
@@ -69,7 +170,6 @@ func ApplyRepetitionPenalty(logits []float32, recentTokens []int32, penalty floa
 	}
 }
 
-// ApplyTemperature divides all logits by temperature. Higher temperature = more random.
 func ApplyTemperature(logits []float32, temp float32) {
 	if temp <= 0 || temp == 1.0 {
 		return
@@ -80,23 +180,23 @@ func ApplyTemperature(logits []float32, temp float32) {
 	}
 }
 
-// ApplyTopK zeros out all logits below the K-th largest value.
 func ApplyTopK(logits []float32, k int) {
 	if k <= 0 || k >= len(logits) {
 		return
 	}
-	indices := topKIdxSort(logits, k)
-	cutoff := logits[indices[k-1]]
+	candidates := topKHeap(logits, k)
+	allowed := make(map[int]bool, len(candidates))
+	for _, c := range candidates {
+		allowed[c.idx] = true
+	}
 	negInf := float32(math.Inf(-1))
 	for i := range logits {
-		if logits[i] < cutoff {
+		if !allowed[i] {
 			logits[i] = negInf
 		}
 	}
 }
 
-// ApplyTopP applies nucleus sampling: keeps the smallest set of tokens whose
-// cumulative probability exceeds p. All other logits are set to -inf.
 func ApplyTopP(logits []float32, p float32) {
 	if p >= 1.0 {
 		return
@@ -138,9 +238,6 @@ func ApplyTopP(logits []float32, p float32) {
 	}
 }
 
-// ApplyMinP filters tokens whose probability is below minP * max_probability.
-// More adaptive than top-k: keeps more tokens when the distribution is uncertain,
-// fewer when it's confident.
 func ApplyMinP(logits []float32, minP float32) {
 	if minP <= 0 {
 		return
@@ -163,37 +260,4 @@ func ApplyMinP(logits []float32, minP float32) {
 			logits[i] = negInf
 		}
 	}
-}
-
-func sampleFromLogits(logits []float32, rng *rand.Rand) int {
-	probs := make([]float32, len(logits))
-	copy(probs, logits)
-	Softmax(probs)
-
-	r := rng.Float32()
-	var cumSum float32
-	for i, p := range probs {
-		cumSum += p
-		if cumSum >= r {
-			return i
-		}
-	}
-	return len(probs) - 1
-}
-
-func topKIdxSort(vals []float32, k int) []int {
-	type iv struct {
-		idx int
-		val float32
-	}
-	items := make([]iv, len(vals))
-	for i, v := range vals {
-		items[i] = iv{i, v}
-	}
-	sort.Slice(items, func(a, b int) bool { return items[a].val > items[b].val })
-	out := make([]int, k)
-	for i := 0; i < k; i++ {
-		out[i] = items[i].idx
-	}
-	return out
 }

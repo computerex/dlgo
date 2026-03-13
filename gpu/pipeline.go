@@ -1002,7 +1002,6 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	var recentTokens []int32
 	var genText strings.Builder
 	stopStrings := gpuStopStrings()
-
 	pos := len(tokens)
 	nextToken := ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
 	var tokenText string

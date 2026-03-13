@@ -271,6 +271,7 @@ RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 	}
 	MatVec(rs.Logits, output.Buf, rs.X, output.Rows, output.Cols, output.Type)
 	DownloadF32(rs.Logits, logitsBuf)
+
 }
 
 // GpuForwardPartial performs a single-token forward pass where only the first
