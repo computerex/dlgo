@@ -172,11 +172,11 @@ response, _ = model.ChatMessages([]dlgo.Message{
 ## Building from Source
 
 ```bash
-# CPU only
-go build -o dlgo ./cmd/dlgo/
+# CPU only (portable static binary with internal linking)
+go build -ldflags "-linkmode internal" -o dlgo ./cmd/dlgo/
 
 # With Vulkan GPU support
-go build -tags vulkan -o dlgo ./cmd/dlgo/
+go build -tags vulkan -ldflags "-linkmode internal" -o dlgo ./cmd/dlgo/
 
 # Build the web frontend (requires Node.js)
 cd frontend && npm install && npm run build && cd ..

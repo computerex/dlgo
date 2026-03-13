@@ -48,6 +48,7 @@ type InferenceRequest struct {
 	Messages        []llm.Message
 	StopSequences   []string      // user-provided stop sequences from API
 	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
+	EnableThinking  *bool         // nil = auto (enabled for thinking models), false = disable
 	Config          llm.GenerateConfig
 	Tokens          []int32       // prompt tokens after formatting
 	Generated       []int32       // output tokens so far
@@ -118,7 +119,7 @@ func (s *Scheduler) processRequest(req *InferenceRequest) {
 	m := s.model
 
 	// Format messages into a prompt
-	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort}
+	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
 	prompt := llm.FormatMessages(m.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
 	// Tokenize
@@ -230,7 +231,7 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	pipe := s.model.GpuPipeline
 
 	// Use GenerateDetailed with streaming callback
-	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort}
+	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
 	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
 	cfg := req.Config

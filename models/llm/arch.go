@@ -9,17 +9,18 @@ import (
 
 // ArchDescriptor describes architecture-specific behavior for an LLM.
 type ArchDescriptor struct {
-	RopeNeox      bool   // true = NeoX-style RoPE, false = interleaved
-	FFNGelu       bool   // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
-	EmbedScaleMode string // "none" or "sqrt_dim"
-	ChatTemplate  string // "chatml", "llama2", "llama3", "gemma", "phi"
+	RopeNeox         bool   // true = NeoX-style RoPE, false = interleaved
+	FFNGelu          bool   // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
+	EmbedScaleMode   string // "none" or "sqrt_dim"
+	ChatTemplate     string // "chatml", "llama2", "llama3", "gemma", "phi"
+	SupportsThinking bool   // true = model uses <think> blocks (Qwen3/3.5)
 }
 
 // archRegistry maps architecture names to their descriptors.
 var archRegistry = map[string]ArchDescriptor{
 	"llama":     {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "llama2"},
 	"qwen2":     {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"qwen3":     {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen3":     {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 	"qwen2moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"gemma":     {RopeNeox: true, FFNGelu: true, EmbedScaleMode: "sqrt_dim", ChatTemplate: "gemma"},
 	"gemma2":    {RopeNeox: true, FFNGelu: true, EmbedScaleMode: "sqrt_dim", ChatTemplate: "gemma"},
@@ -27,12 +28,12 @@ var archRegistry = map[string]ArchDescriptor{
 	"phi2":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"phi3":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"mistral":   {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "llama2"},
-	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
+	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 	"deepseek2": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "harmony"},
-	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"qwen3next": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
+	"qwen3next": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.
@@ -97,6 +98,7 @@ type Message struct {
 // FormatOptions controls template-level formatting (e.g. reasoning effort).
 type FormatOptions struct {
 	ReasoningEffort string // "low", "medium", "high" (default: "medium")
+	EnableThinking  *bool  // nil = auto (enabled for thinking models), false = disable
 }
 
 // FormatChat formats a single-turn chat prompt (system + user) for the model.
@@ -119,28 +121,42 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	var prompt string
 	switch template {
 	case "chatml":
-		return formatChatMLMessages(messages)
+		prompt = formatChatMLMessages(messages)
 	case "chatml_sep":
-		return formatChatMLSepMessages(messages)
+		prompt = formatChatMLSepMessages(messages)
 	case "llama3":
-		return formatLlama3Messages(messages)
+		prompt = formatLlama3Messages(messages)
 	case "llama2":
-		return formatLlamaMessages(messages)
+		prompt = formatLlamaMessages(messages)
 	case "gemma":
-		return formatGemmaMessages(messages)
+		prompt = formatGemmaMessages(messages)
 	case "phi":
-		return formatPhiMessages(messages)
+		prompt = formatPhiMessages(messages)
 	case "chatglm":
-		return formatChatGLMMessages(messages)
+		prompt = formatChatGLMMessages(messages)
 	case "harmony":
-		return formatHarmonyMessages(messages, opt)
+		prompt = formatHarmonyMessages(messages, opt)
 	case "plain":
-		return formatPlainMessages(messages)
+		prompt = formatPlainMessages(messages)
 	default:
-		return formatChatMLMessages(messages)
+		prompt = formatChatMLMessages(messages)
 	}
+
+	// Thinking model support: append <think> primer to prompt the model into
+	// thinking mode. Matches the official Qwen3/3.5 Jinja template behavior.
+	arch := GetArchDescriptor(cfg.Architecture)
+	thinking := arch.SupportsThinking
+	if opt.EnableThinking != nil {
+		thinking = *opt.EnableThinking
+	}
+	if thinking {
+		prompt += "<think>\n"
+	}
+
+	return prompt
 }
 
 func formatPlainMessages(messages []Message) string {

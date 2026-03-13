@@ -82,6 +82,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Messages:        msgs,
 		StopSequences:   req.Stop,
 		ReasoningEffort: req.ReasoningEffort,
+		EnableThinking:  req.EnableThinking,
 		Config: llm.GenerateConfig{
 			MaxTokens: maxTokens,
 			Sampler:   sampler,
