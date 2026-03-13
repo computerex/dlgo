@@ -121,6 +121,30 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+
+	// Thinking model support: determine whether to inject <think> primer.
+	// Matches the official Qwen3/3.5 Jinja template behavior.
+	arch := GetArchDescriptor(cfg.Architecture)
+	thinking := arch.SupportsThinking
+	if opt.EnableThinking != nil {
+		thinking = *opt.EnableThinking
+	}
+
+	// For thinking models, strip <think>...</think> blocks from assistant
+	// messages in history. The Jinja template does this to prevent context
+	// explosion: each thinking block can be hundreds of tokens; including them
+	// verbatim in every subsequent turn exhausts MaxSeqLen after 1-2 turns.
+	if thinking {
+		stripped := make([]Message, len(messages))
+		copy(stripped, messages)
+		for i := range stripped {
+			if stripped[i].Role == "assistant" {
+				stripped[i].Content = stripThinkingBlock(stripped[i].Content)
+			}
+		}
+		messages = stripped
+	}
+
 	var prompt string
 	switch template {
 	case "chatml":
@@ -145,18 +169,24 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 		prompt = formatChatMLMessages(messages)
 	}
 
-	// Thinking model support: append <think> primer to prompt the model into
-	// thinking mode. Matches the official Qwen3/3.5 Jinja template behavior.
-	arch := GetArchDescriptor(cfg.Architecture)
-	thinking := arch.SupportsThinking
-	if opt.EnableThinking != nil {
-		thinking = *opt.EnableThinking
-	}
 	if thinking {
 		prompt += "<think>\n"
 	}
 
 	return prompt
+}
+
+// stripThinkingBlock removes the leading <think>...</think> block from an
+// assistant message. The official Qwen3/3.5 Jinja template strips reasoning
+// from history turns so only the final answer is included for context.
+func stripThinkingBlock(content string) string {
+	if !strings.HasPrefix(content, "<think>") {
+		return content
+	}
+	if idx := strings.Index(content, "</think>"); idx >= 0 {
+		content = strings.TrimLeft(content[idx+len("</think>"):], "\n")
+	}
+	return content
 }
 
 func formatPlainMessages(messages []Message) string {
