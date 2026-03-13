@@ -20,6 +20,7 @@ type ChatCompletionRequest struct {
 	Stop              []string  `json:"stop,omitempty"`
 	Seed              *int64    `json:"seed,omitempty"`
 	RepetitionPenalty *float64  `json:"repetition_penalty,omitempty"`
+	ReasoningEffort   string    `json:"reasoning_effort,omitempty"`
 }
 
 type ChatCompletionChoice struct {

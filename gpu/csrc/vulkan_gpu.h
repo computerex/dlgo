@@ -214,10 +214,10 @@ int gpu_copy_f32(GpuBuf dst, GpuBuf src, int n);
 // out_buf: [num_heads * head_dim]
 int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                   int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                  int seq_len, float scale);
+                  int seq_len, float scale, int start_pos);
 int gpu_attention_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                         GpuBuf sinks_buf, int num_heads, int num_kv_heads, int head_dim,
-                        int kv_dim, int seq_len, float scale);
+                        int kv_dim, int seq_len, float scale, int start_pos);
 
 // KV cache operations
 int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
@@ -293,6 +293,7 @@ typedef struct {
     int use_dp4a;        // 1 to use dp4a path, 0 for float path
     int core_type;       // 0=attention, 1=SSM (skip attn, Go fills attn_proj)
     GpuBuf attn_sinks;   // learned sink logits per head (0 if not used)
+    int sliding_window;  // ISWA: max window size for this layer (0 = full attention)
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.

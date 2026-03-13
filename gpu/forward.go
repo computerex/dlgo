@@ -52,6 +52,9 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 		if gl.AttnSinks != 0 {
 			lc.SetAttnSinks(gl.AttnSinks)
 		}
+		if layer.Spec.SlidingWindow > 0 {
+			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
+		}
 	}
 
 	if gl.IsMoE {
@@ -205,8 +208,12 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
+			gqWinStart := 0
+			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
+				gqWinStart = seqLen - w
+			}
 			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart, scale)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
@@ -355,8 +362,12 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
+			gqWinStart2 := 0
+			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
+				gqWinStart2 = seqLen - w
+			}
 			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart2, scale)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
@@ -449,6 +460,12 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
 			gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
 		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+		if gl.AttnSinks != 0 {
+			lc.SetAttnSinks(gl.AttnSinks)
+		}
+		if layer.Spec.SlidingWindow > 0 {
+			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
+		}
 	}
 
 	if gl.IsMoE {
@@ -874,14 +891,18 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
+			gqWinStart3 := 0
+			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
+				gqWinStart3 = seqLen - w
+			}
 			if gl.AttnSinks != 0 {
 				if err := AttentionSinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart3, scale); err != nil {
 					return fmt.Errorf("layer %d gatedq attention_sinks: %w", l, err)
 				}
 			} else {
 				Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-					numHeads, numKVHeads, headDim, kvDim, seqLen, scale)
+					numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart3, scale)
 			}
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnOut", rs.AttnOut, numHeads*headDim)
@@ -987,17 +1008,21 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 
 			Barrier()
+			winStart := 0
+			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
+				winStart = seqLen - w
+			}
 			if gl.AttnSinks != 0 {
 				if diagL {
-					GpuDiag.LogInfo("GPU", l, pos, "attention_sinks seqLen=%d scale=%.6f", seqLen, scale)
+					GpuDiag.LogInfo("GPU", l, pos, "attention_sinks seqLen=%d winStart=%d scale=%.6f", seqLen, winStart, scale)
 				}
 				if err := AttentionSinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale); err != nil {
 					return fmt.Errorf("layer %d attention_sinks: %w", l, err)
 				}
 			} else {
 				if err := Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-					numHeads, numKVHeads, headDim, kvDim, seqLen, scale); err != nil {
+					numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale); err != nil {
 					return fmt.Errorf("layer %d attention: %w", l, err)
 				}
 			}

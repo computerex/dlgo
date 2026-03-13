@@ -66,7 +66,11 @@ type ModelConfig struct {
 	LeadingDenseCount int // Number of initial dense layers before MoE
 }
 
-// parseConfig extracts a ModelConfig from GGUF metadata.
+// ParseConfig extracts a ModelConfig from GGUF metadata.
+func ParseConfig(md map[string]interface{}) (ModelConfig, error) {
+	return parseConfig(md)
+}
+
 func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	arch := metaString(md, "general.architecture")
 	if arch == "" {

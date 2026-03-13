@@ -1005,12 +1005,24 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	pos := len(tokens)
 	nextToken := ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
+	var tokenText string
+
+	firstTok := int32(nextToken)
+	if firstTok == p.CPUModel.Config.EOS {
+		goto done
+	}
+	for _, stop := range p.CPUModel.Config.StopTokens {
+		if firstTok == stop {
+			goto done
+		}
+	}
+
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
 
-	tokenText := p.Tokenizer.DecodeToken(int32(nextToken))
+	tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
 	genText.WriteString(tokenText)
-	if cfg.Stream != nil {
+	if !gpuCheckTextStop(genText.String(), stopStrings) && cfg.Stream != nil {
 		cfg.Stream(tokenText)
 	}
 
@@ -1178,6 +1190,11 @@ func gpuStopStrings() []string {
 		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
+		"<|channel|>",
+		"<|start|>",
+		"<|message|>",
+		"<|constrain|>",
+		"<|call|>",
 	}
 }
 

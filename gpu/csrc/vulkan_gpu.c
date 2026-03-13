@@ -1925,18 +1925,23 @@ int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
 
 int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                   int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                  int seq_len, float scale) {
+                  int seq_len, float scale, int start_pos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
+    int window_len = seq_len - start_pos;
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 4;
+
     struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION;
     dp.bufs[0] = out_buf;
     dp.bufs[1] = q_buf;
     dp.bufs[2] = k_cache_buf;
     dp.bufs[3] = v_cache_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
     dp.num_bufs = 4;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
@@ -1948,12 +1953,15 @@ int gpu_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cac
 
 int gpu_attention_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                         GpuBuf sinks_buf, int num_heads, int num_kv_heads, int head_dim,
-                        int kv_dim, int seq_len, float scale) {
+                        int kv_dim, int seq_len, float scale, int start_pos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
+    int window_len = seq_len - start_pos;
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 4;
+
     struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_SINKS;
     dp.bufs[0] = out_buf;
@@ -1961,6 +1969,8 @@ int gpu_attention_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf
     dp.bufs[2] = k_cache_buf;
     dp.bufs[3] = v_cache_buf;
     dp.bufs[4] = sinks_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
     dp.num_bufs = 5;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
@@ -2291,12 +2301,17 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
         gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
 
-        if (lc->attn_sinks) {
-            gpu_attention_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
-        } else {
-            gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                          num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale);
+        {
+            int win_start = 0;
+            if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
+                win_start = seq_len - lc->sliding_window;
+            if (lc->attn_sinks) {
+                gpu_attention_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                    lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
+            } else {
+                gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                              num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
+            }
         }
 
         gpu_barrier();

@@ -12,6 +12,7 @@ interface ChatPanelProps {
   topK: number;
   maxTokens: number;
   systemPrompt: string;
+  reasoningEffort: 'low' | 'medium' | 'high';
 }
 
 interface LocalChatMessage extends Message {
@@ -20,7 +21,7 @@ interface LocalChatMessage extends Message {
   metrics?: { tokPerSec: number; ttft: number; totalMs: number };
 }
 
-export function ChatPanel({ chat, model, temperature, topP, topK, maxTokens, systemPrompt }: ChatPanelProps) {
+export function ChatPanel({ chat, model, temperature, topP, topK, maxTokens, systemPrompt, reasoningEffort }: ChatPanelProps) {
   const [messages, setMessages] = useState<LocalChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [generating, setGenerating] = useState(false);
@@ -78,7 +79,7 @@ export function ChatPanel({ chat, model, temperature, topP, topK, maxTokens, sys
 
     try {
       await chatCompletion(
-        { model, messages: apiMessages, temperature, top_p: topP, top_k: topK, max_tokens: maxTokens },
+        { model, messages: apiMessages, temperature, top_p: topP, top_k: topK, max_tokens: maxTokens, reasoning_effort: reasoningEffort },
         {
           onToken: (token) => {
             tokenCount++;

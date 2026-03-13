@@ -44,17 +44,18 @@ const (
 
 // InferenceRequest represents a single chat completion request in flight.
 type InferenceRequest struct {
-	ID            string
-	Messages      []llm.Message
-	StopSequences []string      // user-provided stop sequences from API
-	Config        llm.GenerateConfig
-	Tokens        []int32       // prompt tokens after formatting
-	Generated     []int32       // output tokens so far
-	Position      int           // current sequence position
-	Status        RequestStatus
-	Output        chan StreamEvent
-	Ctx           context.Context
-	Cancel        context.CancelFunc
+	ID              string
+	Messages        []llm.Message
+	StopSequences   []string      // user-provided stop sequences from API
+	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
+	Config          llm.GenerateConfig
+	Tokens          []int32       // prompt tokens after formatting
+	Generated       []int32       // output tokens so far
+	Position        int           // current sequence position
+	Status          RequestStatus
+	Output          chan StreamEvent
+	Ctx             context.Context
+	Cancel          context.CancelFunc
 }
 
 // Scheduler manages the inference loop for a single loaded model.
@@ -117,7 +118,8 @@ func (s *Scheduler) processRequest(req *InferenceRequest) {
 	m := s.model
 
 	// Format messages into a prompt
-	prompt := llm.FormatMessages(m.CPUPipeline.Model.Config, req.Messages)
+	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort}
+	prompt := llm.FormatMessages(m.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
 	// Tokenize
 	tokens := m.CPUPipeline.Tokenizer.Encode(prompt)
@@ -168,15 +170,21 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		return
 	}
 
+	stopStrings := collectStopStrings(pipe.Model.Config)
+	stopStrings = append(stopStrings, req.StopSequences...)
+
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
+	var genText strings.Builder
+	genText.WriteString(tokenText)
+
+	if checkTextStop(genText.String(), stopStrings) {
+		req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
+		return
+	}
+
 	req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
 	req.Generated = append(req.Generated, nextToken)
 	recentTokens = append(recentTokens, nextToken)
-
-	var genText strings.Builder
-	genText.WriteString(tokenText)
-	stopStrings := collectStopStrings(pipe.Model.Config)
-	stopStrings = append(stopStrings, req.StopSequences...)
 
 	for step := 1; step < req.Config.MaxTokens; step++ {
 		if req.Ctx.Err() != nil {
@@ -222,7 +230,8 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	pipe := s.model.GpuPipeline
 
 	// Use GenerateDetailed with streaming callback
-	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages)
+	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort}
+	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
 	cfg := req.Config
 	cfg.Stream = func(token string) {
@@ -275,6 +284,11 @@ func collectStopStrings(cfg llm.ModelConfig) []string {
 		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
+		"<|channel|>",
+		"<|start|>",
+		"<|message|>",
+		"<|constrain|>",
+		"<|call|>",
 	}
 }
 

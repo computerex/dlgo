@@ -13,6 +13,7 @@ function App() {
   const [topK, setTopK] = useState(40);
   const [maxTokens, setMaxTokens] = useState(512);
   const [systemPrompt, setSystemPrompt] = useState('');
+  const [reasoningEffort, setReasoningEffort] = useState<'low' | 'medium' | 'high'>('medium');
   const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [useGPU, setUseGPU] = useState(false);
@@ -126,6 +127,7 @@ function App() {
           topK={topK}
           maxTokens={maxTokens}
           systemPrompt={systemPrompt}
+          reasoningEffort={reasoningEffort}
         />
       </div>
 
@@ -152,12 +154,14 @@ function App() {
               topK={topK}
               maxTokens={maxTokens}
               systemPrompt={systemPrompt}
+              reasoningEffort={reasoningEffort}
               useGPU={useGPU}
               onTemperatureChange={setTemperature}
               onTopPChange={setTopP}
               onTopKChange={setTopK}
               onMaxTokensChange={setMaxTokens}
               onSystemPromptChange={setSystemPrompt}
+              onReasoningEffortChange={setReasoningEffort}
               onGPUChange={handleGPUToggle}
             />
           </div>

@@ -4,18 +4,20 @@ interface SettingsPanelProps {
   topK: number;
   maxTokens: number;
   systemPrompt: string;
+  reasoningEffort: 'low' | 'medium' | 'high';
   useGPU: boolean;
   onTemperatureChange: (v: number) => void;
   onTopPChange: (v: number) => void;
   onTopKChange: (v: number) => void;
   onMaxTokensChange: (v: number) => void;
   onSystemPromptChange: (v: string) => void;
+  onReasoningEffortChange: (v: 'low' | 'medium' | 'high') => void;
   onGPUChange: (v: boolean) => void;
 }
 
 export function SettingsPanel({
-  temperature, topP, topK, maxTokens, systemPrompt, useGPU,
-  onTemperatureChange, onTopPChange, onTopKChange, onMaxTokensChange, onSystemPromptChange, onGPUChange,
+  temperature, topP, topK, maxTokens, systemPrompt, reasoningEffort, useGPU,
+  onTemperatureChange, onTopPChange, onTopKChange, onMaxTokensChange, onSystemPromptChange, onReasoningEffortChange, onGPUChange,
 }: SettingsPanelProps) {
   return (
     <div className="space-y-5">
@@ -50,6 +52,29 @@ export function SettingsPanel({
           {useGPU
             ? 'Using Vulkan GPU acceleration'
             : 'Using CPU inference'}
+        </p>
+      </div>
+
+      {/* Reasoning Effort */}
+      <div className="space-y-1.5">
+        <div className="text-xs text-[var(--text-secondary)]">Reasoning Effort</div>
+        <div className="flex rounded-lg overflow-hidden border border-[var(--border)]">
+          {(['low', 'medium', 'high'] as const).map(level => (
+            <button
+              key={level}
+              onClick={() => onReasoningEffortChange(level)}
+              className={`flex-1 px-3 py-2 text-xs font-medium transition-colors capitalize ${
+                reasoningEffort === level
+                  ? 'bg-[var(--accent)] text-white'
+                  : 'bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              {level}
+            </button>
+          ))}
+        </div>
+        <p className="text-[10px] text-[var(--text-secondary)]">
+          Controls how much the model reasons before responding
         </p>
       </div>
 

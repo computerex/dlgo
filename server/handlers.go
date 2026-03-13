@@ -78,9 +78,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Submit to the scheduler
 	infReq := &InferenceRequest{
-		ID:            newCompletionID(),
-		Messages:      msgs,
-		StopSequences: req.Stop,
+		ID:              newCompletionID(),
+		Messages:        msgs,
+		StopSequences:   req.Stop,
+		ReasoningEffort: req.ReasoningEffort,
 		Config: llm.GenerateConfig{
 			MaxTokens: maxTokens,
 			Sampler:   sampler,
@@ -205,6 +206,7 @@ func trimTrailingStopTokens(text string) string {
 		"<|end|>", "<|return|>", "<|im_end|>", "<|endoftext|>",
 		"<end_of_turn><eos>", "<end_of_turn>", "<eos>", "</s>",
 		"<|eot_id|>", "<|assistant|>", "<|user|>",
+		"<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|call|>",
 	}
 	for {
 		trimmed := strings.TrimRight(text, " \t\r\n")

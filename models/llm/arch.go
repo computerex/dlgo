@@ -1,8 +1,10 @@
 package llm
 
 import (
+	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // ArchDescriptor describes architecture-specific behavior for an LLM.
@@ -92,6 +94,11 @@ type Message struct {
 	Content string
 }
 
+// FormatOptions controls template-level formatting (e.g. reasoning effort).
+type FormatOptions struct {
+	ReasoningEffort string // "low", "medium", "high" (default: "medium")
+}
+
 // FormatChat formats a single-turn chat prompt (system + user) for the model.
 func FormatChat(cfg ModelConfig, system, user string) string {
 	var msgs []Message
@@ -103,10 +110,14 @@ func FormatChat(cfg ModelConfig, system, user string) string {
 }
 
 // FormatMessages formats a multi-turn conversation for the model.
-func FormatMessages(cfg ModelConfig, messages []Message) string {
+func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) string {
 	template := cfg.ChatTemplate
 	if template == "" {
 		template = GetArchDescriptor(cfg.Architecture).ChatTemplate
+	}
+	var opt FormatOptions
+	if len(opts) > 0 {
+		opt = opts[0]
 	}
 	switch template {
 	case "chatml":
@@ -124,7 +135,7 @@ func FormatMessages(cfg ModelConfig, messages []Message) string {
 	case "chatglm":
 		return formatChatGLMMessages(messages)
 	case "harmony":
-		return formatHarmonyMessages(messages)
+		return formatHarmonyMessages(messages, opt)
 	case "plain":
 		return formatPlainMessages(messages)
 	default:
@@ -283,22 +294,58 @@ func formatChatMLSepMessages(messages []Message) string {
 	return b.String()
 }
 
-// formatHarmonyMessages formats messages using OpenAI Harmony template (gpt-oss).
-// Matches llama.cpp LLM_CHAT_TEMPLATE_OPENAI_MOE.
-// Format: <|start|>role<|message|>content<|end|> (user/system) or <|return|> (assistant)
-func formatHarmonyMessages(messages []Message) string {
+// formatHarmonyMessages formats messages using the OpenAI Harmony template (gpt-oss).
+// Matches the official Jinja chat_template embedded in the GGUF metadata.
+//
+// Structure:
+//   1. Built-in system message (model identity, date, reasoning, channel info)
+//   2. Optional developer message (from user's "system" role message)
+//   3. User/assistant turns
+//   4. Generation prompt forcing the "final" channel
+func formatHarmonyMessages(messages []Message, opt FormatOptions) string {
+	reasoning := opt.ReasoningEffort
+	if reasoning == "" {
+		reasoning = "medium"
+	}
+
 	var b strings.Builder
-	for _, m := range messages {
-		b.WriteString("<|start|>")
-		b.WriteString(m.Role)
-		b.WriteString("<|message|>")
-		b.WriteString(m.Content)
-		if m.Role == "assistant" {
-			b.WriteString("<|return|>")
-		} else {
+
+	// 1. Built-in system message (always present per official template)
+	b.WriteString("<|start|>system<|message|>")
+	b.WriteString("You are a helpful assistant.\n")
+	b.WriteString("Knowledge cutoff: 2024-06\n")
+	b.WriteString(fmt.Sprintf("Current date: %s\n\n", time.Now().Format("2006-01-02")))
+	b.WriteString(fmt.Sprintf("Reasoning: %s\n\n", reasoning))
+	b.WriteString("# Valid channels: analysis, commentary, final. Channel must be included for every message.")
+	b.WriteString("<|end|>")
+
+	// 2. Separate user-provided system/developer message if present
+	start := 0
+	if len(messages) > 0 && (messages[0].Role == "system" || messages[0].Role == "developer") {
+		if messages[0].Content != "" {
+			b.WriteString("<|start|>developer<|message|>")
+			b.WriteString("# Instructions\n\n")
+			b.WriteString(messages[0].Content)
+			b.WriteString("\n\n<|end|>")
+		}
+		start = 1
+	}
+
+	// 3. Conversation turns
+	for _, m := range messages[start:] {
+		switch m.Role {
+		case "assistant":
+			b.WriteString("<|start|>assistant<|channel|>final<|message|>")
+			b.WriteString(m.Content)
+			b.WriteString("<|end|>")
+		case "user":
+			b.WriteString("<|start|>user<|message|>")
+			b.WriteString(m.Content)
 			b.WriteString("<|end|>")
 		}
 	}
-	b.WriteString("<|start|>assistant<|message|>")
+
+	// 4. Generation prompt: force the final channel for direct content
+	b.WriteString("<|start|>assistant<|channel|>final<|message|>")
 	return b.String()
 }

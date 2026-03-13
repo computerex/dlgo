@@ -30,7 +30,7 @@ func GeGLU(out, gate, up Buf, n int) error  { return errNoGPU }
 func GELU(Buf, int) error                   { return errNoGPU }
 func Add(out, a, b Buf, n int) error        { return errNoGPU }
 func Scale(Buf, float32, int) error         { return errNoGPU }
-func Attention(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl int, s float32) error { return errNoGPU }
+func Attention(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl, sp int, s float32) error { return errNoGPU }
 func KVStore(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func Sync()                                 {}
 func HasDp4a() bool                          { return false }
@@ -54,6 +54,7 @@ func NewLayerConf() *LayerConf                                            { retu
 func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf) {}
 func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, bo Buf, qn, kn Buf) {}
 func (lc *LayerConf) SetAttnSinks(s Buf) {}
+func (lc *LayerConf) SetSlidingWindow(w int) {}
 func (lc *LayerConf) SetFFN(fn Buf, gate, up, down *GpuTensor, pan, pfn Buf)                     {}
 func (lc *LayerConf) SetFFNMoE(fn Buf, pan Buf)                          {}
 func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}

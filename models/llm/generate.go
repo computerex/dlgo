@@ -220,6 +220,14 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	}
 	m.Config.AddBOS = tok.AddBOS
 
+	// For architectures with structural tokens that should never appear in output,
+	// register them as stop tokens for fast token-level detection.
+	for _, special := range []string{"<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|call|>"} {
+		if id, ok := tok.TokenToID[special]; ok {
+			m.Config.StopTokens = append(m.Config.StopTokens, id)
+		}
+	}
+
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
 	kv := memory.NewMultiLayerKVCache(m.Config.NumLayers, maxSeqLen, kvDim)
 	rs := NewRunState(m.Config, maxSeqLen)
@@ -472,6 +480,11 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
+		"<|channel|>",
+		"<|start|>",
+		"<|message|>",
+		"<|constrain|>",
+		"<|call|>",
 	}
 }
 

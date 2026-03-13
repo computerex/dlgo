@@ -300,9 +300,10 @@ func Scale(buf Buf, s float32, n int) error {
 }
 
 // Attention performs fused multi-head attention entirely on GPU.
-func Attention(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32) error {
+// startPos specifies the sliding window start position (0 for full attention).
+func Attention(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
 	rc := C.gpu_attention(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale))
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: attention failed (%d)", rc)
 	}
@@ -310,9 +311,10 @@ func Attention(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim,
 }
 
 // AttentionSinks performs attention with learned sink logits per KV head.
-func AttentionSinks(out, q, kCache, vCache, sinks Buf, numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32) error {
+// startPos specifies the sliding window start position (0 for full attention).
+func AttentionSinks(out, q, kCache, vCache, sinks Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
 	rc := C.gpu_attention_sinks(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
-		C.GpuBuf(sinks), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale))
+		C.GpuBuf(sinks), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: attention_sinks failed (%d)", rc)
 	}
@@ -627,6 +629,10 @@ func (lc *LayerConf) SetAttn(attnNorm Buf, wq, wk, wv, wo *GpuTensor,
 
 func (lc *LayerConf) SetAttnSinks(sinks Buf) {
 	lc.c.attn_sinks = C.GpuBuf(sinks)
+}
+
+func (lc *LayerConf) SetSlidingWindow(w int) {
+	lc.c.sliding_window = C.int(w)
 }
 
 func (lc *LayerConf) SetFFN(ffnNorm Buf, gate, up, down *GpuTensor,
