@@ -147,9 +147,10 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request) {
 		name = strings.TrimSuffix(name, ".gguf")
 		req.ID = name
 	}
-	if req.Context <= 0 {
-		req.Context = 2048
-	}
+	// Default to 0 = use model's native context length, automatically reduced
+	// by the memory budget checker to fit available RAM/VRAM. Avoids the old
+	// 2048-token default that causes thinking models to run out of context after
+	// just 1-2 turns when users request large max_tokens.
 
 	if err := s.manager.LoadModel(req.ID, req.Path, req.GPU, req.Context); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load model: "+err.Error(), "server_error")

@@ -151,7 +151,7 @@ export function ModelSelector({ selectedModel, useGPU, onSelectModel, onGPUStatu
                     </span>
                   ) : !isLoaded ? (
                     <button
-                      onClick={() => handleLoad(m, useGPU, 2048)}
+                      onClick={() => handleLoad(m, useGPU, 0)}
                       disabled={loadingModelId !== null}
                       className="ml-2 px-2 py-0.5 bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white rounded text-xs transition-colors disabled:opacity-40"
                     >

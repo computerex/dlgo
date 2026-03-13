@@ -31,7 +31,7 @@ function App() {
         const current = models.find(m => m.id === model);
         if (current?.path) {
           await unloadModel(model);
-          await loadModel({ id: model, path: current.path, gpu, context: 2048 });
+          await loadModel({ id: model, path: current.path, gpu, context: 0 });
         }
       } catch (e) {
         console.error('Failed to toggle backend:', e);

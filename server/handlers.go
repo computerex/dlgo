@@ -63,7 +63,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		sampler.RepetitionPenalty = float32(*req.RepetitionPenalty)
 	}
 
-	maxTokens := 512
+	maxTokens := 8192
 	if req.MaxTokens > 0 {
 		maxTokens = req.MaxTokens
 	}
