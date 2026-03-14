@@ -9,6 +9,7 @@ import (
 
 func findModel(names ...string) string {
 	bases := []string{
+		`C:\models\`,
 		`C:\projects\evoke\models\`,
 	}
 	for _, base := range bases {

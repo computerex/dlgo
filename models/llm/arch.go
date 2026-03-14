@@ -171,6 +171,12 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 
 	if thinking {
 		prompt += "<think>\n"
+	} else if arch.SupportsThinking {
+		// Thinking-capable model with thinking explicitly disabled.
+		// Append an empty closed think block so the model skips the thinking
+		// phase and goes straight to the answer. This matches the official
+		// Qwen3/3.5 Jinja template behavior and is what Ollama does.
+		prompt += "<think></think>\n"
 	}
 
 	return prompt
