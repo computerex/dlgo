@@ -51,7 +51,7 @@ func main() {
 		ffnDim := cfg.FFNDim
 
 		rs := gpu.NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize)
-		kv := gpu.NewGpuKVCache(cfg.NumLayers, 512, kvDim)
+		kv := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 
 		prompt := "Hello"
 		tokens := pipe.Tokenizer.Encode(prompt)

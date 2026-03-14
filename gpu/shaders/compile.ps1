@@ -61,7 +61,10 @@ $shaders = @(
     @{name="matvec_mxfp4_dp4a_moe"; file="matvec_mxfp4_dp4a_moe.comp"},
     @{name="moe_accumulate"; file="moe_accumulate.comp"},
     @{name="swiglu_oai_bias_moe"; file="swiglu_oai_bias_moe.comp"},
-    @{name="moe_bias_add"; file="moe_bias_add.comp"}
+    @{name="moe_bias_add"; file="moe_bias_add.comp"},
+    @{name="attention_tiled"; file="attention_tiled.comp"},
+    @{name="kv_store_f16"; file="kv_store_f16.comp"},
+    @{name="kv_store_batch_f16"; file="kv_store_batch_f16.comp"}
 )
 
 $header = @"
@@ -178,6 +181,9 @@ static const ShaderInfo shader_registry[] = {
     {"moe_accumulate", spv_moe_accumulate, spv_moe_accumulate_size, 5, 12}, // PIPE_MOE_ACCUMULATE
     {"swiglu_oai_bias_moe", spv_swiglu_oai_bias_moe, spv_swiglu_oai_bias_moe_size, 6, 16}, // PIPE_SWIGLU_OAI_BIAS_MOE
     {"moe_bias_add", spv_moe_bias_add, spv_moe_bias_add_size, 3, 8}, // PIPE_MOE_BIAS_ADD
+    {"attention_tiled", spv_attention_tiled, spv_attention_tiled_size, 4, 24}, // PIPE_ATTENTION_TILED
+    {"kv_store_f16", spv_kv_store_f16, spv_kv_store_f16_size, 4, 8}, // PIPE_KV_STORE_F16
+    {"kv_store_batch_f16", spv_kv_store_batch_f16, spv_kv_store_batch_f16_size, 4, 8}, // PIPE_KV_STORE_BATCH_F16
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

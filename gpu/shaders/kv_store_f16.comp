@@ -1,0 +1,32 @@
+// KV Store FP16: quantize float32 K/V vectors to packed half2 (uint32) in KV cache.
+//
+// Each uint32 stores two consecutive FP16 values via packHalf2x16().
+// Dispatch: groups_x = ceil(kv_dim/2 / 256), groups_y = 1, groups_z = 1
+// Push constants: pos (int), kv_dim (int)
+// Buffers: 0=KCache_out (uint), 1=VCache_out (uint), 2=K_in (float), 3=V_in (float)
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer KOut { uint k_out[]; };
+layout(set = 0, binding = 1) buffer VOut { uint v_out[]; };
+layout(set = 0, binding = 2) readonly buffer KIn { float k_in[]; };
+layout(set = 0, binding = 3) readonly buffer VIn { float v_in[]; };
+
+layout(push_constant) uniform Params {
+    int pos;
+    int kv_dim;
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint half_dim = uint(kv_dim) / 2u;
+    if (tid >= half_dim) return;
+
+    uint src = tid * 2u;
+    uint dst = uint(pos) * half_dim + tid;
+
+    k_out[dst] = packHalf2x16(vec2(k_in[src], k_in[src + 1u]));
+    v_out[dst] = packHalf2x16(vec2(v_in[src], v_in[src + 1u]));
+}

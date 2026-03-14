@@ -1,0 +1,170 @@
+// Tiled attention with online softmax and FP16 KV cache.
+// Removes the 4096 seq_len limit by processing K/V in tiles.
+// KV cache is stored as packed FP16 pairs (uint32 = 2 × float16).
+// Uses FlashAttention-style online softmax to avoid materializing all scores.
+//
+// Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2)
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 2) readonly buffer KCache { uint k_packed[]; };
+layout(set = 0, binding = 3) readonly buffer VCache { uint v_packed[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;     // number of float elements per KV position (NOT byte size)
+    int seq_len;    // starting seq_len (batch attention: pos 0 attends to seq_len tokens)
+    float scale;
+};
+
+#define WG_SIZE 256
+#define TILE_SIZE 256
+
+shared float q_sh[128];        // query vector (max head_dim=128)
+shared float tile_s[TILE_SIZE]; // Q·K scores for current tile
+shared float reduce_buf[WG_SIZE];
+shared float sh_out[128];      // running output accumulator
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    if (head >= uint(num_heads)) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    uint kv_head = head / kv_mul;
+    uint q_dim = uint(num_heads) * uint(head_dim);
+    uint hd = uint(head_dim);
+    uint kvd = uint(kv_dim);
+    uint q_base = pos_id * q_dim + head * hd;
+    uint kv_offset = kv_head * hd;  // float-element offset within a position
+
+    int actual_seq_len = seq_len + int(pos_id);
+    if (actual_seq_len <= 0) {
+        // No tokens to attend to — zero output
+        if (tid < hd) {
+            attn_out[pos_id * q_dim + head * hd + tid] = 0.0;
+        }
+        return;
+    }
+
+    // Half-element counts for packed uint32 addressing
+    uint kv_half = kvd / 2u;         // uint32s per KV position
+    uint kv_off_half = kv_offset / 2u; // uint32 offset to this head's KV
+    uint hd_half = hd / 2u;           // uint32s per head
+
+    // Load Q into shared memory as float32
+    for (uint d = tid; d < hd; d += WG_SIZE) {
+        q_sh[d] = q_data[q_base + d];
+    }
+
+    // Initialize output accumulator
+    if (tid < hd) {
+        sh_out[tid] = 0.0;
+    }
+    barrier();
+
+    float running_max = -1.0e30;
+    float running_sum = 0.0;
+
+    // Process K/V in tiles of TILE_SIZE
+    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
+        int tile_len = tile_end - tile_start;
+
+        // ----- Phase 1: Q·K dot products (parallelize over tile positions) -----
+        if (int(tid) < tile_len) {
+            int t = tile_start + int(tid);
+            float dot_val = 0.0;
+            uint k_base = uint(t) * kv_half + kv_off_half;
+            for (uint d2 = 0; d2 < hd_half; d2++) {
+                vec2 k2 = unpackHalf2x16(k_packed[k_base + d2]);
+                uint fi = d2 * 2u;
+                dot_val += q_sh[fi] * k2.x + q_sh[fi + 1u] * k2.y;
+            }
+            tile_s[tid] = dot_val * scale;
+        }
+        barrier();
+
+        // ----- Phase 2: Find tile max (parallel reduction) -----
+        float local_max = -1.0e30;
+        if (int(tid) < tile_len) local_max = tile_s[tid];
+        reduce_buf[tid] = local_max;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
+            barrier();
+        }
+        float tile_max = reduce_buf[0];
+        barrier();
+
+        // ----- Phase 3: Online softmax correction -----
+        float new_max = max(running_max, tile_max);
+        float correction = exp(running_max - new_max);
+
+        // Rescale running output and sum
+        if (tid < hd) {
+            sh_out[tid] *= correction;
+        }
+        // All threads need the updated running_sum, so one thread updates it
+        // and we barrier after.
+        if (tid == 0u) {
+            reduce_buf[0] = running_sum * correction;
+        }
+        barrier();
+        running_sum = reduce_buf[0];
+
+        // ----- Phase 4: Compute exp(score - new_max) -----
+        if (int(tid) < tile_len) {
+            tile_s[tid] = exp(tile_s[tid] - new_max);
+        }
+        barrier();
+
+        // ----- Phase 5: Accumulate tile sum -----
+        float local_sum = 0.0;
+        if (int(tid) < tile_len) local_sum = tile_s[tid];
+        reduce_buf[tid] = local_sum;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+            barrier();
+        }
+        running_sum += reduce_buf[0];
+        barrier();
+
+        // ----- Phase 6: Weighted sum of V (parallelize over head_dim) -----
+        if (tid < hd) {
+            uint d = tid;
+            uint d_pair = d / 2u;
+            uint d_which = d & 1u;
+            float acc = 0.0;
+            for (int ti = 0; ti < tile_len; ti++) {
+                float w = tile_s[ti];
+                uint v_base = uint(tile_start + ti) * kv_half + kv_off_half;
+                vec2 v2 = unpackHalf2x16(v_packed[v_base + d_pair]);
+                float v_val = (d_which == 0u) ? v2.x : v2.y;
+                acc += w * v_val;
+            }
+            sh_out[tid] += acc;
+        }
+        barrier();
+
+        running_max = new_max;
+    }
+
+    // ----- Final: normalize and write output -----
+    float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
+    if (tid < hd) {
+        uint out_idx = pos_id * q_dim + head * hd + tid;
+        attn_out[out_idx] = sh_out[tid] * inv_sum;
+    }
+}

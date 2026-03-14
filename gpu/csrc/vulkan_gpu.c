@@ -2060,6 +2060,100 @@ int gpu_kv_store(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
 }
 
 // ---------------------------------------------------------------------------
+// FP16 KV cache operations
+// ---------------------------------------------------------------------------
+
+int gpu_kv_store_f16(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                     GpuBuf k_buf, GpuBuf v_buf,
+                     int pos, int kv_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int pos; int kv_dim; } pc = {pos, kv_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_KV_STORE_F16;
+    dp.bufs[0] = k_cache_buf;
+    dp.bufs[1] = v_cache_buf;
+    dp.bufs[2] = k_buf;
+    dp.bufs[3] = v_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (kv_dim / 2 + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_kv_store_f16(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                           GpuBuf k_buf, GpuBuf v_buf,
+                           int start_pos, int kv_dim, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int start_pos; int kv_dim; } pc = {start_pos, kv_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_KV_STORE_BATCH_F16;
+    dp.bufs[0] = k_cache_buf;
+    dp.bufs[1] = v_cache_buf;
+    dp.bufs[2] = k_buf;
+    dp.bufs[3] = v_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (kv_dim / 2 + 255) / 256;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                      int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                      int seq_len, float scale, int start_pos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int window_len = seq_len - start_pos;
+    // FP16 KV: each position = kv_dim/2 uint32s = kv_dim*2 bytes
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
+                            int num_heads, int num_kv_heads, int head_dim,
+                            int kv_dim, int start_seq_len, float scale, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED;
+    dp.bufs[0] = out; dp.bufs[1] = q;
+    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+    dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// ---------------------------------------------------------------------------
 // PagedAttention operations
 // ---------------------------------------------------------------------------
 
@@ -2335,19 +2429,14 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
 
         gpu_barrier();
         gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
-        gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        gpu_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
 
         {
             int win_start = 0;
             if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
                 win_start = seq_len - lc->sliding_window;
-            if (lc->attn_sinks) {
-                gpu_attention_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                    lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
-            } else {
-                gpu_attention(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+            gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
                               num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
-            }
         }
 
         gpu_barrier();
@@ -2569,38 +2658,17 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
     }
 
     {
-        BufferAlloc* kc = get_buf(lc->k_cache);
-        BufferAlloc* vc = get_buf(lc->v_cache);
-        BufferAlloc* kb = get_buf(lc->k);
-        BufferAlloc* vb = get_buf(lc->v);
-        if (!kc || !vc || !kb || !vb) return GPU_ERR_DISPATCH;
-
-        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier_(g.cmd_buf,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &mb, 0, NULL, 0, NULL);
-
-        VkBufferCopy kr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
-        vkCmdCopyBuffer_(g.cmd_buf, kb->buffer, kc->buffer, 1, &kr);
-        VkBufferCopy vr = {0, (uint64_t)start_pos * kv_dim * 4, (uint64_t)npos * kv_dim * 4};
-        vkCmdCopyBuffer_(g.cmd_buf, vb->buffer, vc->buffer, 1, &vr);
-
-        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier_(g.cmd_buf,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &mb, 0, NULL, 0, NULL);
-        g.dispatch_count++;
+        // FP16 KV store: dispatch compute shader instead of vkCmdCopyBuffer
+        gpu_barrier();
+        gpu_batch_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, start_pos, kv_dim, npos);
     }
 
     {
+        gpu_barrier();
         struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
             {num_heads, num_kv_heads, head_dim, kv_dim, start_pos + 1, scale};
         DispatchParams dp = {0};
-        dp.pipe = PIPE_ATTENTION;
+        dp.pipe = PIPE_ATTENTION_TILED;
         dp.bufs[0] = lc->attn_out; dp.bufs[1] = lc->q;
         dp.bufs[2] = lc->k_cache; dp.bufs[3] = lc->v_cache;
         dp.num_bufs = 4;

@@ -349,15 +349,21 @@ type GpuKVCache struct {
 // NewGpuKVCache allocates GPU buffers for KV cache.
 // gpuLayers controls how many layers get GPU-allocated KV buffers.
 // Layers beyond gpuLayers get zero-valued (nil) buffers.
-func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int) *GpuKVCache {
+// needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
+// If needsKV is nil, all layers within gpuLayers get buffers (legacy behavior).
+func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) *GpuKVCache {
 	c := &GpuKVCache{
 		KeyBufs: make([]Buf, totalLayers),
 		ValBufs: make([]Buf, totalLayers),
 		KVDim:   kvDim,
 		MaxSeq:  maxSeqLen,
 	}
-	size := uint64(maxSeqLen * kvDim * 4)
+	// FP16 KV cache: each element is 2 bytes (packed half2 as uint32 pairs)
+	size := uint64(maxSeqLen * kvDim * 2)
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
+		if needsKV != nil && !needsKV[l] {
+			continue
+		}
 		c.KeyBufs[l] = Alloc(size)
 		c.ValBufs[l] = Alloc(size)
 	}

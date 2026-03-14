@@ -1,0 +1,33 @@
+// Batch KV Store FP16: quantize npos float32 K/V vectors to packed half2.
+//
+// Dispatch: groups_x = ceil(kv_dim/2 / 256), groups_y = npos, groups_z = 1
+// Push constants: start_pos (int), kv_dim (int)
+// Buffers: 0=KCache_out (uint), 1=VCache_out (uint), 2=K_batch (float), 3=V_batch (float)
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer KOut { uint k_out[]; };
+layout(set = 0, binding = 1) buffer VOut { uint v_out[]; };
+layout(set = 0, binding = 2) readonly buffer KIn { float k_in[]; };
+layout(set = 0, binding = 3) readonly buffer VIn { float v_in[]; };
+
+layout(push_constant) uniform Params {
+    int start_pos;
+    int kv_dim;
+};
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    uint half_dim = uint(kv_dim) / 2u;
+    if (tid >= half_dim) return;
+
+    uint src_base = pos_id * uint(kv_dim);
+    uint src = src_base + tid * 2u;
+    uint dst = (uint(start_pos) + pos_id) * half_dim + tid;
+
+    k_out[dst] = packHalf2x16(vec2(k_in[src], k_in[src + 1u]));
+    v_out[dst] = packHalf2x16(vec2(v_in[src], v_in[src + 1u]));
+}

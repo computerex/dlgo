@@ -32,7 +32,7 @@ func main() {
 
 	gpuModel, _ := gpu.UploadModel(pipe.Model)
 	gpuRS := gpu.NewGpuRunState(dim, qDim, kvDim, cfg.FFNDim, cfg.VocabSize)
-	gpuKV := gpu.NewGpuKVCache(cfg.NumLayers, 512, kvDim)
+	gpuKV := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 	logitsBuf := make([]float32, cfg.VocabSize)
 
 	// Warm up

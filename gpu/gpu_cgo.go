@@ -335,6 +335,26 @@ func KVStore(kCache, vCache, k, v Buf, pos, kvDim int) error {
 	return nil
 }
 
+// KVStoreF16 converts float32 K/V to packed half2 and stores in FP16 KV cache.
+func KVStoreF16(kCache, vCache, k, v Buf, pos, kvDim int) error {
+	rc := C.gpu_kv_store_f16(C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.GpuBuf(k), C.GpuBuf(v), C.int(pos), C.int(kvDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: kv_store_f16 failed (%d)", rc)
+	}
+	return nil
+}
+
+// AttentionF16 performs tiled attention with FP16 KV cache (online softmax, no seq_len limit).
+func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
+	rc := C.gpu_attention_f16(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention_f16 failed (%d)", rc)
+	}
+	return nil
+}
+
 // PagedKVStore writes K and V into block pool buffers at the effective position.
 // effectivePos = physical_block * block_size + slot_in_block (computed on CPU).
 func PagedKVStore(kPool, vPool, k, v Buf, effectivePos, kvDim int) error {
@@ -845,6 +865,17 @@ func BatchKVStore(kCache, vCache, k, v Buf, startPos, kvDim, npos int) error {
 	return nil
 }
 
+// BatchKVStoreF16 converts float32 K/V to packed half2 and stores npos positions in FP16 KV cache.
+func BatchKVStoreF16(kCache, vCache, k, v Buf, startPos, kvDim, npos int) error {
+	rc := C.gpu_batch_kv_store_f16(C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.GpuBuf(k), C.GpuBuf(v),
+		C.int(startPos), C.int(kvDim), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_kv_store_f16 failed (%d)", rc)
+	}
+	return nil
+}
+
 // BatchAttention performs causal attention for npos positions.
 // startSeqLen is the sequence length for the first position (startPos + 1).
 func BatchAttention(out, q, kCache, vCache Buf,
@@ -855,6 +886,19 @@ func BatchAttention(out, q, kCache, vCache Buf,
 		C.int(startSeqLen), C.float(scale), C.int(npos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_attention failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchAttentionF16 performs tiled causal attention for npos positions with FP16 KV cache.
+func BatchAttentionF16(out, q, kCache, vCache Buf,
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale float32, npos int) error {
+	rc := C.gpu_batch_attention_f16(C.GpuBuf(out), C.GpuBuf(q),
+		C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
+		C.int(startSeqLen), C.float(scale), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_attention_f16 failed (%d)", rc)
 	}
 	return nil
 }

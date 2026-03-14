@@ -61,7 +61,7 @@ func main() {
 	fmt.Printf("Barrier cost per dispatch: %.1f µs\n\n", barrierCost)
 
 	// Test 3: Measure a full forward pass breakdown
-	gpuKV := gpu.NewGpuKVCache(cfg.NumLayers, 512, kvDim)
+	gpuKV := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 	logitsBuf := make([]float32, cfg.VocabSize)
 	gpu.GpuForward(pipe.Model, gpuModel, 2, 0, gpuKV, gpuRS, logitsBuf) // warmup
 

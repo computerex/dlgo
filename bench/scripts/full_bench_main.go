@@ -179,7 +179,7 @@ func main() {
 			fmt.Printf("  [Correctness] GPU upload fail: %v — CPU-only\n", gpuUploadErr)
 		} else {
 			rs := gpu.NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize)
-			kv := gpu.NewGpuKVCache(cfg.NumLayers, 512, kvDim)
+			kv := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 			gpuLogits := make([]float32, vocabSize)
 			var fwdErr error
 			for i, tok := range tokens {

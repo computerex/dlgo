@@ -124,6 +124,12 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	return total
 }
 
+// layerNeedsKV returns true if a layer uses GPU KV cache (attention or GatedQ).
+// SSM and MLA layers have their own state and don't use the KV cache buffers.
+func layerNeedsKV(layer *llm.Layer) bool {
+	return layer.Spec.Core == llm.CoreAttention || layer.Spec.GatedQ
+}
+
 // computeGPULayerBudget determines how many layers fit in available VRAM,
 // accounting for both weight data AND per-layer KV cache VRAM.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
@@ -151,7 +157,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 
 	// Per-layer KV cache cost
 	kvDim := int64(m.Config.NumKVHeads * m.Config.HeadDim)
-	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 4 // K + V buffers
+	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 2 // K + V buffers (FP16)
 
 	// Per-layer SSM state cost (only for SSM layers)
 	var ssmPerLayer int64
@@ -169,10 +175,13 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		ssmPerLayer = numHeads*headKDim*headVDim*4 + convK*qkvDim*4
 	}
 
-	// Greedily add layers: each layer costs weights + KV cache + optional SSM state
+	// Greedily add layers: each layer costs weights + KV cache (attention only) + optional SSM state
 	numLayers := 0
 	for l := 0; l < len(m.Layers); l++ {
-		layerCost := llm.EstimateLayerBytes(&m.Layers[l]) + kvPerLayer
+		layerCost := llm.EstimateLayerBytes(&m.Layers[l])
+		if layerNeedsKV(&m.Layers[l]) {
+			layerCost += kvPerLayer
+		}
 		if m.Layers[l].Spec.Core == llm.CoreSSM {
 			layerCost += ssmPerLayer
 		}
@@ -497,7 +506,11 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			}
 
 			rs = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
-			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim)
+			needsKV := make([]bool, cfg.NumLayers)
+			for l := 0; l < cfg.NumLayers; l++ {
+				needsKV[l] = layerNeedsKV(&m.Layers[l])
+			}
+			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim, needsKV)
 
 			cosTable, sinTable := cpuPipeline.RunState.RoPETables()
 			if cosTable != nil && sinTable != nil {
@@ -942,7 +955,14 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	mcfg := p.CPUModel.Config
 	npos := len(tokens)
 
-	if p.BatchState == nil || p.BatchState.Npos < npos {
+	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
+	const prefillChunkSize = 4096
+	batchSize := npos
+	if batchSize > prefillChunkSize {
+		batchSize = prefillChunkSize
+	}
+
+	if p.BatchState == nil || p.BatchState.Npos < batchSize {
 		if p.BatchState != nil {
 			p.BatchState.Free()
 		}
@@ -950,10 +970,10 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		qDim := mcfg.NumHeads * mcfg.HeadDim
 		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
 		ffnDim := mcfg.FFNDim
-		p.BatchState = NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim)
+		p.BatchState = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
 		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p, p.BatchState, p.KVCache)
 		if p.HasGatedQ {
-			p.BatchState.AllocGatedQBatch(npos, qDim)
+			p.BatchState.AllocGatedQBatch(batchSize, qDim)
 		}
 		if p.HasSSM {
 			numHeads := mcfg.SSMTimeStepRank
@@ -966,7 +986,7 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			keyDim := numKVGroups * headKDim
 			qkvDim := keyDim*2 + numHeads*headVDim
 			valueDim := numHeads * headVDim
-			p.BatchState.AllocSSMBatch(npos, qkvDim, valueDim, numHeads)
+			p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads)
 		}
 	}
 
@@ -987,8 +1007,18 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	} else {
 		isHybrid := isHybridSSMModel(p.CPUModel)
 		if isHybrid {
-			GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p)
+			// Chunked prefill: process prompt in chunks to bound VRAM usage
+			for startPos := 0; startPos < npos; startPos += prefillChunkSize {
+				end := startPos + prefillChunkSize
+				if end > npos {
+					end = npos
+				}
+				chunkTokens := tokens[startPos:end]
+				isLast := end >= npos
+				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, chunkTokens, p.KVCache, p.RunState,
+					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, startPos, isLast)
+				Sync()
+			}
 		} else {
 			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
 				p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
