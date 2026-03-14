@@ -90,6 +90,7 @@ VK_FUNC(vkCmdPipelineBarrier)
 VK_FUNC(vkCmdCopyBuffer)
 VK_FUNC(vkDeviceWaitIdle)
 static PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_ = NULL;
+static PFN_vkGetPhysicalDeviceMemoryProperties2 vkGetPhysicalDeviceMemoryProperties2_ = NULL;
 #undef VK_FUNC
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,9 @@ static struct {
 
     // dp4a capability (VK_KHR_shader_integer_dot_product)
     int has_dp4a;
+
+    // VK_EXT_memory_budget support for querying free VRAM
+    int has_memory_budget;
 } g = {0};
 
 // ---------------------------------------------------------------------------
@@ -225,6 +229,8 @@ static void load_instance_funcs(VkInstance inst) {
 
     vkCmdPushDescriptorSetKHR_ = (PFN_vkCmdPushDescriptorSetKHR)
         vkGetInstanceProcAddr_(g.instance, "vkCmdPushDescriptorSetKHR");
+    vkGetPhysicalDeviceMemoryProperties2_ = (PFN_vkGetPhysicalDeviceMemoryProperties2)
+        vkGetInstanceProcAddr_(g.instance, "vkGetPhysicalDeviceMemoryProperties2");
 }
 
 static int has_instance_extension(const char* name) {
@@ -481,7 +487,7 @@ int gpu_init(void) {
     int dp4a_ext = has_device_extension(g.physical_device, "VK_KHR_shader_integer_dot_product");
     g.has_dp4a = dp4a_ext;
 
-    const char* device_extensions[4];
+    const char* device_extensions[5];
     uint32_t device_extension_count = 0;
     if (has_device_extension(g.physical_device, "VK_KHR_push_descriptor")) {
         device_extensions[device_extension_count++] = "VK_KHR_push_descriptor";
@@ -491,6 +497,10 @@ int gpu_init(void) {
     }
     if (dp4a_ext) {
         device_extensions[device_extension_count++] = "VK_KHR_shader_integer_dot_product";
+    }
+    g.has_memory_budget = has_device_extension(g.physical_device, "VK_EXT_memory_budget");
+    if (g.has_memory_budget) {
+        device_extensions[device_extension_count++] = "VK_EXT_memory_budget";
     }
 
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -628,6 +638,32 @@ uint64_t gpu_vram_bytes(void) {
             total += g.mem_props.memoryHeaps[i].size;
     }
     return total;
+}
+
+uint64_t gpu_vram_free_bytes(void) {
+    if (!g.initialized) return 0;
+    if (!g.has_memory_budget || !vkGetPhysicalDeviceMemoryProperties2_) {
+        // Fallback: assume 90% of total is available (conservative)
+        return gpu_vram_bytes() * 9 / 10;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+    };
+    VkPhysicalDeviceMemoryProperties2 mem_props2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+        .pNext = &budget_props
+    };
+    vkGetPhysicalDeviceMemoryProperties2_(g.physical_device, &mem_props2);
+    uint64_t free_bytes = 0;
+    for (uint32_t i = 0; i < mem_props2.memoryProperties.memoryHeapCount; i++) {
+        if (mem_props2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            uint64_t budget = budget_props.heapBudget[i];
+            uint64_t usage  = budget_props.heapUsage[i];
+            if (budget > usage)
+                free_bytes += budget - usage;
+        }
+    }
+    return free_bytes;
 }
 
 int gpu_is_initialized(void) { return g.initialized; }

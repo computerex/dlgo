@@ -13,6 +13,7 @@ func Shutdown()             {}
 func IsInitialized() bool   { return false }
 func DeviceName() string    { return "none" }
 func VRAMBytes() uint64     { return 0 }
+func VRAMFreeBytes() uint64 { return 0 }
 func Alloc(uint64) Buf      { return 0 }
 func Free(Buf)              {}
 func ResetBufferTable()     {}

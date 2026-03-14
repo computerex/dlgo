@@ -43,6 +43,16 @@ type Pipeline struct {
 	MaxSeqLen  int
 }
 
+// FreeForGPU releases CPU-side KV cache, RunState, and BatchState that are
+// unused when a GPU pipeline handles all inference. Only Model, Tokenizer,
+// and MaxSeqLen are retained (needed by the scheduler for tokenization and
+// config lookups). Call this after the GPU pipeline is successfully created.
+func (p *Pipeline) FreeForGPU() {
+	p.KVCache = nil
+	p.RunState = nil
+	p.BatchState = nil
+}
+
 const (
 	minContextLen = 64 // smallest context we'll auto-shrink to
 )

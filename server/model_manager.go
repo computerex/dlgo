@@ -134,6 +134,15 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 		}
 	}
 
+	// When GPU handles inference, the CPU pipeline's KV cache, RunState,
+	// and BatchState are dead weight (~5 GB at 32k context). Free them.
+	if loaded.GpuPipeline != nil {
+		pipe.FreeForGPU()
+		runtime.GC()
+		debug.FreeOSMemory()
+		log.Printf("Freed CPU pipeline buffers (GPU mode active)")
+	}
+
 	loaded.Info.GPU = loaded.GpuPipeline != nil
 	loaded.Scheduler = NewScheduler(loaded)
 	mm.models[id] = loaded

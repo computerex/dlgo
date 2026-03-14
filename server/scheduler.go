@@ -174,6 +174,11 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	stopStrings := collectStopStrings(pipe.Model.Config)
 	stopStrings = append(stopStrings, req.StopSequences...)
 
+	// When thinking is disabled on a thinking-capable model, suppress the
+	// leading </think> token the model emits.
+	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking &&
+		llm.GetArchDescriptor(pipe.Model.Config.Architecture).SupportsThinking
+
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
 	genText.WriteString(tokenText)
@@ -183,7 +188,14 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		return
 	}
 
-	req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+	if suppressThinkClose {
+		tokenText = strings.TrimPrefix(tokenText, "</think>")
+		tokenText = strings.TrimLeft(tokenText, "\n")
+		suppressThinkClose = false
+	}
+	if tokenText != "" {
+		req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+	}
 	req.Generated = append(req.Generated, nextToken)
 	recentTokens = append(recentTokens, nextToken)
 
@@ -234,10 +246,24 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
 	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
+	// When thinking is disabled on a thinking-capable model, the model emits
+	// a leading </think> token we need to suppress from the streamed output.
+	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking &&
+		llm.GetArchDescriptor(s.model.CPUPipeline.Model.Config.Architecture).SupportsThinking
+	thinkSuppressed := false
+
 	cfg := req.Config
 	cfg.Stream = func(token string) {
 		if req.Ctx.Err() != nil {
 			return
+		}
+		if suppressThinkClose && !thinkSuppressed {
+			thinkSuppressed = true
+			token = strings.TrimPrefix(token, "</think>")
+			token = strings.TrimLeft(token, "\n")
+			if token == "" {
+				return
+			}
 		}
 		req.Output <- StreamEvent{Type: EventToken, Token: token}
 	}

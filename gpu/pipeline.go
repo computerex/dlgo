@@ -127,8 +127,8 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 // computeGPULayerBudget determines how many layers fit in available VRAM,
 // accounting for both weight data AND per-layer KV cache VRAM.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
-	totalVRAM := int64(VRAMBytes())
-	if totalVRAM <= 0 {
+	freeVRAM := int64(VRAMFreeBytes())
+	if freeVRAM <= 0 {
 		return 0
 	}
 
@@ -144,7 +144,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
 
-	available := totalVRAM - fixedOverhead - nonLayerBytes
+	available := freeVRAM - fixedOverhead - nonLayerBytes
 	if available <= 0 {
 		return 0
 	}
@@ -443,8 +443,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	cfg := m.Config
 
 	totalVRAM := float64(VRAMBytes()) / (1024 * 1024)
-	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB VRAM)...\n",
-		DeviceName(), totalVRAM)
+	freeVRAM := float64(VRAMFreeBytes()) / (1024 * 1024)
+	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB total, %.0f MB free)...\n",
+		DeviceName(), totalVRAM, freeVRAM)
 
 	// Determine how many layers fit in VRAM.
 	// DLGO_GPU_LAYERS overrides the automatic VRAM budget calculation.

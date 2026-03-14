@@ -54,6 +54,10 @@ func DeviceName() string { return C.GoString(C.gpu_device_name()) }
 // VRAMBytes returns total device-local VRAM in bytes.
 func VRAMBytes() uint64 { return uint64(C.gpu_vram_bytes()) }
 
+// VRAMFreeBytes returns currently available device-local VRAM in bytes.
+// Uses VK_EXT_memory_budget when available, otherwise falls back to 90% of total.
+func VRAMFreeBytes() uint64 { return uint64(C.gpu_vram_free_bytes()) }
+
 // Alloc allocates a GPU buffer of the given size.
 func Alloc(sizeBytes uint64) Buf {
 	return uint64(C.gpu_alloc(C.uint64_t(sizeBytes), C.GPU_BUF_STORAGE))
