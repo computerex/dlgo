@@ -206,13 +206,13 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			Barrier()
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
-			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart = seqLen - w
 			}
-			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart, scale)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
@@ -361,13 +361,13 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			Barrier()
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
-			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart2 := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart2 = seqLen - w
 			}
-			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart2, scale)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
@@ -681,8 +681,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 			Barrier()
 			BatchRoPE(bs.Q, bs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, startPos,
 				cfg.RopeNeox, npos)
-			BatchKVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
-			BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+			BatchKVStore(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
+			BatchAttention(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, npos)
 			Barrier()
 			SigmoidGate(bs.AttnOut, bs.QGate, qDim*npos)
@@ -892,13 +892,13 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ Q post-RoPE", rs.Q, numHeads*headDim)
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ K post-RoPE", rs.K, kvDim)
 			}
-			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart3 := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart3 = seqLen - w
 			}
-			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart3, scale)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnOut", rs.AttnOut, numHeads*headDim)
@@ -999,7 +999,7 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				GpuDiag.LogBuf("GPU", l, pos, "K post-RoPE", rs.K, kvDim)
 			}
 
-			if err := KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
+			if err := KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
 				return fmt.Errorf("layer %d kvstore: %w", l, err)
 			}
 
@@ -1008,7 +1008,7 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				winStart = seqLen - w
 			}
-			if err := AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+			if err := Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale); err != nil {
 				return fmt.Errorf("layer %d attention: %w", l, err)
 			}
@@ -1676,3 +1676,4 @@ func gpuDualMatVec(out1 Buf, gpuW1 *GpuTensor, cpuW1 *core.QuantizedTensor, out2
 	BeginBatch()
 	return nil
 }
+

@@ -2153,6 +2153,52 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
     return dispatch_compute(&dp);
 }
 
+int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                            int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                            int seq_len, float scale, int start_pos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int window_len = seq_len - start_pos;
+    // FP32 KV: each position = kv_dim floats = kv_dim*4 bytes
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 4;
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED_F32;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_attention_tiled_f32(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
+                                  int num_heads, int num_kv_heads, int head_dim,
+                                  int kv_dim, int start_seq_len, float scale, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED_F32;
+    dp.bufs[0] = out; dp.bufs[1] = q;
+    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+    dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 // ---------------------------------------------------------------------------
 // PagedAttention operations
 // ---------------------------------------------------------------------------
@@ -2429,14 +2475,14 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
 
         gpu_barrier();
         gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
-        gpu_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
 
         {
             int win_start = 0;
             if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
                 win_start = seq_len - lc->sliding_window;
-            gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                              num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
+            gpu_attention_tiled_f32(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                    num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
         }
 
         gpu_barrier();
@@ -2658,23 +2704,16 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
     }
 
     {
-        // FP16 KV store: dispatch compute shader instead of vkCmdCopyBuffer
+        // FP32 KV store: batch buffer copy
         gpu_barrier();
-        gpu_batch_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, start_pos, kv_dim, npos);
+        gpu_batch_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, start_pos, kv_dim, npos);
     }
 
     {
         gpu_barrier();
-        struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
-            {num_heads, num_kv_heads, head_dim, kv_dim, start_pos + 1, scale};
-        DispatchParams dp = {0};
-        dp.pipe = PIPE_ATTENTION_TILED;
-        dp.bufs[0] = lc->attn_out; dp.bufs[1] = lc->q;
-        dp.bufs[2] = lc->k_cache; dp.bufs[3] = lc->v_cache;
-        dp.num_bufs = 4;
-        dp.push_data = &pc; dp.push_size = sizeof(pc);
-        dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
-        dispatch_compute(&dp);
+        gpu_batch_attention_tiled_f32(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                      num_heads, num_kv_heads, head_dim, kv_dim,
+                                      start_pos + 1, scale, npos);
     }
 
     gpu_barrier();

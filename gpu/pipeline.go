@@ -157,7 +157,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 
 	// Per-layer KV cache cost
 	kvDim := int64(m.Config.NumKVHeads * m.Config.HeadDim)
-	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 2 // K + V buffers (FP16)
+	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 4 // K + V buffers (FP32)
 
 	// Per-layer SSM state cost (only for SSM layers)
 	var ssmPerLayer int64

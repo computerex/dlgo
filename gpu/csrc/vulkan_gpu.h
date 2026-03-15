@@ -120,6 +120,7 @@ typedef enum {
     PIPE_ATTENTION_TILED,
     PIPE_KV_STORE_F16,
     PIPE_KV_STORE_BATCH_F16,
+    PIPE_ATTENTION_TILED_F32,
     PIPE_COUNT
 } PipelineID;
 
@@ -243,6 +244,14 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
                             int kv_dim, int start_seq_len, float scale, int npos);
+
+// Tiled attention with FP32 KV cache (online softmax, no seq_len limit)
+int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                            int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                            int seq_len, float scale, int start_pos);
+int gpu_batch_attention_tiled_f32(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
+                                  int num_heads, int num_kv_heads, int head_dim,
+                                  int kv_dim, int start_seq_len, float scale, int npos);
 
 // Paged KV store: write K/V into block pool at computed block offset.
 // effective_pos = physical_block * block_size + slot_in_block (computed on CPU)

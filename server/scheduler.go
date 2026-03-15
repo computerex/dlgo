@@ -174,10 +174,14 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	stopStrings := collectStopStrings(pipe.Model.Config)
 	stopStrings = append(stopStrings, req.StopSequences...)
 
+	supportsThinking := llm.GetArchDescriptor(pipe.Model.Config.Architecture).SupportsThinking
+
 	// When thinking is disabled on a thinking-capable model, suppress the
 	// leading </think> token the model emits.
-	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking &&
-		llm.GetArchDescriptor(pipe.Model.Config.Architecture).SupportsThinking
+	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking && supportsThinking
+
+	// When thinking is active, suppress all output until </think> is found.
+	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
 
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
@@ -193,7 +197,16 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		tokenText = strings.TrimLeft(tokenText, "\n")
 		suppressThinkClose = false
 	}
-	if tokenText != "" {
+	if inThinkBlock {
+		if idx := strings.Index(genText.String(), "</think>"); idx >= 0 {
+			inThinkBlock = false
+			after := genText.String()[idx+len("</think>"):]
+			after = strings.TrimLeft(after, "\n")
+			if after != "" {
+				req.Output <- StreamEvent{Type: EventToken, Token: after}
+			}
+		}
+	} else if tokenText != "" {
 		req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
 	}
 	req.Generated = append(req.Generated, nextToken)
@@ -233,7 +246,18 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 			break
 		}
 
-		req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+		if inThinkBlock {
+			if idx := strings.Index(genText.String(), "</think>"); idx >= 0 {
+				inThinkBlock = false
+				after := genText.String()[idx+len("</think>"):]
+				after = strings.TrimLeft(after, "\n")
+				if after != "" {
+					req.Output <- StreamEvent{Type: EventToken, Token: after}
+				}
+			}
+		} else {
+			req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+		}
 	}
 
 	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
@@ -246,11 +270,16 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
 	prompt := llm.FormatMessages(s.model.CPUPipeline.Model.Config, req.Messages, fmtOpts)
 
+	supportsThinking := llm.GetArchDescriptor(s.model.CPUPipeline.Model.Config.Architecture).SupportsThinking
+
 	// When thinking is disabled on a thinking-capable model, the model emits
 	// a leading </think> token we need to suppress from the streamed output.
-	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking &&
-		llm.GetArchDescriptor(s.model.CPUPipeline.Model.Config.Architecture).SupportsThinking
+	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking && supportsThinking
 	thinkSuppressed := false
+
+	// When thinking is active, suppress all output until </think> is found.
+	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
+	var thinkBuf strings.Builder
 
 	cfg := req.Config
 	cfg.Stream = func(token string) {
@@ -264,6 +293,18 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 			if token == "" {
 				return
 			}
+		}
+		if inThinkBlock {
+			thinkBuf.WriteString(token)
+			if idx := strings.Index(thinkBuf.String(), "</think>"); idx >= 0 {
+				inThinkBlock = false
+				after := thinkBuf.String()[idx+len("</think>"):]
+				after = strings.TrimLeft(after, "\n")
+				if after != "" {
+					req.Output <- StreamEvent{Type: EventToken, Token: after}
+				}
+			}
+			return
 		}
 		req.Output <- StreamEvent{Type: EventToken, Token: token}
 	}

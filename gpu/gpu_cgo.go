@@ -355,6 +355,16 @@ func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvD
 	return nil
 }
 
+// AttentionTiledF32 performs tiled causal attention with FP32 KV cache (no seq_len limit).
+func AttentionTiledF32(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
+	rc := C.gpu_attention_tiled_f32(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention_tiled_f32 failed (%d)", rc)
+	}
+	return nil
+}
+
 // PagedKVStore writes K and V into block pool buffers at the effective position.
 // effectivePos = physical_block * block_size + slot_in_block (computed on CPU).
 func PagedKVStore(kPool, vPool, k, v Buf, effectivePos, kvDim int) error {
@@ -899,6 +909,19 @@ func BatchAttentionF16(out, q, kCache, vCache Buf,
 		C.int(startSeqLen), C.float(scale), C.int(npos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_attention_f16 failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchAttentionTiledF32 performs tiled causal attention for npos positions with FP32 KV cache.
+func BatchAttentionTiledF32(out, q, kCache, vCache Buf,
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale float32, npos int) error {
+	rc := C.gpu_batch_attention_tiled_f32(C.GpuBuf(out), C.GpuBuf(q),
+		C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
+		C.int(startSeqLen), C.float(scale), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_attention_tiled_f32 failed (%d)", rc)
 	}
 	return nil
 }

@@ -358,8 +358,8 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 		KVDim:   kvDim,
 		MaxSeq:  maxSeqLen,
 	}
-	// FP16 KV cache: each element is 2 bytes (packed half2 as uint32 pairs)
-	size := uint64(maxSeqLen * kvDim * 2)
+	// FP32 KV cache: each element is 4 bytes
+	size := uint64(maxSeqLen * kvDim * 4)
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		if needsKV != nil && !needsKV[l] {
 			continue
