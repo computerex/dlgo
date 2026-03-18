@@ -53,9 +53,29 @@ func (p *Pipeline) FreeForGPU() {
 	p.BatchState = nil
 }
 
+// RebuildBuffers re-creates KV cache, RunState, and BatchState using the
+// current MaxSeqLen. Used to restore CPU-side buffers after FreeForGPU when
+// GPU pipeline creation fails and we fall back to CPU inference.
+func (p *Pipeline) RebuildBuffers() {
+	cfg := p.Model.Config
+	kvDim := cfg.NumKVHeads * cfg.HeadDim
+	p.KVCache = newSparseKVCache(cfg, p.MaxSeqLen, kvDim)
+	p.RunState = NewRunState(cfg, p.MaxSeqLen)
+	batchCap := p.MaxSeqLen
+	if batchCap > prefillChunkSize {
+		batchCap = prefillChunkSize
+	}
+	p.BatchState = NewBatchState(cfg, batchCap, p.MaxSeqLen)
+}
+
 const (
 	minContextLen = 64 // smallest context we'll auto-shrink to
 )
+
+// prefillChunkSize is the maximum batch size for prefill processing.
+// BatchState is allocated at this size (not full context) to save RAM.
+// ForwardBatch chunks large prompts automatically.
+const prefillChunkSize = 8192
 
 // EstimateRuntimeBytes estimates heap bytes needed for KV cache, RunState,
 // and BatchState at a given context length, WITHOUT counting the model weights
@@ -71,22 +91,35 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 	nUsed := int64(cfg.ExpertUsedCount)
 	expDim := int64(cfg.ExpertFFNDim)
 
-	// KV cache: 2 * nLayers * seqLen * kvDim * 4 bytes (float32)
-	kvBytes := 2 * nLayers * seq * kvDim * 4
+	// For hybrid SSM+attention models, only attention layers need KV cache.
+	// SSM layers maintain their own recurrent state (SSMState) outside KV cache.
+	attnLayers := nLayers
+	isHybrid := cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0
+	if isHybrid {
+		// Every FullAttentionInterval-th layer is a full-attention layer.
+		attnLayers = (nLayers + int64(cfg.FullAttentionInterval) - 1) / int64(cfg.FullAttentionInterval)
+	}
 
-	// RunState: ~10 buffers of dim, plus qDim, kvDim, ffnDim, vocabSize
+	// KV cache: only attention layers need it (float32 K and V per position)
+	kvBytes := 2 * attnLayers * seq * kvDim * 4
+
+	// RunState: fixed per-token buffers (independent of sequence length except
+	// for HeadScores, Scores, RoPE tables which are small).
 	rsBytes := (3*dim + 2*qDim + 2*kvDim + 3*ffnDim + vocabSize) * 4
-	rsBytes += int64(cfg.NumHeads) * seq * 4 // HeadScores
+	rsBytes += int64(cfg.NumHeads) * seq * 4 // HeadScores[numHeads][maxSeqLen]
+	rsBytes += seq * 4                         // Scores[maxSeqLen]
+	ropeDim := int64(cfg.RopeDim)
+	if ropeDim <= 0 || ropeDim > int64(cfg.HeadDim) {
+		ropeDim = int64(cfg.HeadDim)
+	}
+	rsBytes += 2 * seq * (ropeDim / 2) * 4 // RoPE cos/sin tables
 
 	if nUsed > 0 && expDim > 0 {
 		rsBytes += nUsed * expDim * 4 * 4 // gates, ups, hiddens, outs per expert
 		rsBytes += nUsed * dim * 4         // expert output buffers
 	}
 
-	// BatchState: ~14 buffers of seqLen*dim, plus seqLen*qDim, etc.
-	bsBytes := seq * (3*dim + 2*qDim + 2*kvDim + 3*ffnDim + 4*dim) * 4
-
-	// SSM state (if hybrid model)
+	// SSM state (recurrent state maintained in RunState, not BatchState)
 	if cfg.SSMInnerSize > 0 {
 		ssmHeads := int64(cfg.SSMTimeStepRank)
 		ssmHK := int64(cfg.SSMStateSize)
@@ -94,6 +127,49 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 		statePerLayer := ssmHeads * ssmHK * ssmHV * 4
 		convPerLayer := int64(4) * (ssmHK*2 + ssmHeads*ssmHV) * 4
 		rsBytes += nLayers * (statePerLayer + convPerLayer)
+	}
+
+	// BatchState: batch processing buffers are capped at prefillChunkSize.
+	// Large prompts are chunked, so we don't need to allocate at full context.
+	batchCap := seq
+	if batchCap > prefillChunkSize {
+		batchCap = prefillChunkSize
+	}
+
+	// Standard attention+FFN batch buffers (capped at batch size)
+	bsBytes := batchCap * (3*dim + 2*qDim + 2*kvDim + 3*ffnDim + 4*dim) * 4
+
+	// GatedQ batch buffers (for hybrid models with FullAttentionInterval > 0)
+	if cfg.FullAttentionInterval > 0 {
+		bsBytes += batchCap * (2*qDim + qDim) * 4 // qFullBatch + qGateBatch
+	}
+
+	// SSM batch buffers (scale with batch size, not context)
+	if cfg.SSMInnerSize > 0 {
+		ssmHeads := int64(cfg.SSMTimeStepRank)
+		ssmHK := int64(cfg.SSMStateSize)
+		ssmHV := int64(cfg.SSMInnerSize) / max64(ssmHeads, 1)
+		numKVGroups := int64(cfg.SSMGroupCount)
+		if numKVGroups <= 0 {
+			numKVGroups = ssmHeads
+		}
+		ssmKeyDim := numKVGroups * ssmHK
+		ssmValueDim := ssmHeads * ssmHV
+		ssmQKVDim := ssmKeyDim*2 + ssmValueDim
+		bsBytes += batchCap * (ssmQKVDim + ssmValueDim*2 + ssmHeads*2) * 4
+	}
+
+	// Score buffers: numWorkers * seqLen * 4, scaled to full context length
+	// (each attention head needs scores for all positions). Use est. 8 workers.
+	const estWorkers = 8
+	bsBytes += estWorkers * seq * 4
+
+	// KGather/VGather for SIMD batched attention: numKVHeads * seqLen * headDim * 4 each.
+	// Only allocated when affordable (≤ 512 MB each direction = 1 GB total).
+	const simdGatherLimit = 512 * 1024 * 1024
+	kgatherBytes := int64(cfg.NumKVHeads) * seq * int64(cfg.HeadDim) * 4
+	if kgatherBytes <= simdGatherLimit {
+		bsBytes += kgatherBytes * 2 // K and V gather
 	}
 
 	return kvBytes + rsBytes + bsBytes
@@ -104,6 +180,34 @@ func max64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// newSparseKVCache creates a KV cache that only allocates full-size entries
+// for attention layers. SSM layers get a minimal 1-slot cache (they use their
+// own recurrent SSMState and never access the KV cache during inference).
+// This reduces RAM usage significantly for hybrid SSM+attention models.
+func newSparseKVCache(cfg ModelConfig, maxSeqLen, kvDim int) *memory.MultiLayerKVCache {
+	kv := &memory.MultiLayerKVCache{
+		Layers: make([]*memory.KVCache, cfg.NumLayers),
+	}
+	for l := 0; l < cfg.NumLayers; l++ {
+		if ssmLayerIndex(l, cfg) {
+			// SSM layer: allocate a minimal 1-slot cache (never accessed during
+			// forward pass, but keeps slice indexing safe).
+			kv.Layers[l] = memory.NewKVCache(1, 1)
+		} else {
+			kv.Layers[l] = memory.NewKVCache(maxSeqLen, kvDim)
+		}
+	}
+	return kv
+}
+
+// ssmLayerIndex returns true if layer l is an SSM layer (not a full-attention layer).
+func ssmLayerIndex(l int, cfg ModelConfig) bool {
+	if cfg.FullAttentionInterval <= 0 || cfg.SSMInnerSize == 0 {
+		return false
+	}
+	return ((l + 1) % cfg.FullAttentionInterval) != 0
 }
 
 // CheckMemoryBudget checks whether loading the given model at the requested
@@ -239,15 +343,26 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	}
 
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
-	kv := memory.NewMultiLayerKVCache(m.Config.NumLayers, maxSeqLen, kvDim)
+
+	// Build sparse KV cache: only attention layers need full-context KV storage.
+	// SSM layers maintain their own recurrent state (SSMState) — allocating a
+	// full-size KV cache for them wastes significant RAM (4x for Qwen3.5 0.8B).
+	kv := newSparseKVCache(m.Config, maxSeqLen, kvDim)
 	rs := NewRunState(m.Config, maxSeqLen)
+
+	// BatchState is capped at prefillChunkSize to keep RAM usage predictable.
+	// ForwardBatch chunks large prompts automatically.
+	batchCap := maxSeqLen
+	if batchCap > prefillChunkSize {
+		batchCap = prefillChunkSize
+	}
 
 	return &Pipeline{
 		Model:      m,
 		Tokenizer:  tok,
 		KVCache:    kv,
 		RunState:   rs,
-		BatchState: NewBatchState(m.Config, maxSeqLen),
+		BatchState: NewBatchState(m.Config, batchCap, maxSeqLen),
 		MaxSeqLen:  maxSeqLen,
 	}, nil
 }

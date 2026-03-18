@@ -28,7 +28,7 @@ func main() {
 	modelPath := flag.String("model", "", "initial GGUF model to load")
 	modelID := flag.String("id", "", "model ID (default: filename without .gguf)")
 	useGPU := flag.Bool("gpu", false, "use GPU (Vulkan) for inference")
-	ctx := flag.Int("ctx", 2048, "max context length")
+	ctx := flag.Int("ctx", 0, "max context length (0 = native model context, auto-reduced by memory budget)")
 	frontendDir := flag.String("frontend", "", "path to frontend dist/ directory to serve")
 
 	var modelsDirs stringSlice

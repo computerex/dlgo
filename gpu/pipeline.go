@@ -130,6 +130,38 @@ func layerNeedsKV(layer *llm.Layer) bool {
 	return layer.Spec.Core == llm.CoreAttention || layer.Spec.GatedQ
 }
 
+// computeMaxGPUContext finds the largest context length (up to maxSeqLen) that
+// allows ALL model layers to fit in VRAM. Binary-searches between minCtx and
+// maxSeqLen. Returns maxSeqLen if it already fits, or a reduced value.
+func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
+	// Start by checking if the full context fits all layers.
+	if computeGPULayerBudget(m, maxSeqLen) >= len(m.Layers) {
+		return maxSeqLen
+	}
+
+	// Binary search for the largest context where all layers fit.
+	const minCtx = 2048
+	lo, hi := minCtx, maxSeqLen
+	best := minCtx
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if computeGPULayerBudget(m, mid) >= len(m.Layers) {
+			best = mid
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+
+	// Round down to a nice power-of-two-ish boundary for cleaner allocation.
+	for _, nice := range []int{131072, 65536, 32768, 16384, 8192, 4096, 2048} {
+		if nice <= best {
+			return nice
+		}
+	}
+	return best
+}
+
 // computeGPULayerBudget determines how many layers fit in available VRAM,
 // accounting for both weight data AND per-layer KV cache VRAM.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
@@ -456,9 +488,22 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB total, %.0f MB free)...\n",
 		DeviceName(), totalVRAM, freeVRAM)
 
+	// GPU-aware context capping: if the native context is too large to fit
+	// all layers in VRAM, reduce it to the largest value that does fit.
+	// This prevents OOM crashes with models that have very large native
+	// contexts (e.g., 256K for Qwen3.5) on GPUs with limited VRAM.
+	maxSeqLen := cpuPipeline.MaxSeqLen
+	gpuSafeCtx := computeMaxGPUContext(m, maxSeqLen)
+	if gpuSafeCtx < maxSeqLen {
+		fmt.Printf("[dlgo/gpu] Reducing context from %d to %d tokens to fit all layers in VRAM (%.0f MB)\n",
+			maxSeqLen, gpuSafeCtx, freeVRAM)
+		maxSeqLen = gpuSafeCtx
+		cpuPipeline.MaxSeqLen = maxSeqLen
+	}
+
 	// Determine how many layers fit in VRAM.
 	// DLGO_GPU_LAYERS overrides the automatic VRAM budget calculation.
-	numGPULayers := computeGPULayerBudget(m, cpuPipeline.MaxSeqLen)
+	numGPULayers := computeGPULayerBudget(m, maxSeqLen)
 	if numGPULayers > cfg.NumLayers {
 		numGPULayers = cfg.NumLayers
 	}
@@ -510,9 +555,15 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			for l := 0; l < cfg.NumLayers; l++ {
 				needsKV[l] = layerNeedsKV(&m.Layers[l])
 			}
-			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, cpuPipeline.MaxSeqLen, kvDim, needsKV)
+			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
 
-			cosTable, sinTable := cpuPipeline.RunState.RoPETables()
+			// Upload RoPE tables. Prefer pre-computed tables from CPU RunState
+			// (if available), otherwise compute from config. RunState may be nil
+			// when CPU buffers were freed before GPU pipeline creation.
+			var cosTable, sinTable []float32
+			if cpuPipeline.RunState != nil {
+				cosTable, sinTable = cpuPipeline.RunState.RoPETables()
+			}
 			if cosTable != nil && sinTable != nil {
 				ropeCosTable, err = UploadF32Slice(cosTable)
 				if err != nil {
@@ -527,7 +578,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				if ropeDim <= 0 || ropeDim > cfg.HeadDim {
 					ropeDim = cfg.HeadDim
 				}
-				cos, sin := ops.RoPEFrequencyTable(cpuPipeline.MaxSeqLen, ropeDim, cfg.RopeFreqBase)
+				cos, sin := ops.RoPEFrequencyTable(maxSeqLen, ropeDim, cfg.RopeFreqBase)
 				ropeCosTable, err = UploadF32Slice(cos)
 				if err != nil {
 					return fmt.Errorf("upload RoPE cos table: %w", err)
@@ -629,7 +680,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		Tokenizer:       cpuPipeline.Tokenizer,
 		KVCache:         kv,
 		RunState:        rs,
-		MaxSeqLen:       cpuPipeline.MaxSeqLen,
+		MaxSeqLen:       maxSeqLen,
 		LogitsBuf:       make([]float32, cfg.VocabSize),
 		LayerConfs:      layerConfs,
 		Q8_1Scratch:     q8_1Scratch,
@@ -737,30 +788,30 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// 85% of total, we skip the allocation and let mmap handle it instead.
 	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn
 	if needCPUState {
-		if canAllocRAM(int64(llm.EstimateRuntimeBytes(cfg, cpuPipeline.MaxSeqLen))) {
-			pipe.CPURunState = llm.NewRunState(cfg, cpuPipeline.MaxSeqLen)
+		if canAllocRAM(int64(llm.EstimateRuntimeBytes(cfg, maxSeqLen))) {
+			pipe.CPURunState = llm.NewRunState(cfg, maxSeqLen)
 		} else {
 			fmt.Printf("[dlgo/gpu] WARNING: skipping CPU RunState allocation (RAM pressure)\n")
 		}
 
 		if isPartial {
 			cpuLayers := cfg.NumLayers - numGPULayers
-			kvCacheBytes := int64(2 * cpuLayers * cpuPipeline.MaxSeqLen * kvDim * 4)
+			kvCacheBytes := int64(2 * cpuLayers * maxSeqLen * kvDim * 4)
 			if canAllocRAM(kvCacheBytes) {
-				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
 			} else {
 				fmt.Printf("[dlgo/gpu] WARNING: skipping CPU KV cache allocation (RAM pressure, need %.0f MB)\n",
 					float64(kvCacheBytes)/(1024*1024))
 			}
 			if pipe.CPURunState != nil {
-				pipe.CPUBatchState = llm.NewBatchState(cfg, cpuPipeline.MaxSeqLen)
+				pipe.CPUBatchState = llm.NewBatchState(cfg, maxSeqLen)
 			}
 		}
 
 		if (pipe.HasMLA || hasCPUAttn) && pipe.CPUKVCache == nil {
-			kvCacheBytes := int64(2 * cfg.NumLayers * cpuPipeline.MaxSeqLen * kvDim * 4)
+			kvCacheBytes := int64(2 * cfg.NumLayers * maxSeqLen * kvDim * 4)
 			if canAllocRAM(kvCacheBytes) {
-				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, cpuPipeline.MaxSeqLen, kvDim)
+				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
 				if hasCPUAttn {
 					fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
 				}

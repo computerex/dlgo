@@ -24,7 +24,7 @@ func cmdServer(args []string) {
 	modelPath := fs.String("model", "", "GGUF model to pre-load")
 	modelID := fs.String("id", "", "model ID (default: filename without .gguf)")
 	useGPU := fs.Bool("gpu", false, "use Vulkan GPU backend")
-	ctx := fs.Int("ctx", 2048, "max context length")
+	ctx := fs.Int("ctx", 0, "max context length (0 = native model context, auto-reduced by memory budget)")
 	frontendDir := fs.String("frontend", "", "path to frontend dist/ directory")
 
 	fs.Parse(args)

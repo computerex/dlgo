@@ -73,7 +73,7 @@ Server flags:
   --gpu                Use Vulkan GPU backend
   --host ADDR          Bind address (default: 0.0.0.0)
   --port PORT          Listen port (default: 8080)
-  --ctx N              Context length (default: 2048)
+  --ctx N              Context length (0 = native model context, default: 0)
 
 Examples:
   dlgo run llama-3.2-1b-q4_k_m.gguf

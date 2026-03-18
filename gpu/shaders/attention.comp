@@ -21,7 +21,12 @@ layout(push_constant) uniform Params {
     float scale;
 };
 
-shared float scores[4096];
+// Tile size for K-position tiling. For seq_len <= TILE_K the shader
+// executes a single tile and behaves identically to the non-tiled version.
+// 4096 floats = 16 KB shared memory (same budget as before).
+#define TILE_K 4096
+
+shared float scores[TILE_K];
 shared float reduce[256];
 shared vec4 q_sh[64];
 
@@ -47,63 +52,86 @@ void main() {
     }
     barrier();
 
-    // Phase 1: Q·K scores with vec4 dot products
-    for (int t = int(tid); t < actual_seq_len; t += 256) {
-        float dot_val = 0.0;
-        uint k_base4 = uint(t) * kv_dim4 + kv_off4;
-        for (uint d4 = 0; d4 < head_dim4; d4 += 4u) {
-            [[unroll]] for (uint j = 0; j < 4u; j++) {
-                if (d4 + j < head_dim4)
-                    dot_val += dot(q_sh[d4 + j], k_v4[k_base4 + d4 + j]);
+    // Per-thread online softmax state and V accumulator (in registers).
+    // All threads compute identical r_max / r_sum because they read the
+    // same shared-memory reduction results.  Only threads with
+    // tid < head_dim4 actually accumulate into v_acc; the rest keep it
+    // at zero which is harmless.
+    float r_max = -1.0e30;
+    float r_sum = 0.0;
+    vec4  v_acc = vec4(0.0);
+
+    int num_tiles = (actual_seq_len + TILE_K - 1) / TILE_K;
+
+    for (int tile = 0; tile < num_tiles; tile++) {
+        int tile_start = tile * TILE_K;
+        int tile_end   = min(tile_start + TILE_K, actual_seq_len);
+        int tile_size  = tile_end - tile_start;
+
+        // ---- Phase 1: Q·K scores for this tile ----
+        for (int t = int(tid); t < tile_size; t += 256) {
+            float dot_val = 0.0;
+            uint k_base4 = uint(tile_start + t) * kv_dim4 + kv_off4;
+            for (uint d4 = 0; d4 < head_dim4; d4 += 4u) {
+                [[unroll]] for (uint j = 0; j < 4u; j++) {
+                    if (d4 + j < head_dim4)
+                        dot_val += dot(q_sh[d4 + j], k_v4[k_base4 + d4 + j]);
+                }
+            }
+            scores[t] = dot_val * scale;
+        }
+        barrier();
+
+        // ---- Phase 2: Find tile-local max ----
+        float mx = -1.0e30;
+        for (int t = int(tid); t < tile_size; t += 256) {
+            mx = max(mx, scores[t]);
+        }
+        reduce[tid] = mx;
+        barrier();
+        [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
+            barrier();
+        }
+        float tile_max = reduce[0];
+        barrier();
+
+        // ---- Phase 3: Online softmax – rescale running state ----
+        float new_max    = max(r_max, tile_max);
+        float correction = exp(r_max - new_max);
+        v_acc *= correction;
+        r_sum *= correction;
+
+        // Exp scores (relative to new_max) and tile-local sum
+        float my_sum = 0.0;
+        for (int t = int(tid); t < tile_size; t += 256) {
+            float e = exp(scores[t] - new_max);
+            scores[t] = e;
+            my_sum += e;
+        }
+        reduce[tid] = my_sum;
+        barrier();
+        [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce[tid] += reduce[tid + s];
+            barrier();
+        }
+        r_sum += reduce[0];
+        r_max  = new_max;
+        barrier();
+
+        // ---- Phase 4: Accumulate weighted V for this tile ----
+        for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
+            for (int t = 0; t < tile_size; t++) {
+                v_acc += scores[t] * v_v4[uint(tile_start + t) * kv_dim4 + kv_off4 + d4];
             }
         }
-        scores[t] = dot_val * scale;
-    }
-    barrier();
-
-    // Phase 2: softmax - find max
-    float mx = -1.0e30;
-    for (int t = int(tid); t < actual_seq_len; t += 256) {
-        mx = max(mx, scores[t]);
-    }
-    reduce[tid] = mx;
-    barrier();
-    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) reduce[tid] = max(reduce[tid], reduce[tid + s]);
         barrier();
     }
-    float max_val = reduce[0];
-    barrier();
 
-    // Exp and sum
-    float my_sum = 0.0;
-    for (int t = int(tid); t < actual_seq_len; t += 256) {
-        float e = exp(scores[t] - max_val);
-        scores[t] = e;
-        my_sum += e;
-    }
-    reduce[tid] = my_sum;
-    barrier();
-    [[unroll]] for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        barrier();
-    }
-    float inv_sum = 1.0 / reduce[0];
-    barrier();
-
-    // Normalize
-    for (int t = int(tid); t < actual_seq_len; t += 256) {
-        scores[t] *= inv_sum;
-    }
-    barrier();
-
-    // Phase 3: weighted sum of V using vec4
+    // ---- Write normalised output ----
+    float inv_sum = 1.0 / r_sum;
     uint out_base4 = (pos_id * q_dim + head * uint(head_dim)) >> 2;
     for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
-        vec4 acc = vec4(0.0);
-        for (int t = 0; t < actual_seq_len; t++) {
-            acc += scores[t] * v_v4[uint(t) * kv_dim4 + kv_off4 + d4];
-        }
-        attn_v4[out_base4 + d4] = acc;
+        attn_v4[out_base4 + d4] = v_acc * inv_sum;
     }
 }

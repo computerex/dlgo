@@ -16,7 +16,8 @@ func sigmoidF32(x float32) float32 {
 
 // BatchState holds pre-allocated buffers for batch (prefill) forward passes.
 type BatchState struct {
-	maxPos int
+	maxPos    int // maximum batch size for prefill processing
+	maxSeqLen int // maximum total context length (for score/gather buffers)
 	dim    int
 	qDim   int
 	kvDim  int
@@ -54,13 +55,25 @@ type BatchState struct {
 	MoEExpDim      int       // expert FFN hidden dim
 	MoEShDim       int       // shared expert FFN hidden dim
 
-	ScoreBufs [][]float32 // [numWorkers][maxPos] pre-allocated attention score buffers
-	KGather   []float32  // [numKVHeads * maxPos * headDim] dense per-head K gather
-	VGather   []float32  // [numKVHeads * maxPos * headDim] dense per-head V gather
+	// Score buffers sized to maxSeqLen (full context) — each worker needs one
+	// score vector covering ALL positions for correct causal attention.
+	ScoreBufs [][]float32 // [numWorkers][maxSeqLen]
+
+	// KGather/VGather for SIMD batched attention.
+	// Layout: [numKVHeads * maxSeqLen * headDim]
+	// Nil when maxSeqLen is too large (SIMD disabled, non-SIMD path used instead).
+	KGather   []float32
+	VGather   []float32
 }
 
 // NewBatchState allocates batch buffers for up to maxPos positions.
-func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
+// maxSeqLenHint (optional) specifies the total context length for score/gather
+// buffer sizing; defaults to maxPos when not provided.
+func NewBatchState(cfg ModelConfig, maxPos int, maxSeqLenHint ...int) *BatchState {
+	maxSeqLen := maxPos
+	if len(maxSeqLenHint) > 0 && maxSeqLenHint[0] > maxPos {
+		maxSeqLen = maxSeqLenHint[0]
+	}
 	dim := cfg.EmbeddingDim
 	qDim := cfg.NumHeads * cfg.HeadDim
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
@@ -76,9 +89,12 @@ func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
 	}
 
 	numWorkers := blas.DefaultPool().NumWorkers()
+	// ScoreBufs must hold scores for ALL positions up to maxSeqLen, not just the
+	// current batch. During chunked prefill chunk N, position p in the chunk
+	// attends to positions 0..startPos+p, which can exceed the chunk batch size.
 	scoreBufs := make([][]float32, numWorkers)
 	for i := range scoreBufs {
-		scoreBufs[i] = make([]float32, maxPos)
+		scoreBufs[i] = make([]float32, maxSeqLen)
 	}
 
 	hasGatedQ := cfg.FullAttentionInterval > 0
@@ -120,8 +136,20 @@ func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
 		ssmYBatch = make([]float32, maxPos*ssmValueDim)
 	}
 
+	// KGather/VGather for SIMD batched attention: layout [numKVHeads*maxSeqLen*headDim].
+	// Only allocate when the total size is affordable (≤ 512 MB each).
+	// When nil, ForwardBatch falls back to the non-SIMD attention path.
+	const simdGatherLimit = 512 * 1024 * 1024 // 512 MB per buffer
+	kgatherElems := cfg.NumKVHeads * maxSeqLen * cfg.HeadDim
+	var kGather, vGather []float32
+	if int64(kgatherElems)*4 <= simdGatherLimit {
+		kGather = make([]float32, kgatherElems)
+		vGather = make([]float32, kgatherElems)
+	}
+
 	return &BatchState{
-		maxPos:     maxPos,
+		maxPos:    maxPos,
+		maxSeqLen: maxSeqLen,
 		dim:        dim,
 		qDim:       qDim,
 		kvDim:      kvDim,
@@ -151,13 +179,15 @@ func NewBatchState(cfg ModelConfig, maxPos int) *BatchState {
 		SSMBetaBatch:  ssmBetaBatch,
 		SSMYBatch:     ssmYBatch,
 		ScoreBufs:     scoreBufs,
-		KGather:    make([]float32, maxPos*kvDim),
-		VGather:    make([]float32, maxPos*kvDim),
+		KGather:       kGather,
+		VGather:       vGather,
 	}
 }
 
 // ForwardBatch processes multiple tokens in a single pass (prefill).
 // Returns logits for the last position only. Fills the KV cache for all positions.
+// If the number of tokens exceeds bs.maxPos, the prompt is processed in chunks
+// of bs.maxPos, correctly maintaining KV cache and SSM state across chunks.
 func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerKVCache, rs *RunState, bs *BatchState) []float32 {
 	cfg := m.Config
 	nPos := len(tokens)
@@ -166,6 +196,20 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 	}
 	if nPos == 1 {
 		return Forward(m, tokens[0], startPos, kv, rs)
+	}
+
+	// Chunked prefill: if the prompt is larger than the batch buffer, process in
+	// chunks. Each chunk updates KV cache and SSM state correctly for the next.
+	if nPos > bs.maxPos {
+		chunkSize := bs.maxPos
+		for start := 0; start < nPos; start += chunkSize {
+			end := start + chunkSize
+			if end > nPos {
+				end = nPos
+			}
+			ForwardBatch(m, tokens[start:end], startPos+start, kv, rs, bs)
+		}
+		return rs.Logits
 	}
 
 	dim := cfg.EmbeddingDim
@@ -380,7 +424,9 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 
 		// Pre-compute attention constants needed for KV gather fusion
 		maxSeqLen := startPos + nPos
-		useSIMDAttn := quant.HasCausalAttn()
+		// SIMD batched attention requires pre-allocated KGather/VGather buffers.
+		// These are nil when maxSeqLen would exceed the allocation limit.
+		useSIMDAttn := quant.HasCausalAttn() && len(bs.KGather) >= maxSeqLen*kvDim
 
 		// Per-position: bias, QK norm, RoPE, KV store — parallelized
 		pool.ParallelFor(nPos, func(p int) {
