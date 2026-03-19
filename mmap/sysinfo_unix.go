@@ -2,7 +2,13 @@
 
 package mmap
 
-import "syscall"
+import (
+	"bufio"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+)
 
 // GetSystemMemInfo queries the system for physical memory statistics.
 func GetSystemMemInfo() (SystemMemInfo, error) {
@@ -11,9 +17,30 @@ func GetSystemMemInfo() (SystemMemInfo, error) {
 		return SystemMemInfo{}, err
 	}
 	unit := uint64(si.Unit)
+	total := uint64(si.Totalram) * unit
+	avail := uint64(si.Freeram) * unit
+
+	// Prefer MemAvailable from /proc/meminfo — Freeram excludes
+	// reclaimable page cache, which causes false OOM on Linux/WSL2.
+	if f, err := os.Open("/proc/meminfo"); err == nil {
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "MemAvailable:") {
+				fields := strings.Fields(sc.Text())
+				if len(fields) >= 2 {
+					if kb, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+						avail = kb * 1024
+					}
+				}
+				break
+			}
+		}
+	}
+
 	return SystemMemInfo{
-		TotalPhysical:     uint64(si.Totalram) * unit,
-		AvailablePhysical: uint64(si.Freeram) * unit,
+		TotalPhysical:     total,
+		AvailablePhysical: avail,
 	}, nil
 }
 
