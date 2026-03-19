@@ -8,7 +8,8 @@
 // then compute integer dot products against quantized weight rows.
 // _mm256_maddubs_epi16 processes 32 values per instruction (vs 8 for float FMA).
 
-#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+// -march=native in CGo CFLAGS already enables the best instruction set for
+// the build machine (AVX2, AVX-512, etc). No target pragma needed.
 #pragma GCC optimize("O3")
 
 #include <immintrin.h>

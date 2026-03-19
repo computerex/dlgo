@@ -4,7 +4,8 @@
 // Workers spin-wait with _mm_pause() for sub-µs dispatch latency.
 // Pool is lazily initialized on first matmul call.
 
-#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+// -march=native in CGo CFLAGS already enables the best instruction set for
+// the build machine (AVX2, AVX-512, etc). No target pragma needed.
 #pragma GCC optimize("O3")
 
 #ifdef _WIN32

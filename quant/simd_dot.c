@@ -6,9 +6,8 @@
 // Each function computes: sum_i( dequant(q[i]) * x[i] ) for one row, using
 // AVX2 integer/float conversions and FMA accumulation.
 
-// Enable AVX2/FMA/F16C at the function level via pragmas,
-// so we don't need -mavx2 -mfma -mf16c in CFLAGS (avoids CGo flag restrictions).
-#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+// -march=native in CGo CFLAGS already enables the best instruction set for
+// the build machine (AVX2, AVX-512, etc). No target pragma needed.
 #pragma GCC optimize("O3")
 
 #include <immintrin.h>
