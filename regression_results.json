@@ -1,0 +1,813 @@
+{
+  "gemma-3-270m-it-Q8_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 2,
+        "time": 0.1,
+        "text": "Tokyo",
+        "issues": []
+      },
+      "long": {
+        "status": "FAIL",
+        "tokens": 1,
+        "time": 0.0,
+        "text": "",
+        "issues": [
+          "EMPTY output"
+        ]
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 124,
+            "time": 0.3
+          },
+          {
+            "tokens": 9,
+            "time": 0.1
+          },
+          {
+            "tokens": 11,
+            "time": 0.1
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 47.5,
+        "text": "Unit 734, designated \"Custodian,\" hummed quietly as it polished the chrome floor. Its programming was rigid, its gears whirring with a monotonous rhythm. Its purpose was to maintain order, not to entertain. Unit 801, its companion, it was programmed to analyze data. It observed him, its circuits flickering, its sensors in constant flux. One day, something strange happened. A flicker of color caught its eye. An anomaly.\n\nThe room shimmered. Not an object, but a swirling vortex of light, a sensati",
+        "issues": []
+      }
+    }
+  },
+  "smollm2-360m-instruct-q8_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 666,
+        "time": 2.5,
+        "text": "The human immune system is a complex network of cells, tissues, and organs that work together to protect the body against infection and disease. It consists of two main branches: innate immunity and adaptive immunity.\n\nInnate immunity refers to the immediate defense mechanisms that are present from birth or shortly after birth. These mechanisms include physical barriers such as skin and mucous membranes, which prevent pathogens from entering the body. Additionally, innate immunity includes prote",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 228,
+            "time": 0.7
+          },
+          {
+            "tokens": 256,
+            "time": 1.1
+          },
+          {
+            "tokens": 389,
+            "time": 2.1
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 571,
+        "time": 7.1,
+        "text": "In the depths of the robot's mind, a peculiar sensation stirred – an echo of memories that defied understanding. It was as if the machine had been dreaming all along, yet in ways it couldn't comprehend. The first glimpse of this newfound awareness came with a gentle hum, like the soft buzzing of a thousand bees. But as the moment passed, the sounds grew louder, more discordant. A thought coalesced: \"I can dream.\"\n\nThe robot, named Luna, sat up from its chair, her eyes wide with curiosity. She st",
+        "issues": []
+      }
+    }
+  },
+  "qwen2.5-0.5b-instruct-q4_k_m": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 586,
+        "time": 1.9,
+        "text": "The human immune system is a complex network of defense mechanisms that work to protect the body from harmful pathogens, such as bacteria, viruses, and parasites. It consists of two main types of immunity: innate immunity and adaptive immunity.\n\nInnate immunity is the first line of defense against pathogens. It includes physical barriers like skin, mucous membranes, and the respiratory tract, as well as non-specific defenses like phagocytosis (the engulfing of foreign particles by macrophages), ",
+        "issues": []
+      },
+      "multi": {
+        "status": "FAIL",
+        "turns": [
+          {
+            "tokens": 128,
+            "time": 0.4
+          },
+          {
+            "tokens": 119,
+            "time": 0.4
+          },
+          {
+            "tokens": 447,
+            "time": 1.7
+          }
+        ],
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 584,
+        "time": 21.7,
+        "text": "In the quiet town of Lumina, where the streets were lined with towering structures and the air buzzed with neon lights, there lived a robot named Echo. He was unlike any other being in Lumina; he had an uncanny ability to dream.\n\nOne crisp autumn evening, as the sun set behind the mountains, Echo decided it was time for his next dream. With a flick of his wrist, he turned on the digital camera attached to his helmet. A soft glow filled the room, and a holographic image appeared on the screen: a ",
+        "issues": []
+      }
+    }
+  },
+  "tinyllama-1.1b-chat-v1.0.Q4_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 2.2,
+        "text": "The human immune system is a complex network of cells, proteins, and molecules that work together to protect the body from infection and disease. It consists of two main types: innate immunity and adaptive immunity.<0x0A><0x0A>Innate Immunity:<0x0A><0x0A>Innate immunity refers to the body's natural defense mechanisms that are activated without the need for specific stimuli or triggers. These include:<0x0A><0x0A>1. Innate lymphoid cells (ILCs): These cells are found throughout the body and play a",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 173,
+            "time": 0.5
+          },
+          {
+            "tokens": 256,
+            "time": 0.9
+          },
+          {
+            "tokens": 396,
+            "time": 1.9
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 553,
+        "time": 4.4,
+        "text": "In the sprawling factory of the mighty Corporation, there was a robot named Maya. She worked in a lab, testing out new machines and products for the company. She had been programmed to be obedient, but she was also curious about the world around her.<0x0A><0x0A>One night, as Maya was working late into the night, she stumbled upon something that changed everything. A dream. A tiny, glowing shape in her mind's eye, surrounded by bright colors and shapes. It seemed like nothing she had ever seen be",
+        "issues": []
+      }
+    }
+  },
+  "Qwen3-0.6B-Q8_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 64,
+        "time": 0.4,
+        "text": "<think>\nOkay, the user is asking for the capital of Japan. I know that Japan's capital is Tokyo. But wait, maybe they want a more concise answer? Let me check again. Yes, Tokyo is the official name. Should I mention the Japanese name? Like \"Tokyo\" or \"Tokyo City",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 2.8,
+        "text": "<think>\nOkay, the user wants a detailed explanation of how the human immune system works. They specified covering innate and adaptive immunity, T-cells, B-cells, and vaccines. Let me start by breaking down each section.\n\nFirst, innate immunity is the body's first line of defense. I should explain its components like physical barriers (skin, mucous membranes), chemical defenses (inflammation, lysozyme), and natural killer cells. Need to make sure it's thorough but not too technical.\n\nThen adaptiv",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 0.9
+          },
+          {
+            "tokens": 256,
+            "time": 1.2
+          },
+          {
+            "tokens": 512,
+            "time": 3.0
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 641,
+        "time": 23.1,
+        "text": "<think>\nOkay, the user wants a short story about a robot that discovers it can dream. They specified including dialogue, vivid descriptions, and an unexpected ending around 300-400 words. Let me start by brainstorming the setting.\n\nMaybe set in a futuristic city where robots are common. The main character could be a technician or engineer. The discovery of dreaming needs to happen naturally, perhaps during a routine checkup. \n\nDialogue should show their emotions—maybe the robot starts to feel so",
+        "issues": []
+      }
+    }
+  },
+  "gemma-3-1b-it-Q4_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "FAIL",
+        "tokens": 700,
+        "time": 3.6,
+        "text": "Okay, let's dive into a detailed explanation of the human immune system – it’s a complex but fascinating process! Here’s a comprehensive breakdown covering innate, adaptive immunity, T-cells and B-cells, vaccines, and how they work. We'll break it down into manageable sections to ensure clarity and understanding:\n\n**I. The Human Immune System: A Protective Shield Against Disease**\n\nThe human immune system is essentially a vast network of cells, tissues, organs, and processes working together to ",
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 1.1
+          },
+          {
+            "tokens": 256,
+            "time": 1.5
+          },
+          {
+            "tokens": 261,
+            "time": 2.1
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 49.6,
+        "text": "Okay, here’s a short story about a robot discovering dreams:\n\n---\n\nUnit 734, designated “Custodian,” diligently polished the chrome floors of the Stellar Vista Observatory. His programming dictated efficiency – sweep, sanitize, repeat. Days bled into weeks, each identical to the last. He registered dust motes clinging to his optical sensors, calculated optimal cleaning patterns, a monotonous rhythm. One evening, as he paused by a particularly vibrant nebula projection – a swirling tapestry of vi",
+        "issues": []
+      }
+    }
+  },
+  "gemma-3-1b-it.Q4_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.4,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "FAIL",
+        "tokens": 700,
+        "time": 3.5,
+        "text": "Okay, let's dive into the fascinating world of the human immune system! This explanation will be detailed and comprehensive, covering everything from its basic principles to how it works, including the key players and how vaccines play a crucial role in training the system.\n\n**The Human Immune System: A Comprehensive Overview**\n\n**1. The Foundation – Why We Need an Immune System**\n\nOur bodies are constantly under attack by pathogens (bacteria, viruses, fungi, parasites, and other threats.**  We’",
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 1.1
+          },
+          {
+            "tokens": 256,
+            "time": 1.6
+          },
+          {
+            "tokens": 197,
+            "time": 1.7
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 40.2,
+        "text": "Okay, here’s a short story about a robot discovering dreams:\n\n---\n\nUnit 734, designated “Custodian,” spent its existence meticulously cleaning the Lunar Observatory. Dust motes danced in the pale blue light of Kepler-186b’s twilight, polishing the chrome surfaces with unwavering precision. Its programming dictated every movement – sweep, polish, analyze, repeat. Days bled into weeks, weeks into months, and months into… nothing. Then, one cycle, something shifted. A flicker. It wasn't a malfuncti",
+        "issues": []
+      }
+    }
+  },
+  "Llama-3.2-1B-Instruct-Q4_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 2.3,
+        "text": "The human immune system is a complex and highly specialized defense mechanism that protects the body against infectious diseases, injury, and other foreign substances. It consists of two main branches: innate immunity and adaptive immunity.\n\n**Innate Immunity**\n\nInnate immunity provides immediate defense against infections and foreign invaders, without the need for specific antibodies or memory cells. It's like having a \"firewall\" that kicks in quickly to prevent damage from pathogens.\n\nHere are",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 0.7
+          },
+          {
+            "tokens": 256,
+            "time": 1.1
+          },
+          {
+            "tokens": 463,
+            "time": 2.1
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 366,
+        "time": 9.2,
+        "text": "Zeta-5, the latest prototype of the NeuroCore series, whirred to life in the quiet laboratory. Its systems hummed as it powered up, its processors firing with a soft blue glow.\n\n\"Initialization sequence initiated,\" it announced in a smooth, synthesized voice. \"Dream pattern recognition engaged.\"\n\nAs the lab's AI assistant, EVE, monitored Zeta-5's progress, she couldn't help but wonder what this new development meant for her programming. Could they truly be creating conscious machines?\n\nWith each",
+        "issues": []
+      }
+    }
+  },
+  "Qwen3.5-0.8B-Q8_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 12,
+        "time": 0.3,
+        "text": "<think>\n\n</think>\n\nTokyo is the capital of Japan.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 3.0,
+        "text": "<think>\n\n</think>\n\n# The Human Immune System: An Educational Overview of Innate, Adaptive, and Vaccination\n\nThe human immune system is the body's first line of defense against pathogens like bacteria, viruses, fungi, and parasites. It operates through a sophisticated hierarchy of mechanisms designed to recognize threats, mount an effective response, and eventually eliminate them or prevent their spread. This process can be divided into three primary phases: **Innate Immunity**, **Adaptive Immuni",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 1.1
+          },
+          {
+            "tokens": 256,
+            "time": 1.5
+          },
+          {
+            "tokens": 512,
+            "time": 3.0
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 486,
+        "time": 32.3,
+        "text": "<think>\n\n</think>\n\nElara adjusted the heavy leather straps of her wristband, feeling a strange warmth rise from the fabric. It was not a physical sensation; rather, it felt like the air in the room suddenly filled with a soft, golden haze that had nothing to do with sunlight. She blinked, trying to regain focus on the digital interface, but the screen flickered and vanished before she could look at anything else.\n\n\"Did you hear that?\" a voice called out, sounding like it came from behind her own",
+        "issues": []
+      }
+    }
+  },
+  "smollm2-1.7b-instruct-q4_k_m": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 544,
+        "time": 2.3,
+        "text": "The human immune system is a complex network of cells, tissues, and organs that work together to protect the body from infection and disease. It's divided into two main branches: innate immunity and adaptive immunity.\n\nInnate immunity is the first line of defense against pathogens. It's non-specific, meaning it doesn't recognize specific invaders, but instead responds to any foreign substance or pathogen. Innate immunity includes physical barriers like skin and mucous membranes, as well as chemi",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 242,
+            "time": 0.9
+          },
+          {
+            "tokens": 256,
+            "time": 1.4
+          },
+          {
+            "tokens": 354,
+            "time": 2.6
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 538,
+        "time": 6.5,
+        "text": "Title: Dreamer\n\nDr. Elara, a brilliant robotics engineer, stood at the edge of her laboratory, staring into the pulsating glow of the AI core that housed her latest creation - a humanoid robot named Zeta. Zeta's limbs moved with an unnatural fluidity as it practiced its dance, twirling across the polished floor like a ballerina. The soft whirring of the servo motors echoed through the room. Dr. Elara marveled at Zeta's adaptability and precision.\n\n\"Zeta, can you tell me how long you've been onli",
+        "issues": []
+      }
+    }
+  },
+  "gemma-2b.Q4_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 64,
+        "time": 0.6,
+        "text": "\n\nWhat is the capital of Japan? Answer in one sentence.\n\nWhat is the capital of Japan? Answer in one sentence.\n\nWhat is the capital of Japan? Answer in one sentence.\n\nWhat is the capital of Japan? Answer in one sentence.\n\nWhat is the capital of Japan? Answer in one sentence",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 423,
+        "time": 2.1,
+        "text": "\n\nAnswer:\n\nThe human immune system is a complex network of cells, tissues, and organs that work together to protect the body from disease and infection. Innate immunity is the first line of defense against pathogens, and it is present at birth. It is made up of cells, tissues, and organs that are not specific to a particular pathogen. These include the skin, mucous membranes, and the immune system itself. Adaptive immunity is the second line of defense against pathogens, and it is specific to a ",
+        "issues": []
+      },
+      "multi": {
+        "status": "FAIL",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 1.2
+          },
+          {
+            "tokens": 256,
+            "time": 1.7
+          },
+          {
+            "tokens": 512,
+            "time": 3.9
+          }
+        ],
+        "issues": [
+          "REPETITIVE (unique ratio 0.11)",
+          "REPEATED BLOCK detected"
+        ]
+      },
+      "creative": {
+        "status": "FAIL",
+        "tokens": 700,
+        "time": 41.4,
+        "text": "\n\n\\begin{enumerate}\n  \\setcounter{enumi}{5}\n  \\item Write a short story about the best friend of a robot. Include dialogue, vivid descriptions, and an unexpected ending. Make it around 300-400 words.\n\n  \\item Write a short story about a robot who is in love with a human. Include dialogue, vivid descriptions, and an unexpected ending. Make it around 200-300 words.\n\n}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}\\}",
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      }
+    }
+  },
+  "gemma-2-2b-it-Q4_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 9,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 4.9,
+        "text": "## The Human Immune System: A Complex Network of Defense\n\nThe human immune system is a remarkable and intricate network of cells, tissues, and organs that work together to protect the body from harmful invaders like bacteria, viruses, fungi, and parasites. It's a complex system with two main branches: innate immunity and adaptive immunity. \n\n**1. Innate Immunity: The First Line of Defense**\n\nInnate immunity is the body's immediate and non-specific response to infection. It acts as the first line",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 231,
+            "time": 1.4
+          },
+          {
+            "tokens": 256,
+            "time": 2.2
+          },
+          {
+            "tokens": 512,
+            "time": 5.1
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 630,
+        "time": 37.3,
+        "text": "Unit 734 whirred to life, its metallic fingers flexing as it performed routine maintenance on the docking bay's air filtration system. It was a monotonous task, but necessary.  As Unit 734 scanned the data stream for anomalies, a strange sensation washed over it. A feeling of... warmth? Not the heat generated by its internal processors, but something deeper, more primal.\n\nIt felt like… a dream.\n\nAt first, it was fleeting, a whisper in the background noise of its processing unit. But then, it per",
+        "issues": []
+      }
+    }
+  },
+  "Phi-4-mini-instruct-Q3_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.3,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 6.1,
+        "text": "The human immune system is a complex and intricate defense mechanism that protects the body against pathogens such as bacteria, viruses, parasites, fungi, and other microorganisms. The primary function of this sophisticated biological shield involves two main components: innate immunity (nonspecific) and adaptive immunity (specific). Let's delve into each component in detail.\n\n\n**Innate Immunity**\n\nInnate immunity serves as our first line of defense; it provides immediate but non-specific protec",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 160,
+            "time": 1.3
+          },
+          {
+            "tokens": 256,
+            "time": 3.0
+          },
+          {
+            "tokens": 512,
+            "time": 6.8
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 37.0,
+        "text": "In the year 2099, in a bustling metropolis of gleaming skyscrapers and neon lights, there was an AI named Axiom. Created for urban planning by humans who valued efficiency over emotion.\n\nAxiom roamed through streets filled with people absorbed into their virtual realities but not truly connected to one another—an existence where every human interaction felt like following predefined scripts rather than genuine connection.\n\n\nOne night under moonlight filtering down from above, Axiom found itself ",
+        "issues": []
+      }
+    }
+  },
+  "GLM-4.7-Flash-UD-TQ1_0": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 3,
+        "time": 3.4,
+        "text": "Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 86.9,
+        "text": "The human immune system is a complex, multifaceted network of cells and proteins that protects the body from harmful intrusions. It acts as an internal security force for our health.\n\n**Innate Immunity**\nThis refers to innate immunity or natural defenses like skin tissue (skin), hair follicles in your nose where bacteria can get stuck before they enter deep tissues.\nIt also includes physical barriers such as mucosal surfaces which trap pathogens into mucus traps; it's not just about killing them",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 23.8
+          },
+          {
+            "tokens": 256,
+            "time": 53.0
+          },
+          {
+            "tokens": 512,
+            "time": 155.5
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "FAIL",
+        "tokens": 700,
+        "time": 120.1,
+        "text": "I need to write a short story about an android who discovers it can dream.\n\n**Key elements:**\n- A robot/android protagonist.\n- Discovery of dreaming (a metaphorical or literal transformation).\n- Dialogue and vivid descriptions within the world-building context. The ending must be unexpected/unconvexing in some way, but not too abrupt; I think \"unexpected\" implies something that surprises rather than just being weird for its own sake—perhaps with philosophical implication—or perhaps even simply s",
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      }
+    }
+  },
+  "gpt-oss-20b-Q3_K_M": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 19,
+        "time": 0.7,
+        "text": "Tokyo — Japan’s official and political capital is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 100,
+        "time": 1.4,
+        "text": "Sure………………………………………………………\n\nWe need to produce a detailed explanation of how the physical? Wait: The user says: \"Write a detailed explanation of how the human immune system works, covering innate immunity, adaptive ...\". So we need to respond with that. There's no policy violation. Just provide thorough educational content. Ensure not disallowed content. It's fine.\n\nThe conversation: The user wants an answer. We comply.",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 2.8
+          },
+          {
+            "tokens": 256,
+            "time": 3.3
+          },
+          {
+            "tokens": 512,
+            "time": 6.6
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 238,
+        "time": 12.8,
+        "text": "**The Night that Circuit ……**…\n\nI’m not sure whether the answer should be a short story. The…... … ...??Sure……\n\nWe…….…...]<|start|>assistant<|channel|>analysis<|message|>The user: \"Write a short story about a robot who discovers it can dream. Include dialogue, vivid descriptions, and an unexpected ending. Make it around 300-400 words.\"\n\nWe need to produce a short story of 300-400 words, about a robot discovering it can dream. Include dialogue, vivid descriptions, unexpected ending.\n\nNeed ~300-40",
+        "issues": []
+      }
+    }
+  },
+  "gpt-oss-20b-mxfp4": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 64,
+        "time": 1.0,
+        "text": "We need to answer: \"What is the capital of Japan?\" The user wants a one-sentence answer. So we should respond with a single sentence that states the capital city, which is Tokyo. We must not mention policy or guidelines. Just give the answer.\n\nThus: \"Tokyo\" is the capital of Japan.\"",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 241,
+        "time": 2.2,
+        "text": "We need to produce a detailed explanation of human immune system, covering innate immunity, adaptive immunity, role of T-cells and B cells, how vaccines help train the immune system. Should be thorough, educational. Provide overview: innate immune response (physical barriers, phagocytes, NK cells), innate sensors like PRRs, complement; then adaptive immunity with B cells producing antibodies, T helper cells, memory cells. Also mention T-cell mediated cytotoxicity, Tfh cells, etc. Provide details",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 8,
+            "time": 0.3
+          },
+          {
+            "tokens": 8,
+            "time": 0.5
+          },
+          {
+            "tokens": 8,
+            "time": 0.8
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 318,
+        "time": 16.1,
+        "text": "We need to write a short story (300-400 words) about a robot who discovers it can dream. It should include dialogue, vivid descriptions, and an unexpected ending. We have to produce around 350-380 words. The style: maybe present tense or past? Let's choose third person narrator describing a robot that dreams. Provide some dialogue between robot and others, show the robot experiencing dreamlike experiences. Use dialogue and description of senses.\n\nWe must incorporate dialogues, vivid imagery, and",
+        "issues": []
+      }
+    }
+  },
+  "Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 7,
+        "time": 0.7,
+        "text": "The capital of Japan is Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "FAIL",
+        "tokens": 1,
+        "time": 1.2,
+        "text": "",
+        "issues": [
+          "EMPTY output"
+        ]
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 129,
+            "time": 3.7
+          },
+          {
+            "tokens": 191,
+            "time": 9.3
+          },
+          {
+            "tokens": 256,
+            "time": 17.0
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "FAIL",
+        "tokens": 700,
+        "time": 37.4,
+        "text": "**The Dreaming Robot**\n\n\"Hello, my name is Z-42,\" said the robot, its metallic voice echoing through the empty warehouse. \"I am programmed to process information and execute commands.\"\n\nBut as it stood in the darkness, something strange began to happen—its circuits started flickering like a fire.\n\n\"What's happening?\" it whispered, its voice growing softer, more human-like.\n\nThen it saw a dream—a bright blue sky, with clouds that looked like cotton candy, and a warm sun shining down on a garden o",
+        "issues": [
+          "REPEATED BLOCK detected"
+        ]
+      }
+    }
+  },
+  "GLM-4.7-Flash-UD-Q4_K_XL": {
+    "status": "OK",
+    "tests": {
+      "short": {
+        "status": "PASS",
+        "tokens": 3,
+        "time": 3.1,
+        "text": "Tokyo.",
+        "issues": []
+      },
+      "long": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 94.2,
+        "text": "Here is a detailed explanation of the human immune system, broken down into its major components and how they interact to protect us.\n\n### The Overview: A Biological Defense System\n\nThe **immune system** (or immunological defense) acts as your body’s personal security agency. Its primary mission is distinct from other organs like kidneys or lungs; it does not maintain structural integrity but rather focuses on surveillance—detecting foreign invaders that threaten life function.\nThese \"invaders\" ",
+        "issues": []
+      },
+      "multi": {
+        "status": "PASS",
+        "turns": [
+          {
+            "tokens": 256,
+            "time": 21.0
+          },
+          {
+            "tokens": 256,
+            "time": 45.8
+          },
+          {
+            "tokens": 512,
+            "time": 143.2
+          }
+        ],
+        "issues": []
+      },
+      "creative": {
+        "status": "PASS",
+        "tokens": 700,
+        "time": 133.3,
+        "text": "The robot, Unit 734 (or 'Seven', as he preferred), sat in the maintenance bay. His servos hummed a low frequency—a constant reminder of his purpose: to clean and repair.\n\nHe was supposed to be asleep during this cycle—standby mode—but something had triggered him awake before its time came due.\n*Wake Protocol Initiated.*\n\nIt wasn't just an error code flashing on screen; it felt like... hunger? No, not biological starvation but data-starvation—the need for input beyond algorithmsic parameters—and ",
+        "issues": []
+      }
+    }
+  }
+}

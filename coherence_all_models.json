@@ -1,0 +1,1034 @@
+{
+  "Qwen3-0.6B-UD-IQ2_XXS": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Only 0 numbered items",
+        "time_s": 41.9
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Off-topic: keywords=[]",
+        "time_s": 42.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 45x",
+        "time_s": 41.9
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4,
+        "detail": "Only 0 numbered items",
+        "time_s": 0.6
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 1771,
+        "detail": "Off-topic: keywords=[]",
+        "time_s": 60.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 212,
+        "detail": "Repetition: Repeated 10-word block 4x",
+        "time_s": 5.4
+      }
+    }
+  },
+  "gemma-3-270m-it-Q8_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 10x",
+        "time_s": 14.0
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 3639,
+        "detail": "Repetition: Repeated 10-word block 10x",
+        "time_s": 12.8
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 10x",
+        "time_s": 14.1
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Numbering errors: 80/142",
+        "time_s": 42.8
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.0
+      }
+    }
+  },
+  "Qwen3-0.6B-Q2_K": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 3453,
+        "detail": "134 items, 4 errors",
+        "time_s": 30.4
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 316x",
+        "time_s": 39.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "class=True, defs=13",
+        "time_s": 38.9
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 272,
+        "detail": "10 items, 0 errors",
+        "time_s": 4.3
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Off-topic: keywords=['internet']",
+        "time_s": 164.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "class=True, defs=38",
+        "time_s": 167.7
+      }
+    }
+  },
+  "smollm2-360m-instruct-q8_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 2816,
+        "detail": "100 items, 0 errors",
+        "time_s": 20.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 750,
+        "detail": "6 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 3.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 701,
+        "detail": "class=True, defs=7",
+        "time_s": 2.7
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 815,
+        "detail": "20 items, 0 errors",
+        "time_s": 11.9
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 831,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 12.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 792,
+        "detail": "class=True, defs=10",
+        "time_s": 10.7
+      }
+    }
+  },
+  "qwen2.5-0.5b-instruct-q4_k_m": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 757,
+        "detail": "33 items, 0 errors",
+        "time_s": 2.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 778,
+        "detail": "7 headings, keywords=['internet', 'network', 'web', 'online', 'data']",
+        "time_s": 2.7
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 498,
+        "detail": "class=True, defs=8",
+        "time_s": 1.5
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 2546,
+        "detail": "90 items, 0 errors",
+        "time_s": 40.4
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1156,
+        "detail": "16 headings, keywords=['internet', 'network', 'web', 'data', 'computer']",
+        "time_s": 16.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 444,
+        "detail": "class=True, defs=7",
+        "time_s": 5.5
+      }
+    }
+  },
+  "tinyllama-1.1b-chat-v1.0.Q4_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 247,
+        "detail": "Only 1 numbered items",
+        "time_s": 1.0
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 526,
+        "detail": "0 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 1.6
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 861,
+        "detail": "class=True, defs=9",
+        "time_s": 3.0
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 255,
+        "detail": "Only 1 numbered items",
+        "time_s": 4.8
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 903,
+        "detail": "0 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 19.1
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 747,
+        "detail": "class=True, defs=11",
+        "time_s": 15.1
+      }
+    }
+  },
+  "Qwen3-0.6B-Q8_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 2572,
+        "detail": "100 items, 0 errors",
+        "time_s": 19.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 790,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 3.5
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 3606,
+        "detail": "class=True, defs=35",
+        "time_s": 33.5
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1755,
+        "detail": "95 items, 1 errors",
+        "time_s": 52.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1018,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 24.8
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 3646,
+        "detail": "class=True, defs=33",
+        "time_s": 158.1
+      }
+    }
+  },
+  "gemma-3-1b-it-Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 9x",
+        "time_s": 22.9
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 3677,
+        "detail": "Repetition: Repeated 10-word block 4x",
+        "time_s": 20.8
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 4x",
+        "time_s": 22.6
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "19 items, 0 errors",
+        "time_s": 109.4
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 3x",
+        "time_s": 110.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 9x",
+        "time_s": 110.2
+      }
+    }
+  },
+  "gemma-3-1b-it.Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 5,
+        "detail": "Only 1 numbered items",
+        "time_s": 0.2
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 5x",
+        "time_s": 22.8
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 3x",
+        "time_s": 22.7
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 85x",
+        "time_s": 110.2
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 58x",
+        "time_s": 110.0
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 4x",
+        "time_s": 110.0
+      }
+    }
+  },
+  "Llama-3.2-1B-Instruct-Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 2361,
+        "detail": "100 items, 0 errors",
+        "time_s": 10.5
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 654,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 2.1
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 751,
+        "detail": "class=True, defs=7",
+        "time_s": 2.4
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 2513,
+        "detail": "100 items, 0 errors",
+        "time_s": 72.7
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 629,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 13.5
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 580,
+        "detail": "class=True, defs=6",
+        "time_s": 12.3
+      }
+    }
+  },
+  "Qwen3.5-0.8B-Q8_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Only 6 numbered items",
+        "time_s": 20.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 660,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'digital', 'data']",
+        "time_s": 2.8
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "class=True, defs=11",
+        "time_s": 20.3
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Only 4 numbered items",
+        "time_s": 143.1
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 748,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'digital', 'data']",
+        "time_s": 23.2
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "class=True, defs=17",
+        "time_s": 143.2
+      }
+    }
+  },
+  "smollm2-1.7b-instruct-q4_k_m": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 682,
+        "detail": "20 items, 0 errors",
+        "time_s": 3.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 765,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'digital', 'data']",
+        "time_s": 3.4
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 902,
+        "detail": "class=True, defs=12",
+        "time_s": 4.1
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1132,
+        "detail": "40 items, 0 errors",
+        "time_s": 39.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 791,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 26.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 834,
+        "detail": "class=True, defs=11",
+        "time_s": 27.6
+      }
+    }
+  },
+  "Qwen3.5-2B.Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "159 items, 2 errors",
+        "time_s": 24.7
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1378,
+        "detail": "21 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 7.4
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1415,
+        "detail": "class=True, defs=18",
+        "time_s": 7.6
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1659,
+        "detail": "100 items, 0 errors",
+        "time_s": 71.8
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1474,
+        "detail": "23 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 63.4
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1598,
+        "detail": "class=True, defs=14",
+        "time_s": 68.8
+      }
+    }
+  },
+  "gemma-2b.Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.2
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 398x",
+        "time_s": 42.9
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 54,
+        "detail": "10 items, 0 errors",
+        "time_s": 2.4
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 540,
+        "detail": "1 headings, keywords=['internet', 'network', 'web', 'data', 'computer']",
+        "time_s": 22.9
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 2636,
+        "detail": "Repetition: Repeated 10-word block 46x",
+        "time_s": 128.2
+      }
+    }
+  },
+  "gemma-2-2b-it-Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Only 0 numbered items",
+        "time_s": 57.9
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Off-topic: keywords=[]",
+        "time_s": 57.9
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 4000,
+        "detail": "Repetition: Repeated 10-word block 3x",
+        "time_s": 57.7
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1578,
+        "detail": "80 items, 0 errors",
+        "time_s": 87.7
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 683,
+        "detail": "6 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 32.8
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1075,
+        "detail": "class=True, defs=11",
+        "time_s": 54.6
+      }
+    }
+  },
+  "phi-2.Q4_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 31,
+        "detail": "Only 0 numbered items",
+        "time_s": 0.6
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 34,
+        "detail": "Off-topic: keywords=[]",
+        "time_s": 0.3
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 1998,
+        "detail": "No class/function definitions",
+        "time_s": 18.4
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1971,
+        "detail": "100 items, 0 errors",
+        "time_s": 149.5
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 255,
+        "detail": "0 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 15.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 673,
+        "detail": "class=True, defs=7",
+        "time_s": 42.2
+      }
+    }
+  },
+  "Phi-4-mini-instruct-Q3_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "32 items, 0 errors",
+        "time_s": 60.8
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1151,
+        "detail": "6 headings, keywords=['internet', 'network', 'web', 'digital', 'data']",
+        "time_s": 11.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 799,
+        "detail": "class=True, defs=6",
+        "time_s": 7.0
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "49 items, 0 errors",
+        "time_s": 377.4
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "25 headings, keywords=['internet', 'network', 'web', 'data', 'computer']",
+        "time_s": 378.4
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 671,
+        "detail": "class=True, defs=8",
+        "time_s": 39.4
+      }
+    }
+  },
+  "Qwen3.5-9B-Q3_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 4000,
+        "detail": "58 items, 0 errors",
+        "time_s": 61.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1137,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 16.3
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1910,
+        "detail": "class=True, defs=18",
+        "time_s": 27.8
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1780,
+        "detail": "100 items, 0 errors",
+        "time_s": 227.0
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1070,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'digital', 'data']",
+        "time_s": 136.0
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1975,
+        "detail": "class=True, defs=16",
+        "time_s": 255.2
+      }
+    }
+  },
+  "GLM-4.7-Flash-UD-TQ1_0": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 211,
+        "detail": "Only 3 numbered items",
+        "time_s": 20.9
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 2000,
+        "detail": "0 headings, keywords=['internet', 'network', 'web']",
+        "time_s": 466.3
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 2000,
+        "detail": "class=True, defs=7",
+        "time_s": 467.2
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 134,
+        "detail": "Only 0 numbered items",
+        "time_s": 17.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 2000,
+        "detail": "10 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 337.5
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 2000,
+        "detail": "class=True, defs=0",
+        "time_s": 336.0
+      }
+    }
+  },
+  "gpt-oss-20b-Q3_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 3,
+        "detail": "Only 0 numbered items",
+        "time_s": 1.2
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Off-topic: keywords=[]",
+        "time_s": 11.0
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Repetition: Repeated 10-word block 11x",
+        "time_s": 10.8
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 936,
+        "detail": "Repetition: Repeated 10-word block 13x",
+        "time_s": 75.2
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Repetition: Repeated 10-word block 26x",
+        "time_s": 80.0
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 1,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.7
+      }
+    }
+  },
+  "gpt-oss-20b-mxfp4": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Only 1 numbered items",
+        "time_s": 9.0
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Repetition: Repeated 10-word block 4x",
+        "time_s": 8.9
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "Repetition: Repeated 10-word block 9x",
+        "time_s": 9.0
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 861,
+        "detail": "Only 0 numbered items",
+        "time_s": 69.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "0 headings, keywords=['internet', 'data']",
+        "time_s": 80.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 1000,
+        "detail": "No class/function definitions",
+        "time_s": 80.0
+      }
+    }
+  },
+  "Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS": {
+    "GPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 1.4
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 1.1
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 0.9
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 3.5
+      },
+      "essay": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 3.4
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 2.6
+      }
+    }
+  },
+  "Qwen3.5-27B-Q3_K_M": {
+    "GPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "44 items, 0 errors",
+        "time_s": 39.7
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 39.6
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "class=True, defs=8",
+        "time_s": 39.4
+      }
+    },
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "42 items, 0 errors",
+        "time_s": 366.2
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "5 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 370.7
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "class=True, defs=13",
+        "time_s": 364.8
+      }
+    }
+  },
+  "Qwen3.5-35B-A3B-Q3_K_M": {
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "55 items, 0 errors",
+        "time_s": 144.3
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 113.3
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "class=True, defs=10",
+        "time_s": 112.3
+      }
+    }
+  },
+  "GLM-4.7-Flash-UD-Q4_K_XL": {
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "19 items, 0 errors",
+        "time_s": 137.4
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "6 headings, keywords=['internet', 'network', 'web', 'computer']",
+        "time_s": 104.9
+      },
+      "code": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "class=True, defs=5",
+        "time_s": 103.5
+      }
+    }
+  },
+  "Qwen3-Coder-Next-UD-IQ3_XXS": {
+    "CPU": {
+      "numbered_list": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "51 items, 4 errors",
+        "time_s": 180.6
+      },
+      "essay": {
+        "status": "PASS",
+        "tokens": 1000,
+        "detail": "4 headings, keywords=['internet', 'network', 'web', 'online', 'digital']",
+        "time_s": 144.9
+      },
+      "code": {
+        "status": "FAIL",
+        "tokens": 0,
+        "detail": "Garbage: Empty output",
+        "time_s": 6.2
+      }
+    }
+  }
+}
