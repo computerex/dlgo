@@ -195,6 +195,12 @@ func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 
 // computeGPULayerBudget determines how many layers fit in available VRAM,
 // accounting for both weight data AND per-layer KV cache VRAM.
+//
+// IMPORTANT: The estimates here are intentionally 30% over what we think is
+// needed. Vulkan buffer allocations have alignment overhead, descriptor sets,
+// staging buffers, and batch state that are not explicitly tracked. On Windows
+// the GPU driver can freeze the entire system if VRAM is exhausted — there is
+// no graceful OOM. Being conservative here is critical for system stability.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	freeVRAM := effectiveFreeVRAM()
 	if freeVRAM <= 0 {
@@ -212,6 +218,12 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		nonLayerBytes += int64(len(m.Output.Data))
 	}
 	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
+
+	// Apply 30% safety multiplier to all overhead estimates. This accounts for
+	// Vulkan allocation alignment, descriptor sets, staging buffer, compute
+	// pipeline objects, batch state LayerConfs, and other untracked allocations.
+	fixedOverhead = fixedOverhead * 130 / 100
+	nonLayerBytes = nonLayerBytes * 130 / 100
 
 	available := freeVRAM - fixedOverhead - nonLayerBytes
 	if available <= 0 {
@@ -238,7 +250,8 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		ssmPerLayer = numHeads*headKDim*headVDim*4 + convK*qkvDim*4
 	}
 
-	// Greedily add layers: each layer costs weights + KV cache (attention only) + optional SSM state
+	// Greedily add layers: each layer costs weights + KV cache + optional SSM.
+	// Apply same 30% safety multiplier to per-layer costs.
 	numLayers := 0
 	for l := 0; l < len(m.Layers); l++ {
 		layerCost := llm.EstimateLayerBytes(&m.Layers[l])
@@ -248,6 +261,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		if m.Layers[l].Spec.Core == llm.CoreSSM {
 			layerCost += ssmPerLayer
 		}
+		layerCost = layerCost * 130 / 100 // 30% safety margin
 		if layerCost > available {
 			break
 		}
@@ -644,7 +658,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			// causing a full system freeze.
 			Sync() // flush so the driver sees all allocations
 			postFree := int64(VRAMFreeBytes())
-			const vramFloor = 2 * 1024 * 1024 * 1024 // 2 GB
+			const vramFloor = 3 * 1024 * 1024 * 1024 // 3 GB
 			if postFree < vramFloor {
 				return fmt.Errorf("VRAM floor violated: only %.0f MB free (need %.0f MB)",
 					float64(postFree)/(1024*1024), float64(vramFloor)/(1024*1024))
