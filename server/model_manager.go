@@ -157,8 +157,8 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 	loaded.Scheduler = NewScheduler(loaded)
 	mm.models[id] = loaded
 
-	log.Printf("Model %q loaded successfully (arch=%s, layers=%d, gpu=%v)",
-		id, pipe.Model.Config.Architecture, pipe.Model.Config.NumLayers, loaded.GpuPipeline != nil)
+	log.Printf("Model %q loaded successfully (arch=%s, layers=%d, gpu=%v, ctx=%d)",
+		id, pipe.Model.Config.Architecture, pipe.Model.Config.NumLayers, loaded.GpuPipeline != nil, pipe.MaxSeqLen)
 	return nil
 }
 

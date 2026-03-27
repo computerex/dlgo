@@ -170,6 +170,15 @@ func RMSNorm(out, x, weight Buf, n int, eps float32) error {
 	return nil
 }
 
+// LayerNorm performs layer normalization on GPU.
+func LayerNorm(out, x, weight, bias Buf, n int, eps float32) error {
+	rc := C.gpu_layernorm(C.GpuBuf(out), C.GpuBuf(x), C.GpuBuf(weight), C.GpuBuf(bias), C.int(n), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: layernorm failed (%d)", rc)
+	}
+	return nil
+}
+
 // RMSNormHeads performs per-head in-place RMS normalization on GPU.
 func RMSNormHeads(data, weight Buf, numHeads, headDim int, eps float32) error {
 	rc := C.gpu_rmsnorm_heads(C.GpuBuf(data), C.GpuBuf(weight), C.int(numHeads), C.int(headDim), C.float(eps))

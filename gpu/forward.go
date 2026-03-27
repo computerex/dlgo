@@ -825,6 +825,10 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := RMSNorm(rs.XNorm, rs.X, gl.AttnNorm, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d attn rmsnorm: %w", l, err)
 			}
+		} else if spec.Norm == llm.NormLayer {
+			if err := LayerNorm(rs.XNorm, rs.X, gl.AttnNorm, gl.AttnNormBias, dim, cfg.RMSNormEps); err != nil {
+				return fmt.Errorf("layer %d attn layernorm: %w", l, err)
+			}
 		}
 
 		if diagL {
@@ -1139,8 +1143,14 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 	}
 
 	Barrier()
-	if err := RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps); err != nil {
-		return fmt.Errorf("output norm: %w", err)
+	if gm.OutputNormBias != 0 {
+		if err := LayerNorm(rs.X, rs.X, gm.OutputNorm, gm.OutputNormBias, dim, cfg.RMSNormEps); err != nil {
+			return fmt.Errorf("output layernorm: %w", err)
+		}
+	} else {
+		if err := RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps); err != nil {
+			return fmt.Errorf("output norm: %w", err)
+		}
 	}
 
 	if diagOn && GpuDiag.Active(-1, pos) {
@@ -1212,12 +1222,27 @@ func gpuForwardFFN(layer *llm.Layer, gl *GpuLayer, rs *GpuRunState, input Buf, d
 		if err := gpuMatVec(rs.Up, gl.FFNUp, layer.FFNUp, input, rs); err != nil {
 			return err
 		}
+		if gl.FFNUpBias != 0 {
+			Barrier()
+			if err := AddOffset(rs.Up, gl.FFNUpBias, gl.FFNUp.Rows, 0); err != nil {
+				return err
+			}
+		}
 		Barrier()
 		if err := GELU(rs.Up, gl.FFNUp.Rows); err != nil {
 			return err
 		}
 		Barrier()
-		return gpuMatVec(rs.FFNOut, gl.FFNDown, layer.FFNDown, rs.Up, rs)
+		if err := gpuMatVec(rs.FFNOut, gl.FFNDown, layer.FFNDown, rs.Up, rs); err != nil {
+			return err
+		}
+		if gl.FFNDownBias != 0 {
+			Barrier()
+			if err := AddOffset(rs.FFNOut, gl.FFNDownBias, gl.FFNDown.Rows, 0); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return nil
 }

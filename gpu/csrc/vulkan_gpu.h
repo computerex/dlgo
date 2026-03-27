@@ -121,6 +121,7 @@ typedef enum {
     PIPE_KV_STORE_F16,
     PIPE_KV_STORE_BATCH_F16,
     PIPE_ATTENTION_TILED_F32,
+    PIPE_LAYERNORM,
     PIPE_COUNT
 } PipelineID;
 
@@ -188,6 +189,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 
 // Element-wise operations
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps);
+int gpu_layernorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, GpuBuf bias_buf, int n, float eps);
 int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps);
 int gpu_softmax(GpuBuf buf, int n);
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, GpuBuf cos_table, GpuBuf sin_table,

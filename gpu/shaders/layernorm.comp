@@ -1,0 +1,64 @@
+#version 450
+
+// LayerNorm: out[i] = weight[i] * (x[i] - mean) / sqrt(var + eps) + bias[i]
+// where mean = mean(x), var = mean((x - mean)^2)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer X { float x_data[]; };
+layout(set = 0, binding = 2) buffer Weight { float w_data[]; };
+layout(set = 0, binding = 3) buffer Bias { float b_data[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    float eps;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    uint base = pos_id * uint(n);
+
+    // Pass 1: compute mean
+    float sum = 0.0;
+    for (int i = int(tid); i < n; i += 256) {
+        sum += x_data[base + uint(i)];
+    }
+    sdata[tid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float mean = sdata[0] / float(n);
+
+    barrier();
+
+    // Pass 2: compute variance
+    float var_sum = 0.0;
+    for (int i = int(tid); i < n; i += 256) {
+        float d = x_data[base + uint(i)] - mean;
+        var_sum += d * d;
+    }
+    sdata[tid] = var_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float inv_std = 1.0 / sqrt(sdata[0] / float(n) + eps);
+
+    barrier();
+
+    // Pass 3: normalize
+    for (int i = int(tid); i < n; i += 256) {
+        out_data[base + uint(i)] = w_data[i] * (x_data[base + uint(i)] - mean) * inv_std + b_data[i];
+    }
+}

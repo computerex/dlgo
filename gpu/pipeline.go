@@ -1214,6 +1214,10 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	}
 	for i := range m.Layers {
 		l := &m.Layers[i]
+		// Fused C path only supports RMSNorm; force non-fused for LayerNorm models.
+		if l.Spec.Norm == llm.NormLayer {
+			return false
+		}
 		if l.Spec.FFN == llm.FFNMoE || l.Spec.FFN == llm.FFNMoESwiOAI {
 			for _, t := range []*core.QuantizedTensor{
 				l.SSMInProj, l.AttnGate, l.SSMAlpha, l.SSMBeta, l.SSMOut,

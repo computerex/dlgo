@@ -23,6 +23,7 @@ func Download(Buf, []byte) error           { return errNoGPU }
 func DownloadF32(Buf, []float32) error     { return errNoGPU }
 func MatVec(out, w, x Buf, rows, cols int, qtype uint32) error { return errNoGPU }
 func RMSNorm(out, x, w Buf, n int, eps float32) error          { return errNoGPU }
+func LayerNorm(out, x, w, b Buf, n int, eps float32) error     { return errNoGPU }
 func RMSNormHeads(data, w Buf, nh, hd int, eps float32) error { return errNoGPU }
 func Softmax(Buf, int) error               { return errNoGPU }
 func RoPE(q, k Buf, nh, nkv, hd, rd, pos int, fb float32, neox bool) error { return errNoGPU }
