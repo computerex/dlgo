@@ -53,10 +53,16 @@ type GpuPipeline struct {
 }
 
 // MaxVRAMBytes caps the VRAM the GPU pipeline may use. 0 = no cap (use all free).
-// Set via DLGO_MAX_VRAM_MB environment variable.
+// Set via DLGO_MAX_VRAM_MB environment variable or --max-vram flag.
 var MaxVRAMBytes int64
+var maxVRAMLoaded bool
 
-func init() {
+// loadMaxVRAM reads the DLGO_MAX_VRAM_MB env var once.
+func loadMaxVRAM() {
+	if maxVRAMLoaded {
+		return
+	}
+	maxVRAMLoaded = true
 	if s := os.Getenv("DLGO_MAX_VRAM_MB"); s != "" {
 		var mb int
 		if _, err := fmt.Sscanf(s, "%d", &mb); err == nil && mb > 0 {
@@ -68,6 +74,7 @@ func init() {
 
 // effectiveFreeVRAM returns the free VRAM, capped by MaxVRAMBytes if set.
 func effectiveFreeVRAM() int64 {
+	loadMaxVRAM()
 	free := int64(VRAMFreeBytes())
 	if MaxVRAMBytes > 0 && free > MaxVRAMBytes {
 		free = MaxVRAMBytes
@@ -137,10 +144,10 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	// Safety margin: reserve VRAM for Windows display compositor, video decode,
 	// browser GPU acceleration, etc. Running near VRAM limits causes system-wide
 	// freezes because the GPU driver can't service display requests.
-	// Use max(1.5 GB, 10% of total VRAM) as minimum reserve.
+	// Use max(2 GB, 12% of total VRAM) as minimum reserve.
 	vram := int64(VRAMBytes())
-	margin := int64(1536 * 1024 * 1024) // 1.5 GB minimum
-	if pct := vram * 10 / 100; pct > margin {
+	margin := int64(2048 * 1024 * 1024) // 2 GB minimum
+	if pct := vram * 12 / 100; pct > margin {
 		margin = pct
 	}
 	total += margin
@@ -628,6 +635,21 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			if q8_1Scratch == 0 {
 				return fmt.Errorf("alloc q8_1 scratch")
 			}
+
+			// Post-allocation VRAM floor check: verify the GPU still has
+			// enough free memory for the Windows display compositor, video
+			// decode, and other system GPU users. Without this, the budget
+			// solver can be slightly optimistic and leave the system in a
+			// state where the display driver can't service frame requests,
+			// causing a full system freeze.
+			Sync() // flush so the driver sees all allocations
+			postFree := int64(VRAMFreeBytes())
+			const vramFloor = 2 * 1024 * 1024 * 1024 // 2 GB
+			if postFree < vramFloor {
+				return fmt.Errorf("VRAM floor violated: only %.0f MB free (need %.0f MB)",
+					float64(postFree)/(1024*1024), float64(vramFloor)/(1024*1024))
+			}
+
 			return nil
 		}()
 

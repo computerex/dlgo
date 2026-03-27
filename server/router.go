@@ -93,7 +93,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	resp := map[string]interface{}{"status": "ok"}
+	if vram := s.manager.GetVRAMStatus(); vram != nil {
+		resp["vram"] = vram
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {

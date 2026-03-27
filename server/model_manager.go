@@ -36,6 +36,13 @@ type AvailableModel struct {
 	Path string `json:"path"`
 }
 
+// VRAMStatus holds GPU memory information for health reporting.
+type VRAMStatus struct {
+	TotalMB float64 `json:"total_mb"`
+	FreeMB  float64 `json:"free_mb"`
+	UsedMB  float64 `json:"used_mb"`
+}
+
 // ModelManager manages multiple loaded models.
 type ModelManager struct {
 	mu             sync.RWMutex
@@ -43,6 +50,20 @@ type ModelManager struct {
 	available      map[string]*AvailableModel
 	gpuInit        func() error
 	gpuNewPipeline func(pipe *llm.Pipeline) (GpuPipelineInterface, error)
+	vramStatus     func() *VRAMStatus
+}
+
+// SetVRAMStatusFunc registers a callback to query GPU VRAM usage.
+func (mm *ModelManager) SetVRAMStatusFunc(f func() *VRAMStatus) {
+	mm.vramStatus = f
+}
+
+// GetVRAMStatus returns current VRAM usage, or nil if GPU is not active.
+func (mm *ModelManager) GetVRAMStatus() *VRAMStatus {
+	if mm.vramStatus == nil {
+		return nil
+	}
+	return mm.vramStatus()
 }
 
 // NewModelManager creates a new model manager.

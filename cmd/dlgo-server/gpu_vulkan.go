@@ -55,4 +55,16 @@ func registerGPU(manager *server.ModelManager) {
 			return &gpuPipelineAdapter{pipe: gp}, nil
 		},
 	)
+	manager.SetVRAMStatusFunc(func() *server.VRAMStatus {
+		if !gpu.IsInitialized() {
+			return nil
+		}
+		total := float64(gpu.VRAMBytes()) / (1024 * 1024)
+		free := float64(gpu.VRAMFreeBytes()) / (1024 * 1024)
+		return &server.VRAMStatus{
+			TotalMB: total,
+			FreeMB:  free,
+			UsedMB:  total - free,
+		}
+	})
 }
