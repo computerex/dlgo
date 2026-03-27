@@ -13,10 +13,13 @@ type GpuTensor struct {
 
 type GpuLayer struct{}
 type GpuModel struct {
-	TokenEmbed *GpuTensor
-	OutputNorm Buf
-	Output     *GpuTensor
-	Layers     []GpuLayer
+	TokenEmbed   *GpuTensor
+	OutputNorm   Buf
+	OutputNormBias Buf
+	Output       *GpuTensor
+	OutputBias   Buf
+	Layers       []GpuLayer
+	NumGPULayers int
 }
 type GpuRunState struct{}
 type GpuKVCache struct{}

@@ -142,12 +142,14 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	total += q8_1Blocks * 36
 
 	// Safety margin: reserve VRAM for Windows display compositor, video decode,
-	// browser GPU acceleration, etc. Running near VRAM limits causes system-wide
-	// freezes because the GPU driver can't service display requests.
-	// Use max(2 GB, 12% of total VRAM) as minimum reserve.
+	// browser GPU acceleration, Vulkan driver internals (pipeline objects,
+	// descriptor pools, command buffers, staging buffers), etc. Running near
+	// VRAM limits causes system-wide freezes because the GPU driver can't
+	// service display requests.
+	// Use max(3 GB, 15% of total VRAM) as minimum reserve.
 	vram := int64(VRAMBytes())
-	margin := int64(2048 * 1024 * 1024) // 2 GB minimum
-	if pct := vram * 12 / 100; pct > margin {
+	margin := int64(3072) * 1024 * 1024 // 3 GB minimum
+	if pct := vram * 15 / 100; pct > margin {
 		margin = pct
 	}
 	total += margin
@@ -164,6 +166,11 @@ func layerNeedsKV(layer *llm.Layer) bool {
 // computeMaxGPUContext finds the largest context length (up to maxSeqLen) that
 // allows ALL model layers to fit in VRAM. Binary-searches between minCtx and
 // maxSeqLen. Returns maxSeqLen if it already fits, or a reduced value.
+//
+// If no context >= minCtx fits all layers, returns minCtx and the caller
+// must use partial GPU offloading. This is safer than reducing context to
+// extremely small values (e.g. 2048) just to force all layers onto GPU —
+// that leaves no VRAM safety margin and crashes Windows.
 func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 	// Start by checking if the full context fits all layers.
 	if computeGPULayerBudget(m, maxSeqLen) >= len(m.Layers) {
@@ -171,9 +178,11 @@ func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 	}
 
 	// Binary search for the largest context where all layers fit.
-	const minCtx = 2048
+	// Don't go below 8K — it's better to have some layers on CPU at a
+	// useful context than all layers on GPU at a tiny context.
+	const minCtx = 8192
 	lo, hi := minCtx, maxSeqLen
-	best := minCtx
+	best := 0 // 0 = can't fit all layers even at minCtx
 	for lo <= hi {
 		mid := lo + (hi-lo)/2
 		if computeGPULayerBudget(m, mid) >= len(m.Layers) {
@@ -184,8 +193,15 @@ func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 		}
 	}
 
+	if best == 0 {
+		// Can't fit all layers even at minimum context.
+		// Return minCtx — partial offloading will handle the rest.
+		// This gives the most GPU layers at a usable context.
+		return minCtx
+	}
+
 	// Round down to a nice power-of-two-ish boundary for cleaner allocation.
-	for _, nice := range []int{131072, 65536, 32768, 16384, 8192, 4096, 2048} {
+	for _, nice := range []int{131072, 65536, 32768, 16384, 8192} {
 		if nice <= best {
 			return nice
 		}
@@ -219,11 +235,12 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
 
-	// Apply 30% safety multiplier to all overhead estimates. This accounts for
+	// Apply 50% safety multiplier to all overhead estimates. This accounts for
 	// Vulkan allocation alignment, descriptor sets, staging buffer, compute
 	// pipeline objects, batch state LayerConfs, and other untracked allocations.
-	fixedOverhead = fixedOverhead * 130 / 100
-	nonLayerBytes = nonLayerBytes * 130 / 100
+	// Empirically measured overhead ranges from 30-40% on NVIDIA drivers.
+	fixedOverhead = fixedOverhead * 150 / 100
+	nonLayerBytes = nonLayerBytes * 150 / 100
 
 	available := freeVRAM - fixedOverhead - nonLayerBytes
 	if available <= 0 {
@@ -251,7 +268,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 
 	// Greedily add layers: each layer costs weights + KV cache + optional SSM.
-	// Apply same 30% safety multiplier to per-layer costs.
+	// Apply same 50% safety multiplier to per-layer costs.
 	numLayers := 0
 	for l := 0; l < len(m.Layers); l++ {
 		layerCost := llm.EstimateLayerBytes(&m.Layers[l])
@@ -261,7 +278,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		if m.Layers[l].Spec.Core == llm.CoreSSM {
 			layerCost += ssmPerLayer
 		}
-		layerCost = layerCost * 130 / 100 // 30% safety margin
+		layerCost = layerCost * 150 / 100 // 50% safety margin
 		if layerCost > available {
 			break
 		}
@@ -285,6 +302,10 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 	gm := &GpuModel{
 		Layers: make([]GpuLayer, len(m.Layers)),
 	}
+
+	// VRAM floor: stop uploading layers if free VRAM drops below this.
+	// On Windows the GPU driver freezes the entire system on exhaustion.
+	const uploadFloor int64 = 4 * 1024 * 1024 * 1024 // 4 GB
 
 	var err error
 	gm.TokenEmbed, err = UploadTensor(m.TokenEmbed)
@@ -508,8 +529,28 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 		if cl.SSMOut != nil {
 			gl.SSMOut, _ = UploadTensor(cl.SSMOut)
 		}
+
+		// Per-layer VRAM floor check: sync the GPU and verify we haven't
+		// consumed too much VRAM. If free memory drops below the floor,
+		// free this layer's allocations and stop — remaining layers stay
+		// on CPU. This prevents the Windows GPU driver from freezing the
+		// entire system when VRAM is exhausted.
+		Sync()
+		if postFree := int64(VRAMFreeBytes()); postFree < uploadFloor {
+			fmt.Printf("[dlgo/gpu] VRAM floor hit after layer %d (%.0f MB free < %.0f MB floor), stopping upload\n",
+				l, float64(postFree)/(1024*1024), float64(uploadFloor)/(1024*1024))
+			// Free this layer and mark it + all remaining as CPU-only.
+			*gl = GpuLayer{} // zero out — freeTensor/freeBuf on zero is no-op
+			gl.OnGPU = false
+			for j := l + 1; j < len(m.Layers); j++ {
+				gm.Layers[j].OnGPU = false
+			}
+			gm.NumGPULayers = l
+			return gm, nil
+		}
 	}
 
+	gm.NumGPULayers = maxLayers
 	return gm, nil
 }
 
@@ -595,6 +636,15 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				return fmt.Errorf("upload model: %w", err)
 			}
 
+			// UploadModel may have stopped early due to VRAM floor check.
+			// Use the actual number of layers that made it to GPU.
+			if gm.NumGPULayers < numGPULayers {
+				fmt.Printf("[dlgo/gpu] Upload stopped early: %d/%d layers on GPU (VRAM floor)\n",
+					gm.NumGPULayers, numGPULayers)
+				numGPULayers = gm.NumGPULayers
+				isPartial = numGPULayers < cfg.NumLayers
+			}
+
 			rs = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
 			needsKV := make([]bool, cfg.NumLayers)
 			for l := 0; l < cfg.NumLayers; l++ {
@@ -650,6 +700,39 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				return fmt.Errorf("alloc q8_1 scratch")
 			}
 
+			// Allocate SSM per-layer state (inside retry loop so floor check covers it).
+			if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
+				numSSMHeads := cfg.SSMTimeStepRank
+				numSSMKVGroups := cfg.SSMGroupCount
+				if numSSMKVGroups <= 0 {
+					numSSMKVGroups = numSSMHeads
+				}
+				ssHeadVDim := cfg.SSMInnerSize / numSSMHeads
+				ssHeadKDim := cfg.SSMStateSize
+				sValueDim := numSSMHeads * ssHeadVDim
+				sKeyDim := numSSMKVGroups * ssHeadKDim
+				sQkvDim := sKeyDim*2 + sValueDim
+				ssConvK := cfg.SSMConvKernel
+
+				rs.AllocSSMScratch(sQkvDim, sValueDim, numSSMHeads)
+
+				for sl := 0; sl < cfg.NumLayers; sl++ {
+					if m.Layers[sl].Spec.Core == llm.CoreSSM && sl < numGPULayers {
+						gl := &gm.Layers[sl]
+						gl.SSMState = Alloc(uint64(numSSMHeads * ssHeadKDim * ssHeadVDim * 4))
+						gl.SSMConvBuf = Alloc(uint64(ssConvK * sQkvDim * 4))
+					}
+				}
+			}
+
+			// Allocate GatedQ scratch (inside retry loop so floor check covers it).
+			for gl := 0; gl < cfg.NumLayers; gl++ {
+				if m.Layers[gl].Spec.GatedQ {
+					rs.AllocGatedQScratch(qDim)
+					break
+				}
+			}
+
 			// Post-allocation VRAM floor check: verify the GPU still has
 			// enough free memory for the Windows display compositor, video
 			// decode, and other system GPU users. Without this, the budget
@@ -658,7 +741,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			// causing a full system freeze.
 			Sync() // flush so the driver sees all allocations
 			postFree := int64(VRAMFreeBytes())
-			const vramFloor = 3 * 1024 * 1024 * 1024 // 3 GB
+			const vramFloor = 4 * 1024 * 1024 * 1024 // 4 GB
 			if postFree < vramFloor {
 				return fmt.Errorf("VRAM floor violated: only %.0f MB free (need %.0f MB)",
 					float64(postFree)/(1024*1024), float64(vramFloor)/(1024*1024))
@@ -757,20 +840,23 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 
-
-	hasGatedQ := false
+	// GatedQ and SSM state were allocated inside the retry loop (so the VRAM
+	// floor check covers them). Just set the pipeline flags here.
 	for l := 0; l < cfg.NumLayers; l++ {
 		if m.Layers[l].Spec.GatedQ {
-			hasGatedQ = true
+			pipe.HasGatedQ = true
 			break
 		}
 	}
-	if hasGatedQ {
-		rs.AllocGatedQScratch(qDim)
-		pipe.HasGatedQ = true
-	}
 
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
+		ssmLayerCount := 0
+		for l := 0; l < cfg.NumLayers; l++ {
+			if m.Layers[l].Spec.Core == llm.CoreSSM && l < numGPULayers {
+				ssmLayerCount++
+			}
+		}
+		pipe.HasSSM = true
 		numHeads := cfg.SSMTimeStepRank
 		numKVGroups := cfg.SSMGroupCount
 		if numKVGroups <= 0 {
@@ -778,24 +864,6 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 		headVDim := cfg.SSMInnerSize / numHeads
 		headKDim := cfg.SSMStateSize
-		valueDim := numHeads * headVDim
-		keyDim := numKVGroups * headKDim
-		qkvDim := keyDim*2 + valueDim
-		convK := cfg.SSMConvKernel
-
-		rs.AllocSSMScratch(qkvDim, valueDim, numHeads)
-
-		ssmLayerCount := 0
-		for l := 0; l < cfg.NumLayers; l++ {
-			if m.Layers[l].Spec.Core == llm.CoreSSM && l < numGPULayers {
-				gl := &gm.Layers[l]
-				gl.SSMState = Alloc(uint64(numHeads * headKDim * headVDim * 4))
-				gl.SSMConvBuf = Alloc(uint64(convK * qkvDim * 4))
-				ssmLayerCount++
-			}
-		}
-
-		pipe.HasSSM = true
 		fmt.Printf("[dlgo/gpu] SSM state on GPU (%d SSM layers, %d heads, %d KV groups, state=%dx%d)\n",
 			ssmLayerCount, numHeads, numKVGroups, headKDim, headVDim)
 	}

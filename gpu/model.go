@@ -145,6 +145,7 @@ type GpuModel struct {
 	Output       *GpuTensor
 	OutputBias   Buf
 	Layers       []GpuLayer
+	NumGPULayers int // actual number of layers uploaded to GPU (may be < requested)
 }
 
 // GpuRunState holds GPU buffers for intermediate activations during inference.
