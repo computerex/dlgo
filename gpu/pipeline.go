@@ -52,6 +52,29 @@ type GpuPipeline struct {
 	AllCPUAttn bool // true if ALL GPU layers use CPU attention fallback
 }
 
+// MaxVRAMBytes caps the VRAM the GPU pipeline may use. 0 = no cap (use all free).
+// Set via DLGO_MAX_VRAM_MB environment variable.
+var MaxVRAMBytes int64
+
+func init() {
+	if s := os.Getenv("DLGO_MAX_VRAM_MB"); s != "" {
+		var mb int
+		if _, err := fmt.Sscanf(s, "%d", &mb); err == nil && mb > 0 {
+			MaxVRAMBytes = int64(mb) * 1024 * 1024
+			fmt.Printf("[dlgo/gpu] VRAM cap set to %d MB via DLGO_MAX_VRAM_MB\n", mb)
+		}
+	}
+}
+
+// effectiveFreeVRAM returns the free VRAM, capped by MaxVRAMBytes if set.
+func effectiveFreeVRAM() int64 {
+	free := int64(VRAMFreeBytes())
+	if MaxVRAMBytes > 0 && free > MaxVRAMBytes {
+		free = MaxVRAMBytes
+	}
+	return free
+}
+
 // estimateFixedVRAM estimates GPU memory for non-per-layer allocations
 // (run state, batch state, SSM scratch, RoPE tables, q8_1 scratch).
 // Does NOT include KV cache or per-layer weights — those are computed
@@ -111,12 +134,13 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	q8_1Blocks := (maxDim + 31) / 32
 	total += q8_1Blocks * 36
 
-	// Safety margin to account for IQ tables, Vulkan driver overhead,
-	// descriptor sets, command buffers, and runtime fragmentation.
-	// Use max(256 MB, 3% of total VRAM) to prevent near-OOM corruption.
+	// Safety margin: reserve VRAM for Windows display compositor, video decode,
+	// browser GPU acceleration, etc. Running near VRAM limits causes system-wide
+	// freezes because the GPU driver can't service display requests.
+	// Use max(1.5 GB, 10% of total VRAM) as minimum reserve.
 	vram := int64(VRAMBytes())
-	margin := int64(256 * 1024 * 1024)
-	if pct := vram * 3 / 100; pct > margin {
+	margin := int64(1536 * 1024 * 1024) // 1.5 GB minimum
+	if pct := vram * 10 / 100; pct > margin {
 		margin = pct
 	}
 	total += margin
@@ -165,7 +189,7 @@ func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 // computeGPULayerBudget determines how many layers fit in available VRAM,
 // accounting for both weight data AND per-layer KV cache VRAM.
 func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
-	freeVRAM := int64(VRAMFreeBytes())
+	freeVRAM := effectiveFreeVRAM()
 	if freeVRAM <= 0 {
 		return 0
 	}
@@ -484,8 +508,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	cfg := m.Config
 
 	totalVRAM := float64(VRAMBytes()) / (1024 * 1024)
-	freeVRAM := float64(VRAMFreeBytes()) / (1024 * 1024)
-	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB total, %.0f MB free)...\n",
+	freeVRAM := float64(effectiveFreeVRAM()) / (1024 * 1024)
+	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB total, %.0f MB usable)...\n",
 		DeviceName(), totalVRAM, freeVRAM)
 
 	// GPU-aware context capping: if the native context is too large to fit

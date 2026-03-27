@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,12 +30,17 @@ func main() {
 	modelID := flag.String("id", "", "model ID (default: filename without .gguf)")
 	useGPU := flag.Bool("gpu", false, "use GPU (Vulkan) for inference")
 	ctx := flag.Int("ctx", 0, "max context length (0 = native model context, auto-reduced by memory budget)")
+	maxVRAM := flag.Int("max-vram", 0, "max VRAM to use in MB (0 = auto, reserves 1.5 GB for system)")
 	frontendDir := flag.String("frontend", "", "path to frontend dist/ directory to serve")
 
 	var modelsDirs stringSlice
 	flag.Var(&modelsDirs, "models-dir", "directory to scan for .gguf models (can be specified multiple times)")
 
 	flag.Parse()
+
+	if *maxVRAM > 0 {
+		os.Setenv("DLGO_MAX_VRAM_MB", fmt.Sprintf("%d", *maxVRAM))
+	}
 
 	manager := server.NewModelManager()
 	chatManager := server.NewChatManager()
