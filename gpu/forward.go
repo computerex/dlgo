@@ -913,6 +913,12 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
 			}
+			if gl.Bo != 0 {
+				Barrier()
+				if err := addBuf(rs.AttnProj, gl.Bo, dim); err != nil {
+					return fmt.Errorf("layer %d bo: %w", l, err)
+				}
+			}
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnProj", rs.AttnProj, dim)
 			}
@@ -1024,6 +1030,12 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			Barrier()
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
+			}
+			if gl.Bo != 0 {
+				Barrier()
+				if err := addBuf(rs.AttnProj, gl.Bo, dim); err != nil {
+					return fmt.Errorf("layer %d bo: %w", l, err)
+				}
 			}
 
 			if diagL {
