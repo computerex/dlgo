@@ -135,6 +135,7 @@ void gpu_shutdown(void);
 const char* gpu_device_name(void);
 uint64_t gpu_vram_bytes(void);
 uint64_t gpu_vram_free_bytes(void);
+uint64_t gpu_allocated_bytes(void);
 int gpu_is_initialized(void);
 int gpu_has_dp4a(void);
 

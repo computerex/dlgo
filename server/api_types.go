@@ -5,8 +5,9 @@ import "time"
 // OpenAI-compatible API types for /v1/chat/completions and /v1/models.
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type ChatCompletionRequest struct {

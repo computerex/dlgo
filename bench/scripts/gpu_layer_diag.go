@@ -49,8 +49,8 @@ func main() {
 
 	gpuModel, _ := gpu.UploadModel(pipe.Model)
 	qDim := cfg.NumHeads * cfg.HeadDim
-	gpuRS := gpu.NewGpuRunState(dim, qDim, kvDim, cfg.FFNDim, vocabSize)
-	gpuKV := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
+	gpuRS, _ := gpu.NewGpuRunState(dim, qDim, kvDim, cfg.FFNDim, vocabSize)
+	gpuKV, _ := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 
 	token := int32(2) // BOS or some token
 	pos := 0

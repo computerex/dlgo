@@ -3,10 +3,8 @@ package server
 import (
 	"fmt"
 	"log"
-	"os"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -117,42 +115,6 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 	}
 
 	log.Printf("Loading model %q from %s (gpu=%v, ctx=%d)", id, path, useGPU, contextLen)
-
-	// Pre-load VRAM check: reject models whose weight file is too large for
-	// available GPU memory BEFORE mmap reads the entire file. Reading a large
-	// model via mmap pulls gigabytes into the page cache, causing Windows
-	// memory pressure that can crash the GPU driver and freeze the system.
-	//
-	// This check uses DLGO_MAX_VRAM_MB (or a conservative default) directly
-	// rather than querying the GPU driver, because the GPU may not be
-	// initialized yet at this point.
-	if useGPU {
-		if fi, err := os.Stat(path); err == nil {
-			fileSizeMB := float64(fi.Size()) / (1024 * 1024)
-			// Get the VRAM budget from env var (same as --max-vram flag).
-			// Default to 10000 MB if not set — conservative for 16 GB cards.
-			vramBudgetMB := 10000.0
-			if s := os.Getenv("DLGO_MAX_VRAM_MB"); s != "" {
-				if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
-					vramBudgetMB = v
-				}
-			}
-			// Model weights go to VRAM, plus ~50% overhead for KV cache,
-			// run state, batch state, and Vulkan internals. Also keep 4 GB free
-			// for the Windows display compositor and other GPU users.
-			const vramFloorMB = 4096  // 4 GB
-			const overheadMult = 1.5  // 50% overhead for runtime state
-			requiredMB := fileSizeMB*overheadMult + vramFloorMB
-			if requiredMB > vramBudgetMB {
-				log.Printf("VRAM pre-check REJECTED: weights %.0f MB, need %.0f MB, budget %.0f MB",
-					fileSizeMB, requiredMB, vramBudgetMB)
-				return fmt.Errorf("model too large for GPU: weights %.0f MB + overhead need %.0f MB, but VRAM budget is %.0f MB (%.0f MB floor reserved). Use a smaller quantization or load on CPU",
-					fileSizeMB, requiredMB, vramBudgetMB, float64(vramFloorMB))
-			}
-			log.Printf("VRAM pre-check OK: weights %.0f MB, need %.0f MB, budget %.0f MB",
-				fileSizeMB, requiredMB, vramBudgetMB)
-		}
-	}
 
 	pipe, err := llm.NewPipeline(path, contextLen)
 	if err != nil {

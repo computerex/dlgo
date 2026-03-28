@@ -31,7 +31,7 @@ func main() {
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 
 	gpuModel, _ := gpu.UploadModel(pipe.Model)
-	gpuRS := gpu.NewGpuRunState(dim, qDim, kvDim, cfg.FFNDim, cfg.VocabSize)
+	gpuRS, _ := gpu.NewGpuRunState(dim, qDim, kvDim, cfg.FFNDim, cfg.VocabSize)
 	gl := &gpuModel.Layers[0]
 
 	N := 200

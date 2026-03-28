@@ -17,7 +17,7 @@ type PagedKVPool struct {
 }
 
 // NewPagedKVPool allocates per-layer block pool buffers on GPU.
-func NewPagedKVPool(nLayers, kvDim, blockSize, totalBlocks int) *PagedKVPool {
+func NewPagedKVPool(nLayers, kvDim, blockSize, totalBlocks int) (*PagedKVPool, error) {
 	pool := &PagedKVPool{
 		KeyPools:    make([]Buf, nLayers),
 		ValPools:    make([]Buf, nLayers),
@@ -27,11 +27,16 @@ func NewPagedKVPool(nLayers, kvDim, blockSize, totalBlocks int) *PagedKVPool {
 		TotalBlocks: totalBlocks,
 	}
 	bufSize := uint64(totalBlocks) * uint64(blockSize) * uint64(kvDim) * 4
+	a := allocChecker{}
 	for l := 0; l < nLayers; l++ {
-		pool.KeyPools[l] = Alloc(bufSize)
-		pool.ValPools[l] = Alloc(bufSize)
+		pool.KeyPools[l] = a.alloc(bufSize)
+		pool.ValPools[l] = a.alloc(bufSize)
+		if a.err != nil {
+			pool.FreeAll()
+			return nil, fmt.Errorf("gpu: NewPagedKVPool(layer %d/%d): %w", l, nLayers, a.err)
+		}
 	}
-	return pool
+	return pool, nil
 }
 
 // FreeAll releases all GPU block pool buffers.

@@ -24,11 +24,12 @@ const (
 
 // StreamEvent is a single event sent from the scheduler to the HTTP handler.
 type StreamEvent struct {
-	Type         EventType
-	Token        string
-	FinishReason string
-	PromptTokens int
-	Error        string
+	Type             EventType
+	Token            string
+	ReasoningContent string // thinking block content (set on EventDone)
+	FinishReason     string
+	PromptTokens     int
+	Error            string
 }
 
 // RequestStatus tracks where a request is in the pipeline.
@@ -182,6 +183,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 	// When thinking is active, suppress all output until </think> is found.
 	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
+	var thinkingContent string // captured reasoning text (between <think> and </think>)
 
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
@@ -200,6 +202,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	if inThinkBlock {
 		if idx := strings.Index(genText.String(), "</think>"); idx >= 0 {
 			inThinkBlock = false
+			thinkingContent = strings.TrimSpace(genText.String()[:idx])
 			after := genText.String()[idx+len("</think>"):]
 			after = strings.TrimLeft(after, "\n")
 			if after != "" {
@@ -249,6 +252,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		if inThinkBlock {
 			if idx := strings.Index(genText.String(), "</think>"); idx >= 0 {
 				inThinkBlock = false
+				thinkingContent = strings.TrimSpace(genText.String()[:idx])
 				after := genText.String()[idx+len("</think>"):]
 				after = strings.TrimLeft(after, "\n")
 				if after != "" {
@@ -260,7 +264,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		}
 	}
 
-	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
+	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent}
 }
 
 func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
@@ -280,6 +284,7 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	// When thinking is active, suppress all output until </think> is found.
 	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
 	var thinkBuf strings.Builder
+	var thinkingContent string
 
 	cfg := req.Config
 	cfg.Stream = func(token string) {
@@ -298,6 +303,7 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 			thinkBuf.WriteString(token)
 			if idx := strings.Index(thinkBuf.String(), "</think>"); idx >= 0 {
 				inThinkBlock = false
+				thinkingContent = strings.TrimSpace(thinkBuf.String()[:idx])
 				after := thinkBuf.String()[idx+len("</think>"):]
 				after = strings.TrimLeft(after, "\n")
 				if after != "" {
@@ -320,9 +326,10 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		finishReason = "length"
 	}
 	req.Output <- StreamEvent{
-		Type:         EventDone,
-		FinishReason: finishReason,
-		PromptTokens: result.PromptTokens,
+		Type:             EventDone,
+		FinishReason:     finishReason,
+		PromptTokens:     result.PromptTokens,
+		ReasoningContent: thinkingContent,
 	}
 }
 

@@ -151,7 +151,14 @@ static struct {
 
     // VK_EXT_memory_budget support for querying free VRAM
     int has_memory_budget;
+
+    // Cumulative VRAM allocation tracking (our own counter)
+    uint64_t allocated_bytes;
 } g = {0};
+
+// Safety floor: refuse allocations that would leave less than this free.
+// 512MB is enough for DWM compositor + other GPU-using processes on Windows.
+#define VRAM_SAFETY_FLOOR_BYTES (512ULL * 1024 * 1024)
 
 // ---------------------------------------------------------------------------
 // Dynamic Vulkan loading
@@ -307,6 +314,33 @@ static int create_buffer(VkBuffer* buf, VkDeviceMemory* mem, uint64_t size, VkBu
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
+
+    // --- WDDM overcommit protection ---
+    // On Windows, vkAllocateMemory almost never fails; WDDM evicts DWM pages
+    // to satisfy the allocation, causing system freeze. We must pre-check the
+    // memory budget BEFORE calling vkAllocateMemory.
+    if (g.has_memory_budget && vkGetPhysicalDeviceMemoryProperties2_ &&
+        (mem_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT
+        };
+        VkPhysicalDeviceMemoryProperties2 mp2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+            .pNext = &bp
+        };
+        vkGetPhysicalDeviceMemoryProperties2_(g.physical_device, &mp2);
+
+        // Find which heap this memory type belongs to
+        uint32_t heap_idx = g.mem_props.memoryTypes[mt].heapIndex;
+        uint64_t budget = bp.heapBudget[heap_idx];
+        uint64_t usage  = bp.heapUsage[heap_idx];
+        uint64_t avail  = (budget > usage) ? (budget - usage) : 0;
+
+        if (avail < req.size + VRAM_SAFETY_FLOOR_BYTES) {
+            vkDestroyBuffer_(g.device, *buf, NULL);
+            return GPU_ERR_OOM;
+        }
+    }
 
     if (vkAllocateMemory_(g.device, &ai, NULL, mem) != VK_SUCCESS) {
         vkDestroyBuffer_(g.device, *buf, NULL);
@@ -668,6 +702,7 @@ uint64_t gpu_vram_free_bytes(void) {
 
 int gpu_is_initialized(void) { return g.initialized; }
 int gpu_has_dp4a(void) { return g.has_dp4a; }
+uint64_t gpu_allocated_bytes(void) { return g.allocated_bytes; }
 
 // ---------------------------------------------------------------------------
 // Buffer management
@@ -684,12 +719,15 @@ GpuBuf gpu_alloc(uint64_t size_bytes, int usage) {
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (rc != GPU_OK) return 0;
 
+    g.allocated_bytes += size_bytes;
     return register_buffer(buf, mem, size_bytes, 0);
 }
 
 void gpu_free(GpuBuf id) {
     BufferAlloc* ba = get_buf(id);
     if (!ba) return;
+    if (ba->size <= g.allocated_bytes)
+        g.allocated_bytes -= ba->size;
     if (ba->buffer) vkDestroyBuffer_(g.device, ba->buffer, NULL);
     if (ba->memory) vkFreeMemory_(g.device, ba->memory, NULL);
     ba->buffer = VK_NULL_HANDLE;

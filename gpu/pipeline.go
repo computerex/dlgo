@@ -122,9 +122,32 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 		total += (int64(cfg.ExpertCount) + 3*expDim + 2*dim + 3*shDim) * 4
 	}
 
-	// Batch state (estimate for 128 tokens)
-	batchTokens := int64(128)
+	// Batch state: estimate for prefillChunkSize tokens (512) to match
+	// actual runtime allocation in PrefillAndDecode. Using 128 was a
+	// severe underestimate that caused the budget solver to accept
+	// contexts that didn't actually fit.
+	batchTokens := int64(512)
 	total += batchTokens * (dim + dim + qDim + kvDim + kvDim + qDim + dim + dim + dim + ffnDim + ffnDim + ffnDim + dim) * 4
+
+	// GatedQ batch buffers (allocated at runtime in AllocGatedQBatch)
+	if cfg.FullAttentionInterval > 0 {
+		total += batchTokens * (2*qDim + qDim) * 4
+	}
+
+	// SSM batch buffers (allocated at runtime in AllocSSMBatch)
+	if cfg.SSMInnerSize > 0 {
+		numHeads := int64(cfg.SSMTimeStepRank)
+		headVDim := int64(cfg.SSMInnerSize) / numHeads
+		numKVGroups := int64(cfg.SSMGroupCount)
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		headKDim := int64(cfg.SSMStateSize)
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		valueDim := numHeads * headVDim
+		total += batchTokens * (qkvDim + valueDim + numHeads + numHeads + valueDim) * 4
+	}
 
 	// RoPE cos/sin tables: 2 * maxSeqLen * (ropeDim/2) * 4 bytes each
 	ropeDim := int64(cfg.RopeDim)
@@ -142,14 +165,13 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	total += q8_1Blocks * 36
 
 	// Safety margin: reserve VRAM for Windows display compositor, video decode,
-	// browser GPU acceleration, Vulkan driver internals (pipeline objects,
-	// descriptor pools, command buffers, staging buffers), etc. Running near
-	// VRAM limits causes system-wide freezes because the GPU driver can't
-	// service display requests.
-	// Use max(3 GB, 15% of total VRAM) as minimum reserve.
+	// browser GPU acceleration, and Vulkan driver internals. The C-level budget
+	// check in create_buffer() enforces a hard 512 MB floor before each
+	// vkAllocateMemory call, so the Go-level margin is a softer estimate.
+	// Use max(1 GB, 6% of total VRAM) as the budget-solver reserve.
 	vram := int64(VRAMBytes())
-	margin := int64(3072) * 1024 * 1024 // 3 GB minimum
-	if pct := vram * 15 / 100; pct > margin {
+	margin := int64(1024) * 1024 * 1024 // 1 GB minimum
+	if pct := vram * 6 / 100; pct > margin {
 		margin = pct
 	}
 	total += margin
@@ -235,12 +257,10 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 	nonLayerBytes += int64(m.Config.EmbeddingDim * 4) // output norm
 
-	// Apply 50% safety multiplier to all overhead estimates. This accounts for
-	// Vulkan allocation alignment, descriptor sets, staging buffer, compute
-	// pipeline objects, batch state LayerConfs, and other untracked allocations.
-	// Empirically measured overhead ranges from 30-40% on NVIDIA drivers.
-	fixedOverhead = fixedOverhead * 150 / 100
-	nonLayerBytes = nonLayerBytes * 150 / 100
+	// Apply 15% safety multiplier for Vulkan allocation alignment overhead,
+	// descriptor sets, and other untracked small allocations.
+	fixedOverhead = fixedOverhead * 115 / 100
+	nonLayerBytes = nonLayerBytes * 115 / 100
 
 	available := freeVRAM - fixedOverhead - nonLayerBytes
 	if available <= 0 {
@@ -268,7 +288,10 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	}
 
 	// Greedily add layers: each layer costs weights + KV cache + optional SSM.
-	// Apply same 50% safety multiplier to per-layer costs.
+	// 25% per-layer multiplier accounts for Vulkan buffer alignment, descriptor
+	// overhead, and staging buffers. This is higher than fixed overhead (15%)
+	// because per-layer costs include KV cache which dominates at large contexts
+	// and whose actual VRAM exceeds the formula due to alignment.
 	numLayers := 0
 	for l := 0; l < len(m.Layers); l++ {
 		layerCost := llm.EstimateLayerBytes(&m.Layers[l])
@@ -278,7 +301,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 		if m.Layers[l].Spec.Core == llm.CoreSSM {
 			layerCost += ssmPerLayer
 		}
-		layerCost = layerCost * 150 / 100 // 50% safety margin
+		layerCost = layerCost * 125 / 100 // 25% safety margin
 		if layerCost > available {
 			break
 		}
@@ -645,12 +668,18 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				isPartial = numGPULayers < cfg.NumLayers
 			}
 
-			rs = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
+			rs, err = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
+			if err != nil {
+				return err
+			}
 			needsKV := make([]bool, cfg.NumLayers)
 			for l := 0; l < cfg.NumLayers; l++ {
 				needsKV[l] = layerNeedsKV(&m.Layers[l])
 			}
-			kv = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
+			kv, err = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
+			if err != nil {
+				return err
+			}
 
 			// Upload RoPE tables. Prefer pre-computed tables from CPU RunState
 			// (if available), otherwise compute from config. RunState may be nil
@@ -714,21 +743,29 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				sQkvDim := sKeyDim*2 + sValueDim
 				ssConvK := cfg.SSMConvKernel
 
-				rs.AllocSSMScratch(sQkvDim, sValueDim, numSSMHeads)
+				if err := rs.AllocSSMScratch(sQkvDim, sValueDim, numSSMHeads); err != nil {
+					return err
+				}
 
+				ssmAlloc := allocChecker{}
 				for sl := 0; sl < cfg.NumLayers; sl++ {
 					if m.Layers[sl].Spec.Core == llm.CoreSSM && sl < numGPULayers {
 						gl := &gm.Layers[sl]
-						gl.SSMState = Alloc(uint64(numSSMHeads * ssHeadKDim * ssHeadVDim * 4))
-						gl.SSMConvBuf = Alloc(uint64(ssConvK * sQkvDim * 4))
+						gl.SSMState = ssmAlloc.alloc(uint64(numSSMHeads * ssHeadKDim * ssHeadVDim * 4))
+						gl.SSMConvBuf = ssmAlloc.alloc(uint64(ssConvK * sQkvDim * 4))
 					}
+				}
+				if ssmAlloc.err != nil {
+					return fmt.Errorf("gpu: SSM state alloc: %w", ssmAlloc.err)
 				}
 			}
 
 			// Allocate GatedQ scratch (inside retry loop so floor check covers it).
 			for gl := 0; gl < cfg.NumLayers; gl++ {
 				if m.Layers[gl].Spec.GatedQ {
-					rs.AllocGatedQScratch(qDim)
+					if err := rs.AllocGatedQScratch(qDim); err != nil {
+						return err
+					}
 					break
 				}
 			}
@@ -741,7 +778,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			// causing a full system freeze.
 			Sync() // flush so the driver sees all allocations
 			postFree := int64(VRAMFreeBytes())
-			const vramFloor = 4 * 1024 * 1024 * 1024 // 4 GB
+			// Soft floor: the C-level create_buffer() enforces a hard 512 MB
+			// floor before each vkAllocateMemory, so this Go check is a
+			// secondary guard with a 1 GB threshold.
+			const vramFloor = 1024 * 1024 * 1024 // 1 GB
 			if postFree < vramFloor {
 				return fmt.Errorf("VRAM floor violated: only %.0f MB free (need %.0f MB)",
 					float64(postFree)/(1024*1024), float64(vramFloor)/(1024*1024))
@@ -783,8 +823,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		// This converges faster and avoids VRAM fragmentation from many small retries.
 		prev := numGPULayers
 		numGPULayers = numGPULayers / 2
-		fmt.Printf("[dlgo/gpu] VRAM alloc failed with %d layers (%v), retrying with %d...\n",
-			prev, allocErr, numGPULayers)
+		fmt.Printf("[dlgo/gpu] VRAM alloc failed with %d layers (%v), retrying with %d... (allocated %.0f MB, driver free %.0f MB)\n",
+			prev, allocErr, numGPULayers, float64(AllocatedBytes())/(1024*1024), float64(VRAMFreeBytes())/(1024*1024))
 	}
 
 	// Release mmap pages from physical RAM. GPU upload reads the entire model
@@ -1135,7 +1175,10 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	npos := len(tokens)
 
 	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
-	const prefillChunkSize = 4096
+	// Keep prefill chunks small to avoid large VRAM spikes from BatchState
+	// allocation during inference. With a 9B model, 4096 tokens × ffnDim
+	// can allocate 1+ GB of transient VRAM for batch buffers.
+	const prefillChunkSize = 512
 	batchSize := npos
 	if batchSize > prefillChunkSize {
 		batchSize = prefillChunkSize
@@ -1149,10 +1192,16 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		qDim := mcfg.NumHeads * mcfg.HeadDim
 		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
 		ffnDim := mcfg.FFNDim
-		p.BatchState = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
+		var bsErr error
+		p.BatchState, bsErr = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
+		if bsErr != nil {
+			return nil, fmt.Errorf("gpu: prefill batch alloc: %w", bsErr)
+		}
 		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p, p.BatchState, p.KVCache)
 		if p.HasGatedQ {
-			p.BatchState.AllocGatedQBatch(batchSize, qDim)
+			if err := p.BatchState.AllocGatedQBatch(batchSize, qDim); err != nil {
+				return nil, fmt.Errorf("gpu: prefill GatedQ batch alloc: %w", err)
+			}
 		}
 		if p.HasSSM {
 			numHeads := mcfg.SSMTimeStepRank
@@ -1165,7 +1214,9 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 			keyDim := numKVGroups * headKDim
 			qkvDim := keyDim*2 + numHeads*headVDim
 			valueDim := numHeads * headVDim
-			p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads)
+			if err := p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads); err != nil {
+				return nil, fmt.Errorf("gpu: prefill SSM batch alloc: %w", err)
+			}
 		}
 	}
 

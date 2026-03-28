@@ -160,6 +160,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 
 func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *InferenceRequest, modelID string) {
 	var fullText string
+	var reasoningContent string
 	var promptTokens, completionTokens int
 	finishReason := "stop"
 
@@ -170,6 +171,7 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 			completionTokens++
 		case EventDone:
 			promptTokens = ev.PromptTokens
+			reasoningContent = ev.ReasoningContent
 			if ev.FinishReason != "" {
 				finishReason = ev.FinishReason
 			}
@@ -188,7 +190,7 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		Model:   modelID,
 		Choices: []ChatCompletionChoice{{
 			Index:        0,
-			Message:      &Message{Role: "assistant", Content: fullText},
+			Message:      &Message{Role: "assistant", Content: fullText, ReasoningContent: reasoningContent},
 			FinishReason: &finishReason,
 		}},
 		Usage: &UsageInfo{

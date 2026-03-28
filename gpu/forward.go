@@ -1331,44 +1331,48 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 
 	// Allocate MoE scratch buffers on first use (per-expert for batched dispatch)
 	if rs.MoELogits == 0 {
-		rs.MoELogits = Alloc(uint64(cfg.ExpertCount * 4))
-		rs.MoETopKIdx = Alloc(uint64(nUsed * 4))
-		rs.MoETopKW = Alloc(uint64(nUsed * 4))
+		a := allocChecker{}
+		rs.MoELogits = a.alloc(uint64(cfg.ExpertCount * 4))
+		rs.MoETopKIdx = a.alloc(uint64(nUsed * 4))
+		rs.MoETopKW = a.alloc(uint64(nUsed * 4))
 		rs.MoEGates = make([]Buf, nUsed)
 		rs.MoEUps = make([]Buf, nUsed)
 		rs.MoEHiddens = make([]Buf, nUsed)
 		rs.MoEOuts = make([]Buf, nUsed)
 		for e := 0; e < nUsed; e++ {
-			rs.MoEGates[e] = Alloc(uint64(expDim * 4))
-			rs.MoEUps[e] = Alloc(uint64(expDim * 4))
-			rs.MoEHiddens[e] = Alloc(uint64(expDim * 4))
-			rs.MoEOuts[e] = Alloc(uint64(dim * 4))
+			rs.MoEGates[e] = a.alloc(uint64(expDim * 4))
+			rs.MoEUps[e] = a.alloc(uint64(expDim * 4))
+			rs.MoEHiddens[e] = a.alloc(uint64(expDim * 4))
+			rs.MoEOuts[e] = a.alloc(uint64(dim * 4))
 		}
 		shDim := cfg.SharedExpertFFNDim
 		if shDim == 0 {
 			shDim = expDim
 		}
-		rs.MoEShGate = Alloc(uint64(shDim * 4))
-		rs.MoEShUp = Alloc(uint64(shDim * 4))
-		rs.MoEShHidden = Alloc(uint64(shDim * 4))
-		rs.MoEShOut = Alloc(uint64(dim * 4))
+		rs.MoEShGate = a.alloc(uint64(shDim * 4))
+		rs.MoEShUp = a.alloc(uint64(shDim * 4))
+		rs.MoEShHidden = a.alloc(uint64(shDim * 4))
+		rs.MoEShOut = a.alloc(uint64(dim * 4))
 
 		if rs.MoEUseDp4a {
 			q8BlocksDim := (dim + 31) / 32
-			rs.MoEQ8_1Scratch = Alloc(uint64(q8BlocksDim) * 36)
+			rs.MoEQ8_1Scratch = a.alloc(uint64(q8BlocksDim) * 36)
 
 			q8BlocksExp := (expDim + 31) / 32
-			rs.MoEQ8_1DownPacked = Alloc(uint64(nUsed) * uint64(q8BlocksExp) * 36)
+			rs.MoEQ8_1DownPacked = a.alloc(uint64(nUsed) * uint64(q8BlocksExp) * 36)
 			rs.MoEQ8_1DownBufs = make([]Buf, nUsed)
 			for e := 0; e < nUsed; e++ {
-				rs.MoEQ8_1DownBufs[e] = Alloc(uint64(q8BlocksExp) * 36)
+				rs.MoEQ8_1DownBufs[e] = a.alloc(uint64(q8BlocksExp) * 36)
 			}
 
-			rs.MoEGateScratch = Alloc(uint64(nUsed * expDim * 4))
-			rs.MoEUpScratch = Alloc(uint64(nUsed * expDim * 4))
-			rs.MoEHiddenScratch = Alloc(uint64(nUsed * expDim * 4))
-			rs.MoEOutScratch = Alloc(uint64(nUsed * dim * 4))
-			rs.MoEWeightsBuf = Alloc(uint64(nUsed * 4))
+			rs.MoEGateScratch = a.alloc(uint64(nUsed * expDim * 4))
+			rs.MoEUpScratch = a.alloc(uint64(nUsed * expDim * 4))
+			rs.MoEHiddenScratch = a.alloc(uint64(nUsed * expDim * 4))
+			rs.MoEOutScratch = a.alloc(uint64(nUsed * dim * 4))
+			rs.MoEWeightsBuf = a.alloc(uint64(nUsed * 4))
+		}
+		if a.err != nil {
+			return fmt.Errorf("gpu: MoE scratch alloc: %w", a.err)
 		}
 	}
 

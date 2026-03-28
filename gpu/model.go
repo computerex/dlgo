@@ -212,39 +212,54 @@ type GpuRunState struct {
 }
 
 // NewGpuRunState allocates all GPU activation buffers.
-func NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize int) *GpuRunState {
-	return &GpuRunState{
-		X:        Alloc(uint64(dim * 4)),
-		XNorm:    Alloc(uint64(dim * 4)),
-		Q:        Alloc(uint64(qDim * 4)),
-		K:        Alloc(uint64(kvDim * 4)),
-		V:        Alloc(uint64(kvDim * 4)),
-		AttnOut:  Alloc(uint64(qDim * 4)),
-		AttnProj: Alloc(uint64(dim * 4)),
-		FFNIn:    Alloc(uint64(dim * 4)),
-		FFNNorm:  Alloc(uint64(dim * 4)),
-		Gate:     Alloc(uint64(ffnDim * 4)),
-		Up:       Alloc(uint64(ffnDim * 4)),
-		Hidden:   Alloc(uint64(ffnDim * 4)),
-		FFNOut:   Alloc(uint64(dim * 4)),
-		Logits:   Alloc(uint64(vocabSize * 4)),
-		Pool:     blas.DefaultPool(),
+// Returns an error if any VRAM allocation fails (OOM).
+func NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize int) (*GpuRunState, error) {
+	rs := &GpuRunState{Pool: blas.DefaultPool()}
+	a := allocChecker{}
+	rs.X = a.alloc(uint64(dim * 4))
+	rs.XNorm = a.alloc(uint64(dim * 4))
+	rs.Q = a.alloc(uint64(qDim * 4))
+	rs.K = a.alloc(uint64(kvDim * 4))
+	rs.V = a.alloc(uint64(kvDim * 4))
+	rs.AttnOut = a.alloc(uint64(qDim * 4))
+	rs.AttnProj = a.alloc(uint64(dim * 4))
+	rs.FFNIn = a.alloc(uint64(dim * 4))
+	rs.FFNNorm = a.alloc(uint64(dim * 4))
+	rs.Gate = a.alloc(uint64(ffnDim * 4))
+	rs.Up = a.alloc(uint64(ffnDim * 4))
+	rs.Hidden = a.alloc(uint64(ffnDim * 4))
+	rs.FFNOut = a.alloc(uint64(dim * 4))
+	rs.Logits = a.alloc(uint64(vocabSize * 4))
+	if a.err != nil {
+		rs.FreeAll()
+		return nil, fmt.Errorf("gpu: NewGpuRunState: %w", a.err)
 	}
+	return rs, nil
 }
 
 // AllocSSMScratch allocates GPU scratch buffers for SSM layers.
-func (rs *GpuRunState) AllocSSMScratch(qkvDim, valueDim, numHeads int) {
-	rs.SSMQKV = Alloc(uint64(qkvDim * 4))
-	rs.SSMZ = Alloc(uint64(valueDim * 4))
-	rs.SSMAlpha = Alloc(uint64(numHeads * 4))
-	rs.SSMBeta = Alloc(uint64(numHeads * 4))
-	rs.SSMY = Alloc(uint64(valueDim * 4))
+func (rs *GpuRunState) AllocSSMScratch(qkvDim, valueDim, numHeads int) error {
+	a := allocChecker{}
+	rs.SSMQKV = a.alloc(uint64(qkvDim * 4))
+	rs.SSMZ = a.alloc(uint64(valueDim * 4))
+	rs.SSMAlpha = a.alloc(uint64(numHeads * 4))
+	rs.SSMBeta = a.alloc(uint64(numHeads * 4))
+	rs.SSMY = a.alloc(uint64(valueDim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocSSMScratch: %w", a.err)
+	}
+	return nil
 }
 
 // AllocGatedQScratch allocates GPU scratch buffers for GatedQ attention.
-func (rs *GpuRunState) AllocGatedQScratch(qDim int) {
-	rs.QFull = Alloc(uint64(2 * qDim * 4))
-	rs.QGate = Alloc(uint64(qDim * 4))
+func (rs *GpuRunState) AllocGatedQScratch(qDim int) error {
+	a := allocChecker{}
+	rs.QFull = a.alloc(uint64(2 * qDim * 4))
+	rs.QGate = a.alloc(uint64(qDim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocGatedQScratch: %w", a.err)
+	}
+	return nil
 }
 
 // GpuBatchState holds batch-sized GPU buffers for prefill.
@@ -277,38 +292,52 @@ type GpuBatchState struct {
 }
 
 // NewGpuBatchState allocates batch-sized GPU activation buffers.
-func NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim int) *GpuBatchState {
-	return &GpuBatchState{
-		X:        Alloc(uint64(npos * dim * 4)),
-		XNorm:    Alloc(uint64(npos * dim * 4)),
-		Q:        Alloc(uint64(npos * qDim * 4)),
-		K:        Alloc(uint64(npos * kvDim * 4)),
-		V:        Alloc(uint64(npos * kvDim * 4)),
-		AttnOut:  Alloc(uint64(npos * qDim * 4)),
-		AttnProj: Alloc(uint64(npos * dim * 4)),
-		FFNIn:    Alloc(uint64(npos * dim * 4)),
-		FFNNorm:  Alloc(uint64(npos * dim * 4)),
-		Gate:     Alloc(uint64(npos * ffnDim * 4)),
-		Up:       Alloc(uint64(npos * ffnDim * 4)),
-		Hidden:   Alloc(uint64(npos * ffnDim * 4)),
-		FFNOut:   Alloc(uint64(npos * dim * 4)),
-		Npos:     npos,
+func NewGpuBatchState(npos, dim, qDim, kvDim, ffnDim int) (*GpuBatchState, error) {
+	bs := &GpuBatchState{Npos: npos}
+	a := allocChecker{}
+	bs.X = a.alloc(uint64(npos * dim * 4))
+	bs.XNorm = a.alloc(uint64(npos * dim * 4))
+	bs.Q = a.alloc(uint64(npos * qDim * 4))
+	bs.K = a.alloc(uint64(npos * kvDim * 4))
+	bs.V = a.alloc(uint64(npos * kvDim * 4))
+	bs.AttnOut = a.alloc(uint64(npos * qDim * 4))
+	bs.AttnProj = a.alloc(uint64(npos * dim * 4))
+	bs.FFNIn = a.alloc(uint64(npos * dim * 4))
+	bs.FFNNorm = a.alloc(uint64(npos * dim * 4))
+	bs.Gate = a.alloc(uint64(npos * ffnDim * 4))
+	bs.Up = a.alloc(uint64(npos * ffnDim * 4))
+	bs.Hidden = a.alloc(uint64(npos * ffnDim * 4))
+	bs.FFNOut = a.alloc(uint64(npos * dim * 4))
+	if a.err != nil {
+		bs.Free()
+		return nil, fmt.Errorf("gpu: NewGpuBatchState(npos=%d): %w", npos, a.err)
 	}
+	return bs, nil
 }
 
 // AllocGatedQBatch allocates batch-sized GatedQ scratch buffers.
-func (bs *GpuBatchState) AllocGatedQBatch(npos, qDim int) {
-	bs.QFull = Alloc(uint64(npos * 2 * qDim * 4))
-	bs.QGate = Alloc(uint64(npos * qDim * 4))
+func (bs *GpuBatchState) AllocGatedQBatch(npos, qDim int) error {
+	a := allocChecker{}
+	bs.QFull = a.alloc(uint64(npos * 2 * qDim * 4))
+	bs.QGate = a.alloc(uint64(npos * qDim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocGatedQBatch: %w", a.err)
+	}
+	return nil
 }
 
 // AllocSSMBatch allocates batch-sized SSM scratch buffers.
-func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) {
-	bs.SSMQKV = Alloc(uint64(npos * qkvDim * 4))
-	bs.SSMZ = Alloc(uint64(npos * valueDim * 4))
-	bs.SSMAlpha = Alloc(uint64(npos * numHeads * 4))
-	bs.SSMBeta = Alloc(uint64(npos * numHeads * 4))
-	bs.SSMY = Alloc(uint64(npos * valueDim * 4))
+func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) error {
+	a := allocChecker{}
+	bs.SSMQKV = a.alloc(uint64(npos * qkvDim * 4))
+	bs.SSMZ = a.alloc(uint64(npos * valueDim * 4))
+	bs.SSMAlpha = a.alloc(uint64(npos * numHeads * 4))
+	bs.SSMBeta = a.alloc(uint64(npos * numHeads * 4))
+	bs.SSMY = a.alloc(uint64(npos * valueDim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocSSMBatch: %w", a.err)
+	}
+	return nil
 }
 
 // FreeBatchState releases all batch GPU buffers.
@@ -352,7 +381,7 @@ type GpuKVCache struct {
 // Layers beyond gpuLayers get zero-valued (nil) buffers.
 // needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
 // If needsKV is nil, all layers within gpuLayers get buffers (legacy behavior).
-func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) *GpuKVCache {
+func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) (*GpuKVCache, error) {
 	c := &GpuKVCache{
 		KeyBufs: make([]Buf, totalLayers),
 		ValBufs: make([]Buf, totalLayers),
@@ -361,14 +390,23 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 	}
 	// FP32 KV cache: each element is 4 bytes
 	size := uint64(maxSeqLen * kvDim * 4)
+	a := allocChecker{}
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		if needsKV != nil && !needsKV[l] {
 			continue
 		}
-		c.KeyBufs[l] = Alloc(size)
-		c.ValBufs[l] = Alloc(size)
+		c.KeyBufs[l] = a.alloc(size)
+		c.ValBufs[l] = a.alloc(size)
+		if a.err != nil {
+			// Free everything allocated so far
+			for j := 0; j <= l; j++ {
+				freeBuf(c.KeyBufs[j])
+				freeBuf(c.ValBufs[j])
+			}
+			return nil, fmt.Errorf("gpu: NewGpuKVCache(layer %d/%d, maxSeq=%d, kvDim=%d): %w", l, totalLayers, maxSeqLen, kvDim, a.err)
+		}
 	}
-	return c
+	return c, nil
 }
 
 func (c *GpuKVCache) Reset() { c.Len = 0 }

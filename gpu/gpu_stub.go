@@ -14,7 +14,9 @@ func IsInitialized() bool   { return false }
 func DeviceName() string    { return "none" }
 func VRAMBytes() uint64     { return 0 }
 func VRAMFreeBytes() uint64 { return 0 }
-func Alloc(uint64) Buf      { return 0 }
+func AllocatedBytes() uint64 { return 0 }
+func Alloc(uint64) Buf                 { return 0 }
+func AllocE(n uint64) (Buf, error)     { return 0, errNoGPU }
 func Free(Buf)              {}
 func ResetBufferTable()     {}
 func Upload(Buf, []byte) error             { return errNoGPU }

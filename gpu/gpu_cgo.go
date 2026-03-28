@@ -58,9 +58,25 @@ func VRAMBytes() uint64 { return uint64(C.gpu_vram_bytes()) }
 // Uses VK_EXT_memory_budget when available, otherwise falls back to 90% of total.
 func VRAMFreeBytes() uint64 { return uint64(C.gpu_vram_free_bytes()) }
 
+// AllocatedBytes returns cumulative VRAM allocated by this process (our own counter).
+func AllocatedBytes() uint64 { return uint64(C.gpu_allocated_bytes()) }
+
 // Alloc allocates a GPU buffer of the given size.
+// Returns 0 on failure — callers that cannot tolerate OOM should use AllocE.
 func Alloc(sizeBytes uint64) Buf {
 	return uint64(C.gpu_alloc(C.uint64_t(sizeBytes), C.GPU_BUF_STORAGE))
+}
+
+// AllocE allocates a GPU buffer, returning an error on failure.
+// This is the safe variant that should be used for all allocations where
+// a failure must be handled gracefully (like llama.cpp does) rather than
+// silently proceeding with a zero buffer.
+func AllocE(sizeBytes uint64) (Buf, error) {
+	buf := uint64(C.gpu_alloc(C.uint64_t(sizeBytes), C.GPU_BUF_STORAGE))
+	if buf == 0 && sizeBytes > 0 {
+		return 0, fmt.Errorf("gpu: VRAM allocation failed for %d bytes (%.1f MB)", sizeBytes, float64(sizeBytes)/(1024*1024))
+	}
+	return buf, nil
 }
 
 // Free releases a GPU buffer.

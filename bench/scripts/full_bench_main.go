@@ -178,70 +178,81 @@ func main() {
 			r.correctnessOK = true
 			fmt.Printf("  [Correctness] GPU upload fail: %v — CPU-only\n", gpuUploadErr)
 		} else {
-			rs := gpu.NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize)
-			kv := gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
-			gpuLogits := make([]float32, vocabSize)
-			var fwdErr error
-			for i, tok := range tokens {
-				fwdErr = gpu.GpuForward(pipe.Model, gpuModel, tok, i, kv, rs, gpuLogits)
-				if fwdErr != nil {
-					break
-				}
+			var gpuAllocErr error
+			rs, gpuAllocErr := gpu.NewGpuRunState(dim, qDim, kvDim, ffnDim, vocabSize)
+			var kv *gpu.GpuKVCache
+			if gpuAllocErr == nil {
+				kv, gpuAllocErr = gpu.NewGpuKVCache(cfg.NumLayers, cfg.NumLayers, 512, kvDim, nil)
 			}
-			gpu.Sync()
-
-			if fwdErr != nil {
+			if gpuAllocErr != nil {
 				r.gpuUploadFail = true
 				r.correctnessOK = true
-				fmt.Printf("  [Correctness] GPU forward fail: %v — CPU-only\n", fwdErr)
+				fmt.Printf("  [Correctness] GPU alloc fail: %v — CPU-only\n", gpuAllocErr)
+				if rs != nil {
+					rs.FreeAll()
+				}
+				gpuModel.FreeAll()
 			} else {
-				maxErr := float64(0)
-				maxIdx := 0
-				sumErr := float64(0)
-				for i := 0; i < vocabSize; i++ {
-					diff := math.Abs(float64(cpuLogits[i] - gpuLogits[i]))
-					sumErr += diff
-					if diff > maxErr {
-						maxErr = diff
-						maxIdx = i
+				gpuLogits := make([]float32, vocabSize)
+				var fwdErr error
+				for i, tok := range tokens {
+					fwdErr = gpu.GpuForward(pipe.Model, gpuModel, tok, i, kv, rs, gpuLogits)
+					if fwdErr != nil {
+						break
 					}
 				}
-				r.maxErr = maxErr
-				r.avgErr = sumErr / float64(vocabSize)
-				r.cpuTopTok = argmax(cpuLogits)
-				r.gpuTopTok = argmax(gpuLogits)
-				r.topMatch = r.cpuTopTok == r.gpuTopTok
-				// SSM models accumulate state through a recurrent delta rule, so
-				// small floating-point differences compound across tokens giving
-				// legitimately higher logit divergence than pure attention models.
-				errThreshold := 10.0
-				if m.hasSSM {
-					errThreshold = 30.0
-				}
-			nearTie := false
-			if !r.topMatch && maxErr < errThreshold {
-				top1 := cpuLogits[r.cpuTopTok]
-				top2 := cpuLogits[r.gpuTopTok]
-				nearTieThresh := float32(0.5)
-				if m.hasSSM {
-					nearTieThresh = float32(maxErr)
-				}
-				if math.Abs(float64(top1-top2)) < float64(nearTieThresh) {
-					nearTie = true
-				}
-			}
-			r.correctnessOK = maxErr < errThreshold && (r.topMatch || nearTie)
+				gpu.Sync()
 
-				status := passOrFail(r.correctnessOK)
-				if nearTie {
-					status = "WARN (near-tie)"
+				if fwdErr != nil {
+					r.gpuUploadFail = true
+					r.correctnessOK = true
+					fmt.Printf("  [Correctness] GPU forward fail: %v — CPU-only\n", fwdErr)
+				} else {
+					maxErr := float64(0)
+					maxIdx := 0
+					sumErr := float64(0)
+					for i := 0; i < vocabSize; i++ {
+						diff := math.Abs(float64(cpuLogits[i] - gpuLogits[i]))
+						sumErr += diff
+						if diff > maxErr {
+							maxErr = diff
+							maxIdx = i
+						}
+					}
+					r.maxErr = maxErr
+					r.avgErr = sumErr / float64(vocabSize)
+					r.cpuTopTok = argmax(cpuLogits)
+					r.gpuTopTok = argmax(gpuLogits)
+					r.topMatch = r.cpuTopTok == r.gpuTopTok
+					errThreshold := 10.0
+					if m.hasSSM {
+						errThreshold = 30.0
+					}
+					nearTie := false
+					if !r.topMatch && maxErr < errThreshold {
+						top1 := cpuLogits[r.cpuTopTok]
+						top2 := cpuLogits[r.gpuTopTok]
+						nearTieThresh := float32(0.5)
+						if m.hasSSM {
+							nearTieThresh = float32(maxErr)
+						}
+						if math.Abs(float64(top1-top2)) < float64(nearTieThresh) {
+							nearTie = true
+						}
+					}
+					r.correctnessOK = maxErr < errThreshold && (r.topMatch || nearTie)
+
+					status := passOrFail(r.correctnessOK)
+					if nearTie {
+						status = "WARN (near-tie)"
+					}
+					fmt.Printf("  [Correctness] maxErr=%.4f (idx %d)  avgErr=%.6f  top_match=%v  %s\n",
+						maxErr, maxIdx, r.avgErr, r.topMatch, status)
 				}
-				fmt.Printf("  [Correctness] maxErr=%.4f (idx %d)  avgErr=%.6f  top_match=%v  %s\n",
-					maxErr, maxIdx, r.avgErr, r.topMatch, status)
+				rs.FreeAll()
+				kv.FreeAll()
+				gpuModel.FreeAll()
 			}
-			rs.FreeAll()
-			kv.FreeAll()
-			gpuModel.FreeAll()
 		}
 
 		// ═══ Phase 2: Coherence + Timing — dlgo CPU ═══
