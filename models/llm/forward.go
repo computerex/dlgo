@@ -338,6 +338,13 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 		ops.AddBias(rs.Logits, m.OutputBias)
 	}
 
+	if cfg.FinalLogitSoftcap > 0 {
+		cap := cfg.FinalLogitSoftcap
+		for i := range rs.Logits {
+			rs.Logits[i] = cap * float32(math.Tanh(float64(rs.Logits[i]/cap)))
+		}
+	}
+
 	return rs.Logits
 }
 
@@ -446,6 +453,13 @@ func ForwardAttention(
 		// Append learned sink logit as extra softmax column
 		if hasSinks {
 			scores[windowLen] = layer.AttnSinks[h]
+		}
+		// Attention logit soft-capping (Gemma 2)
+		if cfg.AttnLogitSoftcap > 0 {
+			cap := cfg.AttnLogitSoftcap
+			for i := range scores {
+				scores[i] = cap * float32(math.Tanh(float64(scores[i]/cap)))
+			}
 		}
 		quant.SIMDSoftmax(scores)
 

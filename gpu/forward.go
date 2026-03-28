@@ -271,6 +271,12 @@ RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 	}
 	MatVec(rs.Logits, output.Buf, rs.X, output.Rows, output.Cols, output.Type)
 	DownloadF32(rs.Logits, logitsBuf)
+	if cfg.FinalLogitSoftcap > 0 {
+		cap := float64(cfg.FinalLogitSoftcap)
+		for i := range logitsBuf {
+			logitsBuf[i] = float32(cap * math.Tanh(float64(logitsBuf[i])/cap))
+		}
+	}
 
 }
 
@@ -1184,6 +1190,12 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 	if err := DownloadF32(rs.Logits, logitsBuf); err != nil {
 		return err
+	}
+	if cfg.FinalLogitSoftcap > 0 {
+		cap := float64(cfg.FinalLogitSoftcap)
+		for i := range logitsBuf {
+			logitsBuf[i] = float32(cap * math.Tanh(float64(logitsBuf[i])/cap))
+		}
 	}
 	return nil
 }

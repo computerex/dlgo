@@ -62,6 +62,11 @@ func applyArchDefaults(config *ModelConfig) {
 	if desc.EmbedScaleMode == "sqrt_dim" && config.EmbeddingDim > 0 {
 		config.EmbedScale = float32(math.Sqrt(float64(config.EmbeddingDim)))
 	}
+	// Gemma 2/3: alternating sliding window (even layers = sliding, odd layers = full)
+	if (config.Architecture == "gemma2" || config.Architecture == "gemma3") &&
+		config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
+		config.SlidingWindowPattern = 2
+	}
 	// gpt-oss (OpenAI MoE) architecture-specific defaults matching llama.cpp
 	if config.Architecture == "gpt-oss" {
 		if config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {

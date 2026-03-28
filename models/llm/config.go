@@ -39,6 +39,10 @@ type ModelConfig struct {
 	EmbedScale    float32  // non-zero = scale embeddings (Gemma: sqrt(dim))
 	ChatTemplate  string   // chat format: "chatml", "llama2", "llama3", "gemma", "phi"
 
+	// Gemma 2 soft-capping
+	AttnLogitSoftcap  float32 // 0=disabled; >0 = tanh(logit/cap)*cap before softmax
+	FinalLogitSoftcap float32 // 0=disabled; >0 = tanh(logit/cap)*cap on final logits
+
 	// Qwen3.5 hybrid Mamba/Attention
 	FullAttentionInterval int  // 0 = all attention; N = every Nth layer is attention
 	SSMConvKernel         int
@@ -115,6 +119,8 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		RopeYaRNAttnFactor: metaFloat(md, arch+".rope.scaling.yarn.attn_factor", 1.0),
 		SlidingWindow:      metaInt(md, arch+".attention.sliding_window", 0),
 		SlidingWindowPattern: metaInt(md, arch+".attention.sliding_window_pattern", 0),
+		AttnLogitSoftcap:  metaFloat(md, arch+".attn_logit_softcapping", 0),
+		FinalLogitSoftcap: metaFloat(md, arch+".final_logit_softcapping", 0),
 		BOS:                int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
 		EOS:           int32(metaInt(md, "tokenizer.ggml.eos_token_id", 2)),
 		AddBOS:        metaBool(md, "tokenizer.ggml.add_bos_token", true),
