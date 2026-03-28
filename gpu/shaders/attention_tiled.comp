@@ -29,10 +29,10 @@ layout(push_constant) uniform Params {
 #define WG_SIZE 256
 #define TILE_SIZE 256
 
-shared float q_sh[128];        // query vector (max head_dim=128)
+shared float q_sh[256];        // query vector (supports head_dim up to 256)
 shared float tile_s[TILE_SIZE]; // Q·K scores for current tile
 shared float reduce_buf[WG_SIZE];
-shared float sh_out[128];      // running output accumulator
+shared float sh_out[256];      // running output accumulator (supports head_dim up to 256)
 
 void main() {
     uint head = gl_WorkGroupID.x;

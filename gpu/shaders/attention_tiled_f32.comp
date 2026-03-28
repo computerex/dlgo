@@ -1,0 +1,159 @@
+// Two-pass tiled attention with FP32 KV cache.
+// Removes the 4096 seq_len limit of attention.comp by processing K/V in tiles.
+// Uses the same standard two-pass softmax as the working attention.comp shader
+// (no online softmax correction needed).
+//
+// Pass 1: Compute Q·K scores in tiles, find global max.
+// Pass 2: Recompute Q·K, apply exp(score - max), accumulate sum and weighted V.
+//
+// Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Buffers: 0=out (float), 1=Q (float), 2=KCache (float), 3=VCache (float)
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 2) readonly buffer KCache { float k_cache[]; };
+layout(set = 0, binding = 3) readonly buffer VCache { float v_cache[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_len;
+    float scale;
+};
+
+#define WG_SIZE 256
+#define TILE_SIZE 256
+
+shared float q_sh[256];          // Q vector for this head (max head_dim=256)
+shared float tile_s[TILE_SIZE];  // scores for current tile
+shared float reduce_buf[WG_SIZE];
+shared float sh_out[256];        // accumulated weighted V
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    if (head >= uint(num_heads)) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    uint kv_head = head / kv_mul;
+    uint q_dim = uint(num_heads) * uint(head_dim);
+    uint hd = uint(head_dim);
+    uint kvd = uint(kv_dim);
+    uint q_base = pos_id * q_dim + head * hd;
+    uint kv_offset = kv_head * hd;
+
+    int actual_seq_len = seq_len + int(pos_id);
+    if (actual_seq_len <= 0) {
+        if (tid < hd) {
+            attn_out[pos_id * q_dim + head * hd + tid] = 0.0;
+        }
+        return;
+    }
+
+    // Load Q into shared memory
+    for (uint d = tid; d < hd; d += WG_SIZE) {
+        q_sh[d] = q_data[q_base + d];
+    }
+    barrier();
+
+    // =========================================================================
+    // Pass 1: Find global max of Q·K scores across all tiles
+    // =========================================================================
+    float global_max = -1.0e30;
+
+    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
+        int tile_len = tile_end - tile_start;
+
+        // Compute Q·K dot products for this tile
+        float my_score = -1.0e30;
+        if (int(tid) < tile_len) {
+            int t = tile_start + int(tid);
+            float dot_val = 0.0;
+            uint k_base = uint(t) * kvd + kv_offset;
+            for (uint d = 0; d < hd; d++) {
+                dot_val += q_sh[d] * k_cache[k_base + d];
+            }
+            my_score = dot_val * scale;
+        }
+
+        // Reduce to find tile max
+        reduce_buf[tid] = my_score;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
+            barrier();
+        }
+        global_max = max(global_max, reduce_buf[0]);
+        barrier();
+    }
+
+    // =========================================================================
+    // Pass 2: Compute exp(score - max), accumulate sum and weighted V
+    // =========================================================================
+    if (tid < hd) {
+        sh_out[tid] = 0.0;
+    }
+    barrier();
+
+    float running_sum = 0.0;
+
+    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
+        int tile_len = tile_end - tile_start;
+
+        // Recompute Q·K dot products and apply exp(score - max)
+        if (int(tid) < tile_len) {
+            int t = tile_start + int(tid);
+            float dot_val = 0.0;
+            uint k_base = uint(t) * kvd + kv_offset;
+            for (uint d = 0; d < hd; d++) {
+                dot_val += q_sh[d] * k_cache[k_base + d];
+            }
+            tile_s[tid] = exp(dot_val * scale - global_max);
+        } else {
+            tile_s[tid] = 0.0;
+        }
+        barrier();
+
+        // Accumulate tile sum
+        reduce_buf[tid] = tile_s[tid];
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+            barrier();
+        }
+        running_sum += reduce_buf[0];
+        barrier();
+
+        // Accumulate weighted V
+        if (tid < hd) {
+            float acc = 0.0;
+            for (int ti = 0; ti < tile_len; ti++) {
+                float w = tile_s[ti];
+                uint v_base = uint(tile_start + ti) * kvd + kv_offset;
+                acc += w * v_cache[v_base + tid];
+            }
+            sh_out[tid] += acc;
+        }
+        barrier();
+    }
+
+    // =========================================================================
+    // Final: normalize and write output
+    // =========================================================================
+    float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
+    if (tid < hd) {
+        uint out_idx = pos_id * q_dim + head * hd + tid;
+        attn_out[out_idx] = sh_out[tid] * inv_sum;
+    }
+}
