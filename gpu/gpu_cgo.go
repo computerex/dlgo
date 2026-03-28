@@ -371,9 +371,9 @@ func KVStoreF16(kCache, vCache, k, v Buf, pos, kvDim int) error {
 }
 
 // AttentionF16 performs tiled attention with FP16 KV cache (online softmax, no seq_len limit).
-func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
+func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale, softcap float32) error {
 	rc := C.gpu_attention_f16(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.float(softcap), C.int(startPos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: attention_f16 failed (%d)", rc)
 	}
@@ -381,9 +381,9 @@ func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvD
 }
 
 // AttentionTiledF32 performs tiled causal attention with FP32 KV cache (no seq_len limit).
-func AttentionTiledF32(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale float32) error {
+func AttentionTiledF32(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale, softcap float32) error {
 	rc := C.gpu_attention_tiled_f32(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
-		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.int(startPos))
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.float(softcap), C.int(startPos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: attention_tiled_f32 failed (%d)", rc)
 	}
@@ -694,6 +694,10 @@ func (lc *LayerConf) SetSlidingWindow(w int) {
 	lc.c.sliding_window = C.int(w)
 }
 
+func (lc *LayerConf) SetAttnLogitSoftcap(v float32) {
+	lc.c.attn_logit_softcap = C.float(v)
+}
+
 func (lc *LayerConf) SetFFN(ffnNorm Buf, gate, up, down *GpuTensor,
 	postAttnNorm, postFFNNorm Buf) {
 	lc.c.ffn_norm_w = C.GpuBuf(ffnNorm)
@@ -927,11 +931,11 @@ func BatchAttention(out, q, kCache, vCache Buf,
 
 // BatchAttentionF16 performs tiled causal attention for npos positions with FP16 KV cache.
 func BatchAttentionF16(out, q, kCache, vCache Buf,
-	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale float32, npos int) error {
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale, softcap float32, npos int) error {
 	rc := C.gpu_batch_attention_f16(C.GpuBuf(out), C.GpuBuf(q),
 		C.GpuBuf(kCache), C.GpuBuf(vCache),
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
-		C.int(startSeqLen), C.float(scale), C.int(npos))
+		C.int(startSeqLen), C.float(scale), C.float(softcap), C.int(npos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_attention_f16 failed (%d)", rc)
 	}
@@ -940,11 +944,11 @@ func BatchAttentionF16(out, q, kCache, vCache Buf,
 
 // BatchAttentionTiledF32 performs tiled causal attention for npos positions with FP32 KV cache.
 func BatchAttentionTiledF32(out, q, kCache, vCache Buf,
-	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale float32, npos int) error {
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale, softcap float32, npos int) error {
 	rc := C.gpu_batch_attention_tiled_f32(C.GpuBuf(out), C.GpuBuf(q),
 		C.GpuBuf(kCache), C.GpuBuf(vCache),
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
-		C.int(startSeqLen), C.float(scale), C.int(npos))
+		C.int(startSeqLen), C.float(scale), C.float(softcap), C.int(npos))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_attention_tiled_f32 failed (%d)", rc)
 	}

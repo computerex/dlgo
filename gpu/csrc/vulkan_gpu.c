@@ -2167,7 +2167,7 @@ int gpu_batch_kv_store_f16(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
 
 int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                       int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                      int seq_len, float scale, int start_pos) {
+                      int seq_len, float scale, float softcap, int start_pos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
@@ -2175,8 +2175,8 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
     // FP16 KV: each position = kv_dim/2 uint32s = kv_dim*2 bytes
     uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED;
     dp.bufs[0] = out_buf;
@@ -2196,11 +2196,11 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
 
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
-                            int kv_dim, int start_seq_len, float scale, int npos) {
+                            int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale};
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED;
     dp.bufs[0] = out; dp.bufs[1] = q;
@@ -2213,7 +2213,7 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
 
 int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                             int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                            int seq_len, float scale, int start_pos) {
+                            int seq_len, float scale, float softcap, int start_pos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
@@ -2221,8 +2221,8 @@ int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, Gp
     // FP32 KV: each position = kv_dim floats = kv_dim*4 bytes
     uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 4;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale};
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED_F32;
     dp.bufs[0] = out_buf;
@@ -2242,11 +2242,11 @@ int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, Gp
 
 int gpu_batch_attention_tiled_f32(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                                   int num_heads, int num_kv_heads, int head_dim,
-                                  int kv_dim, int start_seq_len, float scale, int npos) {
+                                  int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale};
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED_F32;
     dp.bufs[0] = out; dp.bufs[1] = q;
@@ -2540,7 +2540,7 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
             if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
                 win_start = seq_len - lc->sliding_window;
             gpu_attention_tiled_f32(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                    num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
+                                    num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
         }
 
         gpu_barrier();
@@ -2771,7 +2771,7 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
         gpu_barrier();
         gpu_batch_attention_tiled_f32(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
                                       num_heads, num_kv_heads, head_dim, kv_dim,
-                                      start_pos + 1, scale, npos);
+                                      start_pos + 1, scale, lc->attn_logit_softcap, npos);
     }
 
     gpu_barrier();

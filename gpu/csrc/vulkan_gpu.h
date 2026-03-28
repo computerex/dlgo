@@ -243,18 +243,18 @@ int gpu_batch_kv_store_f16(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
 // Tiled attention with FP16 KV cache (online softmax, no seq_len limit)
 int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                       int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                      int seq_len, float scale, int start_pos);
+                      int seq_len, float scale, float softcap, int start_pos);
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
-                            int kv_dim, int start_seq_len, float scale, int npos);
+                            int kv_dim, int start_seq_len, float scale, float softcap, int npos);
 
 // Tiled attention with FP32 KV cache (online softmax, no seq_len limit)
 int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                             int num_heads, int num_kv_heads, int head_dim, int kv_dim,
-                            int seq_len, float scale, int start_pos);
+                            int seq_len, float scale, float softcap, int start_pos);
 int gpu_batch_attention_tiled_f32(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                                   int num_heads, int num_kv_heads, int head_dim,
-                                  int kv_dim, int start_seq_len, float scale, int npos);
+                                  int kv_dim, int start_seq_len, float scale, float softcap, int npos);
 
 // Paged KV store: write K/V into block pool at computed block offset.
 // effective_pos = physical_block * block_size + slot_in_block (computed on CPU)
@@ -326,6 +326,7 @@ typedef struct {
     int core_type;       // 0=attention, 1=SSM (skip attn, Go fills attn_proj)
     GpuBuf attn_sinks;   // learned sink logits per head (0 if not used)
     int sliding_window;  // ISWA: max window size for this layer (0 = full attention)
+    float attn_logit_softcap; // attention logit soft-capping (0 = disabled)
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.

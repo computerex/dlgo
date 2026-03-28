@@ -4,7 +4,7 @@
 // Uses FlashAttention-style online softmax to avoid materializing all scores.
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap (28 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2)
 
 #version 450
@@ -24,6 +24,7 @@ layout(push_constant) uniform Params {
     int kv_dim;     // number of float elements per KV position (NOT byte size)
     int seq_len;    // starting seq_len (batch attention: pos 0 attends to seq_len tokens)
     float scale;
+    float softcap;
 };
 
 #define WG_SIZE 256
@@ -92,6 +93,7 @@ void main() {
                 dot_val += q_sh[fi] * k2.x + q_sh[fi + 1u] * k2.y;
             }
             tile_s[tid] = dot_val * scale;
+            if (softcap > 0.0) tile_s[tid] = softcap * tanh(tile_s[tid] / softcap);
         }
         barrier();
 

@@ -7,7 +7,7 @@
 // Pass 2: Recompute Q·K, apply exp(score - max), accumulate sum and weighted V.
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap (28 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (float), 3=VCache (float)
 
 #version 450
@@ -27,6 +27,7 @@ layout(push_constant) uniform Params {
     int kv_dim;
     int seq_len;
     float scale;
+    float softcap;
 };
 
 #define WG_SIZE 256
@@ -84,6 +85,7 @@ void main() {
                 dot_val += q_sh[d] * k_cache[k_base + d];
             }
             my_score = dot_val * scale;
+            if (softcap > 0.0) my_score = softcap * tanh(my_score / softcap);
         }
 
         // Reduce to find tile max
@@ -119,7 +121,9 @@ void main() {
             for (uint d = 0; d < hd; d++) {
                 dot_val += q_sh[d] * k_cache[k_base + d];
             }
-            tile_s[tid] = exp(dot_val * scale - global_max);
+            float score = dot_val * scale;
+            if (softcap > 0.0) score = softcap * tanh(score / softcap);
+            tile_s[tid] = exp(score - global_max);
         } else {
             tile_s[tid] = 0.0;
         }

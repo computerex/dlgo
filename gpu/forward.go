@@ -55,6 +55,9 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 		if layer.Spec.SlidingWindow > 0 {
 			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
 		}
+		if cfg.AttnLogitSoftcap > 0 {
+			lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
+		}
 	}
 
 	if gl.IsMoE {
@@ -472,6 +475,9 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 		}
 		if layer.Spec.SlidingWindow > 0 {
 			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
+		}
+		if cfg.AttnLogitSoftcap > 0 {
+			lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
 		}
 	}
 
