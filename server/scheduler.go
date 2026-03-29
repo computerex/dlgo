@@ -177,13 +177,12 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 	supportsThinking := llm.GetArchDescriptor(pipe.Model.Config.Architecture).SupportsThinking
 
-	// When thinking is disabled on a thinking-capable model, suppress the
-	// leading </think> token the model emits.
-	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking && supportsThinking
-
-	// When thinking is active, suppress all output until </think> is found.
-	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
-	var thinkingContent string // captured reasoning text (between <think> and </think>)
+	// For thinking-capable models, always buffer output looking for </think>
+	// to separate reasoning from content. This handles both the normal
+	// thinking-enabled case and the case where a model "thinks" despite
+	// being told not to (matches llama.cpp's post-generation parser approach).
+	inThinkBlock := supportsThinking
+	var thinkingContent string
 
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
@@ -194,11 +193,6 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		return
 	}
 
-	if suppressThinkClose {
-		tokenText = strings.TrimPrefix(tokenText, "</think>")
-		tokenText = strings.TrimLeft(tokenText, "\n")
-		suppressThinkClose = false
-	}
 	if inThinkBlock {
 		if idx := strings.Index(genText.String(), "</think>"); idx >= 0 {
 			inThinkBlock = false
@@ -264,6 +258,20 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		}
 	}
 
+	// If still buffering (no </think> found), flush appropriately.
+	if inThinkBlock {
+		buffered := genText.String()
+		if req.EnableThinking != nil && !*req.EnableThinking {
+			// Thinking disabled and model complied: buffer is content.
+			if buffered != "" {
+				req.Output <- StreamEvent{Type: EventToken, Token: buffered}
+			}
+		} else {
+			// Thinking enabled but never closed: truncated reasoning.
+			thinkingContent = strings.TrimSpace(buffered)
+		}
+	}
+
 	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent}
 }
 
@@ -276,13 +284,9 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 	supportsThinking := llm.GetArchDescriptor(s.model.CPUPipeline.Model.Config.Architecture).SupportsThinking
 
-	// When thinking is disabled on a thinking-capable model, the model emits
-	// a leading </think> token we need to suppress from the streamed output.
-	suppressThinkClose := req.EnableThinking != nil && !*req.EnableThinking && supportsThinking
-	thinkSuppressed := false
-
-	// When thinking is active, suppress all output until </think> is found.
-	inThinkBlock := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
+	// For thinking-capable models, always buffer output looking for </think>
+	// to separate reasoning from content (matches llama.cpp's approach).
+	inThinkBlock := supportsThinking
 	var thinkBuf strings.Builder
 	var thinkingContent string
 
@@ -290,14 +294,6 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	cfg.Stream = func(token string) {
 		if req.Ctx.Err() != nil {
 			return
-		}
-		if suppressThinkClose && !thinkSuppressed {
-			thinkSuppressed = true
-			token = strings.TrimPrefix(token, "</think>")
-			token = strings.TrimLeft(token, "\n")
-			if token == "" {
-				return
-			}
 		}
 		if inThinkBlock {
 			thinkBuf.WriteString(token)
@@ -319,6 +315,20 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	if err != nil {
 		req.Output <- StreamEvent{Type: EventError, Error: err.Error()}
 		return
+	}
+
+	// If still buffering (no </think> found), flush appropriately.
+	if inThinkBlock {
+		buffered := thinkBuf.String()
+		if req.EnableThinking != nil && !*req.EnableThinking {
+			// Thinking disabled and model complied: buffer is content.
+			if buffered != "" {
+				req.Output <- StreamEvent{Type: EventToken, Token: buffered}
+			}
+		} else {
+			// Thinking enabled but never closed: truncated reasoning.
+			thinkingContent = strings.TrimSpace(buffered)
+		}
 	}
 
 	finishReason := "stop"

@@ -183,6 +183,13 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 
 	fullText = trimTrailingStopTokens(fullText)
 
+	// Post-generation cleanup: strip any <think>...</think> blocks or stray
+	// </think> tags that leaked through the scheduler's inline parsing.
+	fullText, extractedReasoning := stripThinkTags(fullText)
+	if extractedReasoning != "" && reasoningContent == "" {
+		reasoningContent = extractedReasoning
+	}
+
 	resp := ChatCompletionResponse{
 		ID:      infReq.ID,
 		Object:  "chat.completion",
@@ -225,5 +232,18 @@ func trimTrailingStopTokens(text string) string {
 		}
 		text = trimmed
 	}
+}
+
+// stripThinkTags removes <think>...</think> blocks and stray </think> tags
+// from generated text. Returns cleaned content and any extracted reasoning.
+func stripThinkTags(text string) (content string, reasoning string) {
+	if idx := strings.Index(text, "</think>"); idx >= 0 {
+		reasoning = strings.TrimSpace(text[:idx])
+		content = strings.TrimLeft(text[idx+len("</think>"):], "\n")
+		reasoning = strings.TrimPrefix(reasoning, "<think>")
+		reasoning = strings.TrimSpace(reasoning)
+		return content, reasoning
+	}
+	return text, ""
 }
 
