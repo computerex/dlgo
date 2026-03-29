@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/computerex/dlgo/grammar"
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/models/whisper"
 )
@@ -237,6 +238,22 @@ func WithSeed(seed int64) Option {
 // WithGreedy enables greedy (argmax) decoding.
 func WithGreedy() Option {
 	return func(c *llm.GenerateConfig) { c.Sampler.Temperature = 0 }
+}
+
+// WithGrammar sets a GBNF grammar constraint for structured output.
+func WithGrammar(g *grammar.Grammar) Option {
+	return func(c *llm.GenerateConfig) { c.Grammar = g }
+}
+
+// WithJSONGrammar constrains output to valid JSON objects.
+func WithJSONGrammar() Option {
+	return func(c *llm.GenerateConfig) {
+		g, err := grammar.Parse(grammar.JSONGrammar)
+		if err != nil {
+			panic("failed to parse built-in JSON grammar: " + err.Error())
+		}
+		c.Grammar = g
+	}
 }
 
 func applyOpts(opts []Option) llm.GenerateConfig {

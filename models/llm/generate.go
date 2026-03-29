@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/computerex/dlgo/format/gguf"
+	"github.com/computerex/dlgo/grammar"
 	"github.com/computerex/dlgo/memory"
 	"github.com/computerex/dlgo/mmap"
 	"github.com/computerex/dlgo/ops"
@@ -22,6 +23,7 @@ type GenerateConfig struct {
 	Sampler   ops.SamplerConfig
 	Seed      int64
 	Stream    func(token string) // called for each generated token (nil = no streaming)
+	Grammar   *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
 }
 
 // DefaultGenerateConfig returns sensible defaults.
@@ -367,6 +369,39 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	}, nil
 }
 
+// buildTokenPieces builds the token-id-to-string mapping needed for grammar masking.
+func (p *Pipeline) buildTokenPieces() []string {
+	vocabSize := p.Tokenizer.VocabSize()
+	pieces := make([]string, vocabSize)
+	for i := 0; i < vocabSize; i++ {
+		pieces[i] = p.Tokenizer.DecodeToken(int32(i))
+	}
+	return pieces
+}
+
+// buildEOSSet returns a set of EOS/stop token IDs for grammar masking.
+func (p *Pipeline) buildEOSSet() map[int32]bool {
+	eos := map[int32]bool{p.Model.Config.EOS: true}
+	for _, stop := range p.Model.Config.StopTokens {
+		eos[stop] = true
+	}
+	return eos
+}
+
+// grammarSample applies grammar constraints (if any) then samples a token.
+// Uses the speculative approach: sample first, check grammar, resample if needed.
+func grammarSample(logits []float32, cfg GenerateConfig, recentTokens []int32, rng *rand.Rand,
+	gram *grammar.Grammar, tokenPieces []string, eosTokens map[int32]bool) int {
+
+	if gram == nil {
+		return ops.SampleToken(logits, cfg.Sampler, recentTokens, rng)
+	}
+
+	// Apply grammar constraint before sampling
+	gram.ApplyToLogits(logits, tokenPieces, eosTokens)
+	return ops.SampleToken(logits, cfg.Sampler, recentTokens, rng)
+}
+
 // Generate produces text from a prompt using the loaded model.
 func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error) {
 	if len(prompt) == 0 {
@@ -390,6 +425,14 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 	prev := debug.SetGCPercent(2000)
 	defer debug.SetGCPercent(prev)
 
+	// Build token pieces and EOS set for grammar masking
+	var tokenPieces []string
+	var eosTokens map[int32]bool
+	if cfg.Grammar != nil {
+		tokenPieces = p.buildTokenPieces()
+		eosTokens = p.buildEOSSet()
+	}
+
 	var generated []int32
 	var recentTokens []int32
 
@@ -397,9 +440,14 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 	ForwardBatch(p.Model, prompt, 0, p.KVCache, p.RunState, p.BatchState)
 
 	pos := len(prompt)
-	nextToken := ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
+	nextToken := grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
+
+	// Advance grammar state
+	if cfg.Grammar != nil {
+		cfg.Grammar.AcceptToken(p.Tokenizer.DecodeToken(int32(nextToken)))
+	}
 
 	if cfg.Stream != nil {
 		cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
@@ -429,8 +477,13 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 			mmap.TrimWorkingSet()
 		}
 
-		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
+		nextToken = grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 		generated = append(generated, int32(nextToken))
+
+		// Advance grammar state
+		if cfg.Grammar != nil && !eosTokens[int32(nextToken)] {
+			cfg.Grammar.AcceptToken(p.Tokenizer.DecodeToken(int32(nextToken)))
+		}
 
 		recentTokens = append(recentTokens, int32(nextToken))
 		if len(recentTokens) > 256 {

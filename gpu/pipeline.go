@@ -1264,7 +1264,31 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	var genText strings.Builder
 	stopStrings := gpuStopStrings()
 	pos := len(tokens)
-	nextToken := ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
+
+	// Build token pieces for grammar masking
+	var tokenPieces []string
+	var eosTokens map[int32]bool
+	if cfg.Grammar != nil {
+		vocabSize := p.Tokenizer.VocabSize()
+		tokenPieces = make([]string, vocabSize)
+		for i := 0; i < vocabSize; i++ {
+			tokenPieces[i] = p.Tokenizer.DecodeToken(int32(i))
+		}
+		eosTokens = map[int32]bool{p.CPUModel.Config.EOS: true}
+		for _, stop := range p.CPUModel.Config.StopTokens {
+			eosTokens[stop] = true
+		}
+	}
+
+	// Grammar-aware sampling helper
+	gpuGrammarSample := func(logits []float32) int {
+		if cfg.Grammar != nil {
+			cfg.Grammar.ApplyToLogits(logits, tokenPieces, eosTokens)
+		}
+		return ops.SampleToken(logits, cfg.Sampler, recentTokens, rng)
+	}
+
+	nextToken := gpuGrammarSample(p.LogitsBuf)
 	var tokenText string
 
 	firstTok := int32(nextToken)
@@ -1279,6 +1303,11 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
+
+	// Advance grammar state
+	if cfg.Grammar != nil {
+		cfg.Grammar.AcceptToken(p.Tokenizer.DecodeToken(int32(nextToken)))
+	}
 
 	tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
 	genText.WriteString(tokenText)
@@ -1312,11 +1341,16 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		}
 		pos++
 
-		nextToken = ops.SampleToken(p.LogitsBuf, cfg.Sampler, recentTokens, rng)
+		nextToken = gpuGrammarSample(p.LogitsBuf)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
 		if len(recentTokens) > 256 {
 			recentTokens = recentTokens[1:]
+		}
+
+		// Advance grammar state
+		if cfg.Grammar != nil && !eosTokens[int32(nextToken)] {
+			cfg.Grammar.AcceptToken(p.Tokenizer.DecodeToken(int32(nextToken)))
 		}
 
 		tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
