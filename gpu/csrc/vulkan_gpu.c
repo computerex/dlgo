@@ -2024,6 +2024,114 @@ static int gpu_batch_add_bias_expand(GpuBuf dst_buf, GpuBuf bias_buf, GpuBuf scr
     return gpu_add(dst_buf, dst_buf, scratch_buf, elems_per_pos * npos);
 }
 
+// ---------------------------------------------------------------------------
+// Diffusion-specific operations
+// ---------------------------------------------------------------------------
+
+int gpu_broadcast_mul(GpuBuf data_buf, GpuBuf scale_buf, int total_n, int dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int total_n; int dim; } pc = {total_n, dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_BROADCAST_MUL;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = scale_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total_n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_tanh_gate_residual(GpuBuf out_buf, GpuBuf residual_buf, GpuBuf data_buf,
+                           GpuBuf gate_buf, int total_n, int dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int total_n; int dim; } pc = {total_n, dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_TANH_GATE_RESIDUAL;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = residual_buf;
+    dp.bufs[2] = data_buf;
+    dp.bufs[3] = gate_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total_n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_rope_3d(GpuBuf vec_buf, GpuBuf pe_buf, int n_pos, int n_heads,
+                int head_dim, int pe_offset, int pe_stride) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int half_dim = head_dim / 2;
+    int total = n_pos * n_heads * half_dim;
+    struct { int n_pos; int n_heads; int head_dim; int pe_offset; int pe_stride; } pc =
+        {n_pos, n_heads, head_dim, pe_offset, pe_stride};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ROPE_3D;
+    dp.bufs[0] = vec_buf;
+    dp.bufs[1] = pe_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_attention_full_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf,
+                           int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                           int seq_len, float scale) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_FULL_F32;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_buf;
+    dp.bufs[3] = v_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = seq_len;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_rmsnorm_heads_batch(GpuBuf data_buf, GpuBuf weight_buf,
+                            int num_heads, int head_dim, int npos, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    // Reuses existing PIPE_RMSNORM_HEADS shader (already supports pos_id via groups_y)
+    struct { int head_dim; float eps; } pc = {head_dim, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_RMSNORM_HEADS;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = weight_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
     // TODO: implement dequantize shaders
     return GPU_ERR_SHADER;

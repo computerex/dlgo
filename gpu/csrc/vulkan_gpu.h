@@ -124,6 +124,10 @@ typedef enum {
     PIPE_ATTENTION_TILED_F32,
     PIPE_LAYERNORM,
     PIPE_MATVEC_BF16,
+    PIPE_BROADCAST_MUL,
+    PIPE_TANH_GATE_RESIDUAL,
+    PIPE_ROPE_3D,
+    PIPE_ATTENTION_FULL_F32,
     PIPE_COUNT
 } PipelineID;
 
@@ -274,6 +278,18 @@ int gpu_paged_attention(GpuBuf out_buf, GpuBuf q_buf,
 
 // Dequantize a buffer from quantized format to float32
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype);
+
+// Diffusion-specific operations
+int gpu_broadcast_mul(GpuBuf data_buf, GpuBuf scale_buf, int total_n, int dim);
+int gpu_tanh_gate_residual(GpuBuf out_buf, GpuBuf residual_buf, GpuBuf data_buf,
+                           GpuBuf gate_buf, int total_n, int dim);
+int gpu_rope_3d(GpuBuf vec_buf, GpuBuf pe_buf, int n_pos, int n_heads,
+                int head_dim, int pe_offset, int pe_stride);
+int gpu_attention_full_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf,
+                           int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+                           int seq_len, float scale);
+int gpu_rmsnorm_heads_batch(GpuBuf data_buf, GpuBuf weight_buf,
+                            int num_heads, int head_dim, int npos, float eps);
 
 // Synchronize: wait for all GPU work to complete
 void gpu_sync(void);

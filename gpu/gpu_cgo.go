@@ -812,6 +812,60 @@ func CopyRegion(dst Buf, dstOff uint64, src Buf, srcOff, size uint64) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Diffusion-specific operations
+// ---------------------------------------------------------------------------
+
+// BroadcastMul multiplies data[i] *= scale[i % dim] in-place.
+func BroadcastMul(data, scale Buf, totalN, dim int) error {
+	rc := C.gpu_broadcast_mul(C.GpuBuf(data), C.GpuBuf(scale), C.int(totalN), C.int(dim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: broadcast_mul failed (%d)", rc)
+	}
+	return nil
+}
+
+// TanhGateResidual computes out[i] = residual[i] + data[i] * tanh(gate[i % dim]).
+func TanhGateResidual(out, residual, data, gate Buf, totalN, dim int) error {
+	rc := C.gpu_tanh_gate_residual(C.GpuBuf(out), C.GpuBuf(residual), C.GpuBuf(data),
+		C.GpuBuf(gate), C.int(totalN), C.int(dim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: tanh_gate_residual failed (%d)", rc)
+	}
+	return nil
+}
+
+// RoPE3D applies 3D RoPE using a precomputed cos/sin table.
+func RoPE3D(vec, pe Buf, nPos, nHeads, headDim, peOffset, peStride int) error {
+	rc := C.gpu_rope_3d(C.GpuBuf(vec), C.GpuBuf(pe), C.int(nPos), C.int(nHeads),
+		C.int(headDim), C.int(peOffset), C.int(peStride))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: rope_3d failed (%d)", rc)
+	}
+	return nil
+}
+
+// AttentionFullF32 performs bidirectional multi-head attention (no causal mask).
+func AttentionFullF32(out, q, k, v Buf, numHeads, numKVHeads, headDim, kvDim, seqLen int, scale float32) error {
+	rc := C.gpu_attention_full_f32(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(k), C.GpuBuf(v),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
+		C.int(seqLen), C.float(scale))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention_full_f32 failed (%d)", rc)
+	}
+	return nil
+}
+
+// RMSNormHeadsBatch applies per-head RMSNorm across npos positions.
+func RMSNormHeadsBatch(data, weight Buf, numHeads, headDim, npos int, eps float32) error {
+	rc := C.gpu_rmsnorm_heads_batch(C.GpuBuf(data), C.GpuBuf(weight),
+		C.int(numHeads), C.int(headDim), C.int(npos), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: rmsnorm_heads_batch failed (%d)", rc)
+	}
+	return nil
+}
+
 // SSMConv1dSiLU performs single-step causal conv1d with state + SiLU.
 func SSMConv1dSiLU(qkv, convState, convW Buf, channels, convK int) error {
 	rc := C.gpu_ssm_conv1d_silu(C.GpuBuf(qkv), C.GpuBuf(convState), C.GpuBuf(convW),

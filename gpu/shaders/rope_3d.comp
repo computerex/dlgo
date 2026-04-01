@@ -1,0 +1,44 @@
+#version 450
+
+// 3D RoPE with precomputed cos/sin table.
+// Each work item rotates one (position, head, dim_pair).
+// pe table layout: pe[(peOffset+p)*peStride + d*4 + 0] = cos
+//                  pe[(peOffset+p)*peStride + d*4 + 2] = sin
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Vec { float vec_buf[]; };
+layout(set = 0, binding = 1) readonly buffer PE { float pe_buf[]; };
+
+layout(push_constant) uniform Params {
+    int n_pos;
+    int n_heads;
+    int head_dim;
+    int pe_offset;
+    int pe_stride;  // = head_dim * 2
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int half_dim = head_dim / 2;
+    int total = n_pos * n_heads * half_dim;
+    if (gid >= uint(total)) return;
+
+    int d = int(gid) % half_dim;
+    int h = (int(gid) / half_dim) % n_heads;
+    int p = int(gid) / (half_dim * n_heads);
+
+    int pe_base = (pe_offset + p) * pe_stride;
+    float cos_val = pe_buf[pe_base + d * 4];
+    float sin_val = pe_buf[pe_base + d * 4 + 2];
+
+    int dim = n_heads * head_dim;
+    int idx0 = p * dim + h * head_dim + 2 * d;
+    int idx1 = idx0 + 1;
+
+    float re = vec_buf[idx0];
+    float im = vec_buf[idx1];
+
+    vec_buf[idx0] = re * cos_val - im * sin_val;
+    vec_buf[idx1] = re * sin_val + im * cos_val;
+}
