@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/rand"
+	"os"
 	"testing"
 
 	"github.com/computerex/dlgo/core"
@@ -506,6 +507,195 @@ func TestGpuForwardBlockWithAdaLN(t *testing.T) {
 			if math.Abs(float64(cpuX[i]-gpuOut[i])) > 0.001 {
 				t.Logf("  [%d] CPU=%.6f GPU=%.6f diff=%.6f", i, cpuX[i], gpuOut[i], cpuX[i]-gpuOut[i])
 			}
+		}
+	}
+}
+
+// TestGpuForwardRealModel loads the real Q4_K_M DiT model, runs one main layer
+// on both CPU and GPU with identical random input, and compares output.
+// This validates GPU correctness with actual quantized weights.
+func TestGpuForwardRealModel(t *testing.T) {
+	const ditPath = `C:\Users\mohd\Downloads\z-image-turbo-Q4_K_M.gguf`
+	if _, err := os.Stat(ditPath); err != nil {
+		t.Skipf("DiT model not found at %s", ditPath)
+	}
+
+	if err := gpu.Init(); err != nil {
+		t.Skipf("GPU not available: %v", err)
+	}
+	defer gpu.Shutdown()
+
+	t.Log("Loading DiT model...")
+	dit, err := LoadDiTModel(ditPath)
+	if err != nil {
+		t.Fatalf("LoadDiTModel: %v", err)
+	}
+	defer dit.MmapFile.Close()
+
+	cfg := dit.Config
+	hidden := cfg.HiddenSize
+	headDim := cfg.HeadDim
+	seqLen := 36 // small: 32 text + 4 image tokens (tiny resolution)
+
+	t.Logf("Model: hidden=%d headDim=%d numHeads=%d ffnDim=%d",
+		hidden, headDim, cfg.NumHeads, cfg.FFNHiddenDim())
+
+	// Use MainLayers[0] which has adaLN
+	cpuLayer := &dit.MainLayers[0]
+
+	// Create PE and random input
+	rng := rand.New(rand.NewSource(123))
+	pe := makeSyntheticPE(seqLen, headDim, 0)
+	peStride := headDim * 2
+	input := randFloats(rng, seqLen*hidden, 0.1)
+	adaLNInput := randFloats(rng, cfg.AdaLNEmbedDim, 0.3)
+
+	// --- CPU forward ---
+	cpuModel := &DiTModel{Config: cfg}
+	cpuRS := NewDiTRunState(cfg, seqLen)
+	cpuX := make([]float32, seqLen*hidden)
+	copy(cpuX, input)
+	forwardBlock(cpuModel, cpuRS, cpuLayer, cpuX, seqLen, pe, 0, adaLNInput)
+
+	// --- GPU forward ---
+	t.Log("Uploading layer 0 weights to GPU...")
+	gpuAttnQKV, err := gpu.UploadTensor(cpuLayer.AttnQKV)
+	if err != nil {
+		t.Fatalf("upload AttnQKV: %v", err)
+	}
+	defer gpu.Free(gpuAttnQKV.Buf)
+	gpuAttnOut, err := gpu.UploadTensor(cpuLayer.AttnOut)
+	if err != nil {
+		t.Fatalf("upload AttnOut: %v", err)
+	}
+	defer gpu.Free(gpuAttnOut.Buf)
+	gpuFFNGate, err := gpu.UploadTensor(cpuLayer.FFNGate)
+	if err != nil {
+		t.Fatalf("upload FFNGate: %v", err)
+	}
+	defer gpu.Free(gpuFFNGate.Buf)
+	gpuFFNDown, err := gpu.UploadTensor(cpuLayer.FFNDown)
+	if err != nil {
+		t.Fatalf("upload FFNDown: %v", err)
+	}
+	defer gpu.Free(gpuFFNDown.Buf)
+	gpuFFNUp, err := gpu.UploadTensor(cpuLayer.FFNUp)
+	if err != nil {
+		t.Fatalf("upload FFNUp: %v", err)
+	}
+	defer gpu.Free(gpuFFNUp.Buf)
+	gpuAdaLN, err := gpu.UploadTensor(cpuLayer.AdaLNWeight)
+	if err != nil {
+		t.Fatalf("upload AdaLN: %v", err)
+	}
+	defer gpu.Free(gpuAdaLN.Buf)
+
+	gpuQNorm, _ := gpu.UploadF32Slice(cpuLayer.QNorm)
+	defer gpu.Free(gpuQNorm)
+	gpuKNorm, _ := gpu.UploadF32Slice(cpuLayer.KNorm)
+	defer gpu.Free(gpuKNorm)
+	gpuAttnNorm1, _ := gpu.UploadF32Slice(cpuLayer.AttnNorm1)
+	defer gpu.Free(gpuAttnNorm1)
+	gpuAttnNorm2, _ := gpu.UploadF32Slice(cpuLayer.AttnNorm2)
+	defer gpu.Free(gpuAttnNorm2)
+	gpuFFNNorm1, _ := gpu.UploadF32Slice(cpuLayer.FFNNorm1)
+	defer gpu.Free(gpuFFNNorm1)
+	gpuFFNNorm2, _ := gpu.UploadF32Slice(cpuLayer.FFNNorm2)
+	defer gpu.Free(gpuFFNNorm2)
+	gpuAdaLNBias, _ := gpu.UploadF32Slice(cpuLayer.AdaLNBias)
+	defer gpu.Free(gpuAdaLNBias)
+
+	gpuLayer := &GpuDiTLayer{
+		AttnQKV:     gpuAttnQKV,
+		AttnOut:     gpuAttnOut,
+		FFNGate:     gpuFFNGate,
+		FFNDown:     gpuFFNDown,
+		FFNUp:       gpuFFNUp,
+		QNorm:       gpuQNorm,
+		KNorm:       gpuKNorm,
+		AttnNorm1:   gpuAttnNorm1,
+		AttnNorm2:   gpuAttnNorm2,
+		FFNNorm1:    gpuFFNNorm1,
+		FFNNorm2:    gpuFFNNorm2,
+		AdaLNWeight: gpuAdaLN,
+		AdaLNBias:   gpuAdaLNBias,
+	}
+
+	gpuModel := &GpuDiTModel{Config: cfg}
+	gpuRS, err := NewGpuDiTRunState(cfg, seqLen)
+	if err != nil {
+		t.Fatalf("GPU run state: %v", err)
+	}
+	defer func() {
+		gpu.Free(gpuRS.X)
+		gpu.Free(gpuRS.XNorm)
+		gpu.Free(gpuRS.QKV)
+		gpu.Free(gpuRS.Q)
+		gpu.Free(gpuRS.K)
+		gpu.Free(gpuRS.V)
+		gpu.Free(gpuRS.AttnOut)
+		gpu.Free(gpuRS.Proj)
+		gpu.Free(gpuRS.Gate)
+		gpu.Free(gpuRS.Up)
+		gpu.Free(gpuRS.Hidden)
+		gpu.Free(gpuRS.FFNOut)
+		gpu.Free(gpuRS.Residual)
+		gpu.Free(gpuRS.Mod)
+		gpu.Free(gpuRS.ScaleBuf)
+		gpu.Free(gpuRS.GateBuf)
+	}()
+
+	peBuf, _ := gpu.AllocE(uint64(len(pe)) * 4)
+	defer gpu.Free(peBuf)
+	gpu.UploadF32(peBuf, pe)
+	gpuRS.PE = peBuf
+
+	gpu.UploadF32(gpuRS.X, input)
+
+	t.Log("Running GPU forward block...")
+	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, 0, adaLNInput, peStride)
+	gpu.Sync()
+
+	gpuOut := make([]float32, seqLen*hidden)
+	gpu.DownloadF32(gpuRS.X, gpuOut)
+
+	// Compare
+	maxErr := float32(0)
+	sumSqErr := float64(0)
+	sumSq := float64(0)
+	for i := 0; i < seqLen*hidden; i++ {
+		diff := float32(math.Abs(float64(cpuX[i] - gpuOut[i])))
+		if diff > maxErr {
+			maxErr = diff
+		}
+		sumSqErr += float64(diff) * float64(diff)
+		sumSq += float64(cpuX[i]) * float64(cpuX[i])
+	}
+	rmse := float32(math.Sqrt(sumSqErr / float64(seqLen*hidden)))
+	relErr := float32(math.Sqrt(sumSqErr / (sumSq + 1e-12)))
+
+	t.Logf("Real Q4_K_M weights — GPU vs CPU: MaxErr=%.6f RMSE=%.6f RelErr=%.6f",
+		maxErr, rmse, relErr)
+
+	// Q4_K_M dequantization differences compound through a full transformer block
+	// (10+ matvec ops, attention, norms). RelErr < 5% is excellent for Q4_K_M.
+	// MaxErr can spike in attention heads that amplify small differences.
+	if relErr > 0.05 {
+		t.Errorf("RelErr too large: %.6f (want < 0.05)", relErr)
+	}
+	if maxErr > 2.0 {
+		t.Errorf("MaxErr too large: %.6f (want < 2.0)", maxErr)
+		mismatches := 0
+		for i := 0; i < seqLen*hidden; i++ {
+			if math.Abs(float64(cpuX[i]-gpuOut[i])) > 0.01 {
+				if mismatches < 20 {
+					t.Logf("  [%d] CPU=%.6f GPU=%.6f diff=%.6f", i, cpuX[i], gpuOut[i], cpuX[i]-gpuOut[i])
+				}
+				mismatches++
+			}
+		}
+		if mismatches > 20 {
+			t.Logf("  ... and %d more mismatches", mismatches-20)
 		}
 	}
 }
