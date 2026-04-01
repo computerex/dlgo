@@ -1087,6 +1087,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
         case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;  // IQ4_NL
         case 39:            pipe = PIPE_MATVEC_MXFP4;   break;  // MXFP4
+        case QTYPE_BF16:    pipe = PIPE_MATVEC_BF16;    break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1104,6 +1105,9 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
             break;
         case 39: // MXFP4: 1 row per WG (128 threads, simple accumulation)
             rows_per_wg = 1;
+            break;
+        case QTYPE_BF16: // BF16: 8 rows per WG (128 threads, 4 subgroups x 2 rows)
+            rows_per_wg = 8;
             break;
     }
 
@@ -1158,6 +1162,7 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
         case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;
         case 39:            pipe = PIPE_MATVEC_MXFP4;   break;
+        case QTYPE_BF16:    pipe = PIPE_MATVEC_BF16;    break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1174,6 +1179,9 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
             break;
         case 39:
             rows_per_wg = 1;
+            break;
+        case QTYPE_BF16:
+            rows_per_wg = 8;
             break;
     }
 
@@ -1939,6 +1947,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  break;
         case 20:            pipe = PIPE_MATVEC_IQ4_NL;  break;
         case 39:            pipe = PIPE_MATVEC_MXFP4;   break;
+        case QTYPE_BF16:    pipe = PIPE_MATVEC_BF16;    break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -1955,6 +1964,9 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
             break;
         case 39:
             rows_per_wg = 1;
+            break;
+        case QTYPE_BF16:
+            rows_per_wg = 8;
             break;
     }
 

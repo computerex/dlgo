@@ -41,6 +41,7 @@ extern "C" {
 #define QTYPE_IQ3_S   21
 #define QTYPE_IQ4_XS  23
 #define QTYPE_IQ1_M   29
+#define QTYPE_BF16    30
 #define QTYPE_TQ1_0   34
 
 // Shader pipeline IDs
@@ -122,6 +123,7 @@ typedef enum {
     PIPE_KV_STORE_BATCH_F16,
     PIPE_ATTENTION_TILED_F32,
     PIPE_LAYERNORM,
+    PIPE_MATVEC_BF16,
     PIPE_COUNT
 } PipelineID;
 

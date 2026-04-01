@@ -66,7 +66,8 @@ $shaders = @(
     @{name="kv_store_f16"; file="kv_store_f16.comp"},
     @{name="kv_store_batch_f16"; file="kv_store_batch_f16.comp"},
     @{name="attention_tiled_f32"; file="attention_tiled_f32.comp"},
-    @{name="layernorm"; file="layernorm.comp"}
+    @{name="layernorm"; file="layernorm.comp"},
+    @{name="matvec_bf16"; file="matvec_bf16.comp"}
 )
 
 $header = @"
@@ -188,6 +189,7 @@ static const ShaderInfo shader_registry[] = {
     {"kv_store_batch_f16", spv_kv_store_batch_f16, spv_kv_store_batch_f16_size, 4, 8}, // PIPE_KV_STORE_BATCH_F16
     {"attention_tiled_f32", spv_attention_tiled_f32, spv_attention_tiled_f32_size, 4, 24}, // PIPE_ATTENTION_TILED_F32
     {"layernorm", spv_layernorm, spv_layernorm_size, 4, 8}, // PIPE_LAYERNORM
+    {"matvec_bf16", spv_matvec_bf16, spv_matvec_bf16_size, 3, 8}, // PIPE_MATVEC_BF16
 };
 
 #endif // DLGO_SHADERS_SPIRV_H
