@@ -128,6 +128,11 @@ typedef enum {
     PIPE_TANH_GATE_RESIDUAL,
     PIPE_ROPE_3D,
     PIPE_ATTENTION_FULL_F32,
+    PIPE_CONV2D_F32,
+    PIPE_GROUP_NORM,
+    PIPE_SILU,
+    PIPE_UPSAMPLE_NEAREST,
+    PIPE_SPATIAL_ATTENTION,
     PIPE_COUNT
 } PipelineID;
 
@@ -290,6 +295,17 @@ int gpu_attention_full_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_
                            int seq_len, float scale);
 int gpu_rmsnorm_heads_batch(GpuBuf data_buf, GpuBuf weight_buf,
                             int num_heads, int head_dim, int npos, float eps);
+
+// VAE-specific operations
+int gpu_conv2d_f32(GpuBuf out_buf, GpuBuf in_buf, GpuBuf weight_buf, GpuBuf bias_buf,
+                   int inCh, int H, int W, int kH, int kW, int padH, int padW,
+                   int stride, int outH, int outW, int outCh);
+int gpu_group_norm(GpuBuf out_buf, GpuBuf in_buf, GpuBuf weight_buf, GpuBuf bias_buf,
+                   int C, int spatialSize, int numGroups, float eps);
+int gpu_silu(GpuBuf data_buf, int n);
+int gpu_upsample_nearest(GpuBuf out_buf, GpuBuf in_buf, int C, int H, int W);
+int gpu_spatial_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf,
+                          int C, int spatial, float scale);
 
 // Synchronize: wait for all GPU work to complete
 void gpu_sync(void);

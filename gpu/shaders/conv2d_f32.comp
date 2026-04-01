@@ -1,0 +1,59 @@
+#version 450
+
+// Conv2D: out[oc, oh, ow] = bias[oc] + sum_{ic,kh,kw} weight[oc,ic,kh,kw] * input[ic, oh*stride+kh-padH, ow*stride+kw-padW]
+// Handles both 3x3 (with padding) and 1x1 (point-wise) convolutions.
+//
+// Dispatch: groups_x = ceil(outH*outW / 256), groups_y = outCh, groups_z = 1
+// Buffers: 0=output, 1=input, 2=weight, 3=bias
+// Push constants: inCh, H, W, kH, kW, padH, padW, stride, outH, outW (40 bytes)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer In { float in_data[]; };
+layout(set = 0, binding = 2) readonly buffer Weight { float w_data[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float b_data[]; };
+
+layout(push_constant) uniform Params {
+    int inCh;
+    int H;       // input height
+    int W;       // input width
+    int kH;      // kernel height
+    int kW;      // kernel width
+    int padH;
+    int padW;
+    int stride;
+    int outH;
+    int outW;
+};
+
+void main() {
+    uint sp = gl_GlobalInvocationID.x;   // output spatial position
+    uint oc = gl_WorkGroupID.y;          // output channel
+    uint spatialOut = uint(outH * outW);
+
+    if (sp >= spatialOut) return;
+
+    uint oh = sp / uint(outW);
+    uint ow = sp % uint(outW);
+
+    float sum = b_data[oc];
+
+    uint wBase = oc * uint(inCh * kH * kW);
+
+    for (int ic = 0; ic < inCh; ic++) {
+        for (int kh = 0; kh < kH; kh++) {
+            int ih = int(oh) * stride + kh - padH;
+            if (ih < 0 || ih >= H) continue;
+            for (int kw = 0; kw < kW; kw++) {
+                int iw = int(ow) * stride + kw - padW;
+                if (iw < 0 || iw >= W) continue;
+                uint wIdx = wBase + uint(ic * kH * kW + kh * kW + kw);
+                uint iIdx = uint(ic) * uint(H * W) + uint(ih) * uint(W) + uint(iw);
+                sum += w_data[wIdx] * in_data[iIdx];
+            }
+        }
+    }
+
+    out_data[oc * spatialOut + sp] = sum;
+}

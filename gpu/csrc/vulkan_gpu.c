@@ -2132,6 +2132,111 @@ int gpu_rmsnorm_heads_batch(GpuBuf data_buf, GpuBuf weight_buf,
     return dispatch_compute(&dp);
 }
 
+// ---------------------------------------------------------------------------
+// VAE-specific operations
+// ---------------------------------------------------------------------------
+
+int gpu_conv2d_f32(GpuBuf out_buf, GpuBuf in_buf, GpuBuf weight_buf, GpuBuf bias_buf,
+                   int inCh, int H, int W, int kH, int kW, int padH, int padW,
+                   int stride, int outH, int outW, int outCh) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int inCh; int H; int W; int kH; int kW; int padH; int padW; int stride; int outH; int outW; } pc =
+        {inCh, H, W, kH, kW, padH, padW, stride, outH, outW};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_CONV2D_F32;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = in_buf;
+    dp.bufs[2] = weight_buf;
+    dp.bufs[3] = bias_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (outH * outW + 255) / 256;
+    dp.groups_y = outCh;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_group_norm(GpuBuf out_buf, GpuBuf in_buf, GpuBuf weight_buf, GpuBuf bias_buf,
+                   int C, int spatialSize, int numGroups, float eps) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int C; int spatialSize; int numGroups; float eps; } pc = {C, spatialSize, numGroups, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GROUP_NORM;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = in_buf;
+    dp.bufs[2] = weight_buf;
+    dp.bufs[3] = bias_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = numGroups;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_silu(GpuBuf data_buf, int n) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int n; } pc = {n};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SILU;
+    dp.bufs[0] = data_buf;
+    dp.num_bufs = 1;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_upsample_nearest(GpuBuf out_buf, GpuBuf in_buf, int C, int H, int W) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int total = C * H * 2 * W * 2;
+    struct { int C; int H; int W; } pc = {C, H, W};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_UPSAMPLE_NEAREST;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = in_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (total + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_spatial_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf,
+                          int C, int spatial, float scale) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int C; int spatial; float scale; } pc = {C, spatial, scale};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SPATIAL_ATTENTION;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_buf;
+    dp.bufs[3] = v_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = spatial;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
     // TODO: implement dequantize shaders
     return GPU_ERR_SHADER;

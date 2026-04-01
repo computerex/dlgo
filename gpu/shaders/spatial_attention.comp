@@ -1,0 +1,128 @@
+// Single-head spatial self-attention for VAE mid-block.
+// Q/K/V are stored channel-major: [C, spatial] where spatial = H * W.
+// This matches the output layout of 1x1 convolutions.
+//
+// Dispatch: groups_x = spatial (one WG per query position), groups_y = 1, groups_z = 1
+// Buffers: 0=output [C, spatial], 1=Q [C, spatial], 2=K [C, spatial], 3=V [C, spatial]
+// Push constants: C, spatial, scale (12 bytes)
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 2) readonly buffer K { float k_data[]; };
+layout(set = 0, binding = 3) readonly buffer V { float v_data[]; };
+
+layout(push_constant) uniform Params {
+    int C;       // channel dimension
+    int spatial; // number of spatial positions (H*W)
+    float scale;
+};
+
+#define WG_SIZE 256
+#define TILE_SIZE 256
+
+shared float q_sh[512];         // query vector (max C=512)
+shared float tile_s[TILE_SIZE]; // attention weights for current tile
+shared float reduce_buf[WG_SIZE];
+shared float sh_out[512];       // output accumulator (max C=512)
+
+void main() {
+    uint qi = gl_WorkGroupID.x;  // query spatial position
+    if (qi >= uint(spatial)) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = uint(C);
+    uint sp = uint(spatial);
+
+    // Load query vector for this position into shared memory
+    // Q layout: Q[c, qi] = q_data[c * spatial + qi]
+    for (uint c = tid; c < hd; c += WG_SIZE) {
+        q_sh[c] = q_data[c * sp + qi];
+    }
+    barrier();
+
+    // Pass 1: find global max of Q·K scores
+    float global_max = -1.0e30;
+
+    for (int tile_start = 0; tile_start < spatial; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, spatial);
+        int tile_len = tile_end - tile_start;
+
+        float my_score = -1.0e30;
+        if (int(tid) < tile_len) {
+            uint ki = uint(tile_start) + tid;
+            float dot_val = 0.0;
+            for (uint c = 0; c < hd; c++) {
+                dot_val += q_sh[c] * k_data[c * sp + ki];
+            }
+            my_score = dot_val * scale;
+        }
+        tile_s[tid] = my_score;
+
+        reduce_buf[tid] = my_score;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
+            barrier();
+        }
+        global_max = max(global_max, reduce_buf[0]);
+        barrier();
+    }
+
+    // Initialize output accumulator
+    for (uint c = tid; c < hd; c += WG_SIZE) {
+        sh_out[c] = 0.0;
+    }
+    barrier();
+
+    // Pass 2: compute exp(score - max), accumulate sum and weighted V
+    float total_sum = 0.0;
+
+    for (int tile_start = 0; tile_start < spatial; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, spatial);
+        int tile_len = tile_end - tile_start;
+
+        // Compute weights
+        float w = 0.0;
+        if (int(tid) < tile_len) {
+            uint ki = uint(tile_start) + tid;
+            float dot_val = 0.0;
+            for (uint c = 0; c < hd; c++) {
+                dot_val += q_sh[c] * k_data[c * sp + ki];
+            }
+            w = exp(dot_val * scale - global_max);
+        }
+        tile_s[tid] = w;
+
+        // Sum weights in this tile
+        reduce_buf[tid] = w;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+            barrier();
+        }
+        total_sum += reduce_buf[0];
+        barrier();
+
+        // Weighted V accumulation
+        // Each thread handles a subset of output channels
+        for (uint c = tid; c < hd; c += WG_SIZE) {
+            float acc = 0.0;
+            for (int j = 0; j < tile_len; j++) {
+                acc += tile_s[j] * v_data[c * sp + uint(tile_start + j)];
+            }
+            sh_out[c] += acc;
+        }
+        barrier();
+    }
+
+    // Write output: normalize by total_sum
+    // Output layout: out[c, qi] = out_data[c * spatial + qi]
+    float inv_sum = 1.0 / total_sum;
+    for (uint c = tid; c < hd; c += WG_SIZE) {
+        out_data[c * sp + qi] = sh_out[c] * inv_sum;
+    }
+}

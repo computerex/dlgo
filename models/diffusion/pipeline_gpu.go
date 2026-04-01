@@ -11,49 +11,67 @@ import (
 )
 
 // setupDiffusionGPU initializes GPU resources for diffusion if cfg.UseGPU is true.
-// Returns (cleanup func, model callback, error).
-// If GPU is not requested, returns (nil, nil, nil) and the caller uses CPU.
+// Returns (cleanup func, model callback, vae decode func, error).
+// If GPU is not requested, returns (nil, nil, nil, nil) and the caller uses CPU.
 func setupDiffusionGPU(
 	dit *DiTModel,
 	rs *DiTRunState,
+	vae *VAEDecoder,
 	cfg ImageGenConfig,
 	context []float32,
 	contextLen int,
 	latentH, latentW int,
 	maxSeqLen int,
-) (cleanup func(), modelFn func([]float32, float32) []float32, err error) {
+) (cleanup func(), modelFn func([]float32, float32) []float32,
+	vaeFn func([]float32, int, int) []float32, err error) {
 	if !cfg.UseGPU {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	log.Println("[diffusion/gpu] Initializing GPU...")
 	gpuStart := time.Now()
 	if err := gpu.Init(); err != nil {
-		return nil, nil, fmt.Errorf("GPU init: %w", err)
+		return nil, nil, nil, fmt.Errorf("GPU init: %w", err)
 	}
 	log.Printf("[diffusion/gpu] GPU: %s (%.0f MB VRAM)", gpu.DeviceName(),
 		float64(gpu.VRAMBytes())/(1024*1024))
 
-	// Upload model weights to GPU
+	// Upload DiT weights to GPU
 	log.Println("[diffusion/gpu] Uploading DiT weights to GPU...")
 	gm, err := UploadDiTModel(dit)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, fmt.Errorf("upload DiT: %w", err)
+		return nil, nil, nil, fmt.Errorf("upload DiT: %w", err)
 	}
 
-	// Allocate GPU run state
+	// Allocate DiT GPU run state
 	grs, err := NewGpuDiTRunState(dit.Config, maxSeqLen)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, fmt.Errorf("GPU run state: %w", err)
+		return nil, nil, nil, fmt.Errorf("GPU run state: %w", err)
 	}
 
-	log.Printf("[diffusion/gpu] GPU setup complete in %v", time.Since(gpuStart))
+	// Upload VAE weights to GPU
+	log.Println("[diffusion/gpu] Uploading VAE weights to GPU...")
+	gvm, err := UploadVAEModel(vae)
+	if err != nil {
+		gpu.Shutdown()
+		return nil, nil, nil, fmt.Errorf("upload VAE: %w", err)
+	}
+
+	// Allocate VAE GPU scratch buffers
+	gvrs, err := NewGpuVAERunState(vae.Config, latentH, latentW)
+	if err != nil {
+		gpu.Shutdown()
+		return nil, nil, nil, fmt.Errorf("VAE GPU run state: %w", err)
+	}
+
+	log.Printf("[diffusion/gpu] GPU setup complete in %v (VRAM used: %.1f MB)",
+		time.Since(gpuStart), float64(gpu.AllocatedBytes())/(1024*1024))
 
 	cleanup = func() {
 		log.Println("[diffusion/gpu] Freeing GPU resources...")
-		// Run state buffers
+		// DiT run state buffers
 		gpu.Free(grs.X)
 		gpu.Free(grs.XNorm)
 		gpu.Free(grs.QKV)
@@ -74,7 +92,7 @@ func setupDiffusionGPU(
 			gpu.Free(grs.PE)
 		}
 
-		// Layer buffers
+		// DiT layer buffers
 		for i := range gm.Layers {
 			l := &gm.Layers[i]
 			if l.AttnQKV != nil {
@@ -118,6 +136,19 @@ func setupDiffusionGPU(
 			}
 		}
 
+		// VAE scratch buffers
+		gpu.Free(gvrs.Act)
+		gpu.Free(gvrs.Tmp1)
+		gpu.Free(gvrs.Tmp2)
+		gpu.Free(gvrs.Ups)
+		gpu.Free(gvrs.AttnQ)
+		gpu.Free(gvrs.AttnK)
+		gpu.Free(gvrs.AttnV)
+		gpu.Free(gvrs.AttnOut)
+
+		// NOTE: VAE weight buffers are not individually freed here since
+		// gpu.Shutdown() releases all GPU resources.
+
 		gpu.Shutdown()
 		log.Println("[diffusion/gpu] GPU resources freed")
 	}
@@ -126,5 +157,9 @@ func setupDiffusionGPU(
 		return GpuDiTForward(dit, gm, rs, grs, x, timestep, context, contextLen, latentH, latentW)
 	}
 
-	return cleanup, modelFn, nil
+	vaeFn = func(latent []float32, h, w int) []float32 {
+		return GpuVAEDecode(vae, gvm, gvrs, latent, h, w)
+	}
+
+	return cleanup, modelFn, vaeFn, nil
 }

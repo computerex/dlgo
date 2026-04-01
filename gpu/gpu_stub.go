@@ -68,6 +68,13 @@ func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e, f float32, rd int, n b
 func (lc *LayerConf) SetDP4A(q Buf) {}
 func ForwardLayer(lc *LayerConf, pos, sl int, s float32, nan Buf) error   { return errNoGPU }
 
+// VAE-specific stubs
+func Conv2dF32(out, in, weight, bias Buf, inCh, H, W, kH, kW, padH, padW, stride, outH, outW, outCh int) error { return errNoGPU }
+func GroupNorm(out, in, weight, bias Buf, channels, spatialSize, numGroups int, eps float32) error { return errNoGPU }
+func SiLU(data Buf, n int) error { return errNoGPU }
+func UpsampleNearest(out, in Buf, channels, H, W int) error { return errNoGPU }
+func SpatialAttention(out, q, k, v Buf, channels, spatial int, scale float32) error { return errNoGPU }
+
 type MoEFFNConf struct{}
 
 func NewMoEFFNConf() *MoEFFNConf                                                       { return nil }

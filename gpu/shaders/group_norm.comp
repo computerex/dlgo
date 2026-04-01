@@ -1,0 +1,78 @@
+#version 450
+
+// GroupNorm: normalize within each group of channels.
+// Input/Output: [C, spatialSize] float32
+// Weight, Bias: [C] float32 (per-channel affine)
+//
+// Dispatch: groups_x = numGroups, groups_y = 1, groups_z = 1
+// Buffers: 0=out, 1=input, 2=weight, 3=bias
+// Push constants: C, spatialSize, numGroups, eps (16 bytes)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer In { float in_data[]; };
+layout(set = 0, binding = 2) readonly buffer Weight { float w_data[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float b_data[]; };
+
+layout(push_constant) uniform Params {
+    int C;
+    int spatialSize;
+    int numGroups;
+    float eps;
+};
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint group = gl_WorkGroupID.x;
+
+    int groupSize = C / numGroups;
+    int startCh = int(group) * groupSize;
+    int n = groupSize * spatialSize;
+
+    // Pass 1: compute mean
+    float sum = 0.0;
+    for (int i = int(tid); i < n; i += 256) {
+        int ch = startCh + i / spatialSize;
+        int s = i % spatialSize;
+        sum += in_data[ch * spatialSize + s];
+    }
+    sdata[tid] = sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float mean = sdata[0] / float(n);
+    barrier();
+
+    // Pass 2: compute variance
+    float var_sum = 0.0;
+    for (int i = int(tid); i < n; i += 256) {
+        int ch = startCh + i / spatialSize;
+        int s = i % spatialSize;
+        float d = in_data[ch * spatialSize + s] - mean;
+        var_sum += d * d;
+    }
+    sdata[tid] = var_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float variance = sdata[0] / float(n);
+    float invStd = inversesqrt(variance + eps);
+    barrier();
+
+    // Pass 3: normalize with per-channel affine
+    for (int i = int(tid); i < n; i += 256) {
+        int ch = startCh + i / spatialSize;
+        int s = i % spatialSize;
+        int idx = ch * spatialSize + s;
+        out_data[idx] = (in_data[idx] - mean) * invStd * w_data[ch] + b_data[ch];
+    }
+}

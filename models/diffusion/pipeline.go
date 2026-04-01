@@ -205,7 +205,8 @@ func GenerateImage(
 
 	// 7. GPU setup (if requested)
 	var modelFn func(x []float32, timestep float32) []float32
-	gpuCleanup, gpuModelFn, gpuErr := setupDiffusionGPU(dit, rs, cfg, context, contextLen, latentH, latentW, maxSeqLen)
+	var gpuVaeFn func([]float32, int, int) []float32
+	gpuCleanup, gpuModelFn, gpuVaeDecodeFn, gpuErr := setupDiffusionGPU(dit, rs, vae, cfg, context, contextLen, latentH, latentW, maxSeqLen)
 	if gpuErr != nil {
 		return fmt.Errorf("GPU setup: %w", gpuErr)
 	}
@@ -220,6 +221,7 @@ func GenerateImage(
 			return DiTForward(dit, rs, x, timestep, context, contextLen, latentH, latentW)
 		}
 	}
+	gpuVaeFn = gpuVaeDecodeFn
 
 	// 8. Run Euler sampler
 	// 8. Run Euler sampler
@@ -232,7 +234,12 @@ func GenerateImage(
 	// 9. VAE decode
 	log.Println("Decoding with VAE...")
 	decStart := time.Now()
-	pixels := VAEDecode(vae, latent, latentH, latentW)
+	var pixels []float32
+	if gpuVaeFn != nil {
+		pixels = gpuVaeFn(latent, latentH, latentW)
+	} else {
+		pixels = VAEDecode(vae, latent, latentH, latentW)
+	}
 	log.Printf("VAE decode done in %v", time.Since(decStart))
 
 	// 10. Save as PNG

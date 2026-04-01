@@ -1,0 +1,36 @@
+#version 450
+
+// Nearest-neighbor 2x upsampling: [C, H, W] -> [C, 2H, 2W]
+//
+// Dispatch: groups_x = ceil(C * 2H * 2W / 256), groups_y = 1, groups_z = 1
+// Buffers: 0=output [C, 2H, 2W], 1=input [C, H, W]
+// Push constants: C, H, W (12 bytes)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer In { float in_data[]; };
+
+layout(push_constant) uniform Params {
+    int C;
+    int H;
+    int W;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    int outH = H * 2;
+    int outW = W * 2;
+    uint total = uint(C * outH * outW);
+    if (i >= total) return;
+
+    uint c = i / uint(outH * outW);
+    uint rem = i % uint(outH * outW);
+    uint oh = rem / uint(outW);
+    uint ow = rem % uint(outW);
+
+    uint srcH = oh / 2;
+    uint srcW = ow / 2;
+
+    out_data[i] = in_data[c * uint(H * W) + srcH * uint(W) + srcW];
+}

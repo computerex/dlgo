@@ -931,6 +931,59 @@ func SigmoidGate(out, gate Buf, n int) error {
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// VAE-specific operations
+// ---------------------------------------------------------------------------
+
+// Conv2dF32 performs 2D convolution with F32 weights.
+func Conv2dF32(out, in, weight, bias Buf, inCh, H, W, kH, kW, padH, padW, stride, outH, outW, outCh int) error {
+	rc := C.gpu_conv2d_f32(C.GpuBuf(out), C.GpuBuf(in), C.GpuBuf(weight), C.GpuBuf(bias),
+		C.int(inCh), C.int(H), C.int(W), C.int(kH), C.int(kW),
+		C.int(padH), C.int(padW), C.int(stride), C.int(outH), C.int(outW), C.int(outCh))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: conv2d_f32 failed (%d)", rc)
+	}
+	return nil
+}
+
+// GroupNorm performs group normalization.
+func GroupNorm(out, in, weight, bias Buf, channels, spatialSize, numGroups int, eps float32) error {
+	rc := C.gpu_group_norm(C.GpuBuf(out), C.GpuBuf(in), C.GpuBuf(weight), C.GpuBuf(bias),
+		C.int(channels), C.int(spatialSize), C.int(numGroups), C.float(eps))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: group_norm failed (%d)", rc)
+	}
+	return nil
+}
+
+// SiLU performs in-place SiLU activation.
+func SiLU(data Buf, n int) error {
+	rc := C.gpu_silu(C.GpuBuf(data), C.int(n))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: silu failed (%d)", rc)
+	}
+	return nil
+}
+
+// UpsampleNearest performs 2× nearest-neighbor upsampling.
+func UpsampleNearest(out, in Buf, channels, H, W int) error {
+	rc := C.gpu_upsample_nearest(C.GpuBuf(out), C.GpuBuf(in), C.int(channels), C.int(H), C.int(W))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: upsample_nearest failed (%d)", rc)
+	}
+	return nil
+}
+
+// SpatialAttention performs single-head spatial self-attention for channel-major [C, spatial] layout.
+func SpatialAttention(out, q, k, v Buf, channels, spatial int, scale float32) error {
+	rc := C.gpu_spatial_attention(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(k), C.GpuBuf(v),
+		C.int(channels), C.int(spatial), C.float(scale))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: spatial_attention failed (%d)", rc)
+	}
+	return nil
+}
+
 // BatchRoPE applies RoPE to Q and K for npos positions starting at startPos.
 func BatchRoPE(q, k, cosTable, sinTable Buf, numHeads, numKVHeads, headDim, ropeDim, startPos int,
 	neox bool, npos int) error {

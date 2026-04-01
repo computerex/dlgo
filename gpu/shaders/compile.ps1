@@ -71,7 +71,12 @@ $shaders = @(
     @{name="broadcast_mul"; file="broadcast_mul.comp"},
     @{name="tanh_gate_residual"; file="tanh_gate_residual.comp"},
     @{name="rope_3d"; file="rope_3d.comp"},
-    @{name="attention_full_f32"; file="attention_full_f32.comp"}
+    @{name="attention_full_f32"; file="attention_full_f32.comp"},
+    @{name="conv2d_f32"; file="conv2d_f32.comp"},
+    @{name="group_norm"; file="group_norm.comp"},
+    @{name="silu"; file="silu.comp"},
+    @{name="upsample_nearest"; file="upsample_nearest.comp"},
+    @{name="spatial_attention"; file="spatial_attention.comp"}
 )
 
 $header = @"
@@ -198,6 +203,11 @@ static const ShaderInfo shader_registry[] = {
     {"tanh_gate_residual", spv_tanh_gate_residual, spv_tanh_gate_residual_size, 4, 8}, // PIPE_TANH_GATE_RESIDUAL
     {"rope_3d", spv_rope_3d, spv_rope_3d_size, 2, 20}, // PIPE_ROPE_3D
     {"attention_full_f32", spv_attention_full_f32, spv_attention_full_f32_size, 4, 24}, // PIPE_ATTENTION_FULL_F32
+    {"conv2d_f32", spv_conv2d_f32, spv_conv2d_f32_size, 4, 40}, // PIPE_CONV2D_F32
+    {"group_norm", spv_group_norm, spv_group_norm_size, 4, 16}, // PIPE_GROUP_NORM
+    {"silu", spv_silu, spv_silu_size, 1, 4}, // PIPE_SILU
+    {"upsample_nearest", spv_upsample_nearest, spv_upsample_nearest_size, 2, 12}, // PIPE_UPSAMPLE_NEAREST
+    {"spatial_attention", spv_spatial_attention, spv_spatial_attention_size, 4, 12}, // PIPE_SPATIAL_ATTENTION
 };
 
 #endif // DLGO_SHADERS_SPIRV_H
