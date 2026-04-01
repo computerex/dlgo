@@ -20,6 +20,7 @@ type ImageGenConfig struct {
 	Steps   int
 	CFGScale float32
 	Seed    int64
+	UseGPU  bool
 }
 
 // DefaultImageGenConfig returns default generation parameters matching sd-cli.
@@ -202,24 +203,39 @@ func GenerateImage(
 	maxSeqLen := nTxtPaddedMax + nImgPaddedMax
 	rs := NewDiTRunState(dit.Config, maxSeqLen)
 
-	// 7. Run Euler sampler
+	// 7. GPU setup (if requested)
+	var modelFn func(x []float32, timestep float32) []float32
+	gpuCleanup, gpuModelFn, gpuErr := setupDiffusionGPU(dit, rs, cfg, context, contextLen, latentH, latentW, maxSeqLen)
+	if gpuErr != nil {
+		return fmt.Errorf("GPU setup: %w", gpuErr)
+	}
+	if gpuCleanup != nil {
+		defer gpuCleanup()
+	}
+
+	if gpuModelFn != nil {
+		modelFn = gpuModelFn
+	} else {
+		modelFn = func(x []float32, timestep float32) []float32 {
+			return DiTForward(dit, rs, x, timestep, context, contextLen, latentH, latentW)
+		}
+	}
+
+	// 8. Run Euler sampler
+	// 8. Run Euler sampler
 	log.Printf("Sampling: %d steps, seed=%d, cfg_scale=%.1f", cfg.Steps, cfg.Seed, cfg.CFGScale)
 	sampleStart := time.Now()
-
-	modelFn := func(x []float32, timestep float32) []float32 {
-		return DiTForward(dit, rs, x, timestep, context, contextLen, latentH, latentW)
-	}
 
 	latent := EulerSample(modelFn, latentSize, cfg.Steps, cfg.Seed)
 	log.Printf("Sampling done in %v", time.Since(sampleStart))
 
-	// 8. VAE decode
+	// 9. VAE decode
 	log.Println("Decoding with VAE...")
 	decStart := time.Now()
 	pixels := VAEDecode(vae, latent, latentH, latentW)
 	log.Printf("VAE decode done in %v", time.Since(decStart))
 
-	// 9. Save as PNG
+	// 10. Save as PNG
 	log.Printf("Saving to %s...", outputPath)
 	err = savePNG(pixels, cfg.Width, cfg.Height, outputPath)
 	if err != nil {

@@ -19,6 +19,7 @@ func main() {
 	steps := flag.Int("steps", 8, "Number of sampling steps")
 	seed := flag.Int64("seed", 42, "Random seed")
 	cfgScale := flag.Float64("cfg-scale", 1.0, "CFG scale (1.0 = no guidance)")
+	useGPU := flag.Bool("gpu", false, "Use GPU acceleration for DiT inference")
 
 	flag.Parse()
 
@@ -34,6 +35,7 @@ func main() {
 		Steps:    *steps,
 		CFGScale: float32(*cfgScale),
 		Seed:     *seed,
+		UseGPU:   *useGPU,
 	}
 
 	err := diffusion.GenerateImage(*ditPath, *vaePath, *llmPath, *prompt, cfg, *output)
