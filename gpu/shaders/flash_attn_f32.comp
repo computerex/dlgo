@@ -1,0 +1,158 @@
+// Flash Attention for bidirectional (DiT) self-attention.
+// Single-pass online softmax — eliminates the two-pass approach of attention_full_f32.
+// Same dispatch pattern and memory access patterns as the old shader.
+//
+// Q/K/V layout: [seq_len, num_heads * head_dim] (f32, row-major)
+// Output:       [seq_len, num_heads * head_dim] (f32, row-major)
+//
+// Dispatch: groups_x = num_heads, groups_y = seq_len (one WG per query pos), groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Buffers: 0=out (float), 1=Q (float), 2=K (float), 3=V (float)
+
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 2) readonly buffer K { float k_data[]; };
+layout(set = 0, binding = 3) readonly buffer V { float v_data[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_len;
+    float scale;
+};
+
+#define WG_SIZE 256
+#define TILE_SIZE 256
+
+shared float q_sh[256];          // query vector (head_dim), max 256
+shared float tile_s[TILE_SIZE];  // exp scores for current tile
+shared float reduce_buf[WG_SIZE];
+shared float sh_out[256];        // output accumulator (head_dim)
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint qi = gl_WorkGroupID.y;
+    if (head >= uint(num_heads)) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    uint kv_head = head / kv_mul;
+    uint q_dim = uint(num_heads) * uint(head_dim);
+    uint hd = uint(head_dim);
+    uint kvd = uint(kv_dim);
+    uint q_base = qi * q_dim + head * hd;
+    uint kv_offset = kv_head * hd;
+
+    int N = seq_len;
+    if (N <= 0) {
+        if (tid < hd) {
+            attn_out[qi * q_dim + head * hd + tid] = 0.0;
+        }
+        return;
+    }
+
+    // Load Q into shared memory
+    for (uint d = tid; d < hd; d += WG_SIZE) {
+        q_sh[d] = q_data[q_base + d];
+    }
+    // Init output accumulator
+    for (uint d = tid; d < hd; d += WG_SIZE) {
+        sh_out[d] = 0.0;
+    }
+    barrier();
+
+    // Online softmax state
+    float M_val = -1.0e30;   // running max
+    float L_val = 0.0;       // running sum of exp
+
+    // =========================================================================
+    // Single pass: compute QK scores, online softmax, accumulate P@V
+    // =========================================================================
+    for (int tile_start = 0; tile_start < N; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, N);
+        int tile_len = tile_end - tile_start;
+
+        // --- Step 1: Each thread computes dot(Q, K[tile_start + tid]) ---
+        float my_score = -1.0e30;
+        if (int(tid) < tile_len) {
+            int t = tile_start + int(tid);
+            float dot_val = 0.0;
+            uint k_base = uint(t) * kvd + kv_offset;
+            for (uint d = 0; d < hd; d++) {
+                dot_val += q_sh[d] * k_data[k_base + d];
+            }
+            my_score = dot_val * scale;
+        }
+
+        // --- Step 2: Find tile max via shared memory reduction ---
+        reduce_buf[tid] = my_score;
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
+            barrier();
+        }
+        float tile_max = reduce_buf[0];
+        barrier();
+
+        // --- Step 3: Online softmax rescaling ---
+        float M_old = M_val;
+        float M_new = max(M_val, tile_max);
+        float eM = exp(M_old - M_new);
+
+        // Rescale running sum
+        L_val *= eM;
+        M_val = M_new;
+
+        // Rescale accumulated output
+        for (uint d = tid; d < hd; d += WG_SIZE) {
+            sh_out[d] *= eM;
+        }
+        barrier();
+
+        // --- Step 4: Compute exp(score - M_new) and sum ---
+        if (int(tid) < tile_len) {
+            tile_s[tid] = exp(my_score - M_new);
+        } else {
+            tile_s[tid] = 0.0;
+        }
+        barrier();
+
+        // Sum for L
+        reduce_buf[tid] = tile_s[tid];
+        barrier();
+        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+            barrier();
+        }
+        L_val += reduce_buf[0];
+        barrier();
+
+        // --- Step 5: Accumulate O += tile_s @ V ---
+        // Same pattern as the working attention_full_f32.comp
+        if (tid < hd) {
+            float acc = 0.0;
+            for (int ti = 0; ti < tile_len; ti++) {
+                float w = tile_s[ti];
+                uint v_base = uint(tile_start + ti) * kvd + kv_offset;
+                acc += w * v_data[v_base + tid];
+            }
+            sh_out[tid] += acc;
+        }
+        barrier();
+    }
+
+    // =========================================================================
+    // Normalize and write output
+    // =========================================================================
+    float inv_L = (L_val > 0.0) ? (1.0 / L_val) : 0.0;
+    if (tid < hd) {
+        attn_out[qi * q_dim + head * hd + tid] = sh_out[tid] * inv_L;
+    }
+}

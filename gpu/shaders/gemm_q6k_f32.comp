@@ -1,0 +1,168 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Q6_K-weight × FP32-input GEMM using f32 shared memory tiling.
+// This avoids f16 precision loss that causes issues with large K dimensions.
+// Tile: BM=64, BN=32, BK=32. 256 threads, each computes 4×1 output elements.
+
+#define BM     64u
+#define BN     32u
+#define BK     32u
+
+layout(local_size_x = 256) in;
+
+struct block_q6_k {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t  scales[16];
+    float16_t d;
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q6_k data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int npos;
+};
+
+// Shared memory: f32 for both A and B
+shared float smA[BM * BK];  // 64 * 32 = 2048 floats = 8 KB
+shared float smB[BN * BK];  // 32 * 32 = 1024 floats = 4 KB
+// Total: 12 KB — well within limits
+
+float dequant_q6k(uint ib, uint local_k) {
+    float d_val = float(data_a[ib].d);
+    uint v_im = local_k / 128u;
+    uint within_half = local_k % 128u;
+    uint quadrant = within_half / 32u;
+    uint l = within_half % 32u;
+
+    uint ql_offset = 64u * v_im + l;
+    uint qh_offset = 32u * v_im + l;
+    uint s_offset  = 8u * v_im + (l / 16u);
+
+    uint ql0_byte = uint(data_a[ib].ql[ql_offset]);
+    uint ql32_byte = uint(data_a[ib].ql[ql_offset + 32u]);
+    uint qh_byte = uint(data_a[ib].qh[qh_offset]);
+
+    uint q6;
+    float sc;
+    if (quadrant == 0u) {
+        q6 = (ql0_byte & 0xFu) | ((qh_byte & 0x3u) << 4u);
+        sc = float(data_a[ib].scales[s_offset]);
+    } else if (quadrant == 1u) {
+        q6 = (ql32_byte & 0xFu) | (((qh_byte >> 2u) & 0x3u) << 4u);
+        sc = float(data_a[ib].scales[s_offset + 2u]);
+    } else if (quadrant == 2u) {
+        q6 = (ql0_byte >> 4u) | (((qh_byte >> 4u) & 0x3u) << 4u);
+        sc = float(data_a[ib].scales[s_offset + 4u]);
+    } else {
+        q6 = (ql32_byte >> 4u) | (((qh_byte >> 6u) & 0x3u) << 4u);
+        sc = float(data_a[ib].scales[s_offset + 6u]);
+    }
+
+    return d_val * sc * (float(q6) - 32.0);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint M = uint(rows);
+    uint K = uint(cols);
+    uint N = uint(npos);
+    uint num_blocks_per_row = K / 256u;
+
+    // 2D tile indexing
+    uint n_tiles_n = (N + BN - 1u) / BN;
+    uint tile_n = gl_WorkGroupID.x % n_tiles_n;
+    uint tile_m = gl_WorkGroupID.x / n_tiles_n;
+    uint wg_m = tile_m * BM;
+    uint wg_n = tile_n * BN;
+
+    // Each thread computes a 4x1 output block
+    // 256 threads cover 64 rows × 32 cols: thread (i) → rows [i/32*4 .. i/32*4+3], col [i%32]
+    // Actually: 256 threads, BM=64 rows, BN=32 cols → 2048 outputs → 8 per thread
+    // Layout: tid_m = tid / 32 → 8 row groups of 8 rows? No...
+    // Let's do: each thread handles 8 output elements
+    // tid_row_base = (tid / BN) * 8 = (tid/32)*8, 0,8,16,...,56 → but 256/32=8 row groups
+    // Hmm, 8 row groups × 8 rows = 64 = BM. tid_col = tid % BN = tid % 32
+    // But 8 outputs per thread × 256 threads = 2048 = 64×32 ✓
+
+    // Simpler: tile thread layout
+    uint t_col = tid % BN;         // 0..31
+    uint t_row_base = (tid / BN);  // 0..7, each handles 8 rows
+    uint ROWS_PER_THREAD = BM / (256u / BN);  // 64 / 8 = 8
+
+    float acc[8];  // ROWS_PER_THREAD = 8
+    for (uint i = 0u; i < 8u; i++) acc[i] = 0.0;
+
+    for (uint k_base = 0u; k_base < K; k_base += BK) {
+        // Load A tile: each thread loads ceil(BM*BK/256) = 8 elements
+        // BM*BK = 2048, 2048/256 = 8 elements per thread
+        for (uint e = 0u; e < 8u; e++) {
+            uint idx = e * 256u + tid;
+            uint row = idx / BK;      // 0..63
+            uint col = idx % BK;      // 0..31
+            uint m_global = wg_m + row;
+            uint k_global = k_base + col;
+
+            float val = 0.0;
+            if (m_global < M && k_global < K) {
+                uint block_k = k_global / 256u;
+                uint local_k = k_global % 256u;
+                uint ib = m_global * num_blocks_per_row + block_k;
+                val = dequant_q6k(ib, local_k);
+            }
+            smA[row * BK + col] = val;
+        }
+
+        // Load B tile: BN*BK = 1024, 1024/256 = 4 elements per thread
+        for (uint e = 0u; e < 4u; e++) {
+            uint idx = e * 256u + tid;
+            uint row = idx / BK;      // 0..31 (position within BN)
+            uint col = idx % BK;      // 0..31 (K within BK)
+            uint n_global = wg_n + row;
+            uint k_global = k_base + col;
+
+            float val = 0.0;
+            if (n_global < N && k_global < K) {
+                val = data_b[n_global * K + k_global];
+            }
+            smB[row * BK + col] = val;
+        }
+
+        barrier();
+
+        // Accumulate: each thread does dot product of its A rows with its B column
+        float b_cache[BK];  // Cache the B column in registers
+        for (uint k = 0u; k < BK; k++) {
+            b_cache[k] = smB[t_col * BK + k];
+        }
+
+        for (uint r = 0u; r < 8u; r++) {
+            uint row = t_row_base * 8u + r;
+            float sum = 0.0;
+            for (uint k = 0u; k < BK; k++) {
+                sum = fma(smA[row * BK + k], b_cache[k], sum);
+            }
+            acc[r] += sum;
+        }
+
+        barrier();
+    }
+
+    // Store results: column-major [N, M]
+    for (uint r = 0u; r < 8u; r++) {
+        uint m_global = wg_m + t_row_base * 8u + r;
+        uint n_global = wg_n + t_col;
+        if (m_global < M && n_global < N) {
+            out_data[n_global * M + m_global] = acc[r];
+        }
+    }
+}

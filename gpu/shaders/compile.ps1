@@ -59,6 +59,7 @@ $shaders = @(
     @{name="matvec_q3_k_dp4a_moe"; file="matvec_q3_k_dp4a_moe.comp"},
     @{name="matvec_q5_k_dp4a_moe"; file="matvec_q5_k_dp4a_moe.comp"},
     @{name="matvec_mxfp4_dp4a_moe"; file="matvec_mxfp4_dp4a_moe.comp"},
+    @{name="matvec_iq3_xxs_moe"; file="matvec_iq3_xxs_moe.comp"},
     @{name="moe_accumulate"; file="moe_accumulate.comp"},
     @{name="swiglu_oai_bias_moe"; file="swiglu_oai_bias_moe.comp"},
     @{name="moe_bias_add"; file="moe_bias_add.comp"},
@@ -72,11 +73,52 @@ $shaders = @(
     @{name="tanh_gate_residual"; file="tanh_gate_residual.comp"},
     @{name="rope_3d"; file="rope_3d.comp"},
     @{name="attention_full_f32"; file="attention_full_f32.comp"},
+    @{name="attention_full_f16"; file="attention_full_f16.comp"},
+    @{name="flash_attn_f32"; file="flash_attn_f32.comp"},
     @{name="conv2d_f32"; file="conv2d_f32.comp"},
     @{name="group_norm"; file="group_norm.comp"},
     @{name="silu"; file="silu.comp"},
     @{name="upsample_nearest"; file="upsample_nearest.comp"},
-    @{name="spatial_attention"; file="spatial_attention.comp"}
+    @{name="spatial_attention"; file="spatial_attention.comp"},
+    @{name="gemm_q4_k"; file="gemm_q4_k.comp"},
+    @{name="split_qkv"; file="split_qkv.comp"},
+    @{name="dequant_q4k_f16"; file="dequant_q4k_f16.comp"},
+    @{name="gemm_f16"; file="gemm_f16.comp"},
+    @{name="gemm_q4k_dp4a"; file="gemm_q4k_dp4a.comp"},
+    @{name="gemm_q4k_coopmat"; file="gemm_q4k_coopmat.comp"; target="vulkan1.3"},
+    @{name="gemm_q5k_coopmat"; file="gemm_q5k_coopmat.comp"; target="vulkan1.3"},
+    @{name="gemm_q6k_coopmat"; file="gemm_q6k_coopmat.comp"; target="vulkan1.3"},
+    @{name="gemm_q6k_f32"; file="gemm_q6k_f32.comp"; target="vulkan1.3"},
+    @{name="gemm_bf16"; file="gemm_bf16.comp"; target="vulkan1.3"},
+    @{name="gemm_f16_coopmat"; file="gemm_f16_f32.comp"; target="vulkan1.3"},
+    @{name="matvec_f32_moe"; file="matvec_f32_moe.comp"},
+    @{name="matvec_q4_0_moe"; file="matvec_q4_0_moe.comp"},
+    @{name="matvec_q8_0_moe"; file="matvec_q8_0_moe.comp"},
+    @{name="matvec_q3_k_moe"; file="matvec_q3_k_moe.comp"},
+    @{name="matvec_q4_k_moe"; file="matvec_q4_k_moe.comp"},
+    @{name="matvec_q5_k_moe"; file="matvec_q5_k_moe.comp"},
+    @{name="matvec_q5_0_moe"; file="matvec_q5_0_moe.comp"},
+    @{name="matvec_q6_k_moe"; file="matvec_q6_k_moe.comp"},
+    @{name="matvec_q2_k_moe"; file="matvec_q2_k_moe.comp"},
+    @{name="matvec_tq1_0_moe"; file="matvec_tq1_0_moe.comp"},
+    @{name="matvec_iq1_s_moe"; file="matvec_iq1_s_moe.comp"},
+    @{name="matvec_iq1_m_moe"; file="matvec_iq1_m_moe.comp"},
+    @{name="matvec_iq2_xxs_moe"; file="matvec_iq2_xxs_moe.comp"},
+    @{name="matvec_iq2_s_moe"; file="matvec_iq2_s_moe.comp"},
+    @{name="matvec_iq3_s_moe"; file="matvec_iq3_s_moe.comp"},
+    @{name="matvec_iq4_xs_moe"; file="matvec_iq4_xs_moe.comp"},
+    @{name="matvec_iq4_nl_moe"; file="matvec_iq4_nl_moe.comp"},
+    @{name="matvec_mxfp4_moe"; file="matvec_mxfp4_moe.comp"},
+    @{name="shared_expert_gate"; file="shared_expert_gate.comp"},
+    @{name="matvec_q4_k_dp4a_fused"; file="matvec_q4_k_dp4a_fused.comp"},
+    @{name="matvec_iq3_xxs_dp4a"; file="matvec_iq3_xxs_dp4a.comp"},
+    @{name="matvec_iq4_xs_dp4a"; file="matvec_iq4_xs_dp4a.comp"},
+    @{name="matvec_iq4_nl_dp4a"; file="matvec_iq4_nl_dp4a.comp"},
+    @{name="matvec_iq3_s_dp4a"; file="matvec_iq3_s_dp4a.comp"},
+    @{name="matvec_iq3_xxs_dp4a_moe"; file="matvec_iq3_xxs_dp4a_moe.comp"},
+    @{name="matvec_iq4_xs_dp4a_moe"; file="matvec_iq4_xs_dp4a_moe.comp"},
+    @{name="matvec_iq4_nl_dp4a_moe"; file="matvec_iq4_nl_dp4a_moe.comp"},
+    @{name="matvec_iq3_s_dp4a_moe"; file="matvec_iq3_s_dp4a_moe.comp"}
 )
 
 $header = @"
@@ -91,8 +133,9 @@ $header = @"
 
 foreach ($s in $shaders) {
     $spvFile = "$($s.name).spv"
-    Write-Host "Compiling $($s.file) -> $spvFile"
-    & glslc --target-env=vulkan1.2 -O $s.file -o $spvFile
+    $env = if ($s.target) { $s.target } else { "vulkan1.2" }
+    Write-Host "Compiling $($s.file) -> $spvFile ($env)"
+    & glslc --target-env=$env -O $s.file -o $spvFile
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to compile $($s.file)"
         exit 1
@@ -170,7 +213,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_tq1_0",   spv_matvec_tq1_0,   spv_matvec_tq1_0_size,   3, 8},   // PIPE_MATVEC_TQ1_0
     {"matvec_iq2_xxs", spv_matvec_iq2_xxs, spv_matvec_iq2_xxs_size, 4, 8},   // PIPE_MATVEC_IQ2_XXS
     {"matvec_iq2_s",   spv_matvec_iq2_s,   spv_matvec_iq2_s_size,   4, 8},   // PIPE_MATVEC_IQ2_S
-    {"matvec_iq3_xxs", spv_matvec_iq3_xxs, spv_matvec_iq3_xxs_size, 4, 8},   // PIPE_MATVEC_IQ3_XXS
+    {"matvec_iq3_xxs", spv_matvec_iq3_xxs, spv_matvec_iq3_xxs_size, 3, 8},   // PIPE_MATVEC_IQ3_XXS
     {"matvec_iq3_s",   spv_matvec_iq3_s,   spv_matvec_iq3_s_size,   4, 8},   // PIPE_MATVEC_IQ3_S
     {"matvec_iq4_xs",  spv_matvec_iq4_xs,  spv_matvec_iq4_xs_size,  3, 8},   // PIPE_MATVEC_IQ4_XS
     {"matvec_iq4_nl",  spv_matvec_iq4_nl,  spv_matvec_iq4_nl_size,  3, 8},   // PIPE_MATVEC_IQ4_NL
@@ -180,7 +223,7 @@ static const ShaderInfo shader_registry[] = {
     {"add_offset",     spv_add_offset,     spv_add_offset_size,     2, 8},   // PIPE_ADD_OFFSET
     {"scale_add",      spv_scale_add,      spv_scale_add_size,      2, 8},   // PIPE_SCALE_ADD
     {"swiglu_oai_bias", spv_swiglu_oai_bias, spv_swiglu_oai_bias_size, 5, 20}, // PIPE_SWIGLU_OAI_BIAS
-    {"moe_topk",       spv_moe_topk,       spv_moe_topk_size,       3, 12},  // PIPE_MOE_TOPK
+    {"moe_topk",       spv_moe_topk,       spv_moe_topk_size,       3, 20},  // PIPE_MOE_TOPK
     {"matvec_mxfp4_dp4a", spv_matvec_mxfp4_dp4a, spv_matvec_mxfp4_dp4a_size, 3, 8}, // PIPE_MATVEC_MXFP4_DP4A
     {"matvec_q4_0_dp4a_moe", spv_matvec_q4_0_dp4a_moe, spv_matvec_q4_0_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q4_0_DP4A_MOE
     {"matvec_q5_0_dp4a_moe", spv_matvec_q5_0_dp4a_moe, spv_matvec_q5_0_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q5_0_DP4A_MOE
@@ -190,24 +233,68 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_q3_k_dp4a_moe", spv_matvec_q3_k_dp4a_moe, spv_matvec_q3_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q3_K_DP4A_MOE
     {"matvec_q5_k_dp4a_moe", spv_matvec_q5_k_dp4a_moe, spv_matvec_q5_k_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_Q5_K_DP4A_MOE
     {"matvec_mxfp4_dp4a_moe", spv_matvec_mxfp4_dp4a_moe, spv_matvec_mxfp4_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_MXFP4_DP4A_MOE
+    {"matvec_iq3_xxs_moe", spv_matvec_iq3_xxs_moe, spv_matvec_iq3_xxs_moe_size, 4, 20}, // PIPE_MATVEC_IQ3_XXS_MOE
     {"moe_accumulate", spv_moe_accumulate, spv_moe_accumulate_size, 5, 12}, // PIPE_MOE_ACCUMULATE
     {"swiglu_oai_bias_moe", spv_swiglu_oai_bias_moe, spv_swiglu_oai_bias_moe_size, 6, 16}, // PIPE_SWIGLU_OAI_BIAS_MOE
     {"moe_bias_add", spv_moe_bias_add, spv_moe_bias_add_size, 3, 8}, // PIPE_MOE_BIAS_ADD
-    {"attention_tiled", spv_attention_tiled, spv_attention_tiled_size, 4, 24}, // PIPE_ATTENTION_TILED
+    {"attention_tiled", spv_attention_tiled, spv_attention_tiled_size, 4, 28}, // PIPE_ATTENTION_TILED
     {"kv_store_f16", spv_kv_store_f16, spv_kv_store_f16_size, 4, 8}, // PIPE_KV_STORE_F16
     {"kv_store_batch_f16", spv_kv_store_batch_f16, spv_kv_store_batch_f16_size, 4, 8}, // PIPE_KV_STORE_BATCH_F16
-    {"attention_tiled_f32", spv_attention_tiled_f32, spv_attention_tiled_f32_size, 4, 24}, // PIPE_ATTENTION_TILED_F32
+    {"attention_tiled_f32", spv_attention_tiled_f32, spv_attention_tiled_f32_size, 4, 28}, // PIPE_ATTENTION_TILED_F32
     {"layernorm", spv_layernorm, spv_layernorm_size, 4, 8}, // PIPE_LAYERNORM
     {"matvec_bf16", spv_matvec_bf16, spv_matvec_bf16_size, 3, 8}, // PIPE_MATVEC_BF16
     {"broadcast_mul", spv_broadcast_mul, spv_broadcast_mul_size, 2, 8}, // PIPE_BROADCAST_MUL
     {"tanh_gate_residual", spv_tanh_gate_residual, spv_tanh_gate_residual_size, 4, 8}, // PIPE_TANH_GATE_RESIDUAL
     {"rope_3d", spv_rope_3d, spv_rope_3d_size, 2, 20}, // PIPE_ROPE_3D
     {"attention_full_f32", spv_attention_full_f32, spv_attention_full_f32_size, 4, 24}, // PIPE_ATTENTION_FULL_F32
+    {"attention_full_f16", spv_attention_full_f16, spv_attention_full_f16_size, 4, 24}, // PIPE_ATTENTION_FULL_F16
+    {"flash_attn_f32", spv_flash_attn_f32, spv_flash_attn_f32_size, 4, 24}, // PIPE_FLASH_ATTN_F32
     {"conv2d_f32", spv_conv2d_f32, spv_conv2d_f32_size, 4, 40}, // PIPE_CONV2D_F32
     {"group_norm", spv_group_norm, spv_group_norm_size, 4, 16}, // PIPE_GROUP_NORM
     {"silu", spv_silu, spv_silu_size, 1, 4}, // PIPE_SILU
     {"upsample_nearest", spv_upsample_nearest, spv_upsample_nearest_size, 2, 12}, // PIPE_UPSAMPLE_NEAREST
     {"spatial_attention", spv_spatial_attention, spv_spatial_attention_size, 4, 12}, // PIPE_SPATIAL_ATTENTION
+    {"gemm_q4_k", spv_gemm_q4_k, spv_gemm_q4_k_size, 3, 12}, // PIPE_GEMM_Q4_K
+    {"split_qkv", spv_split_qkv, spv_split_qkv_size, 4, 12}, // PIPE_SPLIT_QKV
+    {"dequant_q4k_f16", spv_dequant_q4k_f16, spv_dequant_q4k_f16_size, 2, 8}, // PIPE_DEQUANT_Q4K_F16
+    {"gemm_f16", spv_gemm_f16, spv_gemm_f16_size, 3, 16}, // PIPE_GEMM_F16
+    {"gemm_q4k_dp4a", spv_gemm_q4k_dp4a, spv_gemm_q4k_dp4a_size, 3, 12}, // PIPE_GEMM_Q4K_DP4A
+    {"gemm_q4k_dp4a", spv_gemm_q4k_dp4a, spv_gemm_q4k_dp4a_size, 3, 12}, // PIPE_GEMM_Q4K_FUSED (placeholder)
+    {"gemm_q4k_dp4a", spv_gemm_q4k_dp4a, spv_gemm_q4k_dp4a_size, 3, 12}, // PIPE_GEMM_Q4K_SMEM (placeholder)
+    {"gemm_q4k_coopmat", spv_gemm_q4k_coopmat, spv_gemm_q4k_coopmat_size, 3, 12}, // PIPE_GEMM_Q4K_COOPMAT
+    {"gemm_q5k_coopmat", spv_gemm_q5k_coopmat, spv_gemm_q5k_coopmat_size, 3, 12}, // PIPE_GEMM_Q5K_COOPMAT
+    {"gemm_q6k_coopmat", spv_gemm_q6k_coopmat, spv_gemm_q6k_coopmat_size, 3, 12}, // PIPE_GEMM_Q6K_COOPMAT
+    {"gemm_q6k_f32", spv_gemm_q6k_f32, spv_gemm_q6k_f32_size, 3, 12}, // PIPE_GEMM_Q6K_F32
+    {"gemm_bf16", spv_gemm_bf16, spv_gemm_bf16_size, 3, 12}, // PIPE_GEMM_BF16
+    {"gemm_f16_coopmat", spv_gemm_f16_coopmat, spv_gemm_f16_coopmat_size, 3, 12}, // PIPE_GEMM_F16_COOPMAT
+    {"matvec_f32_moe", spv_matvec_f32_moe, spv_matvec_f32_moe_size, 4, 20}, // PIPE_MATVEC_F32_MOE
+    {"matvec_q4_0_moe", spv_matvec_q4_0_moe, spv_matvec_q4_0_moe_size, 4, 20}, // PIPE_MATVEC_Q4_0_MOE
+    {"matvec_q8_0_moe", spv_matvec_q8_0_moe, spv_matvec_q8_0_moe_size, 4, 20}, // PIPE_MATVEC_Q8_0_MOE
+    {"matvec_q3_k_moe", spv_matvec_q3_k_moe, spv_matvec_q3_k_moe_size, 4, 20}, // PIPE_MATVEC_Q3_K_MOE
+    {"matvec_q4_k_moe", spv_matvec_q4_k_moe, spv_matvec_q4_k_moe_size, 4, 20}, // PIPE_MATVEC_Q4_K_MOE
+    {"matvec_q5_k_moe", spv_matvec_q5_k_moe, spv_matvec_q5_k_moe_size, 4, 20}, // PIPE_MATVEC_Q5_K_MOE
+    {"matvec_q5_0_moe", spv_matvec_q5_0_moe, spv_matvec_q5_0_moe_size, 4, 20}, // PIPE_MATVEC_Q5_0_MOE
+    {"matvec_q6_k_moe", spv_matvec_q6_k_moe, spv_matvec_q6_k_moe_size, 4, 20}, // PIPE_MATVEC_Q6_K_MOE
+    {"matvec_q2_k_moe", spv_matvec_q2_k_moe, spv_matvec_q2_k_moe_size, 4, 20}, // PIPE_MATVEC_Q2_K_MOE
+    {"matvec_tq1_0_moe", spv_matvec_tq1_0_moe, spv_matvec_tq1_0_moe_size, 4, 20}, // PIPE_MATVEC_TQ1_0_MOE
+    {"matvec_iq1_s_moe", spv_matvec_iq1_s_moe, spv_matvec_iq1_s_moe_size, 5, 20}, // PIPE_MATVEC_IQ1_S_MOE
+    {"matvec_iq1_m_moe", spv_matvec_iq1_m_moe, spv_matvec_iq1_m_moe_size, 5, 20}, // PIPE_MATVEC_IQ1_M_MOE
+    {"matvec_iq2_xxs_moe", spv_matvec_iq2_xxs_moe, spv_matvec_iq2_xxs_moe_size, 5, 20}, // PIPE_MATVEC_IQ2_XXS_MOE
+    {"matvec_iq2_s_moe", spv_matvec_iq2_s_moe, spv_matvec_iq2_s_moe_size, 5, 20}, // PIPE_MATVEC_IQ2_S_MOE
+    {"matvec_iq3_s_moe", spv_matvec_iq3_s_moe, spv_matvec_iq3_s_moe_size, 5, 20}, // PIPE_MATVEC_IQ3_S_MOE
+    {"matvec_iq4_xs_moe", spv_matvec_iq4_xs_moe, spv_matvec_iq4_xs_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_XS_MOE
+    {"matvec_iq4_nl_moe", spv_matvec_iq4_nl_moe, spv_matvec_iq4_nl_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_NL_MOE
+    {"matvec_mxfp4_moe", spv_matvec_mxfp4_moe, spv_matvec_mxfp4_moe_size, 4, 20}, // PIPE_MATVEC_MXFP4_MOE
+    {"shared_expert_gate", spv_shared_expert_gate, spv_shared_expert_gate_size, 3, 4}, // PIPE_SHARED_EXPERT_GATE
+    {"matvec_q4_k_dp4a_fused", spv_matvec_q4_k_dp4a_fused, spv_matvec_q4_k_dp4a_fused_size, 3, 8}, // PIPE_MATVEC_Q4_K_DP4A_FUSED
+    {"matvec_iq3_xxs_dp4a", spv_matvec_iq3_xxs_dp4a, spv_matvec_iq3_xxs_dp4a_size, 3, 8}, // PIPE_MATVEC_IQ3_XXS_DP4A
+    {"matvec_iq4_xs_dp4a", spv_matvec_iq4_xs_dp4a, spv_matvec_iq4_xs_dp4a_size, 3, 8}, // PIPE_MATVEC_IQ4_XS_DP4A
+    {"matvec_iq4_nl_dp4a", spv_matvec_iq4_nl_dp4a, spv_matvec_iq4_nl_dp4a_size, 3, 8}, // PIPE_MATVEC_IQ4_NL_DP4A
+    {"matvec_iq3_s_dp4a", spv_matvec_iq3_s_dp4a, spv_matvec_iq3_s_dp4a_size, 4, 8}, // PIPE_MATVEC_IQ3_S_DP4A
+    {"matvec_iq3_xxs_dp4a_moe", spv_matvec_iq3_xxs_dp4a_moe, spv_matvec_iq3_xxs_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ3_XXS_DP4A_MOE
+    {"matvec_iq4_xs_dp4a_moe", spv_matvec_iq4_xs_dp4a_moe, spv_matvec_iq4_xs_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_XS_DP4A_MOE
+    {"matvec_iq4_nl_dp4a_moe", spv_matvec_iq4_nl_dp4a_moe, spv_matvec_iq4_nl_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_NL_DP4A_MOE
+    {"matvec_iq3_s_dp4a_moe", spv_matvec_iq3_s_dp4a_moe, spv_matvec_iq3_s_dp4a_moe_size, 5, 20}, // PIPE_MATVEC_IQ3_S_DP4A_MOE
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

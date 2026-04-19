@@ -17,25 +17,32 @@ type modelSpec struct {
 }
 
 var models = []modelSpec{
-	{"Gemma 3 270M Q8_0", `C:\projects\evoke\models\gemma-3-270m-it-Q8_0.gguf`},
-	{"SmolLM2 360M Q8_0", `C:\projects\evoke\models\smollm2-360m-instruct-q8_0.gguf`},
-	{"Qwen 2.5 0.5B Q4_K_M", `C:\projects\evoke\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`},
-	{"Qwen3 0.6B Q8_0", `C:\projects\evoke\models\Qwen3-0.6B-Q8_0.gguf`},
-	{"TinyLlama 1.1B Q4_0", `C:\projects\evoke\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`},
-	{"Gemma 3 1B Q4_K_M", `C:\projects\evoke\models\gemma-3-1b-it-Q4_K_M.gguf`},
-	{"Llama 3.2 1B Q4_K_M", `C:\projects\evoke\models\Llama-3.2-1B-Instruct-Q4_K_M.gguf`},
-	{"SmolLM2 1.7B Q4_K_M", `C:\projects\evoke\models\smollm2-1.7b-instruct-q4_k_m.gguf`},
-	{"Qwen3.5 0.8B Q8_0", `C:\projects\evoke\models\Qwen3.5-0.8B-Q8_0.gguf`},
-	{"Phi-4-mini Q3_K_M", `C:\projects\evoke\models\Phi-4-mini-instruct-Q3_K_M.gguf`},
-	{"Qwen3.5 2B Q4_K_M", `C:\projects\gollm\Qwen3.5-2B.Q4_K_M.gguf`},
-	{"Qwen3.5 9B Q3_K_M", `C:\projects\gollm\Qwen3.5-9B-Q3_K_M.gguf`},
-	{"gpt-oss-20b Q3_K_M", `C:\Users\mohd\Downloads\gpt-oss-20b-Q3_K_M.gguf`},
-	{"gpt-oss-20b MXFP4", `C:\Users\mohd\Downloads\gpt-oss-20b-mxfp4.gguf`},
-	{"GLM-4.7-Flash Q4_K_XL", `C:\Users\mohd\Downloads\GLM-4.7-Flash-UD-Q4_K_XL.gguf`},
-	{"Qwen3.5 35B-A3B MoE Q3_K_M", `C:\projects\gollm\Qwen3.5-35B-A3B-Q3_K_M.gguf`},
-	{"Qwen3-Coder-30B-A3B IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf`},
-	{"Qwen3-Coder-Next IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3-Coder-Next-UD-IQ3_XXS.gguf`},
-	{"Qwen3.5-122B-A10B IQ3_XXS", `C:\Users\mohd\Downloads\Qwen3.5-122B-A10B-UD-IQ3_XXS.gguf`},
+	{"Gemma 3 270M Q8_0", `C:\models\gemma-3-270m-it-Q8_0.gguf`},
+	{"SmolLM2 360M Q8_0", `C:\models\smollm2-360m-instruct-q8_0.gguf`},
+	{"Qwen 2.5 0.5B Q4_K_M", `C:\models\qwen2.5-0.5b-instruct-q4_k_m.gguf`},
+	{"Qwen3 0.6B Q8_0", `C:\models\Qwen3-0.6B-Q8_0.gguf`},
+	{"Qwen3 0.6B Q2_K", `C:\models\Qwen3-0.6B-Q2_K.gguf`},
+	{"Qwen3 0.6B IQ2_XXS", `C:\models\Qwen3-0.6B-UD-IQ2_XXS.gguf`},
+	{"TinyLlama 1.1B Q4_0", `C:\models\tinyllama-1.1b-chat-v1.0.Q4_0.gguf`},
+	{"Gemma 3 1B Q4_K_M", `C:\models\gemma-3-1b-it-Q4_K_M.gguf`},
+	{"Gemma 3 1B Q4_K_M (dup)", `C:\models\gemma-3-1b-it.Q4_K_M.gguf`},
+	{"Llama 3.2 1B Q4_K_M", `C:\models\Llama-3.2-1B-Instruct-Q4_K_M.gguf`},
+	{"SmolLM2 1.7B Q4_K_M", `C:\models\smollm2-1.7b-instruct-q4_k_m.gguf`},
+	{"Gemma 2 2B Q4_K_M", `C:\models\gemma-2-2b-it-Q4_K_M.gguf`},
+	{"Gemma 2B Q4_K_M", `C:\models\gemma-2b.Q4_K_M.gguf`},
+	{"Phi-2 Q4_K_M", `C:\models\phi-2.Q4_K_M.gguf`},
+	{"Qwen3.5 0.8B Q8_0", `C:\models\Qwen3.5-0.8B-Q8_0.gguf`},
+	{"Phi-4-mini Q3_K_M", `C:\models\Phi-4-mini-instruct-Q3_K_M.gguf`},
+	{"Qwen3.5 2B Q4_K_M", `C:\models\Qwen3.5-2B.Q4_K_M.gguf`},
+	{"Qwen3.5 9B Q3_K_M", `C:\models\Qwen3.5-9B-Q3_K_M.gguf`},
+	{"gpt-oss-20b Q3_K_M", `C:\models\gpt-oss-20b-Q3_K_M.gguf`},
+	{"gpt-oss-20b MXFP4", `C:\models\gpt-oss-20b-mxfp4.gguf`},
+	{"Qwen3.5 27B Q3_K_M", `C:\models\Qwen3.5-27B-Q3_K_M.gguf`},
+	{"GLM-4.7-Flash Q4_K_XL", `C:\models\GLM-4.7-Flash-UD-Q4_K_XL.gguf`},
+	{"GLM-4.7-Flash TQ1_0", `C:\models\GLM-4.7-Flash-UD-TQ1_0.gguf`},
+	{"Qwen3.5 35B-A3B MoE Q3_K_M", `C:\models\Qwen3.5-35B-A3B-Q3_K_M.gguf`},
+	{"Qwen3.6 35B-A3B MoE IQ3_XXS", `C:\models\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`},
+	{"Qwen3-Coder-30B-A3B IQ3_XXS", `C:\models\Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf`},
 }
 
 type CoherencyResult struct {
@@ -58,7 +65,7 @@ func main() {
 
 	fmt.Println("Building coherency worker...")
 	buildCmd := exec.Command("go", "build", "-a", "-tags", "cgo vulkan", "-ldflags", "-linkmode internal",
-		"-o", workerExe, "coherency_worker_main.go")
+		"-o", workerExe, `bench/scripts/coherency_worker_main.go`)
 	buildCmd.Dir = `C:\projects\dlgo`
 	buildCmd.Stdout = os.Stderr
 	buildCmd.Stderr = os.Stderr

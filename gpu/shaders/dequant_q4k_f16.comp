@@ -1,0 +1,98 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Dequantize Q4_K blocks to FP16 row-major matrix.
+// One workgroup per Q4_K block, 128 threads per WG.
+// Each thread handles one byte of qs[] -> two dequantized elements.
+//
+// WorkGroupID.x = block index (0 .. num_blocks-1)
+// Push constants: num_blocks, blocks_per_row
+
+layout(local_size_x = 128) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+layout(scalar, set = 0, binding = 0) readonly buffer A { block_q4_k data_a[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float16_t out_data[]; };
+
+layout(push_constant) uniform Params {
+    int num_blocks;
+    int blocks_per_row;
+};
+
+void main() {
+    uint bid = gl_WorkGroupID.x;
+    if (bid >= uint(num_blocks)) return;
+
+    uint tid = gl_LocalInvocationID.x;  // 0..127
+
+    uint row = bid / uint(blocks_per_row);
+    uint col_block = bid % uint(blocks_per_row);
+    uint col_base = col_block * 256u;
+    uint cols = uint(blocks_per_row) * 256u;
+
+    // Load block-wide scale factors
+    float d  = float(data_a[bid].d);
+    float dm = float(data_a[bid].dmin);
+
+    // Load all 12 scale bytes as uint for bitwise extraction
+    uint us0  = uint(data_a[bid].scales[0]);
+    uint us1  = uint(data_a[bid].scales[1]);
+    uint us2  = uint(data_a[bid].scales[2]);
+    uint us3  = uint(data_a[bid].scales[3]);
+    uint us4  = uint(data_a[bid].scales[4]);
+    uint us5  = uint(data_a[bid].scales[5]);
+    uint us6  = uint(data_a[bid].scales[6]);
+    uint us7  = uint(data_a[bid].scales[7]);
+    uint us8  = uint(data_a[bid].scales[8]);
+    uint us9  = uint(data_a[bid].scales[9]);
+    uint us10 = uint(data_a[bid].scales[10]);
+    uint us11 = uint(data_a[bid].scales[11]);
+
+    // Extract 8 scale factors and 8 min factors (6-bit each)
+    float sc[8], mn[8];
+    sc[0] = float(us0 & 63u);         mn[0] = float(us4 & 63u);
+    sc[1] = float(us1 & 63u);         mn[1] = float(us5 & 63u);
+    sc[2] = float(us2 & 63u);         mn[2] = float(us6 & 63u);
+    sc[3] = float(us3 & 63u);         mn[3] = float(us7 & 63u);
+    sc[4] = float((us8  & 0xFu) | ((us0 >> 6) << 4));
+    mn[4] = float((us8  >> 4)   | ((us4 >> 6) << 4));
+    sc[5] = float((us9  & 0xFu) | ((us1 >> 6) << 4));
+    mn[5] = float((us9  >> 4)   | ((us5 >> 6) << 4));
+    sc[6] = float((us10 & 0xFu) | ((us2 >> 6) << 4));
+    mn[6] = float((us10 >> 4)   | ((us6 >> 6) << 4));
+    sc[7] = float((us11 & 0xFu) | ((us3 >> 6) << 4));
+    mn[7] = float((us11 >> 4)   | ((us7 >> 6) << 4));
+
+    // Thread tid handles qs[tid] -> lower and upper nibble
+    uint q_group = tid >> 5;   // tid / 32: group 0-3
+    uint q_local = tid & 31u;  // tid % 32: position 0-31
+
+    uint8_t qbyte = data_a[bid].qs[tid];
+    float q_lo = float(uint(qbyte) & 0xFu);
+    float q_hi = float(uint(qbyte) >> 4);
+
+    uint si_lo = q_group * 2u;      // scale index for lower nibble
+    uint si_hi = q_group * 2u + 1u; // scale index for upper nibble
+
+    float val_lo = d * q_lo * sc[si_lo] - dm * mn[si_lo];
+    float val_hi = d * q_hi * sc[si_hi] - dm * mn[si_hi];
+
+    // Element positions within the 256-element block
+    // Lower nibble: 0-31, 64-95, 128-159, 192-223
+    // Upper nibble: 32-63, 96-127, 160-191, 224-255
+    uint elem_lo = q_group * 64u + q_local;
+    uint elem_hi = q_group * 64u + 32u + q_local;
+
+    uint out_base = row * cols + col_base;
+    out_data[out_base + elem_lo] = float16_t(val_lo);
+    out_data[out_base + elem_hi] = float16_t(val_hi);
+}

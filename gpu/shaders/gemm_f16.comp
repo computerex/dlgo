@@ -1,0 +1,145 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Tiled GEMM: C[m][n] = sum_k A[m][k] * B[n][k]  (B is transposed)
+//
+// A = input,  FP32,  shape [M x K]  row-major  (tokens x inner)
+// B = weight, FP16,  shape [N x K]  row-major  (rows x inner)
+// C = output, FP32,  shape [M x N]  row-major  (tokens x rows)
+//   stored as C[m * N + n]
+//
+// WorkGroupID.x = token tile (M dimension)
+// WorkGroupID.y = row tile   (N dimension)
+// Push constants: M (npos), N (rows), K (cols)
+
+#define TM 64u    // tile height (M / tokens)
+#define TN 64u    // tile width  (N / rows)
+#define TK 32u    // tile depth  (K / inner)
+
+// Each thread computes a 4x4 sub-tile of the TM x TN output
+#define THREAD_M 4u
+#define THREAD_N 4u
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly buffer B { float16_t data_b_f16[]; };
+layout(set = 0, binding = 2) readonly buffer A { float data_a_f32[]; };
+
+layout(push_constant) uniform Params {
+    int M;          // npos (tokens)
+    int N;          // rows (output dim, may be chunk size)
+    int K;          // cols (inner dim)
+    int out_stride; // output stride in N dimension (= total rows)
+};
+
+// Shared memory with +1 padding to avoid bank conflicts
+shared float smA[TM][TK + 1u];  // 64 x 33 x 4 = 8.25 KB
+shared float smB[TN][TK + 1u];  // 64 x 33 x 4 = 8.25 KB
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;  // 0..255
+    uint bm = gl_WorkGroupID.x * TM;   // token tile start
+    uint bn = gl_WorkGroupID.y * TN;   // row tile start
+
+    // Thread sub-tile position within the 64x64 output tile
+    // 64/4 = 16 sub-tiles per dimension, 16*16 = 256 threads
+    uint tx = tid & 15u;     // 0..15 (N dimension)
+    uint ty = tid >> 4;      // 0..15 (M dimension)
+
+    uint um = uint(M);
+    uint un = uint(N);
+    uint uk = uint(K);
+
+    // Accumulators: 4x4 per thread
+    float acc[THREAD_M][THREAD_N];
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++)
+        [[unroll]] for (uint j = 0u; j < THREAD_N; j++)
+            acc[i][j] = 0.0;
+
+    // Iterate over K-tiles
+    for (uint k0 = 0u; k0 < uk; k0 += TK) {
+        // ----- Load smA: TM x TK = 64 x 32 = 2048 elements -----
+        // 256 threads, 8 elements per thread, in 8 sub-steps
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            uint idx = s * 256u + tid;
+            uint r = idx >> 5;    // idx / 32 -> row in tile (0..63)
+            uint c = idx & 31u;   // idx % 32 -> col in tile (0..31)
+            uint gm = bm + r;     // global M index
+            uint gk = k0 + c;     // global K index
+            float val = 0.0;
+            if (gm < um && gk < uk)
+                val = data_a_f32[gm * uk + gk];
+            smA[r][c] = val;
+        }
+
+        // ----- Load smB: TN x TK = 64 x 32 = 2048 elements -----
+        // 256 threads, 8 elements per thread, FP16 -> FP32
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            uint idx = s * 256u + tid;
+            uint r = idx >> 5;    // row in tile (0..63) -> output row
+            uint c = idx & 31u;   // col in tile (0..31) -> K dimension
+            uint gn = bn + r;     // global N index (row)
+            uint gk = k0 + c;     // global K index
+            float val = 0.0;
+            if (gn < un && gk < uk)
+                val = float(data_b_f16[gn * uk + gk]);
+            smB[r][c] = val;
+        }
+
+        barrier();
+
+        // ----- Compute: each thread does 4x4 x 32 FMAs -----
+        uint rm = ty * THREAD_M;  // row offset in smA
+        uint rn = tx * THREAD_N;  // row offset in smB
+
+        [[unroll]] for (uint k = 0u; k < TK; k++) {
+            float a0 = smA[rm + 0u][k];
+            float a1 = smA[rm + 1u][k];
+            float a2 = smA[rm + 2u][k];
+            float a3 = smA[rm + 3u][k];
+
+            float b0 = smB[rn + 0u][k];
+            float b1 = smB[rn + 1u][k];
+            float b2 = smB[rn + 2u][k];
+            float b3 = smB[rn + 3u][k];
+
+            acc[0][0] = fma(a0, b0, acc[0][0]);
+            acc[0][1] = fma(a0, b1, acc[0][1]);
+            acc[0][2] = fma(a0, b2, acc[0][2]);
+            acc[0][3] = fma(a0, b3, acc[0][3]);
+            acc[1][0] = fma(a1, b0, acc[1][0]);
+            acc[1][1] = fma(a1, b1, acc[1][1]);
+            acc[1][2] = fma(a1, b2, acc[1][2]);
+            acc[1][3] = fma(a1, b3, acc[1][3]);
+            acc[2][0] = fma(a2, b0, acc[2][0]);
+            acc[2][1] = fma(a2, b1, acc[2][1]);
+            acc[2][2] = fma(a2, b2, acc[2][2]);
+            acc[2][3] = fma(a2, b3, acc[2][3]);
+            acc[3][0] = fma(a3, b0, acc[3][0]);
+            acc[3][1] = fma(a3, b1, acc[3][1]);
+            acc[3][2] = fma(a3, b2, acc[3][2]);
+            acc[3][3] = fma(a3, b3, acc[3][3]);
+        }
+
+        barrier();
+    }
+
+    // ----- Write output -----
+    uint rm = ty * THREAD_M;
+    uint rn = tx * THREAD_N;
+
+    uint ustride = uint(out_stride);
+
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++) {
+        uint gm = bm + rm + i;
+        if (gm >= um) continue;
+        [[unroll]] for (uint j = 0u; j < THREAD_N; j++) {
+            uint gn = bn + rn + j;
+            if (gn >= un) continue;
+            out_data[gm * ustride + gn] = acc[i][j];
+        }
+    }
+}

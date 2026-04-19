@@ -407,8 +407,9 @@ func forwardFinalLayer(m *DiTModel, rs *DiTRunState, x []float32, seqLen int, tE
 	blas.QMatVecMulParallel(scale, m.FinalAdaLNWeight, rs.SiLUBuf, rs.pool)
 	addBias(scale, m.FinalAdaLNBias)
 
-	// LayerNorm (no affine) — reuse XNorm for normed output
-	normed := rs.XNorm[:seqLen*hidden]
+	// LayerNorm (no affine) — allocate normed output
+	// We use a local allocation so this works when CPU RunState has minimal maxSeq (GPU path).
+	normed := make([]float32, seqLen*hidden)
 	for i := 0; i < seqLen; i++ {
 		ops.LayerNorm(normed[i*hidden:(i+1)*hidden],
 			x[i*hidden:(i+1)*hidden],
@@ -422,8 +423,8 @@ func forwardFinalLayer(m *DiTModel, rs *DiTRunState, x []float32, seqLen int, tE
 		}
 	}
 
-	// Linear projection to patch space — reuse FinalOut
-	out := rs.FinalOut[:seqLen*patchDim]
+	// Linear projection to patch space
+	out := make([]float32, seqLen*patchDim)
 	blas.QBatchGEMMParallel(out, m.FinalLinWeight, normed, seqLen, rs.pool)
 	addBiasBatch(out, m.FinalLinBias, seqLen, patchDim)
 

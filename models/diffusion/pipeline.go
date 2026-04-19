@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/computerex/dlgo/gpu"
 	"github.com/computerex/dlgo/mmap"
 )
 
@@ -21,6 +22,7 @@ type ImageGenConfig struct {
 	CFGScale float32
 	Seed    int64
 	UseGPU  bool
+	Debug   bool
 }
 
 // DefaultImageGenConfig returns default generation parameters matching sd-cli.
@@ -201,12 +203,18 @@ func GenerateImage(
 	nTxtPaddedMax := contextLen + dit.Config.SeqMultiOf
 	nImgPaddedMax := nImgTokens + dit.Config.SeqMultiOf
 	maxSeqLen := nTxtPaddedMax + nImgPaddedMax
-	rs := NewDiTRunState(dit.Config, maxSeqLen)
+	// GPU path only uses CPU RunState for preprocessing (timestep embed, etc.),
+	// not for the maxSeq-sized activation buffers. Use maxSeqLen=1 to save ~1.2 GB RAM.
+	cpuMaxSeq := maxSeqLen
+	if cfg.UseGPU {
+		cpuMaxSeq = 1
+	}
+	rs := NewDiTRunState(dit.Config, cpuMaxSeq)
 
 	// 7. GPU setup (if requested)
 	var modelFn func(x []float32, timestep float32) []float32
 	var gpuVaeFn func([]float32, int, int) []float32
-	gpuCleanup, gpuModelFn, gpuVaeDecodeFn, gpuErr := setupDiffusionGPU(dit, rs, vae, cfg, context, contextLen, latentH, latentW, maxSeqLen)
+	gpuCleanup, gpuModelFn, gpuPrepareVAE, gpuVaeDecodeFn, gpuErr := setupDiffusionGPU(dit, rs, vae, cfg, context, contextLen, latentH, latentW, maxSeqLen)
 	if gpuErr != nil {
 		return fmt.Errorf("GPU setup: %w", gpuErr)
 	}
@@ -227,9 +235,18 @@ func GenerateImage(
 	// 8. Run Euler sampler
 	log.Printf("Sampling: %d steps, seed=%d, cfg_scale=%.1f", cfg.Steps, cfg.Seed, cfg.CFGScale)
 	sampleStart := time.Now()
+	gpu.PerfReset()
 
 	latent := EulerSample(modelFn, latentSize, cfg.Steps, cfg.Seed)
 	log.Printf("Sampling done in %v", time.Since(sampleStart))
+	gpu.PerfPrint()
+
+	// Free DiT resources and allocate VAE scratch (lazy — avoids peak VRAM overlap)
+	if gpuPrepareVAE != nil {
+		if err := gpuPrepareVAE(); err != nil {
+			return fmt.Errorf("prepare VAE: %w", err)
+		}
+	}
 
 	// 9. VAE decode
 	log.Println("Decoding with VAE...")

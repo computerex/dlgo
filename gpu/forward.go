@@ -16,6 +16,121 @@ import (
 )
 
 var moeDebugOnce sync.Once
+var inlineMoEOnce sync.Once
+
+// initMoEScratchBuffers pre-allocates interleaved MoE scratch buffers.
+// Must be called before BuildLayerConfs if MoE layers exist.
+func initMoEScratchBuffers(rs *GpuRunState, cfg llm.ModelConfig) error {
+	if rs.MoELogits != 0 {
+		return nil
+	}
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nUsed := cfg.ExpertUsedCount
+	if nUsed == 0 {
+		return nil
+	}
+
+	a := allocChecker{}
+	rs.MoELogits = a.alloc(uint64(cfg.ExpertCount * 4))
+	rs.MoETopKIdx = a.alloc(uint64(nUsed * 4))
+	rs.MoETopKW = a.alloc(uint64(nUsed * 4))
+	rs.MoEGates = make([]Buf, nUsed)
+	rs.MoEUps = make([]Buf, nUsed)
+	rs.MoEHiddens = make([]Buf, nUsed)
+	rs.MoEOuts = make([]Buf, nUsed)
+	for e := 0; e < nUsed; e++ {
+		rs.MoEGates[e] = a.alloc(uint64(expDim * 4))
+		rs.MoEUps[e] = a.alloc(uint64(expDim * 4))
+		rs.MoEHiddens[e] = a.alloc(uint64(expDim * 4))
+		rs.MoEOuts[e] = a.alloc(uint64(dim * 4))
+	}
+	shDim := cfg.SharedExpertFFNDim
+	if shDim == 0 {
+		shDim = expDim
+	}
+	rs.MoEShGate = a.alloc(uint64(shDim * 4))
+	rs.MoEShUp = a.alloc(uint64(shDim * 4))
+	rs.MoEShHidden = a.alloc(uint64(shDim * 4))
+	rs.MoEShOut = a.alloc(uint64(dim * 4))
+
+	rs.MoEGateScratch = a.alloc(uint64(nUsed * expDim * 4))
+	rs.MoEUpScratch = a.alloc(uint64(nUsed * expDim * 4))
+	rs.MoEHiddenScratch = a.alloc(uint64(nUsed * expDim * 4))
+	rs.MoEOutScratch = a.alloc(uint64(nUsed * dim * 4))
+	rs.MoEWeightsBuf = a.alloc(uint64(nUsed * 4))
+
+	if rs.MoEUseDp4a {
+		q8BlocksDim := (dim + 31) / 32
+		rs.MoEQ8_1Scratch = a.alloc(uint64(q8BlocksDim) * 36)
+		q8BlocksExp := (expDim + 31) / 32
+		rs.MoEQ8_1DownPacked = a.alloc(uint64(nUsed) * uint64(q8BlocksExp) * 36)
+		rs.MoEQ8_1DownBufs = make([]Buf, nUsed)
+		for e := 0; e < nUsed; e++ {
+			rs.MoEQ8_1DownBufs[e] = a.alloc(uint64(q8BlocksExp) * 36)
+		}
+	}
+	if a.err != nil {
+		return fmt.Errorf("gpu: MoE scratch alloc: %w", a.err)
+	}
+	return nil
+}
+
+// buildMoEConf creates a pre-built MoEFFNConf for a single MoE layer.
+func buildMoEConf(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig) (*MoEFFNConf, bool) {
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nUsed := cfg.ExpertUsedCount
+
+	fused := gl.FFNGateUpExps != nil
+	var gateGpu, upGpu *GpuTensor
+	if fused {
+		gateGpu = gl.FFNGateUpExps
+		upGpu = gl.FFNGateUpExps
+	} else {
+		gateGpu = gl.FFNGateExps
+		upGpu = gl.FFNUpExps
+	}
+
+	isOAI := layer.Spec.FFN == llm.FFNMoESwiOAI
+	useDp4a := rs.MoEUseDp4a && rs.MoEQ8_1Scratch != 0 &&
+		rs.MoEGateScratch != 0 &&
+		hasDp4aQType(gateGpu.Type) && hasDp4aQType(uint32(gl.FFNDownExps.Type))
+
+	gateStride := moeBlockStride(expDim, gateGpu.Cols, gateGpu.Type)
+	downStride := moeBlockStride(dim, gl.FFNDownExps.Cols, uint32(gl.FFNDownExps.Type))
+
+	gateBaseOff := 0
+	upBaseOff := 0
+	upStride := gateStride
+	if fused {
+		gateStride = 2 * gateStride
+		upStride = gateStride
+		upBaseOff = moeBlockStride(expDim, gateGpu.Cols, gateGpu.Type)
+	}
+
+	mc := NewMoEFFNConf()
+	if useDp4a {
+		mc.SetScratch(rs.FFNNorm, rs.FFNOut, rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
+			rs.MoEQ8_1Scratch, rs.MoEGateScratch, rs.MoEUpScratch, rs.MoEQ8_1DownPacked, rs.MoEOutScratch)
+	} else {
+		mc.SetScratch(rs.FFNNorm, rs.FFNOut, rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
+			0, rs.MoEGateScratch, rs.MoEUpScratch, 0, rs.MoEOutScratch)
+	}
+	mc.SetRouter(gl.FFNRouter.Buf, gl.FFNRouter.Rows, gl.FFNRouter.Cols, int(gl.FFNRouter.Type), gl.FFNRouterBias)
+	mc.SetExperts(gateGpu.Buf, int(gateGpu.Type), gateStride, gateBaseOff,
+		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
+		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
+	mc.SetBiases(gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias)
+	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc,
+		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
+		isOAI, 1.702, 7.0)
+
+	setSharedExpertOnConf(mc, gl, rs)
+
+	useNative := !useDp4a
+	return mc, useNative
+}
 
 // BuildLayerConfs creates reusable fused-layer configurations from the model,
 // run state, and KV cache. Call once after model upload; reuse for every token.
@@ -68,6 +183,8 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 			postAttnNorm = 0
 		}
 		lc.SetFFNMoE(ffnNorm, postAttnNorm)
+
+		// Inline MoE conf is set up lazily on first forward (after scratch alloc)
 	} else {
 		var ffnGate *GpuTensor
 		if gl.FFNGate != nil {
@@ -158,6 +275,24 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 	BeginBatch()
 	UploadF32(rs.X, xCPU)
 
+	// Lazy setup of inline MoE confs after scratch buffers are allocated
+	inlineMoEOnce.Do(func() {
+		if cfg.ExpertUsedCount > 0 && os.Getenv("DLGO_NO_FUSED_MOE") != "1" {
+			if err := initMoEScratchBuffers(rs, cfg); err != nil {
+				fmt.Printf("[dlgo/gpu] WARNING: MoE scratch alloc failed: %v\n", err)
+				return
+			}
+			for l := 0; l < cfg.NumLayers; l++ {
+				gl := &gm.Layers[l]
+				layer := &m.Layers[l]
+			if layerConfs[l] != nil && gl.IsMoE && gl.MoEOnGPU && rs.MoEGateScratch != 0 {
+				mc, useNative := buildMoEConf(gl, layer, rs, cfg)
+				layerConfs[l].SetMoEConf(mc, useNative, false)
+			}
+			}
+		}
+	})
+
 	if m.Layers[0].Spec.Norm == llm.NormRMS {
 		Barrier()
 		RMSNorm(rs.XNorm, rs.X, gm.Layers[0].AttnNorm, dim, cfg.RMSNormEps)
@@ -209,14 +344,14 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			Barrier()
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
-			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart = seqLen - w
 			}
-			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart, scale)
+			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart, scale, 0)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
@@ -239,7 +374,10 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
 	if gl.IsMoE && pipe != nil && pipe.HasMoE {
-		if gl.MoEOnGPU {
+		inlineMoE := layerConfs[l].HasInlineMoE()
+		if inlineMoE {
+			// C-side handled MoE experts + shared expert + residual — nothing to do here.
+		} else if gl.MoEOnGPU {
 			GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 			Barrier()
 			if nextAttnNorm != 0 {
@@ -370,14 +508,14 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 			Barrier()
 			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
-			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart2 := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart2 = seqLen - w
 			}
-			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart2, scale)
+			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart2, scale, 0)
 			Barrier()
 			SigmoidGate(rs.AttnOut, rs.QGate, numHeads*headDim)
 			Barrier()
@@ -400,7 +538,10 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
 		if gl.IsMoE && pipe.HasMoE {
-			if gl.MoEOnGPU {
+			inlineMoE2 := layerConfs[l].HasInlineMoE()
+			if inlineMoE2 {
+				// C-side handled MoE experts + shared expert + residual — nothing to do here.
+			} else if gl.MoEOnGPU {
 				GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 				Barrier()
 				if nextAttnNorm != 0 {
@@ -693,9 +834,9 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 			Barrier()
 			BatchRoPE(bs.Q, bs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, startPos,
 				cfg.RopeNeox, npos)
-			BatchKVStore(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
-			BatchAttention(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, npos)
+			BatchKVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
+			BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos)
 			Barrier()
 			SigmoidGate(bs.AttnOut, bs.QGate, qDim*npos)
 			Barrier()
@@ -908,14 +1049,14 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ Q post-RoPE", rs.Q, numHeads*headDim)
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ K post-RoPE", rs.K, kvDim)
 			}
-			KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
+			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart3 := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				gqWinStart3 = seqLen - w
 			}
-			Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart3, scale)
+			AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, seqLen, gqWinStart3, scale, 0)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnOut", rs.AttnOut, numHeads*headDim)
 			}
@@ -1021,7 +1162,7 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				GpuDiag.LogBuf("GPU", l, pos, "K post-RoPE", rs.K, kvDim)
 			}
 
-			if err := KVStore(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
+			if err := KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
 				return fmt.Errorf("layer %d kvstore: %w", l, err)
 			}
 
@@ -1030,8 +1171,8 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				winStart = seqLen - w
 			}
-			if err := Attention(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale); err != nil {
+			if err := AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+				numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale, 0); err != nil {
 				return fmt.Errorf("layer %d attention: %w", l, err)
 			}
 
@@ -1314,9 +1455,15 @@ func moeBlockStride(rows, cols int, qtype uint32) int {
 
 func quantBlockSize(qtype uint32) int {
 	switch qtype {
-	case 2, 6, 8, 20, 39: // Q4_0, Q5_0, Q8_0, IQ4_NL, MXFP4
+	case 0: // F32
+		return 1
+	case 1, 30: // F16, BF16
+		return 1
+	case 2, 3, 6, 7, 8, 9, 20, 39: // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, IQ4_NL, MXFP4
 		return 32
-	case 10, 12, 13, 14: // Q3_K, Q4_K, Q5_K, Q6_K
+	case 10, 11, 12, 13, 14, 15: // Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K
+		return 256
+	case 16, 17, 18, 19, 21, 22, 23, 29, 34, 35: // IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, TQ1_0, TQ2_0
 		return 256
 	default:
 		return 0
@@ -1359,51 +1506,8 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	expDim := cfg.ExpertFFNDim
 	nUsed := cfg.ExpertUsedCount
 
-	// Allocate MoE scratch buffers on first use (per-expert for batched dispatch)
-	if rs.MoELogits == 0 {
-		a := allocChecker{}
-		rs.MoELogits = a.alloc(uint64(cfg.ExpertCount * 4))
-		rs.MoETopKIdx = a.alloc(uint64(nUsed * 4))
-		rs.MoETopKW = a.alloc(uint64(nUsed * 4))
-		rs.MoEGates = make([]Buf, nUsed)
-		rs.MoEUps = make([]Buf, nUsed)
-		rs.MoEHiddens = make([]Buf, nUsed)
-		rs.MoEOuts = make([]Buf, nUsed)
-		for e := 0; e < nUsed; e++ {
-			rs.MoEGates[e] = a.alloc(uint64(expDim * 4))
-			rs.MoEUps[e] = a.alloc(uint64(expDim * 4))
-			rs.MoEHiddens[e] = a.alloc(uint64(expDim * 4))
-			rs.MoEOuts[e] = a.alloc(uint64(dim * 4))
-		}
-		shDim := cfg.SharedExpertFFNDim
-		if shDim == 0 {
-			shDim = expDim
-		}
-		rs.MoEShGate = a.alloc(uint64(shDim * 4))
-		rs.MoEShUp = a.alloc(uint64(shDim * 4))
-		rs.MoEShHidden = a.alloc(uint64(shDim * 4))
-		rs.MoEShOut = a.alloc(uint64(dim * 4))
-
-		if rs.MoEUseDp4a {
-			q8BlocksDim := (dim + 31) / 32
-			rs.MoEQ8_1Scratch = a.alloc(uint64(q8BlocksDim) * 36)
-
-			q8BlocksExp := (expDim + 31) / 32
-			rs.MoEQ8_1DownPacked = a.alloc(uint64(nUsed) * uint64(q8BlocksExp) * 36)
-			rs.MoEQ8_1DownBufs = make([]Buf, nUsed)
-			for e := 0; e < nUsed; e++ {
-				rs.MoEQ8_1DownBufs[e] = a.alloc(uint64(q8BlocksExp) * 36)
-			}
-
-			rs.MoEGateScratch = a.alloc(uint64(nUsed * expDim * 4))
-			rs.MoEUpScratch = a.alloc(uint64(nUsed * expDim * 4))
-			rs.MoEHiddenScratch = a.alloc(uint64(nUsed * expDim * 4))
-			rs.MoEOutScratch = a.alloc(uint64(nUsed * dim * 4))
-			rs.MoEWeightsBuf = a.alloc(uint64(nUsed * 4))
-		}
-		if a.err != nil {
-			return fmt.Errorf("gpu: MoE scratch alloc: %w", a.err)
-		}
+	if err := initMoEScratchBuffers(rs, cfg); err != nil {
+		return err
 	}
 
 	fused := gl.FFNGateUpExps != nil
@@ -1427,13 +1531,20 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 		!diagL
 
 	moeDebugOnce.Do(func() {
-		fmt.Printf("[dlgo/gpu] MoE dp4a check: useFused=%v dp4a=%v q8=%v gate=%v gateT=%v downT=%v hasBias=%v diag=%v fused=%v isOAI=%v weightsNorm=%v weightsScale=%.2f gatingFunc=%d gateType=%d upType=%d downType=%d gateCols=%d dim=%d expDim=%d nExperts=%d nUsed=%d\n",
-			useFusedDp4a, rs.MoEUseDp4a, rs.MoEQ8_1Scratch != 0, rs.MoEGateScratch != 0,
-			hasDp4aQType(gateGpu.Type), hasDp4aQType(uint32(gl.FFNDownExps.Type)),
-			hasBias, diagL, fused, isOAI, cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale, cfg.ExpertGatingFunc,
-			gateGpu.Type, upGpu.Type, gl.FFNDownExps.Type, gateGpu.Cols, dim, expDim, cfg.ExpertCount, nUsed)
+		nativeFused := rs.MoEGateScratch != 0 && !diagL
+		mode := "fallback"
+		if useFusedDp4a {
+			mode = "dp4a-fused"
+		} else if nativeFused {
+			mode = "native-fused"
+		}
+		fmt.Printf("[dlgo/gpu] MoE dispatch: mode=%s dp4a=%v gateType=%d upType=%d downType=%d hasBias=%v isOAI=%v dim=%d expDim=%d nExperts=%d nUsed=%d\n",
+			mode, rs.MoEUseDp4a,
+			gateGpu.Type, upGpu.Type, gl.FFNDownExps.Type,
+			hasBias, isOAI, dim, expDim, cfg.ExpertCount, nUsed)
 	})
-	if os.Getenv("DLGO_NO_FUSED_MOE") == "1" {
+	noFusedMoE := os.Getenv("DLGO_NO_FUSED_MOE") == "1"
+	if noFusedMoE {
 		useFusedDp4a = false
 	}
 	if useFusedDp4a {
@@ -1441,8 +1552,15 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 			gateGpu, upGpu, bpr, downBpr, fused, isOAI)
 	}
 
+	// Native fused path: works for ALL quant types (no Q8_1 quantization).
+	// Keeps everything on GPU — no Sync() or CPU round-trip.
+	useNativeFused := rs.MoEGateScratch != 0 && !diagL && !noFusedMoE
+	if useNativeFused {
+		return gpuForwardMoEFFNNative(gl, layer, rs, cfg, dim, expDim, nUsed,
+			gateGpu, upGpu, bpr, downBpr, fused, isOAI)
+	}
+
 	// Fallback: per-expert dispatch with Sync for top-K indices
-	// 1. Router + top-K entirely on GPU
 	Barrier()
 	MatVec(rs.MoELogits, gl.FFNRouter.Buf, rs.FFNNorm,
 		gl.FFNRouter.Rows, gl.FFNRouter.Cols, gl.FFNRouter.Type)
@@ -1583,36 +1701,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	}
 
 	// 3. Shared expert (if present)
-	if gl.FFNGateShared != nil {
-		Barrier()
-		MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
-			gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
-		MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
-			gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
-		Barrier()
-		shDim := gl.FFNGateShared.Rows
-		SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
-		Barrier()
-		MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
-			gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
-
-		if gl.FFNRouterShared != 0 {
-			Sync()
-			shInput := make([]float32, dim)
-			DownloadF32(rs.FFNNorm, shInput)
-			shGateW := make([]float32, dim)
-			DownloadF32(gl.FFNRouterShared, shGateW)
-			var dot float32
-			for i := 0; i < dim; i++ {
-				dot += shGateW[i] * shInput[i]
-			}
-			gate := float32(1.0 / (1.0 + math.Exp(-float64(dot))))
-			BeginBatch()
-			Scale(rs.MoEShOut, gate, dim)
-		}
-		Barrier()
-		Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
-	}
+	gpuForwardSharedExpertBlock(gl, rs, cfg, dim)
 
 	return nil
 }
@@ -1647,43 +1736,118 @@ func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg 
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
 		isOAI, 1.702, 7.0)
 
+	setSharedExpertOnConf(mc, gl, rs)
+
 	if err := ForwardMoEFFN_C(mc); err != nil {
 		return err
 	}
 
-	// 8. Shared expert (if present)
-	if gl.FFNGateShared != nil {
-		Barrier()
-		MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
-			gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
-		MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
-			gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
-		Barrier()
-		shDim := gl.FFNGateShared.Rows
-		SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
-		Barrier()
-		MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
-			gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
+	return nil
+}
 
-		if gl.FFNRouterShared != 0 {
-			Sync()
-			shInput := make([]float32, dim)
-			DownloadF32(rs.FFNNorm, shInput)
-			shGateW := make([]float32, dim)
-			DownloadF32(gl.FFNRouterShared, shGateW)
-			var dot float32
-			for i := 0; i < dim; i++ {
-				dot += shGateW[i] * shInput[i]
-			}
-			gate := float32(1.0 / (1.0 + math.Exp(-float64(dot))))
-			BeginBatch()
-			Scale(rs.MoEShOut, gate, dim)
-		}
-		Barrier()
-		Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
+// gpuForwardMoEFFNNative runs the MoE FFN entirely on GPU using native matvec.
+// No Sync() or CPU round-trip — everything stays on GPU.
+// Works for ALL quant types (IQ, K-quant, etc.) without Q8_1 quantization.
+func gpuForwardMoEFFNNative(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig,
+	dim, expDim, nUsed int, gateGpu, upGpu *GpuTensor, bpr, downBpr int, fused, isOAI bool) error {
+
+	gateStride := moeBlockStride(expDim, gateGpu.Cols, gateGpu.Type)
+	downStride := moeBlockStride(dim, gl.FFNDownExps.Cols, uint32(gl.FFNDownExps.Type))
+
+	gateBaseOff := 0
+	upBaseOff := 0
+	upStride := gateStride
+	if fused {
+		gateStride = 2 * gateStride
+		upStride = gateStride
+		upBaseOff = moeBlockStride(expDim, gateGpu.Cols, gateGpu.Type)
+	}
+
+	mc := NewMoEFFNConf()
+	mc.SetScratch(rs.FFNNorm, rs.FFNOut, rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
+		0, rs.MoEGateScratch, rs.MoEUpScratch, 0, rs.MoEOutScratch)
+	mc.SetRouter(gl.FFNRouter.Buf, gl.FFNRouter.Rows, gl.FFNRouter.Cols, int(gl.FFNRouter.Type), gl.FFNRouterBias)
+	mc.SetExperts(gateGpu.Buf, int(gateGpu.Type), gateStride, gateBaseOff,
+		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
+		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
+	mc.SetBiases(gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias)
+	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc,
+		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
+		isOAI, 1.702, 7.0)
+
+	setSharedExpertOnConf(mc, gl, rs)
+
+	if err := ForwardMoEFFN_Native_C(mc); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func setSharedExpertOnConf(mc *MoEFFNConf, gl *GpuLayer, rs *GpuRunState) {
+	if gl.FFNGateShared == nil {
+		return
+	}
+	mc.SetSharedExpert(
+		gl.FFNGateShared.Buf, gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, int(gl.FFNGateShared.Type),
+		gl.FFNUpShared.Buf, gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, int(gl.FFNUpShared.Type),
+		gl.FFNDownShared.Buf, gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, int(gl.FFNDownShared.Type),
+		rs.MoEShGate, rs.MoEShUp, rs.MoEShHidden, rs.MoEShOut,
+		gl.FFNRouterShared,
+	)
+}
+
+// gpuForwardSharedExpertBlock runs gate/up/down for the shared expert, with
+// the sigmoid gating done entirely on GPU via the SharedExpertGate shader.
+func gpuForwardSharedExpertBlock(gl *GpuLayer, rs *GpuRunState, cfg llm.ModelConfig, dim int) {
+	if gl.FFNGateShared == nil {
+		return
+	}
+	Barrier()
+	MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
+		gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
+	MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
+		gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
+	Barrier()
+	shDim := gl.FFNGateShared.Rows
+	SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
+	Barrier()
+	MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
+		gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
+
+	if gl.FFNRouterShared != 0 {
+		Barrier()
+		SharedExpertGate(rs.MoEShOut, gl.FFNRouterShared, rs.FFNNorm, dim)
+	}
+	Barrier()
+	Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
+}
+
+// gpuForwardSharedExpert runs the shared expert FFN (if present) on GPU.
+// Called after the main MoE experts have produced output in rs.FFNOut.
+func gpuForwardSharedExpert(gl *GpuLayer, rs *GpuRunState, cfg llm.ModelConfig) {
+	if gl.FFNGateShared == nil {
+		return
+	}
+	dim := cfg.EmbeddingDim
+	Barrier()
+	MatVec(rs.MoEShGate, gl.FFNGateShared.Buf, rs.FFNNorm,
+		gl.FFNGateShared.Rows, gl.FFNGateShared.Cols, gl.FFNGateShared.Type)
+	MatVec(rs.MoEShUp, gl.FFNUpShared.Buf, rs.FFNNorm,
+		gl.FFNUpShared.Rows, gl.FFNUpShared.Cols, gl.FFNUpShared.Type)
+	Barrier()
+	shDim := gl.FFNGateShared.Rows
+	SwiGLU(rs.MoEShHidden, rs.MoEShGate, rs.MoEShUp, shDim)
+	Barrier()
+	MatVec(rs.MoEShOut, gl.FFNDownShared.Buf, rs.MoEShHidden,
+		gl.FFNDownShared.Rows, gl.FFNDownShared.Cols, gl.FFNDownShared.Type)
+
+	if gl.FFNRouterShared != 0 {
+		Barrier()
+		SharedExpertGate(rs.MoEShOut, gl.FFNRouterShared, rs.FFNNorm, dim)
+	}
+	Barrier()
+	Add(rs.FFNOut, rs.FFNOut, rs.MoEShOut, dim)
 }
 
 // topKIndices returns the indices and values of the top-K elements.

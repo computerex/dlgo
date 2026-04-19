@@ -1,8 +1,10 @@
 package diffusion
 
 import (
+	"log"
 	"math"
 	"math/rand"
+	"time"
 )
 
 // DiscreteFlowDenoiser implements the denoiser for Z-Image (Lumina2).
@@ -96,6 +98,7 @@ func EulerSample(
 
 	// Euler method
 	for i := 0; i < steps; i++ {
+		stepStart := time.Now()
 		sigma := sigmas[i]
 		sigmaNext := sigmas[i+1]
 
@@ -105,6 +108,7 @@ func EulerSample(
 
 		// Run model
 		modelOutput := model(x, t)
+		log.Printf("Step %d/%d done in %v (sigma=%.4f)", i+1, steps, time.Since(stepStart), sigma)
 
 		// Get denoised prediction
 		denoised := denoiser.Denoise(modelOutput, x, sigma)

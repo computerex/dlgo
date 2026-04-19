@@ -22,6 +22,7 @@ var (
 	kernel32                     = windows.NewLazySystemDLL("kernel32.dll")
 	procGlobalMemoryStatusEx     = kernel32.NewProc("GlobalMemoryStatusEx")
 	procSetProcessWorkingSetSize = kernel32.NewProc("SetProcessWorkingSetSize")
+	procPrefetchVirtualMemory    = kernel32.NewProc("PrefetchVirtualMemory")
 )
 
 // GetSystemMemInfo queries Windows for physical memory statistics.
@@ -35,6 +36,8 @@ func GetSystemMemInfo() (SystemMemInfo, error) {
 	return SystemMemInfo{
 		TotalPhysical:     ms.TotalPhys,
 		AvailablePhysical: ms.AvailPhys,
+		CommitLimit:       ms.TotalPageFile,
+		CommitAvailable:   ms.AvailPageFile,
 	}, nil
 }
 
@@ -60,4 +63,32 @@ func SetWorkingSetLimit(maxBytes uint64) {
 	minWS := uintptr(1024 * 1024) // 1 MB minimum
 	maxWS := uintptr(maxBytes)
 	procSetProcessWorkingSetSize.Call(uintptr(proc), minWS, maxWS)
+}
+
+// PrefetchRegion asks Windows to pre-fault pages for the given memory range
+// into the page cache. Unlike heap pinning, this does NOT increase commit
+// charge — the pages are file-backed and can be evicted by the OS at any time.
+// This is how llama.cpp warms CPU layer pages on Windows.
+func PrefetchRegion(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if procPrefetchVirtualMemory.Find() != nil {
+		return
+	}
+	type memoryRangeEntry struct {
+		VirtualAddress uintptr
+		NumberOfBytes  uintptr
+	}
+	entry := memoryRangeEntry{
+		VirtualAddress: uintptr(unsafe.Pointer(&data[0])),
+		NumberOfBytes:  uintptr(len(data)),
+	}
+	proc, _ := windows.GetCurrentProcess()
+	procPrefetchVirtualMemory.Call(
+		uintptr(proc),
+		1,
+		uintptr(unsafe.Pointer(&entry)),
+		0,
+	)
 }

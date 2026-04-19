@@ -1,20 +1,31 @@
-// Full (bidirectional) tiled attention with FP32 buffers.
-// Like attention_tiled_f32 but without causal masking — all positions
-// attend to all others (used by diffusion DiT).
+// Full (bidirectional) flash attention with FP32 buffers.
+// vec4 loads, subgroup shuffle reductions, K/V staged through shared memory,
+// per-thread output accumulators, online softmax.
 //
-// Dispatch: groups_x = num_heads, groups_y = seq_len (one WG per query pos), groups_z = 1
+// Architecture: BR=8 rows x 32 threads/row = 256 threads.
+// Each row = 1 subgroup (32 threads) for barrier-free reductions.
+// BC=32 K/V positions per tile, loaded cooperatively into shared memory.
+// Only 4 barriers per tile (K load, K-done, V load, V-done).
+//
+// Q/K/V layout: [seq_len, num_heads * head_dim] (f32, row-major)
+// Output:       [seq_len, num_heads * head_dim] (f32, row-major)
+//
+// Dispatch: groups_x = num_heads,
+//           groups_y = ceil(seq_len / BR),
+//           groups_z = 1
 // Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
-// Buffers: 0=out (float), 1=Q (float), 2=K (float), 3=V (float)
+// Buffers: 0=out (vec4), 1=Q (vec4), 2=K (vec4), 3=V (vec4)
 
 #version 450
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_control_flow_attributes : enable
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) buffer AttnOut { float attn_out[]; };
-layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
-layout(set = 0, binding = 2) readonly buffer K { float k_data[]; };
-layout(set = 0, binding = 3) readonly buffer V { float v_data[]; };
+layout(set = 0, binding = 0) buffer AttnOut   { vec4 out_v4[]; };
+layout(set = 0, binding = 1) readonly buffer Q { vec4 q_v4[];   };
+layout(set = 0, binding = 2) readonly buffer K { vec4 k_v4[];   };
+layout(set = 0, binding = 3) readonly buffer V { vec4 v_v4[];   };
 
 layout(push_constant) uniform Params {
     int num_heads;
@@ -25,127 +36,147 @@ layout(push_constant) uniform Params {
     float scale;
 };
 
-#define WG_SIZE 256
-#define TILE_SIZE 256
+#define WG_SIZE  256
+#define BR       8       // query rows per WG (= WG_SIZE / 32)
+#define BC       32      // K/V positions per tile
+#define HD4      32      // head_dim / 4 = 128 / 4
+#define HD4P     33      // HD4 + 1 for shared memory padding (bank conflict reduction)
 
-shared float q_sh[256];
-shared float tile_s[TILE_SIZE];
-shared float reduce_buf[WG_SIZE];
-shared float sh_out[256];
+// Shared memory (vec4):
+//   Qf:   BR x HD4P  = 8 x 33 = 264 vec4  = 4.1 KB (pre-scaled queries)
+//   kvsh: BC x HD4P  = 32 x 33 = 1056 vec4 = 16.5 KB (K or V tile)
+// Total: ~20.6 KB
+
+shared vec4 Qf[BR * HD4P];
+shared vec4 kvsh[BC * HD4P];
 
 void main() {
     uint head = gl_WorkGroupID.x;
-    uint qi = gl_WorkGroupID.y;   // query position index
+    uint wg_row = gl_WorkGroupID.y;
     if (head >= uint(num_heads)) return;
 
     uint tid = gl_LocalInvocationID.x;
     uint kv_mul = uint(num_heads) / uint(num_kv_heads);
     uint kv_head = head / kv_mul;
-    uint q_dim = uint(num_heads) * uint(head_dim);
-    uint hd = uint(head_dim);
-    uint kvd = uint(kv_dim);
-    uint q_base = qi * q_dim + head * hd;
-    uint kv_offset = kv_head * hd;
+    uint kvd4 = uint(kv_dim) >> 2u;
+    uint qd4 = uint(num_heads) * uint(HD4);
+    uint kv_off4 = kv_head * uint(HD4);
+    int N = seq_len;
+    uint qi_base = wg_row * uint(BR);
+    uint br_valid = min(uint(BR), uint(N) - qi_base);
 
-    // Full bidirectional: attend to all seq_len positions
-    int actual_seq_len = seq_len;
-    if (actual_seq_len <= 0) {
-        if (tid < hd) {
-            attn_out[qi * q_dim + head * hd + tid] = 0.0;
-        }
-        return;
+    uint my_row = tid >> 5u;     // 0..7 (each row = 1 subgroup of 32)
+    uint my_col = tid & 31u;     // 0..31
+
+    // --- Load BR query vectors into Qf (pre-scaled) ---
+    for (uint i = tid; i < uint(BR) * uint(HD4); i += WG_SIZE) {
+        uint r = i / uint(HD4);
+        uint d = i % uint(HD4);
+        uint qi = qi_base + r;
+        Qf[r * HD4P + d] = (qi < uint(N))
+            ? q_v4[qi * qd4 + head * uint(HD4) + d] * scale
+            : vec4(0.0);
     }
 
-    // Load Q into shared memory
-    for (uint d = tid; d < hd; d += WG_SIZE) {
-        q_sh[d] = q_data[q_base + d];
-    }
-    barrier();
+    // Per-thread output accumulator (full head_dim in registers)
+    vec4 my_O[HD4];
+    [[unroll]] for (uint d = 0u; d < uint(HD4); d++) my_O[d] = vec4(0.0);
 
-    // =========================================================================
-    // Pass 1: Find global max of Q·K scores
-    // =========================================================================
-    float global_max = -1.0e30;
-
-    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
-        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
-        int tile_len = tile_end - tile_start;
-
-        float my_score = -1.0e30;
-        if (int(tid) < tile_len) {
-            int t = tile_start + int(tid);
-            float dot_val = 0.0;
-            uint k_base = uint(t) * kvd + kv_offset;
-            for (uint d = 0; d < hd; d++) {
-                dot_val += q_sh[d] * k_data[k_base + d];
-            }
-            my_score = dot_val * scale;
-        }
-
-        reduce_buf[tid] = my_score;
-        barrier();
-        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
-            if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
-            barrier();
-        }
-        global_max = max(global_max, reduce_buf[0]);
-        barrier();
-    }
-
-    // =========================================================================
-    // Pass 2: exp(score - max), accumulate sum and weighted V
-    // =========================================================================
-    if (tid < hd) {
-        sh_out[tid] = 0.0;
-    }
-    barrier();
-
+    float running_max = -1e30;
     float running_sum = 0.0;
 
-    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
-        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
-        int tile_len = tile_end - tile_start;
+    barrier();
 
-        if (int(tid) < tile_len) {
-            int t = tile_start + int(tid);
+    // =====================================================================
+    // Main tile loop
+    // =====================================================================
+    for (int tile_start = 0; tile_start < N; tile_start += int(BC)) {
+        int tile_len = min(int(BC), N - tile_start);
+
+        // --- K load into kvsh (cooperative, coalesced) ---
+        // BC * HD4 = 1024 entries, 256 threads -> 4 iterations
+        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+            uint kp = i / uint(HD4);
+            uint d  = i % uint(HD4);
+            int kpos = tile_start + int(kp);
+            kvsh[kp * HD4P + d] = (kpos < N)
+                ? k_v4[uint(kpos) * kvd4 + kv_off4 + d]
+                : vec4(0.0);
+        }
+        barrier(); // K ready in kvsh
+
+        // --- QK dot product (vec4 native dot, reads from Qf and kvsh) ---
+        float s = -1e30;
+        if (my_row < br_valid && int(my_col) < tile_len) {
             float dot_val = 0.0;
-            uint k_base = uint(t) * kvd + kv_offset;
-            for (uint d = 0; d < hd; d++) {
-                dot_val += q_sh[d] * k_data[k_base + d];
+            [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+                dot_val += dot(Qf[my_row * HD4P + d], kvsh[my_col * HD4P + d]);
             }
-            tile_s[tid] = exp(dot_val * scale - global_max);
-        } else {
-            tile_s[tid] = 0.0;
+            s = dot_val;
         }
-        barrier();
 
-        reduce_buf[tid] = tile_s[tid];
-        barrier();
-        [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
-            if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
-            barrier();
+        // --- Online softmax (subgroup ops only, NO barriers) ---
+        // Each row = 1 subgroup -> 32-wide shuffle = row-wide reduction.
+        float m = s;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            m = max(m, subgroupShuffleXor(m, off));
+
+        float new_max = max(running_max, m);
+        float corr = exp(running_max - new_max);
+        running_max = new_max;
+        running_sum *= corr;
+
+        // Rescale output accumulator for new max
+        [[unroll]] for (uint d = 0u; d < uint(HD4); d++) my_O[d] *= corr;
+
+        // Exp weight for this thread's K column
+        float w = (my_row < br_valid && int(my_col) < tile_len)
+            ? exp(s - new_max) : 0.0;
+
+        // Row-wide sum of weights
+        float wsum = w;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            wsum += subgroupShuffleXor(wsum, off);
+        running_sum += wsum;
+
+        // --- V load into kvsh (reuse shared mem after K reads done) ---
+        barrier(); // ensure all K reads complete before overwriting kvsh
+        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+            uint vp = i / uint(HD4);
+            uint d  = i % uint(HD4);
+            int vpos = tile_start + int(vp);
+            kvsh[vp * HD4P + d] = (vpos < N)
+                ? v_v4[uint(vpos) * kvd4 + kv_off4 + d]
+                : vec4(0.0);
         }
-        running_sum += reduce_buf[0];
-        barrier();
+        barrier(); // V ready in kvsh
 
-        if (tid < hd) {
-            float acc = 0.0;
-            for (int ti = 0; ti < tile_len; ti++) {
-                float w = tile_s[ti];
-                uint v_base = uint(tile_start + ti) * kvd + kv_offset;
-                acc += w * v_data[v_base + tid];
+        // --- Accumulate weighted V into per-thread output ---
+        if (w > 0.0) {
+            [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+                my_O[d] += w * kvsh[my_col * HD4P + d];
             }
-            sh_out[tid] += acc;
         }
-        barrier();
+
+        barrier(); // V reads done, protect next tile's K load
     }
 
-    // =========================================================================
-    // Normalize and write
-    // =========================================================================
+    // =====================================================================
+    // Final: reduce per-thread outputs across 32 threads per row,
+    // normalize by running_sum, and write result
+    // =====================================================================
     float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
-    if (tid < hd) {
-        uint out_idx = qi * q_dim + head * hd + tid;
-        attn_out[out_idx] = sh_out[tid] * inv_sum;
+
+    uint qi = qi_base + my_row;
+    if (my_row < br_valid) {
+        [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+            vec4 val = my_O[d];
+            // Subgroup sum-reduction: 32 lanes -> 1 result (broadcast to all)
+            [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+                val += subgroupShuffleXor(val, off);
+            // Lane 0 writes the final normalized output
+            if (my_col == 0u)
+                out_v4[qi * qd4 + head * uint(HD4) + d] = val * inv_sum;
+        }
     }
 }

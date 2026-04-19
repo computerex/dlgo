@@ -43,7 +43,10 @@ func Init() error {
 }
 
 // Shutdown releases all GPU resources.
-func Shutdown() { C.gpu_shutdown() }
+func Shutdown() {
+	C.gpu_shutdown()
+	ResetIQTables()
+}
 
 // IsInitialized returns true if the GPU backend is ready.
 func IsInitialized() bool { return C.gpu_is_initialized() != 0 }
@@ -60,6 +63,9 @@ func VRAMFreeBytes() uint64 { return uint64(C.gpu_vram_free_bytes()) }
 
 // AllocatedBytes returns cumulative VRAM allocated by this process (our own counter).
 func AllocatedBytes() uint64 { return uint64(C.gpu_allocated_bytes()) }
+
+// HostVisibleBytes returns bytes allocated in host-visible (non-device-local) memory.
+func HostVisibleBytes() uint64 { return uint64(C.gpu_host_visible_bytes()) }
 
 // Alloc allocates a GPU buffer of the given size.
 // Returns 0 on failure — callers that cannot tolerate OOM should use AllocE.
@@ -81,6 +87,23 @@ func AllocE(sizeBytes uint64) (Buf, error) {
 
 // Free releases a GPU buffer.
 func Free(buf Buf) { C.gpu_free(C.GpuBuf(buf)) }
+
+// PoolCreate creates a device-local memory pool for suballocation.
+// All subsequent Alloc/AllocE calls will suballocate from this pool
+// instead of creating individual vkAllocateMemory calls.
+func PoolCreate(sizeBytes uint64) error {
+	rc := C.gpu_pool_create(C.uint64_t(sizeBytes))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: pool create failed for %d bytes (%.1f MB)", sizeBytes, float64(sizeBytes)/(1024*1024))
+	}
+	return nil
+}
+
+// PoolSeal stops suballocation mode but keeps the pool memory alive.
+func PoolSeal() { C.gpu_pool_seal() }
+
+// PoolDestroy frees the pool and all buffers allocated from it.
+func PoolDestroy() { C.gpu_pool_destroy() }
 
 // ResetBufferTable compacts the buffer ID table after freeing all buffers,
 // allowing new allocations to reuse slots from the beginning.
@@ -418,6 +441,21 @@ func PagedAttention(out, q, kPool, vPool, blockTable Buf,
 // Sync waits for all GPU operations to complete.
 func Sync() { C.gpu_sync() }
 
+// PerfReset resets GPU performance counters.
+func PerfReset() { C.gpu_perf_reset() }
+
+// PerfPrint prints GPU performance counters to stderr.
+func PerfPrint() { C.gpu_perf_print() }
+
+// PerfGetGpuUs returns accumulated GPU fence-wait time in microseconds.
+func PerfGetGpuUs() float64 { return float64(C.gpu_perf_get_gpu_us()) }
+
+// PerfGetDispatches returns accumulated dispatch count.
+func PerfGetDispatches() int { return int(C.gpu_perf_get_dispatches()) }
+
+// PerfGetBarriers returns accumulated barrier count.
+func PerfGetBarriers() int { return int(C.gpu_perf_get_barriers()) }
+
 // HasDp4a returns true if the GPU supports integer dot product (dp4a) acceleration.
 func HasDp4a() bool { return C.gpu_has_dp4a() != 0 }
 
@@ -456,6 +494,23 @@ func MoEMatVecDp4a(out, weights, q8_1, indices Buf,
 		C.int(sharedInput), C.int(nUsed))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: moe_matvec_dp4a failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoEMatVecIQ dispatches batched IQ-quant MoE matvec for all active experts.
+// Uses float input + lookup table instead of dp4a Q8_1 input.
+func MoEMatVecIQ(out, weights, x, table, indices Buf,
+	rows, cols int, qtype uint32,
+	expertStride, baseOffset, sharedInput, nUsed int) error {
+	rc := C.gpu_moe_matvec_iq(
+		C.GpuBuf(out), C.GpuBuf(weights),
+		C.GpuBuf(x), C.GpuBuf(table), C.GpuBuf(indices),
+		C.int(rows), C.int(cols), C.int(qtype),
+		C.int(expertStride), C.int(baseOffset),
+		C.int(sharedInput), C.int(nUsed))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_matvec_iq failed (%d)", rc)
 	}
 	return nil
 }
@@ -581,6 +636,32 @@ func (mc *MoEFFNConf) SetBiases(gateBias, upBias, downBias Buf) {
 	mc.c.down_bias = C.GpuBuf(downBias)
 }
 
+func (mc *MoEFFNConf) SetSharedExpert(
+	gateW Buf, gateRows, gateCols, gateType int,
+	upW Buf, upRows, upCols, upType int,
+	downW Buf, downRows, downCols, downType int,
+	gateScratch, upScratch, hiddenScratch, outScratch Buf,
+	routerW Buf) {
+	mc.c.has_shared = 1
+	mc.c.sh_gate_w = C.GpuBuf(gateW)
+	mc.c.sh_gate_rows = C.int(gateRows)
+	mc.c.sh_gate_cols = C.int(gateCols)
+	mc.c.sh_gate_type = C.int(gateType)
+	mc.c.sh_up_w = C.GpuBuf(upW)
+	mc.c.sh_up_rows = C.int(upRows)
+	mc.c.sh_up_cols = C.int(upCols)
+	mc.c.sh_up_type = C.int(upType)
+	mc.c.sh_down_w = C.GpuBuf(downW)
+	mc.c.sh_down_rows = C.int(downRows)
+	mc.c.sh_down_cols = C.int(downCols)
+	mc.c.sh_down_type = C.int(downType)
+	mc.c.sh_gate_scratch = C.GpuBuf(gateScratch)
+	mc.c.sh_up_scratch = C.GpuBuf(upScratch)
+	mc.c.sh_hidden_scratch = C.GpuBuf(hiddenScratch)
+	mc.c.sh_out_scratch = C.GpuBuf(outScratch)
+	mc.c.sh_router_w = C.GpuBuf(routerW)
+}
+
 func (mc *MoEFFNConf) SetConfig(dim, expDim, nExperts, nUsed, gatingFunc int,
 	weightsNorm bool, weightsScale float32,
 	isOAI bool, alpha, limit float32) {
@@ -600,11 +681,21 @@ func (mc *MoEFFNConf) SetConfig(dim, expDim, nExperts, nUsed, gatingFunc int,
 	mc.c.limit = C.float(limit)
 }
 
-// ForwardMoEFFN_C runs the entire MoE FFN in a single CGo call.
+// ForwardMoEFFN_C runs the entire MoE FFN in a single CGo call (dp4a path).
 func ForwardMoEFFN_C(mc *MoEFFNConf) error {
 	rc := C.gpu_forward_moe_ffn(&mc.c)
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: forward_moe_ffn failed (%d)", rc)
+	}
+	return nil
+}
+
+// ForwardMoEFFN_Native_C runs the entire MoE FFN in a single CGo call
+// using native (float-input) matvec pipelines. Works for all quant types.
+func ForwardMoEFFN_Native_C(mc *MoEFFNConf) error {
+	rc := C.gpu_forward_moe_ffn_native(&mc.c)
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: forward_moe_ffn_native failed (%d)", rc)
 	}
 	return nil
 }
@@ -632,11 +723,15 @@ func AddRMSNorm(normOut, sumOut, a, b, weight Buf, n int, eps float32) error {
 // LayerConf holds all buffer handles and parameters for one transformer layer.
 // Set up once per model, reused for every token.
 type LayerConf struct {
-	c C.GpuLayerConf
+	c       C.GpuLayerConf
+	moeConf *MoEFFNConf // prevent GC of the MoEFFNConf while C holds a pointer
 }
 
 // NewLayerConf creates a LayerConf from the model's layer data.
 func NewLayerConf() *LayerConf { return &LayerConf{} }
+
+// HasInlineMoE returns true if this layer handles MoE inline in C.
+func (lc *LayerConf) HasInlineMoE() bool { return lc.c.moe_conf != nil }
 
 func (lc *LayerConf) SetScratch(x, xNorm, q, k, v, attnOut, attnProj Buf,
 	ffnNorm, ffnIn, gate, up, hidden, ffnOut Buf) {
@@ -759,6 +854,23 @@ func (lc *LayerConf) SetDP4A(q8_1Scratch Buf) {
 	lc.c.q8_1_scratch = C.GpuBuf(q8_1Scratch)
 	if q8_1Scratch != 0 {
 		lc.c.use_dp4a = 1
+	}
+}
+
+// SetMoEConf attaches MoE config to run inline with gpu_forward_layer.
+// When set, the C-side will handle the entire MoE FFN + residual
+// instead of returning early for ffn_type=3.
+// The config is copied to C-allocated memory to avoid CGo pointer restrictions.
+func (lc *LayerConf) SetMoEConf(mc *MoEFFNConf, useNative, hasSharedExpert bool) {
+	lc.moeConf = mc
+	cConf := (*C.GpuMoEConf)(C.malloc(C.size_t(unsafe.Sizeof(mc.c))))
+	*cConf = mc.c
+	lc.c.moe_conf = cConf
+	if useNative {
+		lc.c.moe_use_native = 1
+	}
+	if hasSharedExpert {
+		lc.c.moe_has_shared = 1
 	}
 }
 
@@ -931,6 +1043,14 @@ func SigmoidGate(out, gate Buf, n int) error {
 	return nil
 }
 
+func SharedExpertGate(out, gateW, input Buf, n int) error {
+	rc := C.gpu_shared_expert_gate(C.GpuBuf(out), C.GpuBuf(gateW), C.GpuBuf(input), C.int(n))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: shared_expert_gate failed (%d)", rc)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // VAE-specific operations
 // ---------------------------------------------------------------------------
@@ -980,6 +1100,26 @@ func SpatialAttention(out, q, k, v Buf, channels, spatial int, scale float32) er
 		C.int(channels), C.int(spatial), C.float(scale))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: spatial_attention failed (%d)", rc)
+	}
+	return nil
+}
+
+// GemmQ4K runs tiled GEMM for Q4_K weights: out[n*M+m] = sum_k(dequant(W[m][k]) * X[n*K+k]).
+func GemmQ4K(out, weights, x Buf, M, K, N int) error {
+	rc := C.gpu_gemm_q4_k(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.int(M), C.int(K), C.int(N))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gemm_q4_k failed (%d)", rc)
+	}
+	return nil
+}
+
+// SplitQKV splits interleaved QKV[seqLen × (qDim+2*kvDim)] into separate Q, K, V buffers on GPU.
+func SplitQKV(q, k, v, qkv Buf, qDim, kvDim, seqLen int) error {
+	rc := C.gpu_split_qkv(C.GpuBuf(q), C.GpuBuf(k), C.GpuBuf(v), C.GpuBuf(qkv),
+		C.int(qDim), C.int(kvDim), C.int(seqLen))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: split_qkv failed (%d)", rc)
 	}
 	return nil
 }

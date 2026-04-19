@@ -1,0 +1,170 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// BF16-weight × FP32-input GEMM using cooperative matrix (tensor cores).
+// Tile: BM=64, BN=64, BK=32.  128 threads = 4 subgroups in 2×2 layout.
+// Each subgroup: 2×2 coopmat 16×16 tiles → 32×32 output.
+// Shared memory uses SHMEM_STRIDE = BK/2+4 = 20 vec2 padding to avoid bank conflicts.
+
+#define BM     64u
+#define BN     64u
+#define BK     32u
+#define SHMEM_STRIDE (BK / 2u + 4u)  // = 20 f16vec2 per row (padding avoids bank conflicts)
+#define TM     16u
+#define TN     16u
+#define TK     16u
+#define SG_M   2u
+#define SG_N   2u
+#define CMS_M  2u   // coopmat tiles per subgroup in M  (2×16=32)
+#define CMS_N  2u   // coopmat tiles per subgroup in N  (2×16=32)
+#define N_K_TILES (BK / TK)  // = 2
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { uint16_t weight_bf16[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int npos;
+};
+
+// Shared memory: vec2-packed with padding stride.
+// smA: BM rows × SHMEM_STRIDE vec2 = 64×20 = 1280 vec2 = 5120 bytes
+// smB: BN rows × SHMEM_STRIDE vec2 = 64×20 = 1280 vec2 = 5120 bytes
+// Total: 10240 bytes = 10 KB
+shared f16vec2 smA[BM * SHMEM_STRIDE];
+shared f16vec2 smB[BN * SHMEM_STRIDE];
+shared float out_stage[BM * BN];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_m = sg_id / SG_N;   // 0..1
+    uint sg_n = sg_id % SG_N;   // 0..1
+
+    // 2D workgroup grid encoded in groups_x
+    uint n_tiles_n = (uint(npos) + BN - 1u) / BN;
+    uint tile_n = gl_WorkGroupID.x % n_tiles_n;
+    uint tile_m = gl_WorkGroupID.x / n_tiles_n;
+
+    uint wg_m = tile_m * BM;
+    uint wg_n = tile_n * BN;
+    uint M = uint(rows);
+    uint K = uint(cols);
+    uint N = uint(npos);
+
+    // Initialize 2×2 accumulator tiles per subgroup
+    coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[CMS_M * CMS_N];
+    for (uint i = 0u; i < CMS_M * CMS_N; i++)
+        acc[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+
+    // Load counts per thread:
+    // smA: BM * BK/2 = 64*16 = 1024 vec2 / 128 threads = 8 vec2/thread
+    // smB: BN * BK/2 = 64*16 = 1024 vec2 / 128 threads = 8 vec2/thread
+    const uint LOAD_A = (BM * (BK / 2u)) / 128u;  // 8
+    const uint LOAD_B = (BN * (BK / 2u)) / 128u;  // 8
+
+    for (uint k_base = 0u; k_base < K; k_base += BK) {
+        // Load A tile: weight_bf16[M, K] → smA[BM, SHMEM_STRIDE] (padded row-major vec2)
+        // Each thread loads 8 vec2 (= 16 BF16 elements)
+        for (uint e = 0u; e < LOAD_A; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);    // idx / 16
+            uint col2 = idx % (BK / 2u);   // idx % 16 (vec2 index)
+            uint m_global = wg_m + row;
+            uint k_global = k_base + col2 * 2u;
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (m_global < M && k_global + 1u < K) {
+                // Load 2 BF16 values, convert to f16
+                uint v0 = uint(weight_bf16[m_global * K + k_global]);
+                uint v1 = uint(weight_bf16[m_global * K + k_global + 1u]);
+                val.x = float16_t(uintBitsToFloat(v0 << 16u));
+                val.y = float16_t(uintBitsToFloat(v1 << 16u));
+            } else if (m_global < M && k_global < K) {
+                uint v0 = uint(weight_bf16[m_global * K + k_global]);
+                val.x = float16_t(uintBitsToFloat(v0 << 16u));
+            }
+            smA[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        // Load B tile: data_b[N, K] → smB[BN, SHMEM_STRIDE] (padded row-major vec2)
+        for (uint e = 0u; e < LOAD_B; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);    // idx / 16
+            uint col2 = idx % (BK / 2u);   // idx % 16 (vec2 index)
+            uint n_global = wg_n + row;
+            uint k_global = k_base + col2 * 2u;
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (n_global < N && k_global + 1u < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+                val.y = float16_t(data_b[n_global * K + k_global + 1u]);
+            } else if (n_global < N && k_global < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+            }
+            smB[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        barrier();
+
+        // Compute: iterate over K-tiles within BK
+        for (uint kt = 0u; kt < N_K_TILES; kt++) {
+            // Load matA tiles for this subgroup's M-rows (2 tiles)
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA[CMS_M];
+            for (uint am = 0u; am < CMS_M; am++) {
+                uint sm_row = sg_m * CMS_M * TM + am * TM;
+                // coopMatLoad offset/stride are in array-element units (vec2 for f16vec2)
+                coopMatLoad(matA[am], smA, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            // Load matB and multiply for N-columns (2 tiles per subgroup)
+            for (uint an = 0u; an < CMS_N; an++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                uint sm_row = sg_n * CMS_N * TN + an * TN;
+                // coopMatLoad offset/stride in array-element (vec2) units
+                coopMatLoad(matB, smB, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+
+                for (uint am = 0u; am < CMS_M; am++) {
+                    acc[am * CMS_N + an] = coopMatMulAdd(matA[am], matB, acc[am * CMS_N + an]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Stage through shared memory to allow per-element bounds checking.
+    // coopMatStore always writes a full 16×16 tile; without this, edge tiles
+    // where base_n+16 > N would write past the output buffer causing TDR.
+    for (uint am = 0u; am < CMS_M; am++) {
+        for (uint an = 0u; an < CMS_N; an++) {
+            uint sm_m = sg_m * CMS_M * TM + am * TM;
+            uint sm_n = sg_n * CMS_N * TN + an * TN;
+            coopMatStore(acc[am * CMS_N + an], out_stage, sm_n * BM + sm_m, BM,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+
+    barrier();
+
+    // BM*BN = 4096 elements / 128 threads = 32 per thread
+    for (uint e = 0u; e < 32u; e++) {
+        uint idx = e * 128u + tid;
+        uint local_m = idx % BM;
+        uint local_n = idx / BM;
+        uint gm = wg_m + local_m;
+        uint gn = wg_n + local_n;
+        if (gm < M && gn < N) {
+            out_data[gn * M + gm] = out_stage[local_n * BM + local_m];
+        }
+    }
+}

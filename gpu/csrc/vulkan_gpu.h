@@ -115,6 +115,7 @@ typedef enum {
     PIPE_MATVEC_Q3_K_DP4A_MOE,
     PIPE_MATVEC_Q5_K_DP4A_MOE,
     PIPE_MATVEC_MXFP4_DP4A_MOE,
+    PIPE_MATVEC_IQ3_XXS_MOE,
     PIPE_MOE_ACCUMULATE,
     PIPE_SWIGLU_OAI_BIAS_MOE,
     PIPE_MOE_BIAS_ADD,
@@ -128,11 +129,55 @@ typedef enum {
     PIPE_TANH_GATE_RESIDUAL,
     PIPE_ROPE_3D,
     PIPE_ATTENTION_FULL_F32,
+    PIPE_ATTENTION_FULL_F16,
+    PIPE_FLASH_ATTN_F32,
     PIPE_CONV2D_F32,
     PIPE_GROUP_NORM,
     PIPE_SILU,
     PIPE_UPSAMPLE_NEAREST,
     PIPE_SPATIAL_ATTENTION,
+    PIPE_GEMM_Q4_K,
+    PIPE_SPLIT_QKV,
+    PIPE_DEQUANT_Q4K_F16,
+    PIPE_GEMM_F16,
+    PIPE_GEMM_Q4K_DP4A,
+    PIPE_GEMM_Q4K_FUSED,
+    PIPE_GEMM_Q4K_SMEM,
+    PIPE_GEMM_Q4K_COOPMAT,
+    PIPE_GEMM_Q5K_COOPMAT,
+    PIPE_GEMM_Q6K_COOPMAT,
+    PIPE_GEMM_Q6K_F32,
+    PIPE_GEMM_BF16,
+    PIPE_GEMM_F16_COOPMAT,
+    // Native (float-input) MoE matvec variants
+    PIPE_MATVEC_F32_MOE,
+    PIPE_MATVEC_Q4_0_MOE,
+    PIPE_MATVEC_Q8_0_MOE,
+    PIPE_MATVEC_Q3_K_MOE,
+    PIPE_MATVEC_Q4_K_MOE,
+    PIPE_MATVEC_Q5_K_MOE,
+    PIPE_MATVEC_Q5_0_MOE,
+    PIPE_MATVEC_Q6_K_MOE,
+    PIPE_MATVEC_Q2_K_MOE,
+    PIPE_MATVEC_TQ1_0_MOE,
+    PIPE_MATVEC_IQ1_S_MOE,
+    PIPE_MATVEC_IQ1_M_MOE,
+    PIPE_MATVEC_IQ2_XXS_MOE,
+    PIPE_MATVEC_IQ2_S_MOE,
+    PIPE_MATVEC_IQ3_S_MOE,
+    PIPE_MATVEC_IQ4_XS_MOE,
+    PIPE_MATVEC_IQ4_NL_MOE,
+    PIPE_MATVEC_MXFP4_MOE,
+    PIPE_SHARED_EXPERT_GATE,
+    PIPE_MATVEC_Q4_K_DP4A_FUSED,
+    PIPE_MATVEC_IQ3_XXS_DP4A,
+    PIPE_MATVEC_IQ4_XS_DP4A,
+    PIPE_MATVEC_IQ4_NL_DP4A,
+    PIPE_MATVEC_IQ3_S_DP4A,
+    PIPE_MATVEC_IQ3_XXS_DP4A_MOE,
+    PIPE_MATVEC_IQ4_XS_DP4A_MOE,
+    PIPE_MATVEC_IQ4_NL_DP4A_MOE,
+    PIPE_MATVEC_IQ3_S_DP4A_MOE,
     PIPE_COUNT
 } PipelineID;
 
@@ -147,6 +192,7 @@ const char* gpu_device_name(void);
 uint64_t gpu_vram_bytes(void);
 uint64_t gpu_vram_free_bytes(void);
 uint64_t gpu_allocated_bytes(void);
+uint64_t gpu_host_visible_bytes(void);
 int gpu_is_initialized(void);
 int gpu_has_dp4a(void);
 
@@ -159,6 +205,13 @@ int gpu_moe_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf,
                         int rows, int cols, int qtype,
                         int expert_stride, int base_offset,
                         int shared_input, int n_used);
+
+// table_buf may be 0; auto-resolved from qtype using uploaded IQ tables.
+int gpu_moe_matvec_iq(GpuBuf out_buf, GpuBuf weights_buf,
+                      GpuBuf x_buf, GpuBuf table_buf, GpuBuf indices_buf,
+                      int rows, int cols, int qtype,
+                      int expert_stride, int base_offset,
+                      int shared_input, int n_used);
 
 int gpu_moe_accumulate(GpuBuf out_buf, GpuBuf exp_outs_buf, GpuBuf weights_buf,
                        GpuBuf bias_buf, GpuBuf indices_buf,
@@ -182,6 +235,9 @@ int gpu_quantize_q8_1_at(GpuBuf q8_1_buf, int q8_off, GpuBuf f32_buf, int f32_of
 GpuBuf gpu_alloc(uint64_t size_bytes, int usage);
 void gpu_free(GpuBuf buf);
 void gpu_reset_buffer_table(void);
+int gpu_pool_create(uint64_t size_bytes);
+void gpu_pool_seal(void);
+void gpu_pool_destroy(void);
 int gpu_upload(GpuBuf dst, const void* src, uint64_t size_bytes, uint64_t offset);
 int gpu_download(void* dst, GpuBuf src, uint64_t size_bytes, uint64_t offset);
 
@@ -306,6 +362,21 @@ int gpu_silu(GpuBuf data_buf, int n);
 int gpu_upsample_nearest(GpuBuf out_buf, GpuBuf in_buf, int C, int H, int W);
 int gpu_spatial_attention(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf,
                           int C, int spatial, float scale);
+int gpu_gemm_q4_k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                  int M, int K, int N);
+int gpu_split_qkv(GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf, GpuBuf qkv_buf,
+                   int qDim, int kvDim, int seqLen);
+int gpu_dequant_q4k_f16(GpuBuf out_f16, GpuBuf weights_q4k, int rows, int cols);
+int gpu_gemm_f16(GpuBuf out_buf, GpuBuf weight_f16, GpuBuf x_buf,
+                 int M, int N, int K, int out_stride);
+int gpu_gemm_bf16(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                  int rows, int cols, int npos);
+int gpu_gemm_q4k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                 int rows, int cols, int npos);
+int gpu_gemm_q5k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                 int rows, int cols, int npos);
+int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                 int rows, int cols, int npos);
 
 // Synchronize: wait for all GPU work to complete
 void gpu_sync(void);
@@ -321,6 +392,21 @@ int gpu_quantize_q8_1(GpuBuf q8_1_buf, GpuBuf f32_buf, int n_elements);
 // MatVec using dp4a (dotPacked4x8EXT): weights × Q8_1 input
 int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
                     int rows, int cols, int qtype);
+
+// Fused Q4_K dp4a matvec: quantizes float32 input to Q8_1 in shared memory,
+// then performs dp4a dot product. Eliminates separate quantize dispatch + barrier.
+int gpu_matvec_dp4a_fused(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_f32_buf,
+                          int rows, int cols);
+
+// Performance counters
+void gpu_perf_reset(void);
+void gpu_perf_print(void);
+double gpu_perf_get_gpu_us(void);
+int    gpu_perf_get_dispatches(void);
+int    gpu_perf_get_barriers(void);
+
+// Forward declaration for inline MoE conf in layer conf.
+typedef struct GpuMoEConf_s GpuMoEConf;
 
 // Fused layer: records all dispatches for one transformer layer in a single
 // CGo call, eliminating per-operation Go→C overhead.
@@ -361,6 +447,12 @@ typedef struct {
     GpuBuf attn_sinks;   // learned sink logits per head (0 if not used)
     int sliding_window;  // ISWA: max window size for this layer (0 = full attention)
     float attn_logit_softcap; // attention logit soft-capping (0 = disabled)
+
+    // Inline MoE FFN (ffn_type=3): if non-NULL, runs MoE FFN (+ residual
+    // if moe_has_shared=0) in the same C call instead of returning to Go.
+    const GpuMoEConf* moe_conf;
+    int moe_use_native;  // 1=native matvec, 0=dp4a
+    int moe_has_shared;  // 1=shared expert exists, Go handles shared+residual
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.
@@ -394,10 +486,11 @@ int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
 int gpu_deinterleave_qgate(GpuBuf qfull, GpuBuf q, GpuBuf qgate,
                            int num_heads, int head_dim);
 int gpu_sigmoid_gate(GpuBuf out_buf, GpuBuf gate_buf, int n);
+int gpu_shared_expert_gate(GpuBuf out_buf, GpuBuf gate_w_buf, GpuBuf input_buf, int n);
 
 // Fused MoE FFN: runs entire MoE FFN in a single CGo call.
 // Eliminates ~18 CGo calls per layer → 1 call.
-typedef struct {
+struct GpuMoEConf_s {
     // Scratch buffers
     GpuBuf ffn_norm;         // input (RMS-normed hidden state)
     GpuBuf ffn_out;          // output (weighted expert sum)
@@ -434,9 +527,31 @@ typedef struct {
     // Activation mode: 0=SwiGLU, 1=SwiGLU_OAI
     int is_oai;
     float alpha, limit;
-} GpuMoEConf;
+
+    // Shared expert (all 0 if not present)
+    int has_shared;
+    GpuBuf sh_gate_w, sh_up_w, sh_down_w;
+    int sh_gate_rows, sh_gate_cols, sh_gate_type;
+    int sh_up_rows, sh_up_cols, sh_up_type;
+    int sh_down_rows, sh_down_cols, sh_down_type;
+    GpuBuf sh_gate_scratch, sh_up_scratch, sh_hidden_scratch, sh_out_scratch;
+    GpuBuf sh_router_w;
+};
 
 int gpu_forward_moe_ffn(const GpuMoEConf* mc);
+
+// Native (float-input) fused MoE FFN: same as gpu_forward_moe_ffn but uses
+// native matvec pipelines instead of dp4a. Skips Q8_1 quantization.
+// Works for ALL quant types including IQ types.
+int gpu_forward_moe_ffn_native(const GpuMoEConf* mc);
+
+// Batched native MoE matvec: dispatches for all n_used experts in one call.
+// Uses float input (not Q8_1). Supports all quant types.
+int gpu_moe_matvec_native(GpuBuf out_buf, GpuBuf weights_buf,
+                          GpuBuf x_buf, GpuBuf indices_buf,
+                          int rows, int cols, int qtype,
+                          int expert_stride, int base_offset,
+                          int shared_input, int n_used);
 
 // IQ lookup table management for I-quant GPU matvec.
 // Call once after gpu_init to register grid table buffers.

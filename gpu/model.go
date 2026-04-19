@@ -369,18 +369,16 @@ func (bs *GpuBatchState) Free() {
 
 // GpuKVCache holds GPU-resident KV cache for all layers.
 type GpuKVCache struct {
-	KeyBufs []Buf // [nLayers] each is [maxSeqLen * kvDim] floats
+	KeyBufs []Buf // [nLayers] each is [maxSeqLen * kvDim/2] packed uint32 (FP16)
 	ValBufs []Buf
 	KVDim   int
 	MaxSeq  int
 	Len     int
 }
 
-// NewGpuKVCache allocates GPU buffers for KV cache.
+// NewGpuKVCache allocates GPU buffers for FP16 KV cache.
 // gpuLayers controls how many layers get GPU-allocated KV buffers.
-// Layers beyond gpuLayers get zero-valued (nil) buffers.
 // needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
-// If needsKV is nil, all layers within gpuLayers get buffers (legacy behavior).
 func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) (*GpuKVCache, error) {
 	c := &GpuKVCache{
 		KeyBufs: make([]Buf, totalLayers),
@@ -388,8 +386,8 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 		KVDim:   kvDim,
 		MaxSeq:  maxSeqLen,
 	}
-	// FP32 KV cache: each element is 4 bytes
-	size := uint64(maxSeqLen * kvDim * 4)
+	// FP16 KV cache: each pair of f16 values is packed into one uint32 (2 bytes each)
+	size := uint64(maxSeqLen * kvDim * 2)
 	a := allocChecker{}
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		if needsKV != nil && !needsKV[l] {
@@ -398,7 +396,6 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 		c.KeyBufs[l] = a.alloc(size)
 		c.ValBufs[l] = a.alloc(size)
 		if a.err != nil {
-			// Free everything allocated so far
 			for j := 0; j <= l; j++ {
 				freeBuf(c.KeyBufs[j])
 				freeBuf(c.ValBufs[j])

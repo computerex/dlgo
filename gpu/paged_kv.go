@@ -26,7 +26,7 @@ func NewPagedKVPool(nLayers, kvDim, blockSize, totalBlocks int) (*PagedKVPool, e
 		BlockSize:   blockSize,
 		TotalBlocks: totalBlocks,
 	}
-	bufSize := uint64(totalBlocks) * uint64(blockSize) * uint64(kvDim) * 4
+	bufSize := uint64(totalBlocks) * uint64(blockSize) * uint64(kvDim) * 2 // FP16: 2 bytes per element
 	a := allocChecker{}
 	for l := 0; l < nLayers; l++ {
 		pool.KeyPools[l] = a.alloc(bufSize)
@@ -54,7 +54,7 @@ func (p *PagedKVPool) FreeAll() {
 
 // EstimateVRAM returns the total VRAM needed for this pool in bytes.
 func EstimatePagedKVPoolVRAM(nLayers, kvDim, blockSize, totalBlocks int) uint64 {
-	perLayer := uint64(totalBlocks) * uint64(blockSize) * uint64(kvDim) * 4 * 2
+	perLayer := uint64(totalBlocks) * uint64(blockSize) * uint64(kvDim) * 2 * 2 // FP16: 2 bytes * K+V
 	return perLayer * uint64(nLayers)
 }
 

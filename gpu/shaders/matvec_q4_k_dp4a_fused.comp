@@ -1,0 +1,143 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused Q4_K × float32 dp4a matvec: quantizes float32 input to Q8_1 in shared
+// memory, then performs the dp4a dot product against Q4_K weights. Eliminates the
+// separate Q8 quantize dispatch + barrier that the non-fused path requires.
+//
+// 128 threads = 4 subgroups, each subgroup handles one row.
+
+layout(local_size_x = 128) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+struct block_q4_k_p32 {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint32_t qs[32];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q4_k data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP32 { block_q4_k_p32 data_a_p32[]; };
+layout(set = 0, binding = 2) readonly buffer Xf32 { float x_f32[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+// Q8_1 block in shared memory: 32 elements quantized to int8 packed as 8×int32
+struct smem_q8_block {
+    float d;
+    float s;
+    int32_t qs[8];
+};
+
+shared smem_q8_block q8_smem[256]; // max 8192/32 = 256 blocks (dim up to 8192)
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ncols = uint(cols);
+    uint num_q8_blocks = ncols >> 5; // cols / 32
+
+    // Phase 1: cooperatively quantize float32 input to Q8_1 in shared memory
+    for (uint b = tid; b < num_q8_blocks; b += 128u) {
+        uint base = b << 5; // b * 32
+        float amax = 0.0;
+        float vals[32];
+
+        [[unroll]] for (uint i = 0; i < 32u; i++) {
+            float v = x_f32[base + i];
+            vals[i] = v;
+            amax = max(amax, abs(v));
+        }
+
+        float d_val = amax / 127.0;
+        float id = (amax > 0.0) ? 127.0 / amax : 0.0;
+        float sum_val = 0.0;
+        int32_t packed[8];
+
+        [[unroll]] for (uint j = 0; j < 8u; j++) {
+            uint bi = j << 2; // j * 4
+            int b0 = int(round(vals[bi    ] * id));
+            int b1 = int(round(vals[bi + 1] * id));
+            int b2 = int(round(vals[bi + 2] * id));
+            int b3 = int(round(vals[bi + 3] * id));
+            packed[j] = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
+            sum_val += vals[bi] + vals[bi + 1] + vals[bi + 2] + vals[bi + 3];
+        }
+
+        q8_smem[b].d = d_val;
+        q8_smem[b].s = sum_val;
+        [[unroll]] for (uint j = 0; j < 8u; j++)
+            q8_smem[b].qs[j] = packed[j];
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    // Phase 2: dp4a dot product (same logic as matvec_q4_k_dp4a.comp)
+    uint sub_id = tid >> 5;
+    uint sub_tid = tid & 31u;
+    uint row = gl_WorkGroupID.x * 4u + sub_id;
+
+    if (row >= uint(rows)) return;
+
+    uint num_sb = ncols >> 8; // super-blocks per row
+    uint sb_local = sub_tid & 7u;
+    uint sb_stride = sub_tid >> 3;
+    uint qs_base = (sb_local >> 1) * 8u;
+    uint shift = (sb_local & 1u) * 4u;
+
+    float acc = 0.0;
+
+    for (uint i = sb_stride; i < num_sb; i += 4u) {
+        uint b_ib = i * 8u + sb_local;
+        float d_b = q8_smem[b_ib].d;
+        float s_b = q8_smem[b_ib].s;
+
+        int32_t bqs[8];
+        [[unroll]] for (uint j = 0; j < 8u; j++)
+            bqs[j] = q8_smem[b_ib].qs[j];
+
+        uint ib = row * num_sb + i;
+
+        float d_val = float(data_a[ib].d);
+        float dmin_val = float(data_a[ib].dmin);
+
+        uint sc, m;
+        if (sb_local < 4u) {
+            sc = uint(data_a[ib].scales[sb_local]) & 0x3Fu;
+            m = uint(data_a[ib].scales[sb_local + 4u]) & 0x3Fu;
+        } else {
+            uint s_hi = uint(data_a[ib].scales[sb_local + 4u]);
+            uint s_lo_0 = uint(data_a[ib].scales[sb_local - 4u]);
+            uint s_lo_4 = uint(data_a[ib].scales[sb_local]);
+            sc = (s_hi & 0xFu) | ((s_lo_0 & 0xC0u) >> 2);
+            m  = (s_hi >> 4)   | ((s_lo_4 & 0xC0u) >> 2);
+        }
+
+        int dp_sum = 0;
+        [[unroll]] for (uint j = 0; j < 8u; j++) {
+            int32_t a_val = int32_t((data_a_p32[ib].qs[qs_base + j] >> shift) & 0x0F0F0F0Fu);
+            dp_sum += dotPacked4x8EXT(a_val, bqs[j]);
+        }
+
+        acc += d_val * float(sc) * float(dp_sum) * d_b - dmin_val * float(m) * s_b;
+    }
+
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) out_data[row] = acc;
+}

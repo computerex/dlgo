@@ -2,8 +2,14 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// IQ3_S matvec: 4 rows/WG, vec4 B loads, bitfield sign handling.
 
 layout(local_size_x = 128) in;
+
+#define NUM_ROWS 4u
+#define QUANT_K 256u
 
 layout(push_constant) uniform Params {
     int rows;
@@ -11,93 +17,110 @@ layout(push_constant) uniform Params {
 };
 
 struct block_iq3_s {
-    float16_t d;       // 2 bytes
-    uint8_t qs[64];    // grid index low bytes
-    uint8_t qh[8];     // grid index high bits (1 bit per pair)
-    uint8_t signs[32]; // sign bytes
-    uint8_t scales[4]; // 4-bit scale nibbles per byte
+    float16_t d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t signs[32];
+    uint8_t scales[4];
 };
 
-layout(binding = 0, scalar) buffer Out     { float   out_data[]; };
-layout(binding = 1, scalar) buffer Weights { block_iq3_s blocks[]; };
-layout(binding = 2, scalar) buffer X       { float   x_data[];  };
-layout(binding = 3, scalar) buffer Tables  { uint    table_data[]; };
+layout(binding = 0, scalar) buffer Out     { float out_data[]; };
+layout(binding = 1, scalar) buffer Weights { block_iq3_s data_a[]; };
+layout(binding = 2, scalar) buffer X       { float x_data[];  };
+layout(binding = 2) buffer XV4             { vec4  data_b_v4[]; };
+layout(binding = 3, scalar) buffer Tables  { uint  table_data[]; };
 
-shared float shared_sums[128];
+shared float tmpsh[NUM_ROWS][4];
+
+vec4 grid_unpack(uint v) {
+    return vec4(float(v & 0xFFu), float((v >> 8u) & 0xFFu),
+                float((v >> 16u) & 0xFFu), float((v >> 24u) & 0xFFu));
+}
+
+void compute_outputs(uint first_row, uint num_rows) {
+    const uint num_blocks_per_row = uint(cols) / QUANT_K;
+    const uint blocks_per_wg = 128u / 16u;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid & 15u;
+    const uint ix = tid / 16u;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) temp[n] = 0.0;
+
+    uint ib32 = itid / 2u;
+    uint il = itid & 1u;
+
+    for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg) {
+        uint y_idx = i * QUANT_K + 16u * itid;
+
+        uint ibi = first_row * num_blocks_per_row + i;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            float d = float(data_a[ibi].d);
+            uint sc_byte = uint(data_a[ibi].scales[ib32 / 2u]);
+            float db = d * float(1u + 2u * ((ib32 & 1u) == 0u ? (sc_byte & 0xFu) : (sc_byte >> 4u)));
+
+            uint qh = uint(data_a[ibi].qh[ib32]);
+
+            [[unroll]] for (uint l = 0; l < 2u; ++l) {
+                uint qs_off = ib32 * 8u;
+                uint qs_idx = qs_off + 4u * il + 2u * l;
+                uint qs0 = uint(data_a[ibi].qs[qs_idx]);
+                uint qs1 = uint(data_a[ibi].qs[qs_idx + 1u]);
+                uint gridIdx0 = qs0 | ((qh << (8u - 2u * (2u * il + l))) & 256u);
+                uint gridIdx1 = qs1 | ((qh << (7u - 2u * (2u * il + l))) & 256u);
+
+                uint grid0_packed = table_data[gridIdx0];
+                uint grid1_packed = table_data[gridIdx1];
+                vec4 grid0 = grid_unpack(grid0_packed);
+                vec4 grid1 = grid_unpack(grid1_packed);
+
+                uint sign = uint(data_a[ibi].signs[ib32 * 4u + 2u * il + l]);
+
+                vec4 b0 = data_b_v4[y_idx / 4u + 2u * l + 0u];
+                vec4 b4 = data_b_v4[y_idx / 4u + 2u * l + 1u];
+
+                float sum =
+                    fma(b0.x, ((sign &   1u) != 0u) ? -grid0.x : grid0.x,
+                    fma(b0.y, ((sign &   2u) != 0u) ? -grid0.y : grid0.y,
+                    fma(b0.z, ((sign &   4u) != 0u) ? -grid0.z : grid0.z,
+                    fma(b0.w, ((sign &   8u) != 0u) ? -grid0.w : grid0.w,
+                    fma(b4.x, ((sign &  16u) != 0u) ? -grid1.x : grid1.x,
+                    fma(b4.y, ((sign &  32u) != 0u) ? -grid1.y : grid1.y,
+                    fma(b4.z, ((sign &  64u) != 0u) ? -grid1.z : grid1.z,
+                    fma(b4.w, ((sign & 128u) != 0u) ? -grid1.w : grid1.w,
+                    0.0))))))));
+
+                temp[n] = fma(db, sum, temp[n]);
+            }
+            ibi += num_blocks_per_row;
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+    if ((tid & 31u) == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[n][tid / 32u] = temp[n];
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        for (uint n = 0; n < num_rows; ++n) {
+            float total = 0.0;
+            for (uint sg = 0; sg < 128u / 32u; ++sg) {
+                total += tmpsh[n][sg];
+            }
+            if (first_row + n < uint(rows)) {
+                out_data[first_row + n] = total;
+            }
+        }
+    }
+}
 
 void main() {
-    const uint row_pair = gl_WorkGroupID.x;
-    const uint tid = gl_LocalInvocationID.x;
-
-    const uint num_sb = uint(cols) / 256u;
-
-    for (uint n = 0u; n < 2u; n++) {
-        uint first_row = row_pair * 2u + n;
-        if (first_row >= uint(rows)) {
-            if (n == 0u) out_data[first_row] = 0.0;
-            continue;
-        }
-
-        float acc = 0.0;
-
-        for (uint b = tid / 32u; b < num_sb; b += 4u) {
-            uint bi = first_row * num_sb + b;
-            float d = float(blocks[bi].d);
-            uint lane = tid & 31u;
-
-            uint pos_x_off = 0u;
-            uint x_block = b * 256u;
-
-            // 8 groups of 32 values, processed in pairs (ib32 goes 0,2,4,6)
-            // Each thread handles one sub-group of 8 within one of the paired groups
-            // lane: 0..31 maps to ib32_pair(0..3), sub(0..3), first/second(0..1)
-            uint ib32_pair = lane / 8u;       // 0..3 (which pair of 32-groups)
-            uint sub_in_pair = lane & 7u;     // 0..7
-            uint grp_half = sub_in_pair / 4u; // 0=first group, 1=second group
-            uint il = sub_in_pair & 3u;       // 0..3 (which sub-group of 8)
-            uint ib32 = ib32_pair * 2u + grp_half;
-
-            uint sc_byte = uint(blocks[bi].scales[ib32_pair]);
-            float db = d * float(1u + 2u * ((grp_half == 0u) ? (sc_byte & 0xFu) : (sc_byte >> 4u)));
-
-            uint qh = uint(blocks[bi].qh[ib32]);
-
-            uint qs_off = ib32 * 8u;
-            uint gridIdx1 = uint(blocks[bi].qs[qs_off + 2u * il])     | ((qh << (8u - 2u * il)) & 256u);
-            uint gridIdx2 = uint(blocks[bi].qs[qs_off + 2u * il + 1u]) | ((qh << (7u - 2u * il)) & 256u);
-
-            uint grid1 = table_data[gridIdx1];
-            uint grid2 = table_data[gridIdx2];
-
-            uint sign_byte = uint(blocks[bi].signs[ib32 * 4u + il]);
-
-            float sum = 0.0;
-            uint x_off = x_block + ib32 * 32u + il * 8u;
-            for (uint j = 0u; j < 4u; j++) {
-                float gv1 = float((grid1 >> (8u * j)) & 0xFFu);
-                float gv2 = float((grid2 >> (8u * j)) & 0xFFu);
-                float v1 = ((sign_byte & (1u << j)) != 0u) ? -db * gv1 : db * gv1;
-                float v2 = ((sign_byte & (1u << (j + 4u))) != 0u) ? -db * gv2 : db * gv2;
-                sum += v1 * x_data[pos_x_off + x_off + j] + v2 * x_data[pos_x_off + x_off + 4u + j];
-            }
-
-            acc += sum;
-        }
-
-        acc = subgroupAdd(acc);
-
-        if ((tid & 31u) == 0u) {
-            shared_sums[tid / 32u] = acc;
-        }
-        barrier();
-
-        if (tid == 0u) {
-            float total = 0.0;
-            for (uint i = 0u; i < 4u; i++) {
-                total += shared_sums[i];
-            }
-            out_data[first_row] = total;
-        }
-        barrier();
-    }
+    uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    if (first_row >= uint(rows)) return;
+    uint num_rows = min(NUM_ROWS, uint(rows) - first_row);
+    compute_outputs(first_row, num_rows);
 }

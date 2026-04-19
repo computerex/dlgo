@@ -1,0 +1,202 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage  : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused Q4_K tiled GEMM: C[m][n] = sum_k input[m][k] * dequant(W_q4k[n][k])
+//
+// input  = FP32  [M x K]  row-major  (tokens x inner)
+// W_q4k  = Q4_K  [N x K]  quantized  (rows x inner, K_blocks = K/256)
+// output = FP32  [M x N]  row-major  (tokens x rows)
+//
+// Single-pass: loads Q4_K blocks -> shared memory, dequants on the fly, FMAs.
+// Eliminates FP16 scratch buffer and two-pass overhead.
+//
+// Tile: TM=32 tokens, TN=32 rows
+// K-outer: 256 (one Q4_K block per row)
+// K-inner: 32  (one sub-block, 8 per Q4_K block)
+
+#define TM 32u
+#define TN 32u
+#define TK 32u
+
+// Thread assignment: 128 threads = 16 ty x 8 tx
+// Each thread computes THREAD_M x THREAD_N output elements
+#define THREAD_M 2u   // TM / 16 = 2
+#define THREAD_N 4u   // TN / 8  = 4
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) readonly  buffer W   { uint  wdata[];   };   // Q4_K as packed uint32
+layout(set = 0, binding = 2) readonly  buffer A   { float adata[];   };   // input FP32
+
+layout(push_constant) uniform Params {
+    int M;     // npos  (tokens)
+    int N;     // rows  (output dim)
+    int K;     // cols  (inner dim)
+};
+
+// ---- Shared memory ----
+// Raw Q4_K blocks: TN rows x 36 uint32 per block = 4,608 bytes
+shared uint  smQ[TN][36];
+// Dequanted weights for current sub-block: TN x TK FP32.  Padded +1 for bank conflicts.
+shared float smW[TN][TK + 1u];
+// Input tile for current sub-block: TM x TK FP32.  Padded +1.
+shared float smA[TM][TK + 1u];
+
+// ---- Q4_K dequantization helpers (from shared memory) ----
+
+// Extract a single byte from the raw Q4_K block in shared memory.
+// byte_off is relative to start of the block (0..143).
+uint q4k_byte(uint row, uint byte_off) {
+    uint w = smQ[row][byte_off >> 2u];
+    return (w >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+// Extract d and dmin (stored as FP16 in first 4 bytes)
+float q4k_d(uint row)    { return unpackHalf2x16(smQ[row][0]).x; }
+float q4k_dmin(uint row) { return unpackHalf2x16(smQ[row][0]).y; }
+
+// Extract 6-bit scale for sub-block j (0..7)
+float q4k_sc(uint row, uint j) {
+    if (j < 4u) {
+        return float(q4k_byte(row, 4u + j) & 63u);
+    }
+    uint idx = j - 4u;
+    return float((q4k_byte(row, 12u + idx) & 0xFu) | ((q4k_byte(row, 4u + idx) >> 6) << 4));
+}
+
+// Extract 6-bit min for sub-block j (0..7)
+float q4k_mn(uint row, uint j) {
+    if (j < 4u) {
+        return float(q4k_byte(row, 8u + j) & 63u);
+    }
+    uint idx = j - 4u;
+    return float((q4k_byte(row, 12u + idx) >> 4) | ((q4k_byte(row, 8u + idx) >> 6) << 4));
+}
+
+// Dequantize one element from sub-block j, position elem (0..31)
+// j = 0..7 indexes the 32-element sub-block within the 256-element Q4_K block
+float q4k_dequant(uint row, uint j, uint elem) {
+    float d  = q4k_d(row);
+    float dm = q4k_dmin(row);
+    float sc = q4k_sc(row, j);
+    float mn = q4k_mn(row, j);
+
+    // Q4_K block qs layout:
+    //   qs[128] contains 256 4-bit values:
+    //     quarter g = j/2, is_upper = j&1
+    //     qs_byte_index = g * 32 + elem
+    //     lower nibble -> sub-block 2g,   upper nibble -> sub-block 2g+1
+    uint g = j >> 1u;
+    uint qs_byte_off = 16u + g * 32u + elem;  // offset within block: qs starts at byte 16
+    uint qbyte = q4k_byte(row, qs_byte_off);
+    float nibble = ((j & 1u) == 0u) ? float(qbyte & 0xFu) : float(qbyte >> 4);
+
+    return d * nibble * sc - dm * mn;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;  // 0..127
+    uint bm  = gl_WorkGroupID.x * TM;   // token tile start
+    uint bn  = gl_WorkGroupID.y * TN;   // row tile start
+
+    uint tx = tid & 7u;    // 0..7  (N dimension)
+    uint ty = tid >> 3;    // 0..15 (M dimension)
+
+    uint um = uint(M);
+    uint un = uint(N);
+    uint uk = uint(K);
+    uint bpr = uk / 256u;  // blocks per row
+
+    // Accumulators
+    float acc[THREAD_M][THREAD_N];
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++)
+        [[unroll]] for (uint j2 = 0u; j2 < THREAD_N; j2++)
+            acc[i][j2] = 0.0;
+
+    // ---------- K-outer loop: one Q4_K block (256 elements) per iteration ----------
+    for (uint b = 0u; b < bpr; b++) {
+
+        // ---- Cooperative load: TN raw Q4_K blocks into smQ ----
+        // 32 blocks x 36 uint32 = 1,152 words.  128 threads -> 9 sub-steps.
+        [[unroll]] for (uint s = 0u; s < 9u; s++) {
+            uint idx = s * 128u + tid;
+            if (idx < TN * 36u) {
+                uint row  = idx / 36u;   // 0..31
+                uint word = idx % 36u;   // 0..35
+                uint gn   = bn + row;
+                if (gn < un) {
+                    smQ[row][word] = wdata[(gn * bpr + b) * 36u + word];
+                } else {
+                    smQ[row][word] = 0u;
+                }
+            }
+        }
+        barrier();
+
+        // ---- K-inner loop: 8 sub-blocks of 32 elements each ----
+        [[unroll]] for (uint j = 0u; j < 8u; j++) {
+
+            // -- Cooperative dequant: TN rows x 32 elements = 1024 values --
+            // 128 threads -> 8 values per thread
+            [[unroll]] for (uint s = 0u; s < 8u; s++) {
+                uint idx = s * 128u + tid;
+                uint row  = idx >> 5;    // idx / 32
+                uint elem = idx & 31u;   // idx % 32
+                smW[row][elem] = q4k_dequant(row, j, elem);
+            }
+
+            // -- Cooperative load: TM x TK input tile --
+            // 32 x 32 = 1024 values.  128 threads -> 8 per thread.
+            uint gk_base = b * 256u + j * 32u;
+            [[unroll]] for (uint s = 0u; s < 8u; s++) {
+                uint idx = s * 128u + tid;
+                uint r   = idx >> 5;    // row in tile (0..31)
+                uint c   = idx & 31u;   // col in tile (0..31)
+                uint gm  = bm + r;
+                uint gk  = gk_base + c;
+                float val = 0.0;
+                if (gm < um && gk < uk)
+                    val = adata[gm * uk + gk];
+                smA[r][c] = val;
+            }
+
+            barrier();
+
+            // -- FMA: each thread computes THREAD_M x THREAD_N x TK --
+            uint rm = ty * THREAD_M;
+            uint rn = tx * THREAD_N;
+
+            [[unroll]] for (uint k = 0u; k < TK; k++) {
+                float a[THREAD_M];
+                [[unroll]] for (uint i = 0u; i < THREAD_M; i++)
+                    a[i] = smA[rm + i][k];
+
+                [[unroll]] for (uint i = 0u; i < THREAD_M; i++)
+                    [[unroll]] for (uint j2 = 0u; j2 < THREAD_N; j2++)
+                        acc[i][j2] = fma(a[i], smW[rn + j2][k], acc[i][j2]);
+            }
+
+            barrier();
+        } // end K-inner
+
+        // No barrier needed here: next iteration's smQ load is followed by a barrier
+    } // end K-outer
+
+    // ---------- Write output ----------
+    uint rm = ty * THREAD_M;
+    uint rn = tx * THREAD_N;
+
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++) {
+        uint gm = bm + rm + i;
+        if (gm >= um) continue;
+        [[unroll]] for (uint j2 = 0u; j2 < THREAD_N; j2++) {
+            uint gn = bn + rn + j2;
+            if (gn >= un) continue;
+            out_data[gm * un + gn] = acc[i][j2];
+        }
+    }
+}

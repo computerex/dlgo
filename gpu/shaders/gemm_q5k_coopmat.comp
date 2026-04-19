@@ -1,0 +1,237 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Q5_K-weight × FP32-input GEMM using cooperative matrix (tensor cores).
+// Tile: BM=64, BN=64, BK=32.  128 threads = 4 subgroups in 2×2 layout.
+// Each subgroup: 2×2 coopmat 16×16 tiles → 32×32 output.
+// BK=32 aligns with one Q5_K scale group.
+
+#define BM     64u
+#define BN     64u
+#define BK     32u
+#define SHMEM_STRIDE (BK / 2u + 4u)  // = 20 f16vec2 per row
+#define TM     16u
+#define TN     16u
+#define TK     16u
+#define SG_M   2u
+#define SG_N   2u
+#define CMS_M  2u
+#define CMS_N  2u
+#define N_K_TILES (BK / TK)  // = 2
+
+layout(local_size_x = 128) in;
+
+// Q5_K block: 256 elements, 176 bytes
+struct block_q5_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];
+    uint8_t qs[128];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q5_k data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int npos;
+};
+
+shared f16vec2 smA[BM * SHMEM_STRIDE];
+shared f16vec2 smB[BN * SHMEM_STRIDE];
+shared float out_stage[BM * BN];
+
+// Extract 6-bit scale for group `is` (0..7) — identical to Q4_K.
+float extract_scale(uint ib, uint is) {
+    uint scidx0 = (is < 4u) ? is : (is + 4u);
+    uint scidx1 = (is < 4u) ? is : (is - 4u);
+    uint scidxmask1 = (is < 4u) ? 0x30u : 0xC0u;
+    uint scidxshift1 = (is < 4u) ? 0u : 2u;
+    return float(uint8_t(
+        (data_a[ib].scales[scidx0] & 0xFu) |
+        ((data_a[ib].scales[scidx1] & uint8_t(scidxmask1)) >> scidxshift1)
+    ));
+}
+
+// Extract 6-bit min for group `is` (0..7) — identical to Q4_K.
+float extract_min(uint ib, uint is) {
+    uint mbidx0 = is + 4u;
+    uint mbidx1 = (is < 4u) ? (is + 4u) : is;
+    uint mbidxmask0 = (is < 4u) ? 0xFu : 0xF0u;
+    uint mbidxshift0 = (is < 4u) ? 0u : 4u;
+    uint mbidxmask1 = (is < 4u) ? 0x30u : 0xC0u;
+    uint mbidxshift1 = (is < 4u) ? 0u : 2u;
+    return float(uint8_t(
+        ((data_a[ib].scales[mbidx0] & uint8_t(mbidxmask0)) >> mbidxshift0) |
+        ((data_a[ib].scales[mbidx1] & uint8_t(mbidxmask1)) >> mbidxshift1)
+    ));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_m = sg_id / SG_N;
+    uint sg_n = sg_id % SG_N;
+
+    uint n_tiles_n = (uint(npos) + BN - 1u) / BN;
+    uint tile_n = gl_WorkGroupID.x % n_tiles_n;
+    uint tile_m = gl_WorkGroupID.x / n_tiles_n;
+
+    uint wg_m = tile_m * BM;
+    uint wg_n = tile_n * BN;
+    uint M = uint(rows);
+    uint K = uint(cols);
+    uint N = uint(npos);
+    uint num_blocks_per_row = K / 256u;
+
+    coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[CMS_M * CMS_N];
+    for (uint i = 0u; i < CMS_M * CMS_N; i++)
+        acc[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+
+    const uint LOAD_COUNT = (BM * (BK / 2u)) / 128u;  // 8
+
+    for (uint k_base = 0u; k_base < K; k_base += BK) {
+        // === Load A tile: dequantize Q5_K weights into smA ===
+        for (uint e = 0u; e < LOAD_COUNT; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);     // 0..63 row within BM
+            uint col2 = idx % (BK / 2u);    // 0..15 vec2 index within BK
+            uint m_global = wg_m + row;
+            uint k_global = k_base + col2 * 2u;
+
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (m_global < M && k_global < K) {
+                uint block_k = k_global / 256u;
+                uint local_k = k_global % 256u;
+                uint ib = m_global * num_blocks_per_row + block_k;
+
+                uint group = local_k / 32u;  // 0..7
+
+                float d_val = float(data_a[ib].d);
+                float dmin_val = float(data_a[ib].dmin);
+                float sc = extract_scale(ib, group);
+                float mn = extract_min(ib, group);
+                float d = d_val * sc;
+                float m = -dmin_val * mn;
+
+                // Q5_K layout: qs[128] holds low 4 bits, qh[32] holds the 5th bit.
+                // 8 groups of 32 elements. Group g occupies:
+                //   qs: bytes [(g/2)*32 .. (g/2)*32+31], low nibble if g even, high if g odd
+                //   qh: bit (g/2) for even groups, bit (g/2 + 4) for odd groups
+                // Or equivalently per the matvec:
+                //   For element at local_k within 256-block:
+                //   grp = local_k / 64 (0..3), sub = (local_k % 64) / 32 (0..1)
+                //   lane = local_k % 32
+                //   qs_byte_idx = grp * 32 + lane
+                //   nibble: sub==0 → low 4 bits, sub==1 → high 4 bits
+                //   qh byte = qh[lane], bit = (grp*2 + sub) counting from bit 0
+
+                uint grp = local_k / 64u;          // 0..3
+                uint sub = (local_k % 64u) / 32u;  // 0..1
+                uint lane = local_k % 32u;
+
+                uint qs_byte = uint(data_a[ib].qs[grp * 32u + lane]);
+                uint q4 = (qs_byte >> (sub * 4u)) & 0xFu;
+                uint qh_byte = uint(data_a[ib].qh[lane]);
+                uint qh_bit = (qh_byte >> (grp * 2u + sub)) & 1u;
+                float q0 = float(q4 | (qh_bit << 4u));
+
+                // Second element
+                uint k_global2 = k_global + 1u;
+                float q1 = 0.0;
+                if (k_global2 < K) {
+                    uint local_k2 = k_global2 % 256u;
+                    uint grp2 = local_k2 / 64u;
+                    uint sub2 = (local_k2 % 64u) / 32u;
+                    uint lane2 = local_k2 % 32u;
+
+                    uint qs_byte2 = uint(data_a[ib].qs[grp2 * 32u + lane2]);
+                    uint q4_2 = (qs_byte2 >> (sub2 * 4u)) & 0xFu;
+                    uint qh_byte2 = uint(data_a[ib].qh[lane2]);
+                    uint qh_bit2 = (qh_byte2 >> (grp2 * 2u + sub2)) & 1u;
+                    q1 = float(q4_2 | (qh_bit2 << 4u));
+                }
+
+                val.x = float16_t(fma(d, q0, m));
+                val.y = float16_t(fma(d, q1, m));
+            }
+            smA[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        // === Load B tile: FP32 input → smB ===
+        for (uint e = 0u; e < LOAD_COUNT; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);
+            uint col2 = idx % (BK / 2u);
+            uint n_global = wg_n + row;
+            uint k_global = k_base + col2 * 2u;
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (n_global < N && k_global + 1u < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+                val.y = float16_t(data_b[n_global * K + k_global + 1u]);
+            } else if (n_global < N && k_global < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+            }
+            smB[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        barrier();
+
+        // === Compute with cooperative matrix ===
+        for (uint kt = 0u; kt < N_K_TILES; kt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA[CMS_M];
+            for (uint am = 0u; am < CMS_M; am++) {
+                uint sm_row = sg_m * CMS_M * TM + am * TM;
+                coopMatLoad(matA[am], smA, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            for (uint an = 0u; an < CMS_N; an++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                uint sm_row = sg_n * CMS_N * TN + an * TN;
+                coopMatLoad(matB, smB, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+
+                for (uint am = 0u; am < CMS_M; am++) {
+                    acc[am * CMS_N + an] = coopMatMulAdd(matA[am], matB, acc[am * CMS_N + an]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Stage through shared memory to allow per-element bounds checking.
+    // coopMatStore always writes a full 16×16 tile; without this, edge tiles
+    // where base_n+16 > N would write past the output buffer causing TDR.
+    for (uint am = 0u; am < CMS_M; am++) {
+        for (uint an = 0u; an < CMS_N; an++) {
+            uint sm_m = sg_m * CMS_M * TM + am * TM;
+            uint sm_n = sg_n * CMS_N * TN + an * TN;
+            coopMatStore(acc[am * CMS_N + an], out_stage, sm_n * BM + sm_m, BM,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+
+    barrier();
+
+    for (uint e = 0u; e < 32u; e++) {
+        uint idx = e * 128u + tid;
+        uint local_m = idx % BM;
+        uint local_n = idx / BM;
+        uint gm = wg_m + local_m;
+        uint gn = wg_n + local_n;
+        if (gm < M && gn < N) {
+            out_data[gn * M + gm] = out_stage[local_n * BM + local_m];
+        }
+    }
+}

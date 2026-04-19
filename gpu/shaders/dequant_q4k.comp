@@ -1,0 +1,79 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Dequantize Q4_K weights to float16. One thread per output value.
+// Dispatch: groups_x = ceil(rows * cols / 256), groups_y = 1
+
+layout(local_size_x = 256) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+layout(scalar, set = 0, binding = 0) readonly buffer A { block_q4_k data_a[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float16_t out_f16[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = uint(rows) * uint(cols);
+    if (gid >= total) return;
+
+    uint row = gid / uint(cols);
+    uint col = gid % uint(cols);
+    uint blocks_per_row = uint(cols) / 256u;
+    uint block_idx = col / 256u;
+    uint local_k = col % 256u;
+    uint ib = row * blocks_per_row + block_idx;
+
+    float d_val = float(data_a[ib].d);
+    float dmin_val = float(data_a[ib].dmin);
+
+    // Scale group (8 groups of 32 within 256-element block)
+    uint group = local_k / 32u;
+
+    // Extract 6-bit scale
+    uint scidx0 = (group < 4u) ? group : (group + 4u);
+    uint scidx1 = (group < 4u) ? group : (group - 4u);
+    uint scmask1 = (group < 4u) ? 0x30u : 0xC0u;
+    uint scshift1 = (group < 4u) ? 0u : 2u;
+    float sc = float(uint8_t(
+        (data_a[ib].scales[scidx0] & 0xFu) |
+        ((data_a[ib].scales[scidx1] & uint8_t(scmask1)) >> scshift1)
+    ));
+
+    // Extract 6-bit min
+    uint mbidx0 = group + 4u;
+    uint mbidx1 = (group < 4u) ? (group + 4u) : group;
+    uint mbmask0 = (group < 4u) ? 0xFu : 0xF0u;
+    uint mbshift0 = (group < 4u) ? 0u : 4u;
+    uint mbmask1 = (group < 4u) ? 0x30u : 0xC0u;
+    uint mbshift1 = (group < 4u) ? 0u : 2u;
+    float mn = float(uint8_t(
+        ((data_a[ib].scales[mbidx0] & uint8_t(mbmask0)) >> mbshift0) |
+        ((data_a[ib].scales[mbidx1] & uint8_t(mbmask1)) >> mbshift1)
+    ));
+
+    float d = d_val * sc;
+    float m = -dmin_val * mn;
+
+    // Extract 4-bit quant
+    uint n = local_k / 64u;
+    uint b = (local_k % 64u) / 32u;
+    uint rem32 = local_k % 32u;
+    uint qsi = n * 32u + rem32;
+    uint q_byte = uint(data_a[ib].qs[qsi]);
+    float q = float((q_byte >> (b * 4u)) & 0xFu);
+
+    out_f16[gid] = float16_t(fma(d, q, m));
+}

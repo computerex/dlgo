@@ -164,18 +164,6 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	q8_1Blocks := (maxDim + 31) / 32
 	total += q8_1Blocks * 36
 
-	// Safety margin: reserve VRAM for Windows display compositor, video decode,
-	// browser GPU acceleration, and Vulkan driver internals. The C-level budget
-	// check in create_buffer() enforces a hard 512 MB floor before each
-	// vkAllocateMemory call, so the Go-level margin is a softer estimate.
-	// Use max(1 GB, 6% of total VRAM) as the budget-solver reserve.
-	vram := int64(VRAMBytes())
-	margin := int64(1024) * 1024 * 1024 // 1 GB minimum
-	if pct := vram * 6 / 100; pct > margin {
-		margin = pct
-	}
-	total += margin
-
 	return total
 }
 
@@ -326,9 +314,10 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 		Layers: make([]GpuLayer, len(m.Layers)),
 	}
 
-	// VRAM floor: stop uploading layers if free VRAM drops below this.
-	// On Windows the GPU driver freezes the entire system on exhaustion.
-	const uploadFloor int64 = 4 * 1024 * 1024 * 1024 // 4 GB
+	// No VRAM ceiling — the C-level gpu_alloc uses a llama.cpp-style fallback
+	// chain: try device-local first, overflow to host-visible (system RAM
+	// accessible by GPU shaders via PCIe). All layers stay on the GPU compute
+	// path regardless of which memory type they land in.
 
 	var err error
 	gm.TokenEmbed, err = UploadTensor(m.TokenEmbed)
@@ -553,24 +542,6 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			gl.SSMOut, _ = UploadTensor(cl.SSMOut)
 		}
 
-		// Per-layer VRAM floor check: sync the GPU and verify we haven't
-		// consumed too much VRAM. If free memory drops below the floor,
-		// free this layer's allocations and stop — remaining layers stay
-		// on CPU. This prevents the Windows GPU driver from freezing the
-		// entire system when VRAM is exhausted.
-		Sync()
-		if postFree := int64(VRAMFreeBytes()); postFree < uploadFloor {
-			fmt.Printf("[dlgo/gpu] VRAM floor hit after layer %d (%.0f MB free < %.0f MB floor), stopping upload\n",
-				l, float64(postFree)/(1024*1024), float64(uploadFloor)/(1024*1024))
-			// Free this layer and mark it + all remaining as CPU-only.
-			*gl = GpuLayer{} // zero out — freeTensor/freeBuf on zero is no-op
-			gl.OnGPU = false
-			for j := l + 1; j < len(m.Layers); j++ {
-				gm.Layers[j].OnGPU = false
-			}
-			gm.NumGPULayers = l
-			return gm, nil
-		}
 	}
 
 	gm.NumGPULayers = maxLayers
@@ -610,12 +581,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		cpuPipeline.MaxSeqLen = maxSeqLen
 	}
 
-	// Determine how many layers fit in VRAM.
-	// DLGO_GPU_LAYERS overrides the automatic VRAM budget calculation.
-	numGPULayers := computeGPULayerBudget(m, maxSeqLen)
-	if numGPULayers > cfg.NumLayers {
-		numGPULayers = cfg.NumLayers
-	}
+	// Default: upload ALL layers. The C-level gpu_alloc fallback chain handles
+	// VRAM limits (device-local → host-visible). All layers stay on GPU compute.
+	// DLGO_GPU_LAYERS can override for testing.
+	numGPULayers := cfg.NumLayers
 	if envLayers := os.Getenv("DLGO_GPU_LAYERS"); envLayers != "" {
 		if n, err := fmt.Sscanf(envLayers, "%d", &numGPULayers); n == 1 && err == nil {
 			if numGPULayers < 0 {
@@ -659,11 +628,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				return fmt.Errorf("upload model: %w", err)
 			}
 
-			// UploadModel may have stopped early due to VRAM floor check.
-			// Use the actual number of layers that made it to GPU.
+			// With the fallback chain, all requested layers should be uploaded.
+			// If UploadModel reports fewer, update our count.
 			if gm.NumGPULayers < numGPULayers {
-				fmt.Printf("[dlgo/gpu] Upload stopped early: %d/%d layers on GPU (VRAM floor)\n",
-					gm.NumGPULayers, numGPULayers)
 				numGPULayers = gm.NumGPULayers
 				isPartial = numGPULayers < cfg.NumLayers
 			}
@@ -770,23 +737,6 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				}
 			}
 
-			// Post-allocation VRAM floor check: verify the GPU still has
-			// enough free memory for the Windows display compositor, video
-			// decode, and other system GPU users. Without this, the budget
-			// solver can be slightly optimistic and leave the system in a
-			// state where the display driver can't service frame requests,
-			// causing a full system freeze.
-			Sync() // flush so the driver sees all allocations
-			postFree := int64(VRAMFreeBytes())
-			// Soft floor: the C-level create_buffer() enforces a hard 512 MB
-			// floor before each vkAllocateMemory, so this Go check is a
-			// secondary guard with a 1 GB threshold.
-			const vramFloor = 1024 * 1024 * 1024 // 1 GB
-			if postFree < vramFloor {
-				return fmt.Errorf("VRAM floor violated: only %.0f MB free (need %.0f MB)",
-					float64(postFree)/(1024*1024), float64(vramFloor)/(1024*1024))
-			}
-
 			return nil
 		}()
 
@@ -850,12 +800,18 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		fmt.Println("[dlgo/gpu] dp4a not available on this GPU")
 	}
 
+	// Report memory split like llama.cpp does
+	allocMB := float64(AllocatedBytes()) / (1024 * 1024)
+	hvMB := float64(HostVisibleBytes()) / (1024 * 1024)
+	vramMB := allocMB - hvMB
 	if isPartial {
 		fmt.Printf("[dlgo/gpu] Partial GPU: %d/%d layers on GPU, %d on CPU\n",
 			numGPULayers, cfg.NumLayers, cfg.NumLayers-numGPULayers)
 	} else {
-		fmt.Printf("[dlgo/gpu] Model loaded to GPU (%d layers)\n", cfg.NumLayers)
+		fmt.Printf("[dlgo/gpu] All %d layers on GPU\n", cfg.NumLayers)
 	}
+	fmt.Printf("[dlgo/gpu] Memory: %.0f MB VRAM + %.0f MB host-visible = %.0f MB total (FP16 KV cache)\n",
+		vramMB, hvMB, allocMB)
 
 	pipe := &GpuPipeline{
 		CPUModel:        m,
@@ -952,39 +908,19 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	}
 
 	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM).
-	// Each allocation is guarded by a RAM check: if system RAM usage would exceed
-	// 85% of total, we skip the allocation and let mmap handle it instead.
 	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn
 	if needCPUState {
-		if canAllocRAM(int64(llm.EstimateRuntimeBytes(cfg, maxSeqLen))) {
-			pipe.CPURunState = llm.NewRunState(cfg, maxSeqLen)
-		} else {
-			fmt.Printf("[dlgo/gpu] WARNING: skipping CPU RunState allocation (RAM pressure)\n")
-		}
+		pipe.CPURunState = llm.NewRunState(cfg, maxSeqLen)
 
 		if isPartial {
-			cpuLayers := cfg.NumLayers - numGPULayers
-			kvCacheBytes := int64(2 * cpuLayers * maxSeqLen * kvDim * 4)
-			if canAllocRAM(kvCacheBytes) {
-				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
-			} else {
-				fmt.Printf("[dlgo/gpu] WARNING: skipping CPU KV cache allocation (RAM pressure, need %.0f MB)\n",
-					float64(kvCacheBytes)/(1024*1024))
-			}
-			if pipe.CPURunState != nil {
-				pipe.CPUBatchState = llm.NewBatchState(cfg, maxSeqLen)
-			}
+			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
+			pipe.CPUBatchState = llm.NewBatchState(cfg, maxSeqLen)
 		}
 
 		if (pipe.HasMLA || hasCPUAttn) && pipe.CPUKVCache == nil {
-			kvCacheBytes := int64(2 * cfg.NumLayers * maxSeqLen * kvDim * 4)
-			if canAllocRAM(kvCacheBytes) {
-				pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
-				if hasCPUAttn {
-					fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
-				}
-			} else {
-				fmt.Printf("[dlgo/gpu] WARNING: skipping CPU KV cache for MLA/attn (RAM pressure)\n")
+			pipe.CPUKVCache = memory.NewMultiLayerKVCache(cfg.NumLayers, maxSeqLen, kvDim)
+			if hasCPUAttn {
+				fmt.Printf("[dlgo/gpu] CPU attention fallback: allocated CPU KV cache (%d layers)\n", cfg.NumLayers)
 			}
 		}
 
@@ -1008,11 +944,12 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 	}
 
-	// Pin CPU layers to RAM for optimal inference speed (avoid page faults).
-	// Budget: never push total system RAM usage past 85%.
-	if isPartial {
-		pinCPULayersToRAM(m, numGPULayers)
-		mmap.TrimWorkingSet()
+	// If any layers are on CPU (rare with fallback chain), prefetch their mmap
+	// pages so the OS page cache is warm. Unlike pinning (removed), this does
+	// NOT copy data to heap — zero commit charge overhead.
+	if isPartial && m.MmapFile != nil {
+		fmt.Printf("[dlgo/gpu] Prefetching %d CPU layer mmap regions...\n", cfg.NumLayers-numGPULayers)
+		mmap.PrefetchRegion(m.MmapFile.Data)
 	}
 
 	return pipe, nil
@@ -1049,81 +986,6 @@ func (p *GpuPipeline) ResetState() {
 	}
 }
 
-// canAllocRAM checks whether allocating nbytes of heap memory would push
-// total system RAM usage past 85% of physical RAM. Returns false if the
-// allocation should be skipped to prevent system instability.
-func canAllocRAM(nbytes int64) bool {
-	memInfo, err := mmap.GetSystemMemInfo()
-	if err != nil {
-		return true // can't check, assume OK
-	}
-	totalRAM := int64(memInfo.TotalPhysical)
-	availRAM := int64(memInfo.AvailablePhysical)
-	usedRAM := totalRAM - availRAM
-	ceiling := int64(float64(totalRAM) * 0.85)
-	return usedRAM+nbytes < ceiling
-}
-
-// pinCPULayersToRAM copies non-GPU layer weights from mmap to heap memory,
-// prioritizing earlier layers and respecting a system RAM budget.
-//
-// Budget is computed against total physical RAM to prevent the system from
-// thrashing: we allow pinning only until total system RAM usage would reach
-// 85% of total physical RAM. Remaining layers stay on mmap and are served
-// via demand paging (the OS page cache handles them transparently).
-func pinCPULayersToRAM(m *llm.Model, numGPULayers int) {
-	memInfo, err := mmap.GetSystemMemInfo()
-	if err != nil {
-		fmt.Printf("[dlgo/gpu] Warning: couldn't query system RAM: %v\n", err)
-		return
-	}
-
-	totalRAM := int64(memInfo.TotalPhysical)
-	availRAM := int64(memInfo.AvailablePhysical)
-	usedRAM := totalRAM - availRAM
-
-	// Use a conservative 70% ceiling for pinning. The remaining 15%
-	// (up to the 85% process limit) is headroom for mmap page cache,
-	// Go runtime/GC overhead, and other system processes.
-	maxUsage := int64(float64(totalRAM) * 0.70)
-	budget := maxUsage - usedRAM
-	if budget < 0 {
-		budget = 0
-	}
-
-	fmt.Printf("[dlgo/gpu] RAM budget: %.0f MB free of %.0f MB total (%.0f%% used), pin budget %.0f MB\n",
-		float64(availRAM)/(1024*1024), float64(totalRAM)/(1024*1024),
-		float64(usedRAM)/float64(totalRAM)*100, float64(budget)/(1024*1024))
-
-	pinnedBytes := int64(0)
-	pinnedLayers := 0
-
-	for l := numGPULayers; l < len(m.Layers); l++ {
-		layerBytes := llm.EstimateLayerBytes(&m.Layers[l])
-		if pinnedBytes+layerBytes > budget {
-			break
-		}
-		if !canAllocRAM(layerBytes) {
-			fmt.Printf("[dlgo/gpu] Stopping pin: canAllocRAM rejected %d MB layer\n",
-				layerBytes/(1024*1024))
-			break
-		}
-		llm.PinLayerToRAM(&m.Layers[l])
-		pinnedBytes += layerBytes
-		pinnedLayers++
-
-		// Every 4 layers, trim working set to evict the mmap source pages
-		// that were read during the copy but are no longer needed.
-		if pinnedLayers%4 == 0 {
-			mmap.TrimWorkingSet()
-		}
-	}
-
-	mmap.TrimWorkingSet()
-	remaining := len(m.Layers) - numGPULayers - pinnedLayers
-	fmt.Printf("[dlgo/gpu] Pinned %d CPU layers to RAM (%.0f MB), %d layers on mmap\n",
-		pinnedLayers, float64(pinnedBytes)/(1024*1024), remaining)
-}
 
 // FreeAll releases all GPU resources held by this pipeline.
 // Sync is called first to ensure no in-flight commands reference these buffers,

@@ -1,0 +1,193 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Batched Q4_K × Q8_1 dp4a GEMM — with cooperative Q8_1 preload into shared memory.
+//
+// Key optimization: Instead of each thread independently reading Q8_1 blocks
+// from global memory (scattered per-token reads), ALL 128 threads cooperatively
+// preload Q8_1 data into shared memory before the compute phase.
+// This converts scattered reads into semi-coalesced cooperative reads,
+// dramatically improving memory access efficiency.
+//
+// 128 threads = 4 subgroups of 32, each subgroup handles one output row.
+// Within each subgroup: 8 sub-block threads × 4 token-groups.
+// NT=16 tokens processed per workgroup.
+//
+// WorkGroupID.x = row tile (stride 4)
+// WorkGroupID.y = token tile (stride NT)
+// Push: rows, cols, npos
+
+#define NT 16u          // tokens per workgroup
+#define ROWS_PER_WG 4u  // one per subgroup
+
+layout(local_size_x = 128) in;
+
+struct block_q4_k {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+struct block_q4_k_p32 {
+    float16_t d;
+    float16_t dmin;
+    uint8_t scales[12];
+    uint32_t qs[32];
+};
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q4_k data_a[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer AP32 { block_q4_k_p32 data_a_p32[]; };
+layout(set = 0, binding = 2) readonly buffer B { block_q8_1 data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int npos;
+};
+
+// Shared memory for Q8_1 preload.
+// 128 entries (NT=16 tokens × 8 sub-blocks), 11 uint32 each (padded from 10 for bank conflicts).
+// Word 0: packHalf2x16(d, s)
+// Words 1..8: qs[0..7]
+// Word 9-10: padding
+shared uint smQ8[NT * 8u][11];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;  // 0..127
+    uint sub_id = tid >> 5;             // subgroup 0..3 → row offset
+    uint sub_tid = tid & 31u;           // thread within subgroup
+
+    uint row = gl_WorkGroupID.x * ROWS_PER_WG + sub_id;
+    uint first_pos = gl_WorkGroupID.y * NT;
+
+    if (row >= uint(rows)) return;
+    if (first_pos >= uint(npos)) return;
+
+    uint ncols = uint(cols);
+    uint npos_u = uint(npos);
+    uint num_sb = ncols >> 8;       // Q4_K super-blocks per row
+    uint q8_bpr = num_sb * 8u;     // Q8_1 blocks per row (cols/32)
+
+    // Thread role within subgroup:
+    // sb_local  = sub_tid % 8  → handles one of 8 sub-blocks within each super-block
+    // token_grp = sub_tid / 8  → handles 4 consecutive tokens out of NT=16
+    uint sb_local = sub_tid & 7u;
+    uint token_grp = sub_tid >> 3;  // 0..3
+    uint qs_base = (sb_local >> 1) * 8u;
+    uint shift = (sb_local & 1u) * 4u;
+
+    // Each thread accumulates NT_PER_THREAD = 4 tokens
+    #define NT_PER_THREAD 4u
+    float acc[NT_PER_THREAD];
+    [[unroll]] for (uint t = 0u; t < NT_PER_THREAD; t++) acc[t] = 0.0;
+
+    // ---------- Main K-loop: one super-block per iteration ----------
+    for (uint i = 0u; i < num_sb; i++) {
+
+        // ----- Phase 1: Cooperative Q8_1 preload -----
+        // 128 threads load 128 Q8_1 blocks (NT=16 tokens × 8 sub-block positions)
+        // Mapping: load_t = tid / 8 (token 0..15), load_sb = tid % 8 (sub-block 0..7)
+        // This gives: within a warp, adjacent threads load adjacent sub-blocks
+        // for the same token → stride 36 bytes → semi-coalesced.
+        {
+            uint load_t  = tid >> 3;    // 0..15
+            uint load_sb = tid & 7u;    // 0..7
+            uint sm_idx  = load_t * 8u + load_sb;
+            uint pos     = first_pos + load_t;
+
+            if (pos < npos_u) {
+                uint b_ib = pos * q8_bpr + i * 8u + load_sb;
+                // Pack d and s into one uint32
+                smQ8[sm_idx][0] = uint(data_b[b_ib].d) | (uint(data_b[b_ib].s) << 16);
+                [[unroll]] for (uint j = 0u; j < 8u; j++)
+                    smQ8[sm_idx][1u + j] = uint(data_b[b_ib].qs[j]);
+            } else {
+                // Zero for out-of-bounds tokens
+                [[unroll]] for (uint j = 0u; j < 9u; j++)
+                    smQ8[sm_idx][j] = 0u;
+            }
+        }
+        barrier();
+
+        // ----- Phase 2: Compute dp4a for this super-block -----
+        uint ib = row * num_sb + i;
+
+        // Load weight data (shared across all tokens)
+        float d_val = float(data_a[ib].d);
+        float dmin_val = float(data_a[ib].dmin);
+
+        uint sc, m;
+        if (sb_local < 4u) {
+            sc = uint(data_a[ib].scales[sb_local]) & 0x3Fu;
+            m = uint(data_a[ib].scales[sb_local + 4u]) & 0x3Fu;
+        } else {
+            uint s_hi = uint(data_a[ib].scales[sb_local + 4u]);
+            uint s_lo_0 = uint(data_a[ib].scales[sb_local - 4u]);
+            uint s_lo_4 = uint(data_a[ib].scales[sb_local]);
+            sc = (s_hi & 0xFu) | ((s_lo_0 & 0xC0u) >> 2);
+            m  = (s_hi >> 4)   | ((s_lo_4 & 0xC0u) >> 2);
+        }
+
+        // Pre-extract weight nibbles for dp4a
+        int32_t a_vals[8];
+        [[unroll]] for (uint j = 0u; j < 8u; j++)
+            a_vals[j] = int32_t((data_a_p32[ib].qs[qs_base + j] >> shift) & 0x0F0F0F0Fu);
+
+        float d_sc = d_val * float(sc);
+        float dm_m = dmin_val * float(m);
+
+        // Process tokens from shared memory (4 tokens per thread)
+        [[unroll]] for (uint t = 0u; t < NT_PER_THREAD; t++) {
+            uint token_idx = token_grp * NT_PER_THREAD + t;  // 0..15
+            uint sm_idx = token_idx * 8u + sb_local;
+
+            // Unpack d_b and s_b from packed uint32
+            uint packed_ds = smQ8[sm_idx][0];
+            float d_b = unpackHalf2x16(packed_ds).x;
+            float s_b = unpackHalf2x16(packed_ds).y;
+
+            int dp_sum = 0;
+            [[unroll]] for (uint j = 0u; j < 8u; j++)
+                dp_sum += dotPacked4x8EXT(a_vals[j], int32_t(smQ8[sm_idx][1u + j]));
+
+            acc[t] += d_sc * float(dp_sum) * d_b - dm_m * s_b;
+        }
+
+        barrier();
+    } // end K-loop
+
+    // ---------- Reduction: sum across 8 sb_local threads per token_grp ----------
+    // Within sub_tid 0..31: 8 threads with the same token_grp need to reduce.
+    // token_grp = sub_tid / 8, sb_local = sub_tid % 8.
+    // Use shuffle XOR to reduce across the 8 sb_local values.
+    [[unroll]] for (uint t = 0u; t < NT_PER_THREAD; t++) {
+        acc[t] += subgroupShuffleXor(acc[t], 1u);
+        acc[t] += subgroupShuffleXor(acc[t], 2u);
+        acc[t] += subgroupShuffleXor(acc[t], 4u);
+    }
+
+    // Thread with sb_local == 0 writes results
+    if (sb_local == 0u) {
+        [[unroll]] for (uint t = 0u; t < NT_PER_THREAD; t++) {
+            uint token_idx = token_grp * NT_PER_THREAD + t;
+            uint pos = first_pos + token_idx;
+            if (pos < npos_u)
+                out_data[pos * uint(rows) + row] = acc[t];
+        }
+    }
+}

@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// Split interleaved QKV buffer into separate Q, K, V buffers.
+// QKV layout: [seqLen × qkvDim] where qkvDim = qDim + 2*kvDim
+// Q[i*qDim + j]   = QKV[i*qkvDim + j]                  for j in [0, qDim)
+// K[i*kvDim + j]   = QKV[i*qkvDim + qDim + j]           for j in [0, kvDim)
+// V[i*kvDim + j]   = QKV[i*qkvDim + qDim + kvDim + j]   for j in [0, kvDim)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) writeonly buffer OutQ { float out_q[]; };
+layout(set = 0, binding = 1) writeonly buffer OutK { float out_k[]; };
+layout(set = 0, binding = 2) writeonly buffer OutV { float out_v[]; };
+layout(set = 0, binding = 3) readonly buffer InQKV { float in_qkv[]; };
+
+layout(push_constant) uniform Params {
+    int qDim;
+    int kvDim;
+    int seqLen;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    int qkvDim = qDim + 2 * kvDim;
+    uint total = uint(seqLen) * uint(qkvDim);
+    if (idx >= total) return;
+
+    uint pos = idx / uint(qkvDim);
+    uint col = idx % uint(qkvDim);
+
+    float val = in_qkv[idx];
+
+    if (col < uint(qDim)) {
+        out_q[pos * uint(qDim) + col] = val;
+    } else if (col < uint(qDim + kvDim)) {
+        out_k[pos * uint(kvDim) + (col - uint(qDim))] = val;
+    } else {
+        out_v[pos * uint(kvDim) + (col - uint(qDim) - uint(kvDim))] = val;
+    }
+}

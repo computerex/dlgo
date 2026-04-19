@@ -16,10 +16,20 @@ import (
 )
 
 var iqTablesOnce sync.Once
+var iqTablesMu sync.Mutex
+
+func ResetIQTables() {
+	iqTablesMu.Lock()
+	defer iqTablesMu.Unlock()
+	iqTablesOnce = sync.Once{}
+}
 
 func InitIQTables() error {
+	iqTablesMu.Lock()
+	once := &iqTablesOnce
+	iqTablesMu.Unlock()
 	var initErr error
-	iqTablesOnce.Do(func() {
+	once.Do(func() {
 		iq1sBuf, err := uploadGrid64(quant.IQ1sGrid())
 		if err != nil {
 			initErr = err

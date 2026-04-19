@@ -11,8 +11,10 @@ import (
 )
 
 // setupDiffusionGPU initializes GPU resources for diffusion if cfg.UseGPU is true.
-// Returns (cleanup func, model callback, vae decode func, error).
-// If GPU is not requested, returns (nil, nil, nil, nil) and the caller uses CPU.
+// Returns (cleanup func, model callback, prepareVAE func, vae decode func, error).
+// VAE scratch buffers are allocated lazily via prepareVAE, which also frees DiT
+// resources first. This allows 1024x1024 generation on 16 GB cards.
+// If GPU is not requested, returns (nil, nil, nil, nil, nil) and the caller uses CPU.
 func setupDiffusionGPU(
 	dit *DiTModel,
 	rs *DiTRunState,
@@ -23,15 +25,16 @@ func setupDiffusionGPU(
 	latentH, latentW int,
 	maxSeqLen int,
 ) (cleanup func(), modelFn func([]float32, float32) []float32,
+	prepareVAE func() error,
 	vaeFn func([]float32, int, int) []float32, err error) {
 	if !cfg.UseGPU {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 
 	log.Println("[diffusion/gpu] Initializing GPU...")
 	gpuStart := time.Now()
 	if err := gpu.Init(); err != nil {
-		return nil, nil, nil, fmt.Errorf("GPU init: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("GPU init: %w", err)
 	}
 	log.Printf("[diffusion/gpu] GPU: %s (%.0f MB VRAM)", gpu.DeviceName(),
 		float64(gpu.VRAMBytes())/(1024*1024))
@@ -41,37 +44,40 @@ func setupDiffusionGPU(
 	gm, err := UploadDiTModel(dit)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, fmt.Errorf("upload DiT: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("upload DiT: %w", err)
 	}
 
 	// Allocate DiT GPU run state
 	grs, err := NewGpuDiTRunState(dit.Config, maxSeqLen)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, fmt.Errorf("GPU run state: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("GPU run state: %w", err)
 	}
 
-	// Upload VAE weights to GPU
+	// Upload VAE weights to GPU (small, ~189 MB — keep resident)
 	log.Println("[diffusion/gpu] Uploading VAE weights to GPU...")
 	gvm, err := UploadVAEModel(vae)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, fmt.Errorf("upload VAE: %w", err)
-	}
-
-	// Allocate VAE GPU scratch buffers
-	gvrs, err := NewGpuVAERunState(vae.Config, latentH, latentW)
-	if err != nil {
-		gpu.Shutdown()
-		return nil, nil, nil, fmt.Errorf("VAE GPU run state: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("upload VAE: %w", err)
 	}
 
 	log.Printf("[diffusion/gpu] GPU setup complete in %v (VRAM used: %.1f MB)",
 		time.Since(gpuStart), float64(gpu.AllocatedBytes())/(1024*1024))
 
-	cleanup = func() {
-		log.Println("[diffusion/gpu] Freeing GPU resources...")
-		// DiT run state buffers
+	// VAE scratch buffers — allocated lazily via prepareVAE
+	var gvrs *GpuVAERunState
+	ditFreed := false
+
+	freeDiTResources := func() {
+		if ditFreed {
+			return
+		}
+		ditFreed = true
+		log.Println("[diffusion/gpu] Freeing DiT resources for VAE...")
+		beforeMB := float64(gpu.AllocatedBytes()) / (1024 * 1024)
+
+		// DiT run state buffers (pool-backed: Free just destroys VkBuffer handles)
 		gpu.Free(grs.X)
 		gpu.Free(grs.XNorm)
 		gpu.Free(grs.QKV)
@@ -88,11 +94,16 @@ func setupDiffusionGPU(
 		gpu.Free(grs.Mod)
 		gpu.Free(grs.ScaleBuf)
 		gpu.Free(grs.GateBuf)
+		if grs.OnesBuf != 0 {
+			gpu.Free(grs.OnesBuf)
+		}
 		if grs.PE != 0 {
 			gpu.Free(grs.PE)
 		}
+		// Release the pool memory (single vkFreeMemory for all RunState buffers)
+		gpu.PoolDestroy()
 
-		// DiT layer buffers
+		// DiT layer weight buffers
 		for i := range gm.Layers {
 			l := &gm.Layers[i]
 			if l.AttnQKV != nil {
@@ -136,30 +147,51 @@ func setupDiffusionGPU(
 			}
 		}
 
-		// VAE scratch buffers
-		gpu.Free(gvrs.Act)
-		gpu.Free(gvrs.Tmp1)
-		gpu.Free(gvrs.Tmp2)
-		gpu.Free(gvrs.Ups)
-		gpu.Free(gvrs.AttnQ)
-		gpu.Free(gvrs.AttnK)
-		gpu.Free(gvrs.AttnV)
-		gpu.Free(gvrs.AttnOut)
+		afterMB := float64(gpu.AllocatedBytes()) / (1024 * 1024)
+		log.Printf("[diffusion/gpu] Freed %.1f MB DiT resources (%.1f MB -> %.1f MB)",
+			beforeMB-afterMB, beforeMB, afterMB)
+	}
 
-		// NOTE: VAE weight buffers are not individually freed here since
-		// gpu.Shutdown() releases all GPU resources.
+	prepareVAE = func() error {
+		freeDiTResources()
+		log.Println("[diffusion/gpu] Allocating VAE scratch buffers...")
+		var allocErr error
+		gvrs, allocErr = NewGpuVAERunState(vae.Config, latentH, latentW)
+		if allocErr != nil {
+			return fmt.Errorf("VAE GPU run state: %w", allocErr)
+		}
+		log.Printf("[diffusion/gpu] VAE ready (VRAM used: %.1f MB)",
+			float64(gpu.AllocatedBytes())/(1024*1024))
+		return nil
+	}
+
+	cleanup = func() {
+		log.Println("[diffusion/gpu] Freeing GPU resources...")
+		freeDiTResources()
+
+		// VAE scratch buffers (may be nil if prepareVAE was never called)
+		if gvrs != nil {
+			gpu.Free(gvrs.Act)
+			gpu.Free(gvrs.Tmp1)
+			gpu.Free(gvrs.Tmp2)
+			gpu.Free(gvrs.Ups)
+			gpu.Free(gvrs.AttnQ)
+			gpu.Free(gvrs.AttnK)
+			gpu.Free(gvrs.AttnV)
+			gpu.Free(gvrs.AttnOut)
+		}
 
 		gpu.Shutdown()
 		log.Println("[diffusion/gpu] GPU resources freed")
 	}
 
 	modelFn = func(x []float32, timestep float32) []float32 {
-		return GpuDiTForward(dit, gm, rs, grs, x, timestep, context, contextLen, latentH, latentW)
+		return GpuDiTForward(dit, gm, rs, grs, x, timestep, context, contextLen, latentH, latentW, cfg.Debug)
 	}
 
 	vaeFn = func(latent []float32, h, w int) []float32 {
 		return GpuVAEDecode(vae, gvm, gvrs, latent, h, w)
 	}
 
-	return cleanup, modelFn, vaeFn, nil
+	return cleanup, modelFn, prepareVAE, vaeFn, nil
 }

@@ -2,10 +2,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 
-// IQ3_XXS MoE variant: processes n_used experts in one dispatch.
+// IQ3_XXS MoE matvec: processes n_used experts in one dispatch.
+// Ported from llama.cpp with shared-memory grid, vec4 B loads, 4 rows/WG.
 
 layout(local_size_x = 128) in;
+
+#define NUM_ROWS 4u
+#define QUANT_K 256u
 
 layout(push_constant) uniform Params {
     int rows;
@@ -20,88 +25,149 @@ struct block_iq3_xxs {
     uint8_t qs[96];
 };
 
-layout(binding = 0, scalar) buffer Out     { float   out_data[]; };
-layout(binding = 1, scalar) buffer Weights { block_iq3_xxs blocks[]; };
-layout(binding = 2, scalar) buffer X       { float   x_data[];  };
-layout(binding = 3, scalar) buffer Tables  { uint    table_data[]; };
-layout(binding = 4, scalar) buffer Indices { float   expert_indices[]; };
+layout(binding = 0, scalar) buffer Out     { float out_data[]; };
+layout(binding = 1, scalar) buffer Weights { block_iq3_xxs data_a[]; };
+layout(binding = 2, scalar) buffer X       { float x_data[];  };
+layout(binding = 2) buffer XV4             { vec4  data_b_v4[]; };
+layout(binding = 3, scalar) buffer Indices { float expert_indices[]; };
 
-#define KSIGNS_OFF 256u
+const uint iq3xxs_grid_const[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04
+};
 
-shared float shared_sums[128];
+shared uint iq3xxs_grid[256];
+shared float tmpsh[NUM_ROWS][128];
+
+vec4 grid_unpack(uint v) {
+    return vec4(float(v & 0xFFu), float((v >> 8u) & 0xFFu),
+                float((v >> 16u) & 0xFFu), float((v >> 24u) & 0xFFu));
+}
+
+uint pack_signscale(uint bi, uint ib32) {
+    uint lo = uint(data_a[bi].qs[64u + 4u * ib32])
+            | (uint(data_a[bi].qs[64u + 4u * ib32 + 1u]) << 8u);
+    uint hi = uint(data_a[bi].qs[64u + 4u * ib32 + 2u])
+            | (uint(data_a[bi].qs[64u + 4u * ib32 + 3u]) << 8u);
+    return lo | (hi << 16u);
+}
+
+void compute_outputs(uint first_row, uint num_rows, uint expert_offset, uint pos_x_off, uint slot) {
+    const uint num_blocks_per_row = uint(cols) / QUANT_K;
+    const uint blocks_per_wg = 128u / 16u;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid & 15u;
+    const uint ix = tid / 16u;
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) temp[n] = 0.0;
+
+    for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg) {
+        uint y_idx = i * QUANT_K + 16u * itid;
+
+        uint ib32 = itid / 2u;
+        uint ibi = expert_offset + first_row * num_blocks_per_row + i;
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            float d = float(data_a[ibi].d);
+            uint signscale = pack_signscale(ibi, ib32);
+            float db = d * 0.5 * (0.5 + float(signscale >> 28u));
+
+            [[unroll]] for (uint l = 0; l < 2u; ++l) {
+                uint qs0 = data_a[ibi].qs[8u * ib32 + 4u * (itid & 1u) + 2u * l];
+                uint qs1 = data_a[ibi].qs[8u * ib32 + 4u * (itid & 1u) + 2u * l + 1u];
+                uint sign = bitfieldExtract(signscale, 7 * int(2u * (itid & 1u) + l), 7);
+                uint sign7 = bitCount(sign);
+                vec4 grid0 = grid_unpack(iq3xxs_grid[qs0]);
+                vec4 grid1 = grid_unpack(iq3xxs_grid[qs1]);
+
+                vec4 b0 = data_b_v4[(pos_x_off + y_idx) / 4u + 2u * l + 0u];
+                vec4 b4 = data_b_v4[(pos_x_off + y_idx) / 4u + 2u * l + 1u];
+
+                float sum =
+                    fma(b0.x, ((sign &   1u) != 0u) ? -grid0.x : grid0.x,
+                    fma(b0.y, ((sign &   2u) != 0u) ? -grid0.y : grid0.y,
+                    fma(b0.z, ((sign &   4u) != 0u) ? -grid0.z : grid0.z,
+                    fma(b0.w, ((sign &   8u) != 0u) ? -grid0.w : grid0.w,
+                    fma(b4.x, ((sign &  16u) != 0u) ? -grid1.x : grid1.x,
+                    fma(b4.y, ((sign &  32u) != 0u) ? -grid1.y : grid1.y,
+                    fma(b4.z, ((sign &  64u) != 0u) ? -grid1.z : grid1.z,
+                    fma(b4.w, ((sign7 &  1u) != 0u) ? -grid1.w : grid1.w,
+                    0.0))))))));
+
+                temp[n] = fma(db, sum, temp[n]);
+            }
+            ibi += num_blocks_per_row;
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        temp[n] = subgroupAdd(temp[n]);
+    }
+    if ((tid & 31u) == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[n][tid / 32u] = temp[n];
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        for (uint n = 0; n < num_rows; ++n) {
+            float total = 0.0;
+            for (uint sg = 0; sg < 128u / 32u; ++sg) {
+                total += tmpsh[n][sg];
+            }
+            if (first_row + n < uint(rows)) {
+                out_data[slot * uint(rows) + first_row + n] = total;
+            }
+        }
+    }
+}
 
 void main() {
-    const uint row_pair = gl_WorkGroupID.x;
-    const uint tid = gl_LocalInvocationID.x;
-    const uint slot = gl_WorkGroupID.y;
+    uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y;
 
-    const uint num_sb = uint(cols) / 256u;
+    [[unroll]] for (uint i = gl_LocalInvocationID.x; i < 256u; i += 128u) {
+        iq3xxs_grid[i] = iq3xxs_grid_const[i];
+    }
+    barrier();
+
+    if (first_row >= uint(rows)) return;
 
     int eidx = int(expert_indices[slot]);
     uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
     uint pos_x_off = (shared_input != 0) ? 0u : (slot * uint(cols));
 
-    for (uint n = 0u; n < 2u; n++) {
-        uint first_row = row_pair * 2u + n;
-        if (first_row >= uint(rows)) {
-            if (n == 0u) out_data[slot * uint(rows) + first_row] = 0.0;
-            continue;
-        }
-
-        float acc = 0.0;
-
-        for (uint b = tid / 32u; b < num_sb; b += 4u) {
-            uint bi = expert_offset + first_row * num_sb + b;
-            float d = float(blocks[bi].d);
-            uint lane = tid & 31u;
-
-            uint x_block = b * 256u;
-
-            uint ib32 = lane / 4u;
-            uint il = lane & 3u;
-
-            uint qs_base = ib32 * 8u;
-            uint aux32 = uint(blocks[bi].qs[64u + ib32 * 4u])
-                       | (uint(blocks[bi].qs[64u + ib32 * 4u + 1u]) << 8u)
-                       | (uint(blocks[bi].qs[64u + ib32 * 4u + 2u]) << 16u)
-                       | (uint(blocks[bi].qs[64u + ib32 * 4u + 3u]) << 24u);
-
-            float db = d * (0.5 + float(aux32 >> 28u)) * 0.5;
-
-            uint sign_idx = (aux32 >> (7u * il)) & 127u;
-            uint sign_word = table_data[KSIGNS_OFF + sign_idx / 4u];
-            uint signs = (sign_word >> ((sign_idx & 3u) * 8u)) & 0xFFu;
-
-            uint grid1 = table_data[blocks[bi].qs[qs_base + 2u * il]];
-            uint grid2 = table_data[blocks[bi].qs[qs_base + 2u * il + 1u]];
-
-            float sum = 0.0;
-            uint x_off = x_block + ib32 * 32u + il * 8u;
-            for (uint j = 0u; j < 4u; j++) {
-                float gv1 = float((grid1 >> (8u * j)) & 0xFFu);
-                float gv2 = float((grid2 >> (8u * j)) & 0xFFu);
-                float v1 = ((signs & (1u << j)) != 0u) ? -db * gv1 : db * gv1;
-                float v2 = ((signs & (1u << (j + 4u))) != 0u) ? -db * gv2 : db * gv2;
-                sum += v1 * x_data[pos_x_off + x_off + j] + v2 * x_data[pos_x_off + x_off + 4u + j];
-            }
-
-            acc += sum;
-        }
-
-        acc = subgroupAdd(acc);
-
-        if ((tid & 31u) == 0u) {
-            shared_sums[tid / 32u] = acc;
-        }
-        barrier();
-
-        if (tid == 0u) {
-            float total = 0.0;
-            for (uint i = 0u; i < 4u; i++) {
-                total += shared_sums[i];
-            }
-            out_data[slot * uint(rows) + first_row] = total;
-        }
-        barrier();
-    }
+    uint num_rows = min(NUM_ROWS, uint(rows) - first_row);
+    compute_outputs(first_row, num_rows, expert_offset, pos_x_off, slot);
 }

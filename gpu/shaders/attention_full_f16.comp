@@ -1,0 +1,202 @@
+// Full (bidirectional) flash attention with FP16 shared memory + FP16 compute + FP16 accumulators.
+// f32 global buffers, f16 everywhere in shared memory/registers, f32 for softmax only.
+//
+// Key advantage: f16 output accumulators use ~94 regs/thread (vs ~158 for f32),
+// enabling 2 WGs/SM (vs 1) for dramatically better latency hiding.
+//
+// Benefits over f32 version:
+//   - f16 shmem: 2× less bank conflicts (2-way vs 4-way for vec4)
+//   - f16 shmem: halved shared memory footprint (10.5 KB vs 20.6 KB)
+//   - f16 FMA:  2× throughput on NVIDIA (80 vs 40 TFLOPS)
+//   - f16 accumulators: 2 WGs/SM occupancy (vs 1 WG/SM)
+//   - f32 softmax preserved for precision (max, exp, sum)
+//
+// Architecture: BR=8 rows x 32 threads/row = 256 threads.
+// Each row = 1 subgroup (32 threads) for barrier-free reductions.
+// BC=32 K/V positions per tile, loaded cooperatively into shared memory.
+// Only 4 barriers per tile (K load, K-done, V load, V-done).
+//
+// Q/K/V layout: [seq_len, num_heads * head_dim] (f32, row-major)
+// Output:       [seq_len, num_heads * head_dim] (f32, row-major)
+//
+// Dispatch: groups_x = num_heads,
+//           groups_y = ceil(seq_len / BR),
+//           groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
+// Buffers: 0=out (vec4), 1=Q (vec4), 2=K (vec4), 3=V (vec4)
+
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer AttnOut   { vec4 out_v4[]; };
+layout(set = 0, binding = 1) readonly buffer Q { vec4 q_v4[];   };
+layout(set = 0, binding = 2) readonly buffer K { vec4 k_v4[];   };
+layout(set = 0, binding = 3) readonly buffer V { vec4 v_v4[];   };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_len;
+    float scale;
+};
+
+#define WG_SIZE  256
+#define BR       8       // query rows per WG (= WG_SIZE / 32)
+#define BC       32      // K/V positions per tile
+#define HD4      32      // head_dim / 4 = 128 / 4
+#define HD4P     33      // HD4 + 1 for shared memory padding
+
+// Shared memory (f16vec4):
+//   Qf:   BR x HD4P  = 8 x 33 = 264 f16vec4  = 2.1 KB
+//   kvsh: BC x HD4P  = 32 x 33 = 1056 f16vec4 = 8.4 KB
+// Total: ~10.5 KB  (half of f32 version)
+
+shared f16vec4 Qf[BR * HD4P];
+shared f16vec4 kvsh[BC * HD4P];
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint wg_row = gl_WorkGroupID.y;
+    if (head >= uint(num_heads)) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    uint kv_head = head / kv_mul;
+    uint kvd4 = uint(kv_dim) >> 2u;
+    uint qd4 = uint(num_heads) * uint(HD4);
+    uint kv_off4 = kv_head * uint(HD4);
+    int N = seq_len;
+    uint qi_base = wg_row * uint(BR);
+    uint br_valid = min(uint(BR), uint(N) - qi_base);
+
+    uint my_row = tid >> 5u;     // 0..7 (each row = 1 subgroup of 32)
+    uint my_col = tid & 31u;     // 0..31
+
+    // --- Load BR query vectors into Qf: f32 global → f16 shmem (pre-scaled) ---
+    for (uint i = tid; i < uint(BR) * uint(HD4); i += WG_SIZE) {
+        uint r = i / uint(HD4);
+        uint d = i % uint(HD4);
+        uint qi = qi_base + r;
+        vec4 qv = (qi < uint(N))
+            ? q_v4[qi * qd4 + head * uint(HD4) + d] * scale
+            : vec4(0.0);
+        Qf[r * HD4P + d] = f16vec4(qv);
+    }
+
+    // Per-thread output accumulator (full head_dim in registers, f16 for occupancy)
+    // f16 enables ~94 regs/thread → 2 WGs/SM (vs ~158 regs → 1 WG/SM with f32)
+    f16vec4 my_O[HD4];
+    [[unroll]] for (uint d = 0u; d < uint(HD4); d++) my_O[d] = f16vec4(float16_t(0.0));
+
+    float running_max = -1e30;
+    float running_sum = 0.0;
+
+    barrier();
+
+    // =====================================================================
+    // Main tile loop
+    // =====================================================================
+    for (int tile_start = 0; tile_start < N; tile_start += int(BC)) {
+        int tile_len = min(int(BC), N - tile_start);
+
+        // --- K load into kvsh: f32 global → f16 shmem (cooperative, coalesced) ---
+        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+            uint kp = i / uint(HD4);
+            uint d  = i % uint(HD4);
+            int kpos = tile_start + int(kp);
+            vec4 kv = (kpos < N)
+                ? k_v4[uint(kpos) * kvd4 + kv_off4 + d]
+                : vec4(0.0);
+            kvsh[kp * HD4P + d] = f16vec4(kv);
+        }
+        barrier(); // K ready in kvsh
+
+        // --- QK dot product: f16 multiply, f32 accumulate ---
+        float s = -1e30;
+        if (my_row < br_valid && int(my_col) < tile_len) {
+            float dot_val = 0.0;
+            [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+                f16vec4 qv = Qf[my_row * HD4P + d];
+                f16vec4 kv = kvsh[my_col * HD4P + d];
+                // f16 multiplies, accumulate partial sum in f32
+                dot_val += float(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
+            }
+            s = dot_val;
+        }
+
+        // --- Online softmax (subgroup ops only, NO barriers) ---
+        // f32 throughout for precision
+        float m = s;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            m = max(m, subgroupShuffleXor(m, off));
+
+        float new_max = max(running_max, m);
+        float corr = exp(running_max - new_max);
+        running_max = new_max;
+        running_sum *= corr;
+
+        // Rescale output accumulator for new max (f16)
+        float16_t corr16 = float16_t(corr);
+        [[unroll]] for (uint d = 0u; d < uint(HD4); d++) my_O[d] *= corr16;
+
+        // Exp weight for this thread's K column
+        float w = (my_row < br_valid && int(my_col) < tile_len)
+            ? exp(s - new_max) : 0.0;
+
+        // Row-wide sum of weights
+        float wsum = w;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            wsum += subgroupShuffleXor(wsum, off);
+        running_sum += wsum;
+
+        // --- V load into kvsh: f32 global → f16 shmem (reuse after K reads done) ---
+        barrier(); // ensure all K reads complete before overwriting kvsh
+        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+            uint vp = i / uint(HD4);
+            uint d  = i % uint(HD4);
+            int vpos = tile_start + int(vp);
+            vec4 vv = (vpos < N)
+                ? v_v4[uint(vpos) * kvd4 + kv_off4 + d]
+                : vec4(0.0);
+            kvsh[vp * HD4P + d] = f16vec4(vv);
+        }
+        barrier(); // V ready in kvsh
+
+        // --- Accumulate weighted V: pure f16 multiply-add ---
+        if (w > 0.0) {
+            float16_t w16 = float16_t(w);
+            [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+                my_O[d] += w16 * kvsh[my_col * HD4P + d];
+            }
+        }
+
+        barrier(); // V reads done, protect next tile's K load
+    }
+
+    // =====================================================================
+    // Final: reduce per-thread outputs across 32 threads per row,
+    // normalize by running_sum, and write result (f32)
+    // Promote f16 accumulators to f32 for final reduction precision
+    // =====================================================================
+    float inv_sum = (running_sum > 0.0) ? (1.0 / running_sum) : 0.0;
+
+    uint qi = qi_base + my_row;
+    if (my_row < br_valid) {
+        [[unroll]] for (uint d = 0u; d < uint(HD4); d++) {
+            vec4 val = vec4(my_O[d]);  // promote f16 → f32 for reduction
+            // Subgroup sum-reduction: 32 lanes -> 1 result (broadcast to all)
+            [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+                val += subgroupShuffleXor(val, off);
+            // Lane 0 writes the final normalized output
+            if (my_col == 0u)
+                out_v4[qi * qd4 + head * uint(HD4) + d] = val * inv_sum;
+        }
+    }
+}

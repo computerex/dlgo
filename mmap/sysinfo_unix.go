@@ -26,3 +26,11 @@ func TrimWorkingSet() {}
 // SetWorkingSetLimit is a no-op on Linux; the kernel manages page cache
 // eviction effectively via its own heuristics.
 func SetWorkingSetLimit(maxBytes uint64) {}
+
+// PrefetchRegion uses madvise(MADV_WILLNEED) on Linux to pre-fault pages.
+func PrefetchRegion(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	_ = syscall.Madvise(data, syscall.MADV_WILLNEED)
+}

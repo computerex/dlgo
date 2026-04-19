@@ -1,0 +1,110 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+// IQ4_NL dp4a MoE variant: processes n_used experts in one dispatch.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+struct block_q8_1 {
+    float16_t d;
+    float16_t s;
+    int32_t qs[8];
+};
+
+layout(binding = 0, scalar) buffer Out { float out_data[]; };
+layout(binding = 1, scalar) readonly buffer Weights { uint8_t weight_bytes[]; };
+layout(binding = 2, scalar) readonly buffer B { block_q8_1 data_b[]; };
+layout(binding = 3, scalar) readonly buffer Indices { float expert_indices[]; };
+
+const int kvalues[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1, 13, 25, 38, 53, 69, 89, 113
+);
+
+shared float shared_sums[4];
+
+void main() {
+    const uint row_pair = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint slot = gl_WorkGroupID.y;
+    const uint num_blocks = uint(cols) / 32u;
+    const uint block_bytes = 18u;
+    const uint num_q8_blocks = num_blocks;
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint q8_off = (shared_input != 0) ? 0u : (slot * num_q8_blocks);
+
+    uint blk_tid = tid / 4u;
+    uint il = tid & 3u;
+
+    for (uint n = 0u; n < 2u; n++) {
+        uint row = row_pair * 2u + n;
+        if (row >= uint(rows)) {
+            if (n == 0u) out_data[slot * uint(rows) + row] = 0.0;
+            continue;
+        }
+
+        float acc = 0.0;
+
+        for (uint b = blk_tid; b < num_blocks; b += 32u) {
+            uint bi = expert_offset + row * num_blocks + b;
+            uint byte_off = bi * block_bytes;
+
+            uint lo_byte = uint(weight_bytes[byte_off]);
+            uint hi_byte = uint(weight_bytes[byte_off + 1u]);
+            float d = unpackHalf2x16(lo_byte | (hi_byte << 8u)).x;
+
+            uint q8_blk = q8_off + b;
+            float d_b = float(data_b[q8_blk].d);
+            int32_t bqs_lo = data_b[q8_blk].qs[il];
+            int32_t bqs_hi = data_b[q8_blk].qs[4u + il];
+
+            uint qs_base = byte_off + 2u + il * 4u;
+            uint qb0 = uint(weight_bytes[qs_base]);
+            uint qb1 = uint(weight_bytes[qs_base + 1u]);
+            uint qb2 = uint(weight_bytes[qs_base + 2u]);
+            uint qb3 = uint(weight_bytes[qs_base + 3u]);
+
+            i8vec4 w_lo = i8vec4(kvalues[qb0 & 0xFu], kvalues[qb1 & 0xFu],
+                                  kvalues[qb2 & 0xFu], kvalues[qb3 & 0xFu]);
+            i8vec4 w_hi = i8vec4(kvalues[qb0 >> 4u], kvalues[qb1 >> 4u],
+                                  kvalues[qb2 >> 4u], kvalues[qb3 >> 4u]);
+
+            int dp = dotPacked4x8EXT(pack32(w_lo), bqs_lo)
+                   + dotPacked4x8EXT(pack32(w_hi), bqs_hi);
+
+            acc += d * d_b * float(dp);
+        }
+
+        acc = subgroupAdd(acc);
+
+        if (gl_SubgroupInvocationID == 0u) {
+            shared_sums[gl_SubgroupID] = acc;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += shared_sums[i];
+            }
+            out_data[slot * uint(rows) + row] = total;
+        }
+        barrier();
+    }
+}

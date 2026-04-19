@@ -1,0 +1,136 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// F16-weight × FP32-input GEMM using cooperative matrix (tensor cores).
+// Identical to BF16 GEMM except buffer A contains pre-dequantized float16_t.
+// Tile: BM=64, BN=64, BK=32.  128 threads = 4 subgroups in 2×2 layout.
+// Each subgroup: 2×2 coopmat 16×16 tiles → 32×32 output.
+
+#define BM     64u
+#define BN     64u
+#define BK     32u
+#define SHMEM_STRIDE (BK / 2u + 4u)  // = 20 f16vec2 per row
+#define TM     16u
+#define TN     16u
+#define TK     16u
+#define SG_M   2u
+#define SG_N   2u
+#define CMS_M  2u
+#define CMS_N  2u
+#define N_K_TILES (BK / TK)  // = 2
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { float16_t data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int npos;
+};
+
+shared f16vec2 smA[BM * SHMEM_STRIDE];
+shared f16vec2 smB[BN * SHMEM_STRIDE];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg_id = gl_SubgroupID;
+    uint sg_m = sg_id / SG_N;
+    uint sg_n = sg_id % SG_N;
+
+    uint n_tiles_n = (uint(npos) + BN - 1u) / BN;
+    uint tile_n = gl_WorkGroupID.x % n_tiles_n;
+    uint tile_m = gl_WorkGroupID.x / n_tiles_n;
+
+    uint wg_m = tile_m * BM;
+    uint wg_n = tile_n * BN;
+    uint M = uint(rows);
+    uint K = uint(cols);
+    uint N = uint(npos);
+
+    coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc[CMS_M * CMS_N];
+    for (uint i = 0u; i < CMS_M * CMS_N; i++)
+        acc[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+
+    const uint LOAD_A = (BM * (BK / 2u)) / 128u;  // 8
+    const uint LOAD_B = (BN * (BK / 2u)) / 128u;  // 8
+
+    for (uint k_base = 0u; k_base < K; k_base += BK) {
+        // Load A tile: float16_t data_a[M, K] → smA (direct f16 loads, no conversion)
+        for (uint e = 0u; e < LOAD_A; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);
+            uint col2 = idx % (BK / 2u);
+            uint m_global = wg_m + row;
+            uint k_global = k_base + col2 * 2u;
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (m_global < M && k_global + 1u < K) {
+                val.x = data_a[m_global * K + k_global];
+                val.y = data_a[m_global * K + k_global + 1u];
+            } else if (m_global < M && k_global < K) {
+                val.x = data_a[m_global * K + k_global];
+            }
+            smA[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        // Load B tile: data_b[N, K] → smB
+        for (uint e = 0u; e < LOAD_B; e++) {
+            uint idx = e * 128u + tid;
+            uint row = idx / (BK / 2u);
+            uint col2 = idx % (BK / 2u);
+            uint n_global = wg_n + row;
+            uint k_global = k_base + col2 * 2u;
+            f16vec2 val = f16vec2(0.0, 0.0);
+            if (n_global < N && k_global + 1u < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+                val.y = float16_t(data_b[n_global * K + k_global + 1u]);
+            } else if (n_global < N && k_global < K) {
+                val.x = float16_t(data_b[n_global * K + k_global]);
+            }
+            smB[row * SHMEM_STRIDE + col2] = val;
+        }
+
+        barrier();
+
+        for (uint kt = 0u; kt < N_K_TILES; kt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA[CMS_M];
+            for (uint am = 0u; am < CMS_M; am++) {
+                uint sm_row = sg_m * CMS_M * TM + am * TM;
+                coopMatLoad(matA[am], smA, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+
+            for (uint an = 0u; an < CMS_N; an++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                uint sm_row = sg_n * CMS_N * TN + an * TN;
+                coopMatLoad(matB, smB, sm_row * SHMEM_STRIDE + kt * (TK / 2u),
+                            SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+
+                for (uint am = 0u; am < CMS_M; am++) {
+                    acc[am * CMS_N + an] = coopMatMulAdd(matA[am], matB, acc[am * CMS_N + an]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Store results: column-major [N, M] → out_data[n * M + m]
+    for (uint am = 0u; am < CMS_M; am++) {
+        for (uint an = 0u; an < CMS_N; an++) {
+            uint base_m = wg_m + sg_m * CMS_M * TM + am * TM;
+            uint base_n = wg_n + sg_n * CMS_N * TN + an * TN;
+            if (base_m < M && base_n < N) {
+                coopMatStore(acc[am * CMS_N + an], out_data, base_n * M + base_m, M,
+                             gl_CooperativeMatrixLayoutColumnMajor);
+            }
+        }
+    }
+}
