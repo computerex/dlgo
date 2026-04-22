@@ -1,0 +1,39 @@
+#version 450
+
+// SSM Step 4: Output — compute y[h][j] = sum_i(state[h][i][j] * q[i])
+// One workgroup per head, local_size_x threads handle columns.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer State { float state_data[]; };
+layout(set = 0, binding = 1) buffer QKV { float qkv[]; };
+layout(set = 0, binding = 2) buffer Y { float y_data[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int head_k_dim;
+    int head_v_dim;
+    int key_dim;
+};
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    if (h >= num_heads || j >= head_v_dim) return;
+
+    int num_kv_groups = key_dim / head_k_dim;
+    uint kvGroup = h % uint(num_kv_groups);
+    uint sOff = h * uint(head_k_dim) * uint(head_v_dim);
+    uint qOff = kvGroup * uint(head_k_dim);
+
+        precise float dot = 0.0;
+        precise float comp = 0.0;
+        for (int i = 0; i < head_k_dim; i++) {
+            precise float p = state_data[sOff + uint(i) * uint(head_v_dim) + j] * qkv[qOff + uint(i)];
+            precise float y = p - comp;
+            precise float t = dot + y;
+            comp = (t - dot) - y;
+            dot = t;
+        }
+        y_data[h * uint(head_v_dim) + j] = dot;
+}

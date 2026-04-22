@@ -49,6 +49,10 @@ type RunState struct {
 	ropeDim     int // partial RoPE dimension (may be < ropeHeadDim)
 	ropeNeox    bool
 
+	// Separate SWA RoPE tables for architectures with per-layer RoPE (e.g. gpt-oss ISWA)
+	ropeCosSWA []float32
+	ropeSinSWA []float32
+
 	// SSM (Gated Delta Net) scratch buffers — nil for pure transformer models
 	SSMRun   *SSMRunState
 	SSMState *memory.SSMStateCache
@@ -112,6 +116,10 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
 	}
 	rs.SetRopeNeox(cfg.RopeNeox)
+
+	if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
+		rs.PrecomputeSWARoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBaseSWA)
+	}
 
 	if cfg.FullAttentionInterval > 0 {
 		rs.QFull = make([]float32, 2*qDim)
@@ -397,14 +405,23 @@ func ForwardAttention(
 	}
 
 	if rs.ropeCos != nil {
+		useSWA := layer.Spec.SlidingWindow > 0 && rs.ropeCosSWA != nil
+		cos, sin := rs.ropeCos, rs.ropeSin
+		if useSWA {
+			cos, sin = rs.ropeCosSWA, rs.ropeSinSWA
+		}
 		for h := 0; h < numHeads; h++ {
-			rs.ApplyRoPEFast(rs.Q[h*headDim:(h+1)*headDim], pos)
+			rs.applyRoPEWithTables(rs.Q[h*headDim:(h+1)*headDim], pos, cos, sin)
 		}
 		for h := 0; h < numKVHeads; h++ {
-			rs.ApplyRoPEFast(rs.K[h*headDim:(h+1)*headDim], pos)
+			rs.applyRoPEWithTables(rs.K[h*headDim:(h+1)*headDim], pos, cos, sin)
 		}
 	} else {
-		ops.ApplyRoPEBatch(rs.Q, numHeads, rs.K, numKVHeads, pos, headDim, cfg.RopeFreqBase, cfg.RopeNeox)
+		ropeBase := cfg.RopeFreqBase
+		if layer.Spec.SlidingWindow > 0 && cfg.RopeFreqBaseSWA > 0 {
+			ropeBase = cfg.RopeFreqBaseSWA
+		}
+		ops.ApplyRoPEBatch(rs.Q, numHeads, rs.K, numKVHeads, pos, headDim, ropeBase, cfg.RopeNeox)
 	}
 
 	if diagL {

@@ -29,6 +29,10 @@ $shaders = @(
     @{name="ssm_conv1d_silu"; file="ssm_conv1d_silu.comp"},
     @{name="ssm_preprocess"; file="ssm_preprocess.comp"},
     @{name="ssm_delta_rule"; file="ssm_delta_rule.comp"},
+    @{name="ssm_decay"; file="ssm_decay.comp"},
+    @{name="ssm_predict"; file="ssm_predict.comp"},
+    @{name="ssm_update"; file="ssm_update.comp"},
+    @{name="ssm_output"; file="ssm_output.comp"},
     @{name="ssm_norm_gate"; file="ssm_norm_gate.comp"},
     @{name="deinterleave_qgate"; file="deinterleave_qgate.comp"},
     @{name="sigmoid_gate"; file="sigmoid_gate.comp"},
@@ -118,7 +122,9 @@ $shaders = @(
     @{name="matvec_iq3_xxs_dp4a_moe"; file="matvec_iq3_xxs_dp4a_moe.comp"},
     @{name="matvec_iq4_xs_dp4a_moe"; file="matvec_iq4_xs_dp4a_moe.comp"},
     @{name="matvec_iq4_nl_dp4a_moe"; file="matvec_iq4_nl_dp4a_moe.comp"},
-    @{name="matvec_iq3_s_dp4a_moe"; file="matvec_iq3_s_dp4a_moe.comp"}
+    @{name="matvec_iq3_s_dp4a_moe"; file="matvec_iq3_s_dp4a_moe.comp"},
+    @{name="attention_tiled_sinks"; file="attention_tiled_sinks.comp"},
+    @{name="matvec_q5_1"; file="matvec_q5_1.comp"}
 )
 
 $header = @"
@@ -203,6 +209,10 @@ static const ShaderInfo shader_registry[] = {
     {"ssm_conv1d_silu", spv_ssm_conv1d_silu, spv_ssm_conv1d_silu_size, 3, 8},   // PIPE_SSM_CONV1D_SILU
     {"ssm_preprocess",  spv_ssm_preprocess,  spv_ssm_preprocess_size,  5, 20},  // PIPE_SSM_PREPROCESS
     {"ssm_delta_rule",  spv_ssm_delta_rule,  spv_ssm_delta_rule_size,  5, 16},  // PIPE_SSM_DELTA_RULE
+    {"ssm_decay",       spv_ssm_decay,       spv_ssm_decay_size,       2, 12},  // PIPE_SSM_DECAY
+    {"ssm_predict",     spv_ssm_predict,     spv_ssm_predict_size,     3, 16},  // PIPE_SSM_PREDICT
+    {"ssm_update",      spv_ssm_update,      spv_ssm_update_size,      4, 16},  // PIPE_SSM_UPDATE
+    {"ssm_output",      spv_ssm_output,      spv_ssm_output_size,      3, 16},  // PIPE_SSM_OUTPUT
     {"ssm_norm_gate",   spv_ssm_norm_gate,   spv_ssm_norm_gate_size,   3, 8},   // PIPE_SSM_NORM_GATE
     {"deinterleave_qgate", spv_deinterleave_qgate, spv_deinterleave_qgate_size, 3, 8}, // PIPE_DEINTERLEAVE_QGATE
     {"sigmoid_gate",    spv_sigmoid_gate,    spv_sigmoid_gate_size,    2, 4},   // PIPE_SIGMOID_GATE
@@ -295,6 +305,8 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_iq4_xs_dp4a_moe", spv_matvec_iq4_xs_dp4a_moe, spv_matvec_iq4_xs_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_XS_DP4A_MOE
     {"matvec_iq4_nl_dp4a_moe", spv_matvec_iq4_nl_dp4a_moe, spv_matvec_iq4_nl_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_NL_DP4A_MOE
     {"matvec_iq3_s_dp4a_moe", spv_matvec_iq3_s_dp4a_moe, spv_matvec_iq3_s_dp4a_moe_size, 5, 20}, // PIPE_MATVEC_IQ3_S_DP4A_MOE
+    {"attention_tiled_sinks", spv_attention_tiled_sinks, spv_attention_tiled_sinks_size, 5, 28}, // PIPE_ATTENTION_TILED_SINKS
+    {"matvec_q5_1", spv_matvec_q5_1, spv_matvec_q5_1_size, 3, 8}, // PIPE_MATVEC_Q5_1
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

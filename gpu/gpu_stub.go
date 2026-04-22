@@ -40,6 +40,7 @@ func Add(out, a, b Buf, n int) error        { return errNoGPU }
 func Scale(Buf, float32, int) error         { return errNoGPU }
 func Attention(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl, sp int, s float32) error { return errNoGPU }
 func AttentionF16(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl, sp int, s, sc float32) error { return errNoGPU }
+func AttentionF16Sinks(out, q, kc, vc, sinks Buf, nh, nkv, hd, kvd, sl, sp int, s, sc float32) error { return errNoGPU }
 func KVStore(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func KVStoreF16(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func BatchKVStoreF16(kc, vc, k, v Buf, sp, kvd, n int) error { return errNoGPU }
@@ -80,7 +81,7 @@ func (lc *LayerConf) SetFFNMoE(fn Buf, pan Buf)                          {}
 func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}
 func (lc *LayerConf) SetCoreType(ct int)                                 {}
 func (lc *LayerConf) SetAttnNormOnly(an Buf)                             {}
-func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e, f float32, rd int, n bool, ft, rt int) {}
+func (lc *LayerConf) SetConfig(d, hd, nh, nkv, kd int, e float32, rd int, n bool, rc, rs Buf, ft, rt int) {}
 func (lc *LayerConf) SetDP4A(q Buf) {}
 func ForwardLayer(lc *LayerConf, pos, sl int, s float32, nan Buf) error   { return errNoGPU }
 

@@ -1,0 +1,30 @@
+#version 450
+
+// SSM Step 1: Apply decay to state matrix.
+// state[h][i][j] *= decay[h]
+// One workgroup per head, local_size_x threads handle columns.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer State { float state_data[]; };
+layout(set = 0, binding = 1) buffer Alpha { float alpha_data[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int head_k_dim;
+    int head_v_dim;
+};
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint j = gl_LocalInvocationID.x;
+    if (h >= num_heads || j >= head_v_dim) return;
+
+    float decay = exp(alpha_data[h]);
+    uint sOff = h * uint(head_k_dim) * uint(head_v_dim);
+
+    for (int i = 0; i < head_k_dim; i++) {
+        uint idx = sOff + uint(i) * uint(head_v_dim) + j;
+        state_data[idx] *= decay;
+    }
+}

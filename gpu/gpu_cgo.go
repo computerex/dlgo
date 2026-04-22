@@ -403,6 +403,16 @@ func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvD
 	return nil
 }
 
+// AttentionF16Sinks performs tiled attention with FP16 KV cache and learned attention sinks.
+func AttentionF16Sinks(out, q, kCache, vCache, sinks Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale, softcap float32) error {
+	rc := C.gpu_attention_f16_sinks(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
+		C.GpuBuf(sinks), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.float(softcap), C.int(startPos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: attention_f16_sinks failed (%d)", rc)
+	}
+	return nil
+}
+
 // AttentionTiledF32 performs tiled causal attention with FP32 KV cache (no seq_len limit).
 func AttentionTiledF32(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale, softcap float32) error {
 	rc := C.gpu_attention_tiled_f32(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
@@ -1010,6 +1020,45 @@ func SSMDeltaRule(state, qkv, alpha, beta, y Buf, numHeads, headKDim, headVDim, 
 		C.GpuBuf(beta), C.GpuBuf(y), C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: ssm_delta_rule failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMDecay applies decay to the state matrix: state[h][i][j] *= decay[h]
+func SSMDecay(state, alpha Buf, numHeads, headKDim, headVDim int) error {
+	rc := C.gpu_ssm_decay(C.GpuBuf(state), C.GpuBuf(alpha), C.int(numHeads), C.int(headKDim), C.int(headVDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_decay failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMPredict computes pred[h][j] = sum_i(state[h][i][j] * k[i])
+func SSMPredict(state, qkv, pred Buf, numHeads, headKDim, headVDim, keyDim int) error {
+	rc := C.gpu_ssm_predict(C.GpuBuf(state), C.GpuBuf(qkv), C.GpuBuf(pred),
+		C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_predict failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMUpdate applies the error correction: state[h][i][j] += k[i] * beta * (v[j] - pred[j])
+func SSMUpdate(state, qkv, beta, pred Buf, numHeads, headKDim, headVDim, keyDim int) error {
+	rc := C.gpu_ssm_update(C.GpuBuf(state), C.GpuBuf(qkv), C.GpuBuf(beta), C.GpuBuf(pred),
+		C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_update failed (%d)", rc)
+	}
+	return nil
+}
+
+// SSMOutput computes y[h][j] = sum_i(state[h][i][j] * q[i])
+func SSMOutput(state, qkv, y Buf, numHeads, headKDim, headVDim, keyDim int) error {
+	rc := C.gpu_ssm_output(C.GpuBuf(state), C.GpuBuf(qkv), C.GpuBuf(y),
+		C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm_output failed (%d)", rc)
 	}
 	return nil
 }

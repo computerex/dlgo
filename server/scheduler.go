@@ -235,9 +235,6 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		tokenText = pipe.Tokenizer.DecodeToken(nextToken)
 		req.Generated = append(req.Generated, nextToken)
 		recentTokens = append(recentTokens, nextToken)
-		if len(recentTokens) > 256 {
-			recentTokens = recentTokens[1:]
-		}
 
 		genText.WriteString(tokenText)
 		if checkTextStop(genText.String(), stopStrings) {

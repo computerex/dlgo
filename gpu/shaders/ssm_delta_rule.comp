@@ -1,23 +1,21 @@
 #version 450
 
-// SSM Delta Rule: per-head state update + output.
-// One workgroup per head, each thread handles one column j of the state matrix.
-// State layout: [numHeads * headKDim * headVDim], row-major per head: S[h][i][j]
-// QKV layout: [Q: keyDim | K: keyDim | V: valueDim]
+// SSM Delta Rule (fused, legacy — kept for backwards compat).
+// The decomposed path (ssm_decay/predict/update/output) is preferred.
 
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) buffer State { float state_data[]; };  // [numHeads * headK * headV]
-layout(set = 0, binding = 1) buffer QKV { float qkv[]; };           // [qkvDim]
-layout(set = 0, binding = 2) buffer Alpha { float alpha_data[]; };   // [numHeads] (decay = SSMA*softplus)
-layout(set = 0, binding = 3) buffer Beta { float beta_data[]; };     // [numHeads] (sigmoid lr)
-layout(set = 0, binding = 4) buffer Y { float y_data[]; };          // [valueDim]
+layout(set = 0, binding = 0) buffer State { float state_data[]; };
+layout(set = 0, binding = 1) buffer QKV { float qkv[]; };
+layout(set = 0, binding = 2) buffer Alpha { float alpha_data[]; };
+layout(set = 0, binding = 3) buffer Beta { float beta_data[]; };
+layout(set = 0, binding = 4) buffer Y { float y_data[]; };
 
 layout(push_constant) uniform Params {
     int num_heads;
     int head_k_dim;
     int head_v_dim;
-    int key_dim;     // num_kv_groups * head_k_dim (may be < num_heads * head_k_dim)
+    int key_dim;
 };
 
 void main() {
@@ -26,10 +24,9 @@ void main() {
 
     if (h >= num_heads || j >= head_v_dim) return;
 
-    float decay = exp(alpha_data[h]);
+    float decay = alpha_data[h];
     float lr = beta_data[h];
 
-    // GQA-style: map head h to its K/Q group (tiled, matching ggml_repeat)
     int num_kv_groups = key_dim / head_k_dim;
     uint kvGroup = h % uint(num_kv_groups);
 
@@ -38,25 +35,32 @@ void main() {
     uint kOff = uint(key_dim) + kvGroup * uint(head_k_dim);
     uint vOff = 2u * uint(key_dim) + h * uint(head_v_dim);
 
-    // Step A: Decay state column j and compute v_pred = S^T[:,j] . k
-    float vPred = 0.0;
+    precise float col[128];
     for (int i = 0; i < head_k_dim; i++) {
-        uint idx = sOff + uint(i) * uint(head_v_dim) + j;
-        state_data[idx] *= decay;
-        vPred += state_data[idx] * qkv[kOff + uint(i)];
+        col[i] = state_data[sOff + uint(i) * uint(head_v_dim) + j] * decay;
     }
 
-    // Step B: Error-corrected update: S[i][j] += lr * k[i] * (v[j] - vPred)
-    float delta = qkv[vOff + j] - vPred;
+    precise float pred = 0.0;
     for (int i = 0; i < head_k_dim; i++) {
-        uint idx = sOff + uint(i) * uint(head_v_dim) + j;
-        state_data[idx] += lr * qkv[kOff + uint(i)] * delta;
+        precise float product = col[i] * qkv[kOff + uint(i)];
+        pred += product;
     }
 
-    // Step C: Output: y[j] = S^T[:,j] . q_scaled
-    float dot = 0.0;
+    precise float delta = lr * (qkv[vOff + j] - pred);
+
     for (int i = 0; i < head_k_dim; i++) {
-        dot += state_data[sOff + uint(i) * uint(head_v_dim) + j] * qkv[qOff + uint(i)];
+        precise float product = qkv[kOff + uint(i)] * delta;
+        col[i] += product;
+    }
+
+    for (int i = 0; i < head_k_dim; i++) {
+        state_data[sOff + uint(i) * uint(head_v_dim) + j] = col[i];
+    }
+
+    precise float dot = 0.0;
+    for (int i = 0; i < head_k_dim; i++) {
+        precise float product = col[i] * qkv[qOff + uint(i)];
+        dot += product;
     }
     y_data[h * uint(head_v_dim) + j] = dot;
 }

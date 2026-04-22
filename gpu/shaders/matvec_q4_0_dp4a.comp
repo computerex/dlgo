@@ -1,5 +1,6 @@
 #version 450
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
@@ -7,12 +8,16 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : enable
 
-// Q4_0 weights × Q8_1 input using dotPacked4x8EXT (dp4a).
-// 128 threads = 4 subgroups, each subgroup handles one row.
-// K_PER_ITER = 8 (QUANT_R=2), 2 dp4a calls per iteration.
-// Correction: result = da * (q_sum * dsb.x - 2.0 * dsb.y)
+// Q4_0 weights x Q8_1 input using dp4a, ported from llama.cpp style.
+// All 128 threads cooperate on NUM_ROWS=2 rows (hybrid subgroup+shmem reduction).
+// 4 threads per Q4_0 block, K_PER_ITER=8, QUANT_K=32.
 
-layout(local_size_x = 128) in;
+#define BLOCK_SIZE 128
+#define NUM_ROWS 2
+#define K_PER_ITER 8
+#define QUANT_K 32
+
+layout(local_size_x = BLOCK_SIZE) in;
 
 struct block_q4_0 {
     float16_t d;
@@ -39,71 +44,101 @@ layout(push_constant) uniform Params {
     int cols;
 };
 
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE / 32];
+
 void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint sub_id = tid >> 5;
-    uint sub_tid = tid & 31u;
-    uint row = gl_WorkGroupID.x * 4u + sub_id;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint ncols = uint(cols);
+    const uint nrows = uint(rows);
+    const uint bpr = ncols >> 5;
+    const uint b_qs_idx = tid & 3u;
 
-    if (row >= uint(rows)) return;
+    uint num_rows;
+    if (first_row + NUM_ROWS <= nrows)
+        num_rows = NUM_ROWS;
+    else if (first_row < nrows)
+        num_rows = nrows - first_row;
+    else
+        return;
 
-    uint ncols = uint(cols);
-    uint bpr = ncols >> 5;
-    uint b_qs_idx = sub_tid & 3u;
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
 
-    uint num_iters = ncols / 256u;
-    if (num_iters * 256u + 8u * sub_tid < ncols) num_iters++;
+    const uint STRIDE = K_PER_ITER * BLOCK_SIZE;
+    uint num_iters = ncols / STRIDE;
+    if (num_iters * STRIDE + K_PER_ITER * tid < ncols) num_iters++;
+
     uint unrolled = num_iters & ~3u;
-
-    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     uint i = 0;
 
     while (i < unrolled) {
         [[unroll]] for (uint k = 0; k < 4u; k++) {
-            uint col = (i + k) * 256u + 8u * sub_tid;
-            uint a_ib = row * bpr + (col >> 5);
-            uint b_ib = col >> 5;
+            const uint col = i * STRIDE + K_PER_ITER * tid;
+            const uint b_ib = col >> 5;
+
+            vec2 dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+            int32_t b_qs0 = data_b[b_ib].qs[b_qs_idx];
+            int32_t b_qs1 = data_b[b_ib].qs[b_qs_idx + 4];
+
+            uint ibi = first_row * ncols;
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+                const uint a_ib = (ibi + col) / QUANT_K;
+                ibi += ncols;
+
+                float da = float(data_a[a_ib].d);
+                uint vui = uint(data_a_p16[a_ib].qs[b_qs_idx * 2])
+                         | (uint(data_a_p16[a_ib].qs[b_qs_idx * 2 + 1]) << 16);
+                int32_t a_lo = int32_t(vui & 0x0F0F0F0Fu);
+                int32_t a_hi = int32_t((vui >> 4) & 0x0F0F0F0Fu);
+
+                int32_t q_sum = dotPacked4x8EXT(a_lo, b_qs0) + dotPacked4x8EXT(a_hi, b_qs1);
+                temp[n] += da * (float(q_sum) * dsb.x - 2.0 * dsb.y);
+            }
+            i++;
+        }
+    }
+
+    while (i < num_iters) {
+        const uint col = i * STRIDE + K_PER_ITER * tid;
+        const uint b_ib = col >> 5;
+
+        vec2 dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
+        int32_t b_qs0 = data_b[b_ib].qs[b_qs_idx];
+        int32_t b_qs1 = data_b[b_ib].qs[b_qs_idx + 4];
+
+        uint ibi = first_row * ncols;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            const uint a_ib = (ibi + col) / QUANT_K;
+            ibi += ncols;
 
             float da = float(data_a[a_ib].d);
-            vec2 dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
-
             uint vui = uint(data_a_p16[a_ib].qs[b_qs_idx * 2])
                      | (uint(data_a_p16[a_ib].qs[b_qs_idx * 2 + 1]) << 16);
             int32_t a_lo = int32_t(vui & 0x0F0F0F0Fu);
             int32_t a_hi = int32_t((vui >> 4) & 0x0F0F0F0Fu);
 
-            int32_t b_qs0 = data_b[b_ib].qs[b_qs_idx];
-            int32_t b_qs1 = data_b[b_ib].qs[b_qs_idx + 4];
-
             int32_t q_sum = dotPacked4x8EXT(a_lo, b_qs0) + dotPacked4x8EXT(a_hi, b_qs1);
-            float r = da * (float(q_sum) * dsb.x - 2.0 * dsb.y);
-
-            if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
-            else if (k == 2u) acc2 += r; else acc3 += r;
+            temp[n] += da * (float(q_sum) * dsb.x - 2.0 * dsb.y);
         }
-        i += 4u;
-    }
-    while (i < num_iters) {
-        uint col = i * 256u + 8u * sub_tid;
-        uint a_ib = row * bpr + (col >> 5);
-        uint b_ib = col >> 5;
-
-        float da = float(data_a[a_ib].d);
-        vec2 dsb = vec2(float(data_b[b_ib].d), float(data_b[b_ib].s));
-
-        uint vui = uint(data_a_p16[a_ib].qs[b_qs_idx * 2])
-                 | (uint(data_a_p16[a_ib].qs[b_qs_idx * 2 + 1]) << 16);
-        int32_t a_lo = int32_t(vui & 0x0F0F0F0Fu);
-        int32_t a_hi = int32_t((vui >> 4) & 0x0F0F0F0Fu);
-
-        int32_t b_qs0 = data_b[b_ib].qs[b_qs_idx];
-        int32_t b_qs1 = data_b[b_ib].qs[b_qs_idx + 4];
-
-        int32_t q_sum = dotPacked4x8EXT(a_lo, b_qs0) + dotPacked4x8EXT(a_hi, b_qs1);
-        acc0 += da * (float(q_sum) * dsb.x - 2.0 * dsb.y);
         i++;
     }
 
-    float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
-    if (sub_tid == 0u) out_data[row] = acc;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++)
+        temp[n] = subgroupAdd(temp[n]);
+
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++)
+            tmpsh[n][gl_SubgroupID] = temp[n];
+    }
+    barrier();
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < BLOCK_SIZE / 32; s++)
+                sum += tmpsh[n][s];
+            out_data[first_row + n] = sum;
+        }
+    }
 }

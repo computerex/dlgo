@@ -171,6 +171,7 @@ static struct {
     int recording; // 1 = batching dispatches, 0 = immediate submit
     int dispatch_count; // number of dispatches in current batch
     int need_barrier; // 1 = insert barrier before next dispatch
+    PipelineID last_bound_pipe; // pipeline bind cache (skip redundant binds)
 
     // dp4a capability (VK_KHR_shader_integer_dot_product)
     int has_dp4a;
@@ -1254,7 +1255,10 @@ static int dispatch_compute(DispatchParams* p) {
             g.need_barrier = 0;
             g_perf_barriers++;
         }
-        vkCmdBindPipeline_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipelines[p->pipe]);
+        if (g.last_bound_pipe != p->pipe) {
+            vkCmdBindPipeline_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipelines[p->pipe]);
+            g.last_bound_pipe = p->pipe;
+        }
         if (vkCmdPushDescriptorSetKHR_) {
             vkCmdPushDescriptorSetKHR_(g.cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                 g.pipe_layouts[p->pipe], 0, p->num_bufs, writes);
@@ -1341,6 +1345,7 @@ void gpu_begin_batch(void) {
     begin_cmd();
     g.recording = 1;
     g.dispatch_count = 0;
+    g.last_bound_pipe = PIPE_COUNT;
 }
 
 void gpu_end_batch(void) {
@@ -1399,6 +1404,7 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_Q4_K:    pipe = PIPE_MATVEC_Q4_K; break;
         case QTYPE_Q5_K:    pipe = PIPE_MATVEC_Q5_K; break;
         case QTYPE_Q5_0:    pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q5_1:    pipe = PIPE_MATVEC_Q5_1; break;
         case QTYPE_Q6_K:    pipe = PIPE_MATVEC_Q6_K; break;
         case QTYPE_Q2_K:    pipe = PIPE_MATVEC_Q2_K; break;
         case QTYPE_TQ1_0:   pipe = PIPE_MATVEC_TQ1_0; break;
@@ -1416,9 +1422,12 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     }
 
     // Rows per workgroup by quant type.
-    // IQ3_XXS: 4 rows (in-shader grid, vec4 B loads — llama.cpp parity).
+    // Q4_0, Q8_0: 2 rows/WG (all-threads-per-row, llama.cpp style).
+    // Q5_0: 4 rows/WG (subgroup-per-row, 32 threads each).
+    // K-quants and IQ: 2 rows/WG (16-thread cooperation per super-block).
     int rows_per_wg = 4;
     switch (qtype) {
+        case QTYPE_Q4_0: case QTYPE_Q8_0:
         case QTYPE_Q4_K: case QTYPE_Q6_K: case QTYPE_Q3_K: case QTYPE_Q5_K:
         case QTYPE_Q2_K: case QTYPE_TQ1_0:
         case QTYPE_IQ1_S: case QTYPE_IQ1_M:
@@ -1474,6 +1483,7 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
         case QTYPE_Q4_K:    pipe = PIPE_MATVEC_Q4_K; break;
         case QTYPE_Q5_K:    pipe = PIPE_MATVEC_Q5_K; break;
         case QTYPE_Q5_0:    pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q5_1:    pipe = PIPE_MATVEC_Q5_1; break;
         case QTYPE_Q6_K:    pipe = PIPE_MATVEC_Q6_K; break;
         case QTYPE_Q2_K:    pipe = PIPE_MATVEC_Q2_K; break;
         case QTYPE_TQ1_0:   pipe = PIPE_MATVEC_TQ1_0; break;
@@ -1541,7 +1551,7 @@ int gpu_matvec_offset_dp4a(GpuBuf out_buf, int out_offset_bytes,
     PipelineID pipe;
     int rows_per_wg = 4;
     switch (qtype) {
-        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; break;
+        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A; break;
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; break;
@@ -1725,6 +1735,8 @@ int gpu_moe_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf indices_buf,
     return dispatch_compute(&dp);
 }
 
+static int dp4a_safe_type(int qtype, int cols);
+
 // ---------------------------------------------------------------------------
 // Fused MoE FFN: all MoE steps in a single CGo call
 // ---------------------------------------------------------------------------
@@ -1824,22 +1836,43 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
                             dim, n_used, has_down_bias);
     if (rc != GPU_OK) return rc;
 
-    // 9. Shared expert (if present)
+    // 9. Shared expert (if present) — use dp4a when possible.
+    //    mc->q8_input already has Q8_1(ffn_norm) from step 3 for gate/up input.
+    //    mc->q8_down_packed is free (main experts done) for shared down quantization.
     if (mc->has_shared && mc->sh_gate_w) {
         gpu_barrier();
-        rc = gpu_matvec(mc->sh_gate_scratch, mc->sh_gate_w, mc->ffn_norm,
-                        mc->sh_gate_rows, mc->sh_gate_cols, mc->sh_gate_type);
+        int sh_gate_dp4a = mc->q8_input && dp4a_safe_type(mc->sh_gate_type, mc->sh_gate_cols);
+        int sh_up_dp4a   = mc->q8_input && dp4a_safe_type(mc->sh_up_type, mc->sh_up_cols);
+        if (sh_gate_dp4a)
+            rc = gpu_matvec_dp4a(mc->sh_gate_scratch, mc->sh_gate_w, mc->q8_input,
+                                 mc->sh_gate_rows, mc->sh_gate_cols, mc->sh_gate_type);
+        else
+            rc = gpu_matvec(mc->sh_gate_scratch, mc->sh_gate_w, mc->ffn_norm,
+                            mc->sh_gate_rows, mc->sh_gate_cols, mc->sh_gate_type);
         if (rc != GPU_OK) return rc;
-        rc = gpu_matvec(mc->sh_up_scratch, mc->sh_up_w, mc->ffn_norm,
-                        mc->sh_up_rows, mc->sh_up_cols, mc->sh_up_type);
+        if (sh_up_dp4a)
+            rc = gpu_matvec_dp4a(mc->sh_up_scratch, mc->sh_up_w, mc->q8_input,
+                                 mc->sh_up_rows, mc->sh_up_cols, mc->sh_up_type);
+        else
+            rc = gpu_matvec(mc->sh_up_scratch, mc->sh_up_w, mc->ffn_norm,
+                            mc->sh_up_rows, mc->sh_up_cols, mc->sh_up_type);
         if (rc != GPU_OK) return rc;
         gpu_barrier();
         rc = gpu_swiglu(mc->sh_hidden_scratch, mc->sh_gate_scratch, mc->sh_up_scratch,
                         mc->sh_gate_rows);
         if (rc != GPU_OK) return rc;
         gpu_barrier();
-        rc = gpu_matvec(mc->sh_out_scratch, mc->sh_down_w, mc->sh_hidden_scratch,
-                        mc->sh_down_rows, mc->sh_down_cols, mc->sh_down_type);
+        int sh_down_dp4a = mc->q8_down_packed && dp4a_safe_type(mc->sh_down_type, mc->sh_down_cols);
+        if (sh_down_dp4a) {
+            rc = gpu_quantize_q8_1(mc->q8_down_packed, mc->sh_hidden_scratch, mc->sh_gate_rows);
+            if (rc != GPU_OK) return rc;
+            gpu_barrier();
+            rc = gpu_matvec_dp4a(mc->sh_out_scratch, mc->sh_down_w, mc->q8_down_packed,
+                                 mc->sh_down_rows, mc->sh_down_cols, mc->sh_down_type);
+        } else {
+            rc = gpu_matvec(mc->sh_out_scratch, mc->sh_down_w, mc->sh_hidden_scratch,
+                            mc->sh_down_rows, mc->sh_down_cols, mc->sh_down_type);
+        }
         if (rc != GPU_OK) return rc;
         if (mc->sh_router_w) {
             gpu_barrier();
@@ -2459,7 +2492,7 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
     PipelineID pipe;
     int rows_per_wg = 4;
     switch (qtype) {
-        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; break;
+        case QTYPE_Q4_0: pipe = PIPE_MATVEC_Q4_0_DP4A; rows_per_wg = 2; break;
         case QTYPE_Q5_0: pipe = PIPE_MATVEC_Q5_0_DP4A; break;
         case QTYPE_Q8_0: pipe = PIPE_MATVEC_Q8_0_DP4A; break;
         case QTYPE_Q4_K: pipe = PIPE_MATVEC_Q4_K_DP4A; break;
@@ -2468,8 +2501,8 @@ int gpu_matvec_dp4a(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf q8_1_buf,
         case QTYPE_Q5_K: pipe = PIPE_MATVEC_Q5_K_DP4A; rows_per_wg = 2; break;
         case 39: pipe = PIPE_MATVEC_MXFP4_DP4A; break;
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS_DP4A; break;
-        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS_DP4A; break;
-        case 20:             pipe = PIPE_MATVEC_IQ4_NL_DP4A; break;
+        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS_DP4A; rows_per_wg = 2; break;
+        case 20:             pipe = PIPE_MATVEC_IQ4_NL_DP4A; rows_per_wg = 2; break;
         case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S_DP4A; break;
         default: return gpu_matvec(out_buf, weights_buf, q8_1_buf, rows, cols, qtype);
     }
@@ -2588,6 +2621,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         case QTYPE_Q4_K:    pipe = PIPE_MATVEC_Q4_K; break;
         case QTYPE_Q5_K:    pipe = PIPE_MATVEC_Q5_K; break;
         case QTYPE_Q5_0:    pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q5_1:    pipe = PIPE_MATVEC_Q5_1; break;
         case QTYPE_Q6_K:    pipe = PIPE_MATVEC_Q6_K; break;
         case QTYPE_Q2_K:    pipe = PIPE_MATVEC_Q2_K; break;
         case QTYPE_TQ1_0:   pipe = PIPE_MATVEC_TQ1_0; break;
@@ -2606,6 +2640,7 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 
     int rows_per_wg = 4;
     switch (qtype) {
+        case QTYPE_Q4_0: case QTYPE_Q8_0:
         case QTYPE_Q4_K: case QTYPE_Q6_K: case QTYPE_Q3_K: case QTYPE_Q5_K:
         case QTYPE_Q2_K: case QTYPE_TQ1_0:
         case QTYPE_IQ1_S: case QTYPE_IQ1_M:
@@ -3517,6 +3552,35 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
     return dispatch_compute(&dp);
 }
 
+int gpu_attention_f16_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                            GpuBuf sinks_buf, int num_heads, int num_kv_heads, int head_dim,
+                            int kv_dim, int seq_len, float scale, float softcap, int start_pos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int window_len = seq_len - start_pos;
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED_SINKS;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.bufs[4] = sinks_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
                             int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
@@ -3529,6 +3593,24 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
     dp.bufs[0] = out; dp.bufs[1] = q;
     dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
     dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_batch_attention_f16_sinks(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
+                                   GpuBuf sinks, int num_heads, int num_kv_heads, int head_dim,
+                                   int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_TILED_SINKS;
+    dp.bufs[0] = out; dp.bufs[1] = q;
+    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+    dp.bufs[4] = sinks;
+    dp.num_bufs = 5;
     dp.push_data = &pc; dp.push_size = sizeof(pc);
     dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
     return dispatch_compute(&dp);
@@ -3673,6 +3755,69 @@ int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
     return dispatch_compute(&dp);
 }
 
+int gpu_ssm_decay(GpuBuf state, GpuBuf alpha, int num_heads, int head_k_dim, int head_v_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int head_v_dim; }
+        pc = {num_heads, head_k_dim, head_v_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_DECAY;
+    dp.bufs[0] = state; dp.bufs[1] = alpha;
+    dp.num_bufs = 2;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_predict(GpuBuf state, GpuBuf qkv, GpuBuf pred,
+                    int num_heads, int head_k_dim, int head_v_dim, int key_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int head_v_dim; int key_dim; }
+        pc = {num_heads, head_k_dim, head_v_dim, key_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_PREDICT;
+    dp.bufs[0] = state; dp.bufs[1] = qkv; dp.bufs[2] = pred;
+    dp.num_bufs = 3;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_update(GpuBuf state, GpuBuf qkv, GpuBuf beta, GpuBuf pred,
+                   int num_heads, int head_k_dim, int head_v_dim, int key_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int head_v_dim; int key_dim; }
+        pc = {num_heads, head_k_dim, head_v_dim, key_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_UPDATE;
+    dp.bufs[0] = state; dp.bufs[1] = qkv; dp.bufs[2] = beta; dp.bufs[3] = pred;
+    dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+int gpu_ssm_output(GpuBuf state, GpuBuf qkv, GpuBuf y,
+                   int num_heads, int head_k_dim, int head_v_dim, int key_dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int num_heads; int head_k_dim; int head_v_dim; int key_dim; }
+        pc = {num_heads, head_k_dim, head_v_dim, key_dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SSM_OUTPUT;
+    dp.bufs[0] = state; dp.bufs[1] = qkv; dp.bufs[2] = y;
+    dp.num_bufs = 3;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
                       int num_heads, int head_v_dim, float eps) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
@@ -3806,14 +3951,19 @@ int gpu_batch_add_bias2(GpuBuf dst, GpuBuf bias, GpuBuf scratch,
     return gpu_batch_add_bias_expand(dst, bias, scratch, elems_per_pos, npos);
 }
 
-// dp4a_safe_type: returns 1 if the quantization type has a correct dp4a shader.
-static int dp4a_safe_type(int qtype) {
+// dp4a_safe_type: returns 1 if the dp4a path should be used for this type+size.
+// Based on llama.cpp's ggml_vk_should_use_mmvq heuristic for post-Turing NVIDIA:
+//  - Q3_K, Q6_K: skip (2-byte alignment issues in dp4a shaders)
+//  - Q8_0: skip (float dequant is cheap enough that quantize+dp4a overhead isn't worth it)
+static int dp4a_safe_type(int qtype, int cols) {
+    (void)cols;
+    if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q6_K) return 0;
+    if (qtype == QTYPE_Q8_0) return 0;
     switch (qtype) {
-    case QTYPE_Q4_0: case QTYPE_Q5_0: case QTYPE_Q8_0:
-    case QTYPE_Q3_K: case QTYPE_Q4_K: case QTYPE_Q5_K: case QTYPE_Q6_K:
+    case QTYPE_Q4_0: case QTYPE_Q5_0:
+    case QTYPE_Q4_K: case QTYPE_Q5_K:
     case 39: /* MXFP4 */
-    case QTYPE_IQ3_XXS: case QTYPE_IQ4_XS: case 20: /* IQ4_NL */
-    case QTYPE_IQ3_S:
+    /* IQ3_XXS, IQ4_XS, IQ4_NL, IQ3_S: llama.cpp does NOT use dp4a for these */
         return 1;
     default:
         return 0;
@@ -3840,7 +3990,7 @@ static int q4k_fused_ok(int dp4a_ok, int qtype, int cols) {
 // Q4_K uses the fused shader when available and cols <= 8192.
 static int needs_separate_q8(int qtype, int cols) {
     if (fused_q4k_available() && qtype == QTYPE_Q4_K && cols <= 8192) return 0;
-    return dp4a_safe_type(qtype);
+    return dp4a_safe_type(qtype, cols);
 }
 
 // smart_matvec: uses dp4a when the tensor type supports it, else float.
@@ -3850,7 +4000,7 @@ static int smart_matvec(GpuBuf out, GpuBuf weights,
                         int rows, int cols, int qtype) {
     if (q4k_fused_ok(dp4a_ok, qtype, cols))
         return gpu_matvec_dp4a_fused(out, weights, float_input, rows, cols);
-    if (dp4a_ok && dp4a_safe_type(qtype))
+    if (dp4a_ok && dp4a_safe_type(qtype, cols))
         return gpu_matvec_dp4a(out, weights, q8_input, rows, cols, qtype);
     return gpu_matvec(out, weights, float_input, rows, cols, qtype);
 }
@@ -3907,14 +4057,19 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
             int win_start = 0;
             if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
                 win_start = seq_len - lc->sliding_window;
-            gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                              num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+            if (lc->attn_sinks) {
+                gpu_attention_f16_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                        lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+            } else {
+                gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                  num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+            }
         }
 
         gpu_barrier();
         if (q4k_fused_ok(dp4a_ok, lc->wo_type, lc->wo_cols)) {
             gpu_matvec_dp4a_fused(lc->attn_proj, lc->wo, lc->attn_out, lc->wo_rows, lc->wo_cols);
-        } else if (dp4a_ok && dp4a_safe_type(lc->wo_type)) {
+        } else if (dp4a_ok && dp4a_safe_type(lc->wo_type, lc->wo_cols)) {
             gpu_quantize_q8_1(lc->q8_1_scratch, lc->attn_out, num_heads * head_dim);
             gpu_barrier();
             gpu_matvec_dp4a(lc->attn_proj, lc->wo, lc->q8_1_scratch, lc->wo_rows, lc->wo_cols, lc->wo_type);
@@ -3944,11 +4099,6 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
                     mrc = gpu_forward_moe_ffn(lc->moe_conf);
                 }
                 if (mrc != GPU_OK) return mrc;
-
-                if (lc->moe_has_shared) {
-                    // Shared expert exists — Go handles shared expert + residual
-                    return GPU_OK;
-                }
 
                 gpu_barrier();
                 if (next_attn_norm) {
@@ -3992,7 +4142,7 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         int hidden_dim = (lc->ffn_type == 2) ? lc->up_rows : lc->gate_rows;
         if (q4k_fused_ok(dp4a_ok, lc->down_type, lc->down_cols)) {
             gpu_matvec_dp4a_fused(lc->ffn_out, lc->ffn_down_w, hidden_buf, lc->down_rows, lc->down_cols);
-        } else if (dp4a_ok && dp4a_safe_type(lc->down_type)) {
+        } else if (dp4a_ok && dp4a_safe_type(lc->down_type, lc->down_cols)) {
             gpu_quantize_q8_1(lc->q8_1_scratch, hidden_buf, hidden_dim);
             gpu_barrier();
             gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
@@ -4043,7 +4193,7 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         int par_hidden_dim = (lc->ffn_type == 2) ? lc->up_rows : lc->gate_rows;
         if (q4k_fused_ok(dp4a_ok, lc->down_type, lc->down_cols)) {
             gpu_matvec_dp4a_fused(lc->ffn_out, lc->ffn_down_w, par_hidden, lc->down_rows, lc->down_cols);
-        } else if (dp4a_ok && dp4a_safe_type(lc->down_type)) {
+        } else if (dp4a_ok && dp4a_safe_type(lc->down_type, lc->down_cols)) {
             gpu_quantize_q8_1(lc->q8_1_scratch, par_hidden, par_hidden_dim);
             gpu_barrier();
             gpu_matvec_dp4a(lc->ffn_out, lc->ffn_down_w, lc->q8_1_scratch, lc->down_rows, lc->down_cols, lc->down_type);
@@ -4162,9 +4312,15 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
 
     {
         gpu_barrier();
-        gpu_batch_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                num_heads, num_kv_heads, head_dim, kv_dim,
-                                start_pos + 1, scale, lc->attn_logit_softcap, npos);
+        if (lc->attn_sinks) {
+            gpu_batch_attention_f16_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                          lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim,
+                                          start_pos + 1, scale, lc->attn_logit_softcap, npos);
+        } else {
+            gpu_batch_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                    num_heads, num_kv_heads, head_dim, kv_dim,
+                                    start_pos + 1, scale, lc->attn_logit_softcap, npos);
+        }
     }
 
     gpu_barrier();

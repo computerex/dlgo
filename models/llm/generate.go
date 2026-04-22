@@ -486,9 +486,6 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 		}
 
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 256 {
-			recentTokens = recentTokens[1:]
-		}
 
 		if cfg.Stream != nil {
 			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
@@ -613,9 +610,6 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 256 {
-			recentTokens = recentTokens[1:]
-		}
 
 		if cfg.Stream != nil {
 			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
@@ -740,9 +734,6 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 
 		generated = append(generated, nextToken)
 		recentTokens = append(recentTokens, nextToken)
-		if len(recentTokens) > 256 {
-			recentTokens = recentTokens[1:]
-		}
 
 		tokenText := p.Tokenizer.DecodeToken(nextToken)
 		genText.WriteString(tokenText)

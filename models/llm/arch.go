@@ -68,9 +68,10 @@ func applyArchDefaults(config *ModelConfig) {
 		config.SlidingWindowPattern = 2
 	}
 	// gpt-oss (OpenAI MoE) architecture-specific defaults matching llama.cpp
+	// Pattern: 3 sliding window layers + 1 full attention (period = 4)
 	if config.Architecture == "gpt-oss" {
 		if config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
-			config.SlidingWindowPattern = 2
+			config.SlidingWindowPattern = 4
 		}
 		if config.ExpertCount > 0 {
 			config.ExpertGatingFunc = 3

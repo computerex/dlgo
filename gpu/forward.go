@@ -17,6 +17,93 @@ import (
 
 var moeDebugOnce sync.Once
 var inlineMoEOnce sync.Once
+var cpuSSMDelta = os.Getenv("DLGO_CPU_SSM_DELTA") == "1"
+var cpuSSMFull = os.Getenv("DLGO_CPU_SSM") == "1"
+var cpuMoE = os.Getenv("DLGO_CPU_MOE") == "1"
+var cpuMoEOnce sync.Once
+var moeDiag = os.Getenv("DLGO_MOE_DIAG") == "1"
+var moeDiagCount int
+
+// cpuDeltaRuleBufs holds pre-allocated CPU-side buffers for the CPU delta rule fallback.
+type cpuDeltaRuleBufs struct {
+	qkv   []float32
+	alpha []float32
+	beta  []float32
+	y     []float32
+}
+
+var cpuDeltaBufs *cpuDeltaRuleBufs
+
+func ensureCPUDeltaBufs(qkvDim, numHeads, valueDim int) *cpuDeltaRuleBufs {
+	if cpuDeltaBufs == nil || len(cpuDeltaBufs.qkv) < qkvDim {
+		cpuDeltaBufs = &cpuDeltaRuleBufs{
+			qkv:   make([]float32, qkvDim),
+			alpha: make([]float32, numHeads),
+			beta:  make([]float32, numHeads),
+			y:     make([]float32, valueDim),
+		}
+	}
+	return cpuDeltaBufs
+}
+
+// runCPUDeltaRule performs the SSM delta rule on CPU using float64 state
+// for full precision. This matches llama.cpp's CPU fused delta rule behavior
+// while exceeding its float32 FMA precision.
+func runCPUDeltaRule(state64 []float64, qkv []float32, alpha, beta []float32, y []float32,
+	numHeads, headKDim, headVDim, keyDim int, tiledVOrder bool) {
+	numKVGroups := keyDim / headKDim
+	delta := make([]float64, headVDim)
+	for h := 0; h < numHeads; h++ {
+		decay := math.Exp(float64(alpha[h]))
+		lr := float64(beta[h])
+
+		kvGroup := h % numKVGroups
+		if !tiledVOrder {
+			kvGroup = h / (numHeads / numKVGroups)
+		}
+		qOff := kvGroup * headKDim
+		kOff := keyDim + kvGroup*headKDim
+		vOff := 2*keyDim + h*headVDim
+		sOff := h * headKDim * headVDim
+
+		for idx := sOff; idx < sOff+headKDim*headVDim; idx++ {
+			state64[idx] *= decay
+		}
+
+		for j := 0; j < headVDim; j++ {
+			delta[j] = 0
+		}
+		for i := 0; i < headKDim; i++ {
+			ki := float64(qkv[kOff+i])
+			for j := 0; j < headVDim; j++ {
+				delta[j] += state64[sOff+i*headVDim+j] * ki
+			}
+		}
+		for j := 0; j < headVDim; j++ {
+			delta[j] = (float64(qkv[vOff+j]) - delta[j]) * lr
+		}
+		for i := 0; i < headKDim; i++ {
+			ki := float64(qkv[kOff+i])
+			for j := 0; j < headVDim; j++ {
+				state64[sOff+i*headVDim+j] += ki * delta[j]
+			}
+		}
+		yOff := h * headVDim
+		for i := 0; i < headKDim; i++ {
+			qi := float64(qkv[qOff+i])
+			for j := 0; j < headVDim; j++ {
+				if i == 0 {
+					delta[j] = state64[sOff+j] * qi
+				} else {
+					delta[j] += state64[sOff+i*headVDim+j] * qi
+				}
+			}
+		}
+		for j := 0; j < headVDim; j++ {
+			y[yOff+j] = float32(delta[j])
+		}
+	}
+}
 
 // initMoEScratchBuffers pre-allocates interleaved MoE scratch buffers.
 // Must be called before BuildLayerConfs if MoE layers exist.
@@ -132,6 +219,15 @@ func buildMoEConf(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.Model
 	return mc, useNative
 }
 
+// ropeTablesForLayer returns the appropriate RoPE cos/sin table pair for a
+// given layer, using SWA tables for sliding window layers when available.
+func ropeTablesForLayer(pipe *GpuPipeline, spec llm.LayerSpec) (cos, sin Buf) {
+	if spec.SlidingWindow > 0 && pipe.RoPECosTableSWA != 0 {
+		return pipe.RoPECosTableSWA, pipe.RoPESinTableSWA
+	}
+	return pipe.RoPECosTable, pipe.RoPESinTable
+}
+
 // BuildLayerConfs creates reusable fused-layer configurations from the model,
 // run state, and KV cache. Call once after model upload; reuse for every token.
 func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunState, kv *GpuKVCache) []*LayerConf {
@@ -216,9 +312,13 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 		resType = 1
 	}
 
+	cosTable, sinTable := pipe.RoPECosTable, pipe.RoPESinTable
+	if layer.Spec.SlidingWindow > 0 && pipe.RoPECosTableSWA != 0 {
+		cosTable, sinTable = pipe.RoPECosTableSWA, pipe.RoPESinTableSWA
+	}
 	lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
 		cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
-		pipe.RoPECosTable, pipe.RoPESinTable,
+		cosTable, sinTable,
 		ffnType, resType)
 
 	confs[l] = lc
@@ -277,7 +377,10 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 	// Lazy setup of inline MoE confs after scratch buffers are allocated
 	inlineMoEOnce.Do(func() {
-		if cfg.ExpertUsedCount > 0 && os.Getenv("DLGO_NO_FUSED_MOE") != "1" {
+		if cpuMoE {
+			fmt.Println("[dlgo/gpu] MoE forced to CPU via DLGO_CPU_MOE=1")
+		}
+		if cfg.ExpertUsedCount > 0 && os.Getenv("DLGO_NO_FUSED_MOE") != "1" && !cpuMoE {
 			if err := initMoEScratchBuffers(rs, cfg); err != nil {
 				fmt.Printf("[dlgo/gpu] WARNING: MoE scratch alloc failed: %v\n", err)
 				return
@@ -303,24 +406,56 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		gl := &gm.Layers[l]
 
 		if layer.Spec.Core == llm.CoreSSM && pipe != nil && pipe.HasSSM {
-			Barrier()
-			MatVec(rs.SSMQKV, gl.SSMInProj.Buf, rs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, gl.SSMInProj.Type)
-			MatVec(rs.SSMZ, gl.SSMGate.Buf, rs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, gl.SSMGate.Type)
-			MatVec(rs.SSMAlpha, gl.SSMAlpha.Buf, rs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, gl.SSMAlpha.Type)
-			MatVec(rs.SSMBeta, gl.SSMBeta.Buf, rs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, gl.SSMBeta.Type)
-			Barrier()
-			SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
-			Barrier()
-			hasDtBias := gl.SSMDtBias != 0
-			SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
-				ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
-			Barrier()
-			SSMDeltaRule(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMY,
-				ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-			Barrier()
-			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
-			Barrier()
-			MatVec(rs.AttnProj, gl.SSMOut.Buf, rs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, gl.SSMOut.Type)
+			if cpuSSMFull && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
+				EndBatch()
+				Sync()
+				cpuRS := pipe.CPURunState
+				DownloadF32(rs.XNorm, cpuRS.XNorm)
+				attnOut := llm.ForwardSSMLayer(layer, cpuRS, cpuRS.SSMRun,
+					cpuRS.SSMState.Layers[l], cpuRS.XNorm, cfg, cpuRS.Pool)
+				BeginBatch()
+				UploadF32(rs.AttnProj, attnOut)
+			} else {
+				Barrier()
+				MatVec(rs.SSMQKV, gl.SSMInProj.Buf, rs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, gl.SSMInProj.Type)
+				MatVec(rs.SSMZ, gl.SSMGate.Buf, rs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, gl.SSMGate.Type)
+				MatVec(rs.SSMAlpha, gl.SSMAlpha.Buf, rs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, gl.SSMAlpha.Type)
+				MatVec(rs.SSMBeta, gl.SSMBeta.Buf, rs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, gl.SSMBeta.Type)
+				Barrier()
+				SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
+				Barrier()
+				hasDtBias := gl.SSMDtBias != 0
+				SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
+					ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
+				Barrier()
+				if cpuSSMDelta && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
+					valueDim := ssmNumHeads * ssmHeadVDim
+					cb := ensureCPUDeltaBufs(ssmQKVDim, ssmNumHeads, valueDim)
+					EndBatch()
+					Sync()
+					DownloadF32(rs.SSMQKV, cb.qkv[:ssmQKVDim])
+					DownloadF32(rs.SSMAlpha, cb.alpha[:ssmNumHeads])
+					DownloadF32(rs.SSMBeta, cb.beta[:ssmNumHeads])
+					cpuState := pipe.CPURunState.SSMState.Layers[l]
+					runCPUDeltaRule(cpuState.EnsureState64(), cb.qkv[:ssmQKVDim], cb.alpha[:ssmNumHeads],
+						cb.beta[:ssmNumHeads], cb.y[:valueDim],
+						ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, cfg.SSMTiledVOrder)
+					BeginBatch()
+					UploadF32(rs.SSMY, cb.y[:valueDim])
+				} else {
+					SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
+					Barrier()
+					SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+					Barrier()
+					SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+					Barrier()
+					SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				}
+				Barrier()
+				SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
+				Barrier()
+				MatVec(rs.AttnProj, gl.SSMOut.Buf, rs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, gl.SSMOut.Type)
+			}
 		} else if layer.Spec.GatedQ && pipe != nil && pipe.HasGatedQ {
 			Barrier()
 			MatVec(rs.QFull, gl.Wq.Buf, rs.XNorm, gl.Wq.Rows, gl.Wq.Cols, gl.Wq.Type)
@@ -343,7 +478,9 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
+			gqCos, gqSin := ropeTablesForLayer(pipe, m.Layers[l].Spec)
+			RoPE(rs.Q, rs.K, gqCos, gqSin, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
+			Barrier()
 			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart := 0
@@ -375,9 +512,13 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 	if gl.IsMoE && pipe != nil && pipe.HasMoE {
 		inlineMoE := layerConfs[l].HasInlineMoE()
-		if inlineMoE {
+		forceCPU := cpuMoE && pipe.CPURunState != nil
+		if inlineMoE && !forceCPU {
 			// C-side handled MoE experts + shared expert + residual — nothing to do here.
-		} else if gl.MoEOnGPU {
+			if moeDiag && pos == 0 && pipe.CPURunState != nil {
+				runMoEDiag(l, pos, layer, rs, cfg, pipe.CPURunState)
+			}
+		} else if gl.MoEOnGPU && !forceCPU {
 			GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 			Barrier()
 			if nextAttnNorm != 0 {
@@ -388,8 +529,12 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		} else {
 			Sync()
 			cpuRS := pipe.CPURunState
-			DownloadF32(rs.FFNIn, cpuRS.FFNIn)
-			ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+			if forceCPU {
+				DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
+			} else {
+				DownloadF32(rs.FFNIn, cpuRS.FFNIn)
+				ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+			}
 			llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 			BeginBatch()
 			UploadF32(rs.FFNOut, cpuRS.FFNOut)
@@ -485,8 +630,29 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
 				ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, gl.SSMDtBias != 0)
 			Barrier()
-			SSMDeltaRule(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMY,
-				ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+			if cpuSSMDelta && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
+				valueDim := ssmNumHeads * ssmHeadVDim
+				cb := ensureCPUDeltaBufs(ssmQKVDim, ssmNumHeads, valueDim)
+				EndBatch()
+				Sync()
+				DownloadF32(rs.SSMQKV, cb.qkv[:ssmQKVDim])
+				DownloadF32(rs.SSMAlpha, cb.alpha[:ssmNumHeads])
+				DownloadF32(rs.SSMBeta, cb.beta[:ssmNumHeads])
+				cpuState := pipe.CPURunState.SSMState.Layers[l]
+				runCPUDeltaRule(cpuState.EnsureState64(), cb.qkv[:ssmQKVDim], cb.alpha[:ssmNumHeads],
+					cb.beta[:ssmNumHeads], cb.y[:valueDim],
+					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, cfg.SSMTiledVOrder)
+				BeginBatch()
+				UploadF32(rs.SSMY, cb.y[:valueDim])
+			} else {
+				SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
+				Barrier()
+				SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				Barrier()
+				SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				Barrier()
+				SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+			}
 			Barrier()
 			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
 			Barrier()
@@ -507,7 +673,8 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
+			gq2Cos, gq2Sin := ropeTablesForLayer(pipe, m.Layers[l].Spec)
+			RoPE(rs.Q, rs.K, gq2Cos, gq2Sin, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim)
 			Barrier()
 			gqWinStart2 := 0
@@ -539,9 +706,10 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 
 		if gl.IsMoE && pipe.HasMoE {
 			inlineMoE2 := layerConfs[l].HasInlineMoE()
-			if inlineMoE2 {
+			forceCPU2 := cpuMoE && pipe.CPURunState != nil
+			if inlineMoE2 && !forceCPU2 {
 				// C-side handled MoE experts + shared expert + residual — nothing to do here.
-			} else if gl.MoEOnGPU {
+			} else if gl.MoEOnGPU && !forceCPU2 {
 				GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 				Barrier()
 				if nextAttnNorm != 0 {
@@ -552,8 +720,12 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			} else {
 				Sync()
 				cpuRS := pipe.CPURunState
-				DownloadF32(rs.FFNIn, cpuRS.FFNIn)
-				ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+				if forceCPU2 {
+					DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
+				} else {
+					DownloadF32(rs.FFNIn, cpuRS.FFNIn)
+					ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+				}
 				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
 				BeginBatch()
 				UploadF32(rs.FFNOut, cpuRS.FFNOut)
@@ -661,9 +833,13 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 			resType = 1
 		}
 
+		cosTable, sinTable := pipe.RoPECosTable, pipe.RoPESinTable
+		if layer.Spec.SlidingWindow > 0 && pipe.RoPECosTableSWA != 0 {
+			cosTable, sinTable = pipe.RoPECosTableSWA, pipe.RoPESinTableSWA
+		}
 		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
 			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
-			pipe.RoPECosTable, pipe.RoPESinTable,
+			cosTable, sinTable,
 			ffnType, resType)
 
 		confs[l] = lc
@@ -774,15 +950,13 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		gl := &gm.Layers[l]
 
 		if layer.Spec.Core == llm.CoreSSM && pipe.HasSSM {
-			// Batch the 4 SSM input matmuls
-			Barrier()
-			BatchMatVec(bs.SSMQKV, gl.SSMInProj.Buf, bs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, npos, gl.SSMInProj.Type)
-			BatchMatVec(bs.SSMZ, gl.SSMGate.Buf, bs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, npos, gl.SSMGate.Type)
-			BatchMatVec(bs.SSMAlpha, gl.SSMAlpha.Buf, bs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, npos, gl.SSMAlpha.Type)
-			BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
-			Barrier()
+				Barrier()
+				BatchMatVec(bs.SSMQKV, gl.SSMInProj.Buf, bs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, npos, gl.SSMInProj.Type)
+				BatchMatVec(bs.SSMZ, gl.SSMGate.Buf, bs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, npos, gl.SSMGate.Type)
+				BatchMatVec(bs.SSMAlpha, gl.SSMAlpha.Buf, bs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, npos, gl.SSMAlpha.Type)
+				BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
+				Barrier()
 
-			// Per-position: copy from batch to single-token buffers, run recurrence, copy Y back
 			for p := 0; p < npos; p++ {
 				off := uint64(p)
 				CopyRegion(rs.SSMQKV, 0, bs.SSMQKV, off*uint64(ssmQKVDim*4), uint64(ssmQKVDim*4))
@@ -791,22 +965,42 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 				CopyRegion(rs.SSMBeta, 0, bs.SSMBeta, off*uint64(ssmNumHeads*4), uint64(ssmNumHeads*4))
 				Barrier()
 				SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
-				Barrier()
-				hasDtBias := gl.SSMDtBias != 0
-				SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
-					ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
-				Barrier()
-				SSMDeltaRule(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMY,
-					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-				Barrier()
-				SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
-				Barrier()
-				CopyRegion(bs.SSMY, off*uint64(ssmNumHeads*ssmHeadVDim*4), rs.SSMY, 0, uint64(ssmNumHeads*ssmHeadVDim*4))
-				Barrier()
-			}
+					Barrier()
+					hasDtBias := gl.SSMDtBias != 0
+					SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
+						ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
+					Barrier()
+				if cpuSSMDelta && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
+						valueDim := ssmNumHeads * ssmHeadVDim
+						cb := ensureCPUDeltaBufs(ssmQKVDim, ssmNumHeads, valueDim)
+						EndBatch()
+						Sync()
+						DownloadF32(rs.SSMQKV, cb.qkv[:ssmQKVDim])
+						DownloadF32(rs.SSMAlpha, cb.alpha[:ssmNumHeads])
+						DownloadF32(rs.SSMBeta, cb.beta[:ssmNumHeads])
+						cpuState := pipe.CPURunState.SSMState.Layers[l]
+						runCPUDeltaRule(cpuState.EnsureState64(), cb.qkv[:ssmQKVDim], cb.alpha[:ssmNumHeads],
+							cb.beta[:ssmNumHeads], cb.y[:valueDim],
+							ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, cfg.SSMTiledVOrder)
+						BeginBatch()
+						UploadF32(rs.SSMY, cb.y[:valueDim])
+					} else {
+						SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
+						Barrier()
+						SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+						Barrier()
+						SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+						Barrier()
+						SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+					}
+					Barrier()
+					SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
+					Barrier()
+					CopyRegion(bs.SSMY, off*uint64(ssmNumHeads*ssmHeadVDim*4), rs.SSMY, 0, uint64(ssmNumHeads*ssmHeadVDim*4))
+					Barrier()
+				}
 
-			// Batch SSMOut matmul
-			BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
+				BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
 
 		} else if layer.Spec.GatedQ && pipe.HasGatedQ {
 			// GatedQ attention: fully batched Q/K/V, deinterleave, bias, QKnorm, RoPE, KV store, attention, sigmoid gate
@@ -832,7 +1026,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 				RMSNormHeads(bs.K, gl.AttnKNorm, numKVHeads*npos, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			BatchRoPE(bs.Q, bs.K, pipe.RoPECosTable, pipe.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, startPos,
+			bCos, bSin := ropeTablesForLayer(pipe, m.Layers[l].Spec)
+			BatchRoPE(bs.Q, bs.K, bCos, bSin, numHeads, numKVHeads, headDim, cfg.RopeDim, startPos,
 				cfg.RopeNeox, npos)
 			BatchKVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
 			BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
@@ -1001,8 +1196,29 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
 				ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
 			Barrier()
-			SSMDeltaRule(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMY,
-				ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+			if cpuSSMDelta && p != nil && p.CPURunState != nil && p.CPURunState.SSMState != nil {
+				valueDim := ssmNumHeads * ssmHeadVDim
+				cb := ensureCPUDeltaBufs(ssmQKVDim, ssmNumHeads, valueDim)
+				EndBatch()
+				Sync()
+				DownloadF32(rs.SSMQKV, cb.qkv[:ssmQKVDim])
+				DownloadF32(rs.SSMAlpha, cb.alpha[:ssmNumHeads])
+				DownloadF32(rs.SSMBeta, cb.beta[:ssmNumHeads])
+				cpuState := p.CPURunState.SSMState.Layers[l]
+				runCPUDeltaRule(cpuState.EnsureState64(), cb.qkv[:ssmQKVDim], cb.alpha[:ssmNumHeads],
+					cb.beta[:ssmNumHeads], cb.y[:valueDim],
+					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, cfg.SSMTiledVOrder)
+				BeginBatch()
+				UploadF32(rs.SSMY, cb.y[:valueDim])
+			} else {
+				SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
+				Barrier()
+				SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				Barrier()
+				SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				Barrier()
+				SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+			}
 			Barrier()
 			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
 			Barrier()
@@ -1044,7 +1260,8 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
-			RoPE(rs.Q, rs.K, p.RoPECosTable, p.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
+			gqCosSSM, gqSinSSM := ropeTablesForLayer(p, *spec)
+			RoPE(rs.Q, rs.K, gqCosSSM, gqSinSSM, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ Q post-RoPE", rs.Q, numHeads*headDim)
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ K post-RoPE", rs.K, kvDim)
@@ -1153,7 +1370,8 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			}
 
 			Barrier()
-			if err := RoPE(rs.Q, rs.K, p.RoPECosTable, p.RoPESinTable, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox); err != nil {
+			ropeCos, ropeSin := ropeTablesForLayer(p, *spec)
+			if err := RoPE(rs.Q, rs.K, ropeCos, ropeSin, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox); err != nil {
 				return fmt.Errorf("layer %d rope: %w", l, err)
 			}
 
@@ -1171,9 +1389,16 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				winStart = seqLen - w
 			}
-			if err := AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale, 0); err != nil {
-				return fmt.Errorf("layer %d attention: %w", l, err)
+			if gl.AttnSinks != 0 {
+				if err := AttentionF16Sinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale, 0); err != nil {
+					return fmt.Errorf("layer %d attention_sinks: %w", l, err)
+				}
+			} else {
+				if err := AttentionF16(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
+					numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale, 0); err != nil {
+					return fmt.Errorf("layer %d attention: %w", l, err)
+				}
 			}
 
 			if diagL {
@@ -1209,7 +1434,8 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				GpuDiag.LogBuf("GPU", l, pos, "FFNNorm(MoE)", rs.FFNNorm, dim)
 				GpuDiag.LogBuf("GPU", l, pos, "FFNIn(MoE)", rs.FFNIn, dim)
 			}
-			if gl.MoEOnGPU {
+			forceCPU3 := cpuMoE && p.CPURunState != nil
+			if gl.MoEOnGPU && !forceCPU3 {
 				if err := GpuForwardMoEFFN(gl, layer, rs, cfg, diagL, l, pos); err != nil {
 					return fmt.Errorf("layer %d gpu moe: %w", l, err)
 				}
@@ -1420,7 +1646,7 @@ func gpuForwardFFN(layer *llm.Layer, gl *GpuLayer, rs *GpuRunState, input Buf, d
 
 func supportsGPUQType(qtype uint32) bool {
 	switch qtype {
-	case 0, 1, 2, 6, 8, 11, 12, 13, 14: // F32, F16, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
+	case 0, 1, 2, 6, 7, 8, 11, 12, 13, 14: // F32, F16, Q4_0, Q5_0, Q5_1, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
 		return true
 	case 10, 16, 18, 19, 21, 22, 23, 29, 34: // Q2_K, IQ2_XXS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, TQ1_0
 		return true
@@ -1437,6 +1663,8 @@ func supportsGPUQType(qtype uint32) bool {
 func hasDp4aQType(qtype uint32) bool {
 	switch qtype {
 	case 2, 6, 8, 10, 39: // Q4_0, Q5_0, Q8_0, Q3_K, MXFP4
+		return true
+	case 18, 20, 21, 23: // IQ3_XXS, IQ4_NL, IQ3_S, IQ4_XS
 		return true
 	default:
 		return false
@@ -1898,5 +2126,178 @@ func gpuDualMatVec(out1 Buf, gpuW1 *GpuTensor, cpuW1 *core.QuantizedTensor, out2
 	}
 	BeginBatch()
 	return nil
+}
+
+// runMoEDiag downloads GPU MoE intermediates and compares with CPU.
+func runMoEDiag(l, pos int, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig, cpuRS *llm.RunState) {
+	dim := cfg.EmbeddingDim
+	nExperts := cfg.ExpertCount
+	nUsed := cfg.ExpertUsedCount
+	if nExperts == 0 || nUsed == 0 || cpuRS == nil {
+		return
+	}
+
+	EndBatch()
+	Sync()
+
+	gpuFFNNorm := make([]float32, dim)
+	gpuLogits := make([]float32, nExperts)
+	gpuTopKIdx := make([]float32, nUsed)
+	gpuTopKW := make([]float32, nUsed)
+	gpuFFNOut := make([]float32, dim)
+
+	DownloadF32(rs.FFNNorm, gpuFFNNorm)
+	DownloadF32(rs.MoELogits, gpuLogits)
+	DownloadF32(rs.MoETopKIdx, gpuTopKIdx)
+	DownloadF32(rs.MoETopKW, gpuTopKW)
+	DownloadF32(rs.FFNOut, gpuFFNOut)
+
+	cpuLogits := make([]float32, nExperts)
+	blas.QMatVecMulParallel(cpuLogits, layer.FFNRouter, gpuFFNNorm, cpuRS.Pool)
+	if layer.FFNRouterBias != nil {
+		ops.AddBias(cpuLogits, layer.FFNRouterBias)
+	}
+
+	var maxLogitDiff float32
+	maxLogitIdx := 0
+	for i := 0; i < nExperts; i++ {
+		d := gpuLogits[i] - cpuLogits[i]
+		if d < 0 {
+			d = -d
+		}
+		if d > maxLogitDiff {
+			maxLogitDiff = d
+			maxLogitIdx = i
+		}
+	}
+
+	cpuVals := make([]float32, nExperts)
+	copy(cpuVals, cpuLogits)
+	switch cfg.ExpertGatingFunc {
+	case 2:
+		for i := range cpuVals {
+			cpuVals[i] = 1.0 / (1.0 + float32(math.Exp(-float64(cpuVals[i]))))
+		}
+	case 3:
+		// raw logits for top-K, softmax after
+	default:
+		quant.SIMDSoftmax(cpuVals)
+	}
+	cpuIndices, cpuWeights := topKIndicesF32(cpuVals, nUsed)
+
+	if cfg.ExpertGatingFunc == 3 && nUsed > 0 {
+		quant.SIMDSoftmax(cpuWeights)
+	}
+	if cfg.ExpertWeightsNorm && nUsed > 0 {
+		var wSum float32
+		for _, w := range cpuWeights {
+			wSum += w
+		}
+		if wSum > 1e-12 {
+			inv := 1.0 / wSum
+			for i := range cpuWeights {
+				cpuWeights[i] *= inv
+			}
+		}
+	}
+
+	gpuIdx := make([]int, nUsed)
+	for i := 0; i < nUsed; i++ {
+		gpuIdx[i] = int(gpuTopKIdx[i])
+	}
+
+	indicesMatch := true
+	for i := 0; i < nUsed; i++ {
+		if gpuIdx[i] != cpuIndices[i] {
+			indicesMatch = false
+			break
+		}
+	}
+
+	copy(cpuRS.FFNNorm, gpuFFNNorm)
+	llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+	var maxOutDiff float32
+	for i := 0; i < dim; i++ {
+		d := gpuFFNOut[i] - cpuRS.FFNOut[i]
+		if d < 0 {
+			d = -d
+		}
+		if d > maxOutDiff {
+			maxOutDiff = d
+		}
+	}
+
+	fmt.Printf("[MOE_DIAG] pos=%d layer=%d gatingFunc=%d\n", pos, l, cfg.ExpertGatingFunc)
+	fmt.Printf("  router logits: maxDiff=%.6e (at expert %d, gpu=%.6f cpu=%.6f)\n",
+		maxLogitDiff, maxLogitIdx, gpuLogits[maxLogitIdx], cpuLogits[maxLogitIdx])
+	fmt.Printf("  GPU topK idx: %v  weights: [", gpuIdx)
+	for i, w := range gpuTopKW {
+		if i > 0 {
+			fmt.Printf(" ")
+		}
+		fmt.Printf("%.4f", w)
+	}
+	fmt.Printf("]\n")
+	fmt.Printf("  CPU topK idx: %v  weights: [", cpuIndices)
+	for i, w := range cpuWeights {
+		if i > 0 {
+			fmt.Printf(" ")
+		}
+		fmt.Printf("%.4f", w)
+	}
+	fmt.Printf("]\n")
+	// Compute L2 norm of GPU output for relative error
+	var gpuNorm float32
+	for i := 0; i < dim; i++ {
+		gpuNorm += gpuFFNOut[i] * gpuFFNOut[i]
+	}
+	gpuNorm = float32(math.Sqrt(float64(gpuNorm)))
+	relErr := maxOutDiff / gpuNorm
+	fmt.Printf("  indices match: %v  ffnOut maxDiff=%.6e  gpuNorm=%.4f  relErr=%.6e\n", indicesMatch, maxOutDiff, gpuNorm, relErr)
+
+	if !indicesMatch {
+		allIdx := make(map[int]bool)
+		for _, i := range gpuIdx {
+			allIdx[i] = true
+		}
+		for _, i := range cpuIndices {
+			allIdx[i] = true
+		}
+		for idx := range allIdx {
+			if idx >= 0 && idx < nExperts {
+				fmt.Printf("  expert %d: gpuLogit=%.8f cpuLogit=%.8f diff=%.8e\n",
+					idx, gpuLogits[idx], cpuLogits[idx], gpuLogits[idx]-cpuLogits[idx])
+			}
+		}
+	}
+
+	moeDiagCount++
+	BeginBatch()
+}
+
+func topKIndicesF32(vals []float32, k int) ([]int, []float32) {
+	n := len(vals)
+	if k > n {
+		k = n
+	}
+	indices := make([]int, k)
+	weights := make([]float32, k)
+	used := make([]bool, n)
+	for t := 0; t < k; t++ {
+		bestIdx := -1
+		bestVal := float32(-1e30)
+		for i := 0; i < n; i++ {
+			if !used[i] && vals[i] > bestVal {
+				bestVal = vals[i]
+				bestIdx = i
+			}
+		}
+		indices[t] = bestIdx
+		weights[t] = bestVal
+		if bestIdx >= 0 {
+			used[bestIdx] = true
+		}
+	}
+	return indices, weights
 }
 

@@ -1,0 +1,73 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 128) in;
+
+struct block_q5_1 {
+    float16_t d;
+    float16_t m;
+    uint32_t qh;
+    uint8_t qs[16];
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_q5_1 data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+};
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sub_id = tid >> 5;
+    uint sub_tid = tid & 31u;
+    uint row = gl_WorkGroupID.x * 4u + sub_id;
+
+    if (row >= uint(rows)) return;
+
+    uint ncols = uint(cols);
+    uint bpr = ncols / 32u;
+
+    uint pos_id = gl_WorkGroupID.y;
+    uint b_off = pos_id * ncols;
+    uint out_off = pos_id * uint(rows);
+
+    float acc = 0.0;
+
+    for (uint block = sub_tid; block < bpr; block += 32u) {
+        uint ib = row * bpr + block;
+        float d = float(data_a[ib].d);
+        float m = float(data_a[ib].m);
+        uint qh = data_a[ib].qh;
+        uint col_base = block * 32u;
+
+        float block_sum = 0.0;
+        [[unroll]] for (uint j = 0; j < 16u; j++) {
+            uint qs_val = uint(data_a[ib].qs[j]);
+            uint lo = qs_val & 0xFu;
+            uint hi = qs_val >> 4u;
+            uint qh_lo = (qh >> j) & 1u;
+            uint qh_hi = (qh >> (j + 16u)) & 1u;
+            float w_lo = float(lo | (qh_lo << 4u));
+            float w_hi = float(hi | (qh_hi << 4u));
+            float b_lo = data_b[b_off + col_base + j];
+            float b_hi = data_b[b_off + col_base + j + 16u];
+            block_sum += w_lo * b_lo + w_hi * b_hi;
+        }
+        float bsum = 0.0;
+        [[unroll]] for (uint j = 0; j < 32u; j++) {
+            bsum += data_b[b_off + col_base + j];
+        }
+        acc += d * block_sum + m * bsum;
+    }
+
+    acc = subgroupAdd(acc);
+    if (sub_tid == 0u) out_data[out_off + row] = acc;
+}

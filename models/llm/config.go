@@ -29,6 +29,7 @@ type ModelConfig struct {
 	RopeYaRNBetaSlow   float32 // YaRN beta_slow (default 1)
 	RopeYaRNExtFactor  float32 // YaRN ext_factor: 0=disable ramp, 1=full ramp (default 1)
 	RopeYaRNAttnFactor float32 // YaRN attn_factor: magnitude scaling base (default 1)
+	RopeFreqBaseSWA    float32 // Separate RoPE frequency base for SWA layers (0 = same as RopeFreqBase)
 	SlidingWindow      int     // sliding window attention size (0 = disabled)
 	SlidingWindowPattern int   // 0=all layers, N=alternating (every Nth layer is full)
 	BOS           int32
@@ -117,6 +118,7 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		RopeYaRNBetaSlow:   metaFloat(md, arch+".rope.scaling.yarn.beta_slow", 1.0),
 		RopeYaRNExtFactor:  metaFloat(md, arch+".rope.scaling.yarn.ext_factor", 1.0),
 		RopeYaRNAttnFactor: metaFloat(md, arch+".rope.scaling.yarn.attn_factor", 1.0),
+		RopeFreqBaseSWA:    metaFloat(md, arch+".rope.freq_base_swa", 0),
 		SlidingWindow:      metaInt(md, arch+".attention.sliding_window", 0),
 		SlidingWindowPattern: metaInt(md, arch+".attention.sliding_window_pattern", 0),
 		AttnLogitSoftcap:  metaFloat(md, arch+".attn_logit_softcapping", 0),

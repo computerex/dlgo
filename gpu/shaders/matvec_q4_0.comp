@@ -1,12 +1,22 @@
 #version 450
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_control_flow_attributes : enable
 
-layout(local_size_x = 128) in;
+// Ported from llama.cpp mul_mat_vec.comp for Q4_0.
+// All 128 threads cooperate on NUM_ROWS=2 rows (hybrid subgroup+shmem reduction).
+// K_PER_ITER=8, QUANT_K=32, QUANT_R=2.
+
+#define BLOCK_SIZE 128
+#define NUM_ROWS 2
+#define K_PER_ITER 8
+#define QUANT_K 32
+
+layout(local_size_x = BLOCK_SIZE) in;
 
 struct block_q4_0 {
     float16_t d;
@@ -27,73 +37,103 @@ layout(push_constant) uniform Params {
     int cols;
 };
 
+shared float tmpsh[NUM_ROWS][BLOCK_SIZE / 32];
+
 void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint sub_id = tid >> 5;
-    uint sub_tid = tid & 31u;
-    uint row = gl_WorkGroupID.x * 4u + sub_id;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    const uint ncols = uint(cols);
+    const uint nrows = uint(rows);
 
-    if (row >= uint(rows)) return;
+    uint num_rows;
+    if (first_row + NUM_ROWS <= nrows)
+        num_rows = NUM_ROWS;
+    else if (first_row < nrows)
+        num_rows = nrows - first_row;
+    else
+        return;
 
-    uint ncols = uint(cols);
-    uint bpr = ncols >> 5;
+    const uint pos_id = gl_WorkGroupID.y;
+    const uint b_off = pos_id * (ncols >> 2);
+    const uint d_off = pos_id * nrows;
 
-    uint num_iters = ncols / 256u;
-    if (num_iters * 256u + 8u * sub_tid < ncols) num_iters++;
+    float temp[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) temp[n] = 0.0;
+
+    const uint STRIDE = K_PER_ITER * BLOCK_SIZE;
+    uint num_iters = ncols / STRIDE;
+    if (num_iters * STRIDE + K_PER_ITER * tid < ncols) num_iters++;
+
     uint unrolled = num_iters & ~3u;
-
-    uint pos_id = gl_WorkGroupID.y;
-    uint x_off = pos_id * (ncols >> 2);
-    uint out_off = pos_id * uint(rows);
-
-    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
     uint i = 0;
 
     while (i < unrolled) {
-            [[unroll]] for (uint k = 0; k < 4u; k++) {
-                uint col = (i + k) * 256u + 8u * sub_tid;
-                uint ib = row * bpr + (col >> 5);
-                uint iqs = (col & 31u) >> 1;
-                float d = float(data_a[ib].d);
+        [[unroll]] for (uint k = 0; k < 4u; k++) {
+            const uint col = i * STRIDE + K_PER_ITER * tid;
+            const uint iqs = (col % QUANT_K) / 2;
+            const uint iybs = col - col % QUANT_K;
 
-                uint b_base = col - (col & 31u);
-                vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
-                vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
-                vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
-                vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
+            const vec4 bv02 = data_b_v4[b_off + (iybs + iqs) / 4];
+            const vec4 bv13 = data_b_v4[b_off + (iybs + iqs + QUANT_K / 2) / 4];
+            const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+            const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
 
-                uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
+            uint ibi = first_row * ncols;
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+                const uint ib = (ibi + col) / QUANT_K;
+                ibi += ncols;
+
+                uint vui0 = uint(data_a_p16[ib].qs[iqs / 2]);
                 vec4 v0 = vec4(vui0 & 0xFu, (vui0 >> 4) & 0xFu, (vui0 >> 8) & 0xFu, vui0 >> 12) - 8.0;
-                uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
+                uint vui1 = uint(data_a_p16[ib].qs[iqs / 2 + 1u]);
                 vec4 v1 = vec4(vui1 & 0xFu, (vui1 >> 4) & 0xFu, (vui1 >> 8) & 0xFu, vui1 >> 12) - 8.0;
 
-                float r = d * (dot(bv0, v0) + dot(bv1, v1));
-                if (k == 0u) acc0 += r; else if (k == 1u) acc1 += r;
-                else if (k == 2u) acc2 += r; else acc3 += r;
+                temp[n] += float(data_a[ib].d) * (dot(bv0, v0) + dot(bv1, v1));
             }
-            i += 4u;
+            i++;
+        }
     }
+
     while (i < num_iters) {
-            uint col = i * 256u + 8u * sub_tid;
-            uint ib = row * bpr + (col >> 5);
-            uint iqs = (col & 31u) >> 1;
-            float d = float(data_a[ib].d);
+        const uint col = i * STRIDE + K_PER_ITER * tid;
+        const uint iqs = (col % QUANT_K) / 2;
+        const uint iybs = col - col % QUANT_K;
 
-            uint b_base = col - (col & 31u);
-            vec4 bv_lo = data_b_v4[x_off + ((b_base + iqs) >> 2)];
-            vec4 bv_hi = data_b_v4[x_off + ((b_base + iqs + 16u) >> 2)];
-            vec4 bv0 = vec4(bv_lo.x, bv_hi.x, bv_lo.y, bv_hi.y);
-            vec4 bv1 = vec4(bv_lo.z, bv_hi.z, bv_lo.w, bv_hi.w);
+        const vec4 bv02 = data_b_v4[b_off + (iybs + iqs) / 4];
+        const vec4 bv13 = data_b_v4[b_off + (iybs + iqs + QUANT_K / 2) / 4];
+        const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+        const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
 
-            uint vui0 = uint(data_a_p16[ib].qs[iqs >> 1]);
+        uint ibi = first_row * ncols;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++) {
+            const uint ib = (ibi + col) / QUANT_K;
+            ibi += ncols;
+
+            uint vui0 = uint(data_a_p16[ib].qs[iqs / 2]);
             vec4 v0 = vec4(vui0 & 0xFu, (vui0 >> 4) & 0xFu, (vui0 >> 8) & 0xFu, vui0 >> 12) - 8.0;
-            uint vui1 = uint(data_a_p16[ib].qs[(iqs >> 1) + 1u]);
+            uint vui1 = uint(data_a_p16[ib].qs[iqs / 2 + 1u]);
             vec4 v1 = vec4(vui1 & 0xFu, (vui1 >> 4) & 0xFu, (vui1 >> 8) & 0xFu, vui1 >> 12) - 8.0;
 
-        acc0 += d * (dot(bv0, v0) + dot(bv1, v1));
+            temp[n] += float(data_a[ib].d) * (dot(bv0, v0) + dot(bv1, v1));
+        }
         i++;
     }
 
-    float acc = subgroupAdd(acc0 + acc1 + acc2 + acc3);
-    if (sub_tid == 0u) out_data[out_off + row] = acc;
+    [[unroll]] for (uint n = 0; n < NUM_ROWS; n++)
+        temp[n] = subgroupAdd(temp[n]);
+
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; n++)
+            tmpsh[n][gl_SubgroupID] = temp[n];
+    }
+    barrier();
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < BLOCK_SIZE / 32; s++)
+                sum += tmpsh[n][s];
+            out_data[d_off + first_row + n] = sum;
+        }
+    }
 }

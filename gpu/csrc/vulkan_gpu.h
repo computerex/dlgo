@@ -85,6 +85,10 @@ typedef enum {
     PIPE_SSM_CONV1D_SILU,
     PIPE_SSM_PREPROCESS,
     PIPE_SSM_DELTA_RULE,
+    PIPE_SSM_DECAY,
+    PIPE_SSM_PREDICT,
+    PIPE_SSM_UPDATE,
+    PIPE_SSM_OUTPUT,
     PIPE_SSM_NORM_GATE,
     PIPE_DEINTERLEAVE_QGATE,
     PIPE_SIGMOID_GATE,
@@ -178,6 +182,8 @@ typedef enum {
     PIPE_MATVEC_IQ4_XS_DP4A_MOE,
     PIPE_MATVEC_IQ4_NL_DP4A_MOE,
     PIPE_MATVEC_IQ3_S_DP4A_MOE,
+    PIPE_ATTENTION_TILED_SINKS,
+    PIPE_MATVEC_Q5_1,
     PIPE_COUNT
 } PipelineID;
 
@@ -479,6 +485,13 @@ int gpu_ssm_preprocess(GpuBuf alpha, GpuBuf beta, GpuBuf ssma, GpuBuf dt_bias,
                        float rms_eps, int has_dt_bias);
 int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
                        GpuBuf y, int num_heads, int head_k_dim, int head_v_dim, int key_dim);
+int gpu_ssm_decay(GpuBuf state, GpuBuf alpha, int num_heads, int head_k_dim, int head_v_dim);
+int gpu_ssm_predict(GpuBuf state, GpuBuf qkv, GpuBuf pred,
+                    int num_heads, int head_k_dim, int head_v_dim, int key_dim);
+int gpu_ssm_update(GpuBuf state, GpuBuf qkv, GpuBuf beta, GpuBuf pred,
+                   int num_heads, int head_k_dim, int head_v_dim, int key_dim);
+int gpu_ssm_output(GpuBuf state, GpuBuf qkv, GpuBuf y,
+                   int num_heads, int head_k_dim, int head_v_dim, int key_dim);
 int gpu_ssm_norm_gate(GpuBuf y, GpuBuf z, GpuBuf norm_w,
                       int num_heads, int head_v_dim, float eps);
 

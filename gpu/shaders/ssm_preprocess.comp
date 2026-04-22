@@ -35,21 +35,20 @@ void main() {
         if (has_dt_bias != 0) {
             a += dt_bias[h];
         }
-        // softplus
-        float sp = log(1.0 + exp(a));
-        // decay = SSMA * softplus(alpha)
-        alpha_data[h] = ssma_data[h] * sp;
+        // softplus with threshold to avoid exp() overflow (matches llama.cpp)
+        float sp = (a > 20.0) ? a : log(1.0 + exp(a));
+        float gate = ssma_data[h] * sp;
+        alpha_data[h] = gate;
 
-        // sigmoid for beta
         float b = beta_data[h];
         beta_data[h] = 1.0 / (1.0 + exp(-b));
     }
 
-    // --- L2-normalize Q and K per KV group (GQA-style grouping) ---
-    // Only the first numKVGroups workgroups handle Q/K normalization.
+    // --- L2-normalize Q and K per KV group (matches llama.cpp l2_norm.comp) ---
     int num_kv_groups = key_dim / head_k_dim;
     if (int(h) < num_kv_groups) {
         uint qBase = h * uint(head_k_dim);
+
         float sq = 0.0;
         for (int i = int(tid); i < head_k_dim; i += 256) {
             float v = qkv[qBase + uint(i)];
@@ -61,16 +60,21 @@ void main() {
             if (tid < s) sdata[tid] += sdata[tid + s];
             barrier();
         }
-        float normQ = sqrt(sdata[0]);
-        if (normQ < rms_eps) normQ = rms_eps;
-        float invNormQ = 1.0 / normQ;
-
-        float qScale = invNormQ / sqrt(float(head_k_dim));
+        // Step 1: L2 normalize Q (matches llama.cpp: separate dispatch writes to memory)
+        float l2ScaleQ = inversesqrt(max(sdata[0], rms_eps));
+        barrier();
+        for (int i = int(tid); i < head_k_dim; i += 256) {
+            qkv[qBase + uint(i)] *= l2ScaleQ;
+        }
+        barrier();
+        // Step 2: Scale Q by 1/sqrt(headDim) (matches llama autoregressive path)
+        float qScale = 1.0 / sqrt(float(head_k_dim));
         for (int i = int(tid); i < head_k_dim; i += 256) {
             qkv[qBase + uint(i)] *= qScale;
         }
 
         uint kBase = uint(key_dim) + h * uint(head_k_dim);
+
         float sk = 0.0;
         for (int i = int(tid); i < head_k_dim; i += 256) {
             float v = qkv[kBase + uint(i)];
@@ -82,11 +86,10 @@ void main() {
             if (tid < s) sdata[tid] += sdata[tid + s];
             barrier();
         }
-        float normK = sqrt(sdata[0]);
-        if (normK < rms_eps) normK = rms_eps;
-        float invNormK = 1.0 / normK;
+        float scaleK = inversesqrt(max(sdata[0], rms_eps));
+        barrier();
         for (int i = int(tid); i < head_k_dim; i += 256) {
-            qkv[kBase + uint(i)] *= invNormK;
+            qkv[kBase + uint(i)] *= scaleK;
         }
     }
 }

@@ -101,7 +101,7 @@ func ForwardSSMLayer(
 		if layer.SSMDtBias != nil {
 			a += layer.SSMDtBias[h]
 		}
-		softplusA := float32(math.Log(1.0 + math.Exp(float64(a))))
+		softplusA := float32(stableSoftplus(float64(a)))
 		ssm.Alpha[h] = layer.SSMA[h] * softplusA
 
 		ssm.Beta[h] = ops.Sigmoid(ssm.Beta[h])
@@ -204,4 +204,11 @@ func l2Normalize(v []float32, eps float32) {
 	for i := range v {
 		v[i] *= scale
 	}
+}
+
+func stableSoftplus(x float64) float64 {
+	if x > 20 {
+		return x
+	}
+	return math.Log(1 + math.Exp(x))
 }

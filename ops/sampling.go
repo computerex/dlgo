@@ -13,6 +13,9 @@ type SamplerConfig struct {
 	TopP              float32
 	MinP              float32
 	RepetitionPenalty float32
+	FrequencyPenalty  float32
+	PresencePenalty   float32
+	NoRepeatNgramSize int
 }
 
 func DefaultSamplerConfig() SamplerConfig {
@@ -22,6 +25,9 @@ func DefaultSamplerConfig() SamplerConfig {
 		TopP:              0.9,
 		MinP:              0,
 		RepetitionPenalty: 1.1,
+		FrequencyPenalty:  0.0,
+		PresencePenalty:   0.0,
+		NoRepeatNgramSize: 8,
 	}
 }
 
@@ -48,6 +54,10 @@ func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng 
 	n := len(logits)
 
 	ApplyRepetitionPenalty(logits, recentTokens, cfg.RepetitionPenalty)
+	ApplyFrequencyPresencePenalty(logits, recentTokens, cfg.FrequencyPenalty, cfg.PresencePenalty)
+	if cfg.NoRepeatNgramSize > 0 {
+		ApplyNgramBlocking(logits, recentTokens, cfg.NoRepeatNgramSize)
+	}
 
 	if cfg.Temperature <= 0 || rng == nil {
 		return Argmax(logits)
@@ -166,6 +176,56 @@ func ApplyRepetitionPenalty(logits []float32, recentTokens []int32, penalty floa
 			logits[tok] /= penalty
 		} else {
 			logits[tok] *= penalty
+		}
+	}
+}
+
+// ApplyFrequencyPresencePenalty applies frequency and presence penalties.
+// Frequency penalty subtracts freq_penalty * count for each token.
+// Presence penalty subtracts presence_penalty once for any token that appeared.
+func ApplyFrequencyPresencePenalty(logits []float32, recentTokens []int32, freqPenalty, presencePenalty float32) {
+	if (freqPenalty == 0 && presencePenalty == 0) || len(recentTokens) == 0 {
+		return
+	}
+	counts := make(map[int32]int, len(recentTokens))
+	for _, tok := range recentTokens {
+		counts[tok]++
+	}
+	for tok, count := range counts {
+		if tok < 0 || int(tok) >= len(logits) {
+			continue
+		}
+		logits[tok] -= freqPenalty * float32(count)
+		logits[tok] -= presencePenalty
+	}
+}
+
+// ApplyNgramBlocking prevents generation of any n-gram that already appeared
+// in recentTokens. Sets the logit of the token that would complete a repeated
+// n-gram to -inf.
+func ApplyNgramBlocking(logits []float32, recentTokens []int32, ngramSize int) {
+	if ngramSize <= 1 || len(recentTokens) < ngramSize {
+		return
+	}
+	negInf := float32(math.Inf(-1))
+	n := len(recentTokens)
+	// The last (ngramSize-1) tokens form the current suffix we're trying to extend
+	suffix := recentTokens[n-(ngramSize-1):]
+
+	// Scan history for matching (ngramSize-1)-grams and ban the token that followed
+	for i := 0; i <= n-ngramSize; i++ {
+		match := true
+		for j := 0; j < ngramSize-1; j++ {
+			if recentTokens[i+j] != suffix[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			banned := recentTokens[i+ngramSize-1]
+			if banned >= 0 && int(banned) < len(logits) {
+				logits[banned] = negInf
+			}
 		}
 	}
 }

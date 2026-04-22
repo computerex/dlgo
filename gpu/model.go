@@ -171,6 +171,7 @@ type GpuRunState struct {
 	SSMAlpha Buf // [numHeads] alpha scratch
 	SSMBeta  Buf // [numHeads] beta scratch
 	SSMY     Buf // [valueDim] SSM output
+	SSMPred  Buf // [valueDim] prediction scratch for decomposed delta rule
 
 	// GatedQ attention scratch buffers
 	QFull Buf // [2*qDim] fused Q+gate output
@@ -245,6 +246,7 @@ func (rs *GpuRunState) AllocSSMScratch(qkvDim, valueDim, numHeads int) error {
 	rs.SSMAlpha = a.alloc(uint64(numHeads * 4))
 	rs.SSMBeta = a.alloc(uint64(numHeads * 4))
 	rs.SSMY = a.alloc(uint64(valueDim * 4))
+	rs.SSMPred = a.alloc(uint64(valueDim * 4))
 	if a.err != nil {
 		return fmt.Errorf("gpu: AllocSSMScratch: %w", a.err)
 	}
@@ -512,6 +514,7 @@ func (rs *GpuRunState) FreeAll() {
 	freeBuf(rs.SSMAlpha)
 	freeBuf(rs.SSMBeta)
 	freeBuf(rs.SSMY)
+	freeBuf(rs.SSMPred)
 
 	// GatedQ scratch buffers
 	freeBuf(rs.QFull)

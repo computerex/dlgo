@@ -36,8 +36,10 @@ type GpuPipeline struct {
 	HasMoE    bool
 	HasMLA    bool
 
-	RoPECosTable Buf
-	RoPESinTable Buf
+	RoPECosTable    Buf
+	RoPESinTable    Buf
+	RoPECosTableSWA Buf // SWA-specific RoPE tables (0 if not needed)
+	RoPESinTableSWA Buf
 
 	// Partial GPU offloading: layers [0, NumGPULayers) are on GPU,
 	// layers [NumGPULayers, NumLayers) run on CPU (RAM or mmap).
@@ -154,7 +156,11 @@ func estimateFixedVRAM(cfg llm.ModelConfig, maxSeqLen int) int64 {
 	if ropeDim <= 0 || ropeDim > int64(cfg.HeadDim) {
 		ropeDim = int64(cfg.HeadDim)
 	}
-	total += 2 * int64(maxSeqLen) * (ropeDim / 2) * 4
+	ropeTableBytes := 2 * int64(maxSeqLen) * (ropeDim / 2) * 4
+	total += ropeTableBytes
+	if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
+		total += ropeTableBytes // second set for SWA layers
+	}
 
 	// q8_1 scratch buffer for dp4a path
 	maxDim := dim
@@ -611,6 +617,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	var rs *GpuRunState
 	var kv *GpuKVCache
 	var ropeCosTable, ropeSinTable Buf
+	var ropeCosTableSWA, ropeSinTableSWA Buf
 	var layerConfs []*LayerConf
 	var q8_1Scratch Buf
 	var isPartial bool
@@ -680,9 +687,43 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				}
 			}
 
+			// Upload SWA RoPE tables if per-layer RoPE is needed
+			if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
+				var swaCos, swaSin []float32
+				if cpuPipeline.RunState != nil {
+					swaCos, swaSin = cpuPipeline.RunState.RoPETablesSWA()
+				}
+				if swaCos != nil && swaSin != nil {
+					ropeCosTableSWA, err = UploadF32Slice(swaCos)
+					if err != nil {
+						return fmt.Errorf("upload SWA RoPE cos table: %w", err)
+					}
+					ropeSinTableSWA, err = UploadF32Slice(swaSin)
+					if err != nil {
+						return fmt.Errorf("upload SWA RoPE sin table: %w", err)
+					}
+				} else {
+					ropeDimSWA := cfg.RopeDim
+					if ropeDimSWA <= 0 || ropeDimSWA > cfg.HeadDim {
+						ropeDimSWA = cfg.HeadDim
+					}
+					swaCos, swaSin := ops.RoPEFrequencyTable(maxSeqLen, ropeDimSWA, cfg.RopeFreqBaseSWA)
+					ropeCosTableSWA, err = UploadF32Slice(swaCos)
+					if err != nil {
+						return fmt.Errorf("upload SWA RoPE cos table: %w", err)
+					}
+					ropeSinTableSWA, err = UploadF32Slice(swaSin)
+					if err != nil {
+						return fmt.Errorf("upload SWA RoPE sin table: %w", err)
+					}
+				}
+			}
+
 			tempPipe := &GpuPipeline{
-				RoPECosTable: ropeCosTable,
-				RoPESinTable: ropeSinTable,
+				RoPECosTable:    ropeCosTable,
+				RoPESinTable:    ropeSinTable,
+				RoPECosTableSWA: ropeCosTableSWA,
+				RoPESinTableSWA: ropeSinTableSWA,
 			}
 			layerConfs = BuildLayerConfs(m, gm, tempPipe, rs, kv)
 
@@ -757,10 +798,13 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		}
 		freeBuf(ropeCosTable)
 		freeBuf(ropeSinTable)
+		freeBuf(ropeCosTableSWA)
+		freeBuf(ropeSinTableSWA)
 		freeBuf(q8_1Scratch)
 		Sync()
 		ResetBufferTable()
 		ropeCosTable, ropeSinTable, q8_1Scratch = 0, 0, 0
+		ropeCosTableSWA, ropeSinTableSWA = 0, 0
 		gm, rs, kv = nil, nil, nil
 		layerConfs = nil
 
@@ -827,6 +871,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		IsPartialGPU:    isPartial,
 		RoPECosTable:    ropeCosTable,
 		RoPESinTable:    ropeSinTable,
+		RoPECosTableSWA: ropeCosTableSWA,
+		RoPESinTableSWA: ropeSinTableSWA,
 	}
 
 	// Use fused forward when ALL layers are on GPU (including MoE models).
@@ -834,6 +880,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// Go side then handles MoE FFN dispatch.
 	if !isPartial {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
+	}
+	if os.Getenv("DLGO_NO_FUSED") == "1" {
+		pipe.UseFusedForward = false
 	}
 
 	// GatedQ and SSM state were allocated inside the retry loop (so the VRAM
@@ -908,7 +957,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	}
 
 	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM).
-	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn
+	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn || (pipe.HasSSM && (cpuSSMDelta || cpuSSMFull))
 	if needCPUState {
 		pipe.CPURunState = llm.NewRunState(cfg, maxSeqLen)
 
@@ -1002,6 +1051,8 @@ func (p *GpuPipeline) FreeAll() {
 	freeBuf(p.Q8_1Scratch)
 	freeBuf(p.RoPECosTable)
 	freeBuf(p.RoPESinTable)
+	freeBuf(p.RoPECosTableSWA)
+	freeBuf(p.RoPESinTableSWA)
 	ResetBufferTable()
 }
 
@@ -1119,6 +1170,88 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 
+	// Sync GPU SSM state to CPU after prefill so CPU delta rule / CPU SSM
+	// paths start from the correct recurrent state.
+	// When cpuSSMDelta ran during prefill, CPU state64 is already authoritative;
+	// skip GPU→CPU state download. When only cpuSSMFull (no cpuSSMDelta),
+	// GPU handled the delta rule during prefill, so download GPU state.
+	if p.HasSSM && p.CPURunState != nil && p.CPURunState.SSMState != nil {
+		mcfg2 := p.CPUModel.Config
+		numHeads := mcfg2.SSMTimeStepRank
+		headVDim := mcfg2.SSMInnerSize / numHeads
+		headKDim := mcfg2.SSMStateSize
+		numKVGroups := mcfg2.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		convK := mcfg2.SSMConvKernel
+		stateSize := numHeads * headKDim * headVDim
+		convBufSize := convK * qkvDim
+		gpuOwnsState := !cpuSSMDelta
+		needSync := false
+		for l := 0; l < mcfg2.NumLayers; l++ {
+			gl := &p.GpuModel.Layers[l]
+			cpuState := p.CPURunState.SSMState.Layers[l]
+			if gl.SSMState == 0 || cpuState == nil {
+				continue
+			}
+			if gpuOwnsState && (cpuSSMDelta || cpuSSMFull) {
+				if len(cpuState.State) < stateSize {
+					cpuState.State = make([]float32, stateSize)
+				}
+				DownloadF32(gl.SSMState, cpuState.State[:stateSize])
+				if cpuSSMDelta {
+					s64 := cpuState.EnsureState64()
+					for i := 0; i < stateSize; i++ {
+						s64[i] = float64(cpuState.State[i])
+					}
+				}
+				needSync = true
+			}
+			if cpuSSMFull {
+				if len(cpuState.ConvBuf) < convBufSize {
+					cpuState.ConvBuf = make([]float32, convBufSize)
+				}
+				DownloadF32(gl.SSMConvBuf, cpuState.ConvBuf[:convBufSize])
+				needSync = true
+			}
+		}
+		if needSync {
+			Sync()
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu] synced SSM state from GPU to CPU after prefill (gpuOwns=%v, %d layers)\n", gpuOwnsState, mcfg2.NumLayers)
+		}
+	}
+
+	// DEBUG: zero SSM state/conv after prefill to isolate corruption
+	if zeroMode := os.Getenv("DLGO_ZERO_SSM_AFTER_PREFILL"); zeroMode != "" && p.HasSSM {
+		mcfg2 := p.CPUModel.Config
+		numHeads := mcfg2.SSMTimeStepRank
+		headVDim := mcfg2.SSMInnerSize / numHeads
+		headKDim := mcfg2.SSMStateSize
+		numKVGroups := mcfg2.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		convK := mcfg2.SSMConvKernel
+		for l := 0; l < mcfg2.NumLayers; l++ {
+			gl := &p.GpuModel.Layers[l]
+			if gl.SSMState != 0 {
+				if zeroMode == "state" || zeroMode == "1" {
+					ZeroFill(gl.SSMState, uint64(numHeads*headKDim*headVDim*4))
+				}
+				if zeroMode == "conv" || zeroMode == "1" {
+					ZeroFill(gl.SSMConvBuf, uint64(convK*qkvDim*4))
+				}
+			}
+		}
+		Sync()
+		fmt.Fprintf(os.Stderr, "[dlgo/gpu] DEBUG: zeroed SSM %s after prefill\n", zeroMode)
+	}
+
 	// Generate
 	genStart := time.Now()
 	var generated []int32
@@ -1206,9 +1339,6 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		nextToken = gpuGrammarSample(p.LogitsBuf)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
-		if len(recentTokens) > 256 {
-			recentTokens = recentTokens[1:]
-		}
 
 		// Advance grammar state
 		if cfg.Grammar != nil && !eosTokens[int32(nextToken)] {

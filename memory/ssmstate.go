@@ -6,6 +6,10 @@ type SSMLayerState struct {
 	// [numHeads * headKDim * headVDim]. Updated every token.
 	State []float32
 
+	// State64 holds the recurrent state in float64 for precision-critical CPU
+	// delta rule. Allocated lazily when the CPU delta rule path first runs.
+	State64 []float64
+
 	// ConvBuf holds the last (kernelSize-1) input vectors for the causal conv1d.
 	// Stored as [(kernelSize-1) * channels], newest at the end.
 	ConvBuf []float32
@@ -32,10 +36,22 @@ func NewSSMLayerState(numHeads, numKVGroups, headKDim, headVDim, channels, convK
 	}
 }
 
+// EnsureState64 lazily allocates the float64 state array and returns it.
+func (s *SSMLayerState) EnsureState64() []float64 {
+	n := s.NumHeads * s.HeadKDim * s.HeadVDim
+	if len(s.State64) < n {
+		s.State64 = make([]float64, n)
+	}
+	return s.State64
+}
+
 // Reset zeros the recurrent state and conv buffer.
 func (s *SSMLayerState) Reset() {
 	for i := range s.State {
 		s.State[i] = 0
+	}
+	for i := range s.State64 {
+		s.State64[i] = 0
 	}
 	for i := range s.ConvBuf {
 		s.ConvBuf[i] = 0

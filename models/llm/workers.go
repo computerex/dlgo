@@ -203,6 +203,72 @@ func (rs *RunState) RoPETables() (cosTable, sinTable []float32) {
 	return rs.ropeCos, rs.ropeSin
 }
 
+// RoPETablesSWA returns the SWA-specific RoPE tables (nil if not set).
+func (rs *RunState) RoPETablesSWA() (cosTable, sinTable []float32) {
+	return rs.ropeCosSWA, rs.ropeSinSWA
+}
+
+// PrecomputeSWARoPE builds separate cos/sin tables for SWA layers with a
+// different frequency base (e.g. gpt-oss ISWA uses theta=10000 for SWA,
+// theta=150000 for full attention).
+func (rs *RunState) PrecomputeSWARoPE(maxSeqLen, ropeDim, headDim int, freqBase float32) {
+	if maxSeqLen <= 0 || headDim <= 0 {
+		return
+	}
+	if ropeDim <= 0 || ropeDim > headDim {
+		ropeDim = headDim
+	}
+	half := ropeDim / 2
+	if half <= 0 {
+		return
+	}
+	rs.ropeCosSWA = make([]float32, maxSeqLen*half)
+	rs.ropeSinSWA = make([]float32, maxSeqLen*half)
+	for pos := 0; pos < maxSeqLen; pos++ {
+		for i := 0; i < half; i++ {
+			theta := 1.0 / math.Pow(float64(freqBase), float64(2*i)/float64(ropeDim))
+			angle := float64(pos) * theta
+			rs.ropeCosSWA[pos*half+i] = float32(math.Cos(angle))
+			rs.ropeSinSWA[pos*half+i] = float32(math.Sin(angle))
+		}
+	}
+}
+
+// applyRoPEWithTables applies RoPE using the given cos/sin tables.
+func (rs *RunState) applyRoPEWithTables(vec []float32, pos int, cos, sin []float32) {
+	if cos == nil || sin == nil || len(vec) < rs.ropeHeadDim {
+		return
+	}
+	rd := rs.ropeDim
+	if rd <= 0 {
+		rd = rs.ropeHeadDim
+	}
+	half := rd / 2
+	base := pos * half
+	if base+half > len(cos) {
+		return
+	}
+	if rs.ropeNeox {
+		for i := 0; i < half; i++ {
+			c := cos[base+i]
+			s := sin[base+i]
+			v0 := vec[i]
+			v1 := vec[i+half]
+			vec[i] = v0*c - v1*s
+			vec[i+half] = v0*s + v1*c
+		}
+	} else {
+		for i := 0; i < half; i++ {
+			c := cos[base+i]
+			s := sin[base+i]
+			v0 := vec[2*i]
+			v1 := vec[2*i+1]
+			vec[2*i] = v0*c - v1*s
+			vec[2*i+1] = v0*s + v1*c
+		}
+	}
+}
+
 // ApplyRoPEFast applies precomputed RoPE to vec in-place.
 // vec must be one head's worth [headDim]; pos is the token position.
 // Only the first ropeDim dimensions are rotated; the rest pass through unchanged.
