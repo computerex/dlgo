@@ -1762,24 +1762,40 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
         if (rc != GPU_OK) return rc;
     }
 
-    // 3. TopK + QuantizeQ8_1 (independent, single barrier)
+    // 3. TopK (+ optional Q8_1 quantize — only if gate/up types benefit from dp4a)
     gpu_barrier();
     rc = gpu_moe_topk(mc->moe_logits, mc->moe_topk_idx, mc->moe_topk_w,
                       mc->n_experts, n_used, mc->gating_func,
                       mc->weights_norm, mc->weights_scale);
     if (rc != GPU_OK) return rc;
-    rc = gpu_quantize_q8_1(mc->q8_input, mc->ffn_norm, dim);
-    if (rc != GPU_OK) return rc;
+    int gate_dp4a = dp4a_safe_type(mc->gate_type, dim);
+    int up_dp4a   = dp4a_safe_type(mc->up_type, dim);
+    if (gate_dp4a || up_dp4a) {
+        rc = gpu_quantize_q8_1(mc->q8_input, mc->ffn_norm, dim);
+        if (rc != GPU_OK) return rc;
+    }
 
-    // 4. Gate + Up MoE projections (cols = dim = input dimension)
+    // 4. Gate + Up MoE projections — use dp4a or native per tensor type
     gpu_barrier();
-    rc = gpu_moe_matvec_dp4a(mc->gate_scratch, mc->gate_w, mc->q8_input, mc->moe_topk_idx,
-                              exp_dim, dim, mc->gate_type,
-                              mc->gate_stride, mc->gate_base, 1, n_used);
+    if (gate_dp4a) {
+        rc = gpu_moe_matvec_dp4a(mc->gate_scratch, mc->gate_w, mc->q8_input, mc->moe_topk_idx,
+                                  exp_dim, dim, mc->gate_type,
+                                  mc->gate_stride, mc->gate_base, 1, n_used);
+    } else {
+        rc = gpu_moe_matvec_native(mc->gate_scratch, mc->gate_w, mc->ffn_norm, mc->moe_topk_idx,
+                                    exp_dim, dim, mc->gate_type,
+                                    mc->gate_stride, mc->gate_base, 1, n_used);
+    }
     if (rc != GPU_OK) return rc;
-    rc = gpu_moe_matvec_dp4a(mc->up_scratch, mc->up_w, mc->q8_input, mc->moe_topk_idx,
-                              exp_dim, dim, mc->up_type,
-                              mc->up_stride, mc->up_base, 1, n_used);
+    if (up_dp4a) {
+        rc = gpu_moe_matvec_dp4a(mc->up_scratch, mc->up_w, mc->q8_input, mc->moe_topk_idx,
+                                  exp_dim, dim, mc->up_type,
+                                  mc->up_stride, mc->up_base, 1, n_used);
+    } else {
+        rc = gpu_moe_matvec_native(mc->up_scratch, mc->up_w, mc->ffn_norm, mc->moe_topk_idx,
+                                    exp_dim, dim, mc->up_type,
+                                    mc->up_stride, mc->up_base, 1, n_used);
+    }
     if (rc != GPU_OK) return rc;
 
     // 5. Activation (SwiGLU or SwiGLU_OAI, with optional bias)
@@ -1816,16 +1832,21 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
         if (rc != GPU_OK) return rc;
     }
 
-    // 6. Quantize hidden states for down projection
+    // 6–7. Down projections — dp4a or native depending on type
+    int down_dp4a = dp4a_safe_type(mc->down_type, exp_dim);
     gpu_barrier();
-    rc = gpu_quantize_q8_1(mc->q8_down_packed, hidden_buf, total_exp_dim);
-    if (rc != GPU_OK) return rc;
-
-    // 7. Down projections
-    gpu_barrier();
-    rc = gpu_moe_matvec_dp4a(mc->out_scratch, mc->down_w, mc->q8_down_packed, mc->moe_topk_idx,
-                              dim, exp_dim, mc->down_type,
-                              mc->down_stride, 0, 0, n_used);
+    if (down_dp4a) {
+        rc = gpu_quantize_q8_1(mc->q8_down_packed, hidden_buf, total_exp_dim);
+        if (rc != GPU_OK) return rc;
+        gpu_barrier();
+        rc = gpu_moe_matvec_dp4a(mc->out_scratch, mc->down_w, mc->q8_down_packed, mc->moe_topk_idx,
+                                  dim, exp_dim, mc->down_type,
+                                  mc->down_stride, 0, 0, n_used);
+    } else {
+        rc = gpu_moe_matvec_native(mc->out_scratch, mc->down_w, hidden_buf, mc->moe_topk_idx,
+                                    dim, exp_dim, mc->down_type,
+                                    mc->down_stride, 0, 0, n_used);
+    }
     if (rc != GPU_OK) return rc;
 
     // 8. Weighted accumulation
@@ -1843,6 +1864,11 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
         gpu_barrier();
         int sh_gate_dp4a = mc->q8_input && dp4a_safe_type(mc->sh_gate_type, mc->sh_gate_cols);
         int sh_up_dp4a   = mc->q8_input && dp4a_safe_type(mc->sh_up_type, mc->sh_up_cols);
+        if ((sh_gate_dp4a || sh_up_dp4a) && !(gate_dp4a || up_dp4a)) {
+            rc = gpu_quantize_q8_1(mc->q8_input, mc->ffn_norm, dim);
+            if (rc != GPU_OK) return rc;
+            gpu_barrier();
+        }
         if (sh_gate_dp4a)
             rc = gpu_matvec_dp4a(mc->sh_gate_scratch, mc->sh_gate_w, mc->q8_input,
                                  mc->sh_gate_rows, mc->sh_gate_cols, mc->sh_gate_type);
@@ -3952,19 +3978,24 @@ int gpu_batch_add_bias2(GpuBuf dst, GpuBuf bias, GpuBuf scratch,
 }
 
 // dp4a_safe_type: returns 1 if the dp4a path should be used for this type+size.
-// Based on llama.cpp's ggml_vk_should_use_mmvq heuristic for post-Turing NVIDIA:
-//  - Q3_K, Q6_K: skip (2-byte alignment issues in dp4a shaders)
-//  - Q8_0: skip (float dequant is cheap enough that quantize+dp4a overhead isn't worth it)
+// Matches llama.cpp's ggml_vk_should_use_mmvq heuristic for post-Turing NVIDIA:
+//  - Q3_K, Q6_K: never (2-byte alignment issues)
+//  - Q8_0: never (float dequant is cheap enough)
+//  - k <= 4096: never (quantization overhead outweighs dp4a benefit at small dims)
+//  - MXFP4, Q8_0 on post-Turing: never (only benefits pre-Turing)
 static int dp4a_safe_type(int qtype, int cols) {
-    (void)cols;
     if (qtype == QTYPE_Q3_K || qtype == QTYPE_Q6_K) return 0;
     if (qtype == QTYPE_Q8_0) return 0;
+    if (cols <= 4096) return 0;
     switch (qtype) {
     case QTYPE_Q4_0: case QTYPE_Q5_0:
     case QTYPE_Q4_K: case QTYPE_Q5_K:
-    case 39: /* MXFP4 */
-    /* IQ3_XXS, IQ4_XS, IQ4_NL, IQ3_S: llama.cpp does NOT use dp4a for these */
+    case QTYPE_IQ3_XXS: case QTYPE_IQ4_XS:
+    case 20: /* IQ4_NL */
+    case QTYPE_IQ3_S:
         return 1;
+    case 39: /* MXFP4 — llama.cpp disables on post-Turing NVIDIA */
+        return 0;
     default:
         return 0;
     }

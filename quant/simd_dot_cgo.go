@@ -215,7 +215,8 @@ func SIMDSwiGLU(out, gate, up []float32, n int) {
 	C.vec_swiglu((*C.float)(unsafe.Pointer(&out[0])), (*C.float)(unsafe.Pointer(&gate[0])), (*C.float)(unsafe.Pointer(&up[0])), C.int(n))
 }
 
-// SIMDSoftmax performs in-place softmax using AVX2 fast exp approximation.
+// SIMDSoftmax performs in-place softmax using AVX2 fast exp approximation
+// with double-precision sum accumulation to match llama.cpp's ggml_float precision.
 func SIMDSoftmax(x []float32) {
 	C.vec_softmax((*C.float)(unsafe.Pointer(&x[0])), C.int(len(x)))
 }

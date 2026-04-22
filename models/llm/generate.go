@@ -338,9 +338,15 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 
 	// For architectures with structural tokens that should never appear in output,
 	// register them as stop tokens for fast token-level detection.
-	for _, special := range []string{"<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|call|>"} {
-		if id, ok := tok.TokenToID[special]; ok {
-			m.Config.StopTokens = append(m.Config.StopTokens, id)
+	// Harmony-template models (gpt-oss) use these tokens as part of their
+	// multi-channel generation protocol (analysis → final), so they must NOT
+	// be registered as stop tokens — only <|return|> (the true EOS) stops generation.
+	arch := GetArchDescriptor(m.Config.Architecture)
+	if arch.ChatTemplate != "harmony" {
+		for _, special := range []string{"<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|call|>"} {
+			if id, ok := tok.TokenToID[special]; ok {
+				m.Config.StopTokens = append(m.Config.StopTokens, id)
+			}
 		}
 	}
 
@@ -639,7 +645,8 @@ done:
 
 // collectStopStrings returns text-level stop sequences for the model's arch.
 func collectStopStrings(cfg ModelConfig) []string {
-	return []string{
+	arch := GetArchDescriptor(cfg.Architecture)
+	base := []string{
 		"<end_of_turn><eos>",
 		"<eos>",
 		"<|im_end|>",
@@ -652,12 +659,17 @@ func collectStopStrings(cfg ModelConfig) []string {
 		"<|observation|>",
 		"<end_of_turn>",
 		"<|eot_id|>",
-		"<|channel|>",
-		"<|start|>",
-		"<|message|>",
-		"<|constrain|>",
-		"<|call|>",
 	}
+	if arch.ChatTemplate != "harmony" {
+		base = append(base,
+			"<|channel|>",
+			"<|start|>",
+			"<|message|>",
+			"<|constrain|>",
+			"<|call|>",
+		)
+	}
+	return base
 }
 
 // TrimStopText removes trailing stop strings and whitespace from generated text.
@@ -666,6 +678,10 @@ func TrimStopText(text string, cfg ModelConfig) string {
 }
 
 func trimStopText(text string, cfg ModelConfig) string {
+	arch := GetArchDescriptor(cfg.Architecture)
+	if arch.ChatTemplate == "harmony" {
+		text = extractHarmonyFinal(text)
+	}
 	for {
 		trimmed := strings.TrimRight(text, " \t\r\n")
 		for _, ss := range collectStopStrings(cfg) {
@@ -677,6 +693,17 @@ func trimStopText(text string, cfg ModelConfig) string {
 		}
 		text = trimmed
 	}
+}
+
+// extractHarmonyFinal extracts the "final" channel content from Harmony
+// multi-channel output. The model generates analysis → final channels;
+// we return only the final channel's content.
+func extractHarmonyFinal(text string) string {
+	const marker = "<|channel|>final<|message|>"
+	if idx := strings.LastIndex(text, marker); idx >= 0 {
+		return text[idx+len(marker):]
+	}
+	return text
 }
 
 // GenerateTextWithStopStrings is like GenerateText but also handles text-level

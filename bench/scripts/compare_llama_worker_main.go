@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/computerex/dlgo/gpu"
 	"github.com/computerex/dlgo/models/llm"
@@ -26,13 +27,22 @@ type CompareResult struct {
 
 func main() {
 	if len(os.Args) < 5 {
-		fmt.Fprintf(os.Stderr, "usage: compare_worker <name> <gguf_path> <prompt> <output_json>\n")
+		fmt.Fprintf(os.Stderr, "usage: compare_worker <name> <gguf_path> <prompt> <output_json> [max_tokens] [context]\n")
 		os.Exit(1)
 	}
 	name := os.Args[1]
 	ggufPath := os.Args[2]
 	prompt := os.Args[3]
 	outPath := os.Args[4]
+
+	maxTokens := 150
+	ctxLen := 4096
+	if len(os.Args) > 5 {
+		if v, err := strconv.Atoi(os.Args[5]); err == nil { maxTokens = v }
+	}
+	if len(os.Args) > 6 {
+		if v, err := strconv.Atoi(os.Args[6]); err == nil { ctxLen = v }
+	}
 
 	res := CompareResult{Name: name}
 	defer func() {
@@ -46,7 +56,7 @@ func main() {
 	}
 	defer gpu.Shutdown()
 
-	pipe, err := llm.NewPipeline(ggufPath, 2048)
+	pipe, err := llm.NewPipeline(ggufPath, ctxLen)
 	if err != nil {
 		res.Err = fmt.Sprintf("load: %v", err)
 		return
@@ -66,11 +76,15 @@ func main() {
 	chatPrompt := llm.FormatChat(cfg, "You are a helpful assistant.", prompt)
 
 	genCfg := llm.DefaultGenerateConfig()
-	genCfg.MaxTokens = 150
+	genCfg.MaxTokens = maxTokens
 	genCfg.Seed = 42
 	genCfg.Sampler.Temperature = 0
 
+	gpu.PerfReset()
 	result, err := gpuPipe.GenerateDetailed(chatPrompt, genCfg)
+	gpuUs := gpu.PerfGetGpuUs()
+	dispatches := gpu.PerfGetDispatches()
+	barriers := gpu.PerfGetBarriers()
 	if err != nil {
 		res.Err = fmt.Sprintf("gen: %v", err)
 		return
@@ -83,6 +97,12 @@ func main() {
 	res.TotalTokens = result.TotalTokens
 	res.PromptTokens = result.PromptTokens
 
+	genTokens := result.TotalTokens - result.PromptTokens
+	if genTokens < 1 { genTokens = 1 }
 	fmt.Fprintf(os.Stderr, "  dlgo %s: %.1f tok/s, prefill=%.0fms, gen=%.0fms, %d tok\n",
 		name, res.TokS, res.PrefillMs, res.GenerateMs, res.TotalTokens)
+	fmt.Fprintf(os.Stderr, "  [PERF] GPU fence-wait: %.1fms, dispatches: %d (%.0f/tok), barriers: %d (%.0f/tok)\n",
+		gpuUs/1000.0, dispatches, float64(dispatches)/float64(genTokens), barriers, float64(barriers)/float64(genTokens))
+	fmt.Fprintf(os.Stderr, "  [PERF] Host overhead: %.1fms (gen=%.1fms - gpu=%.1fms)\n",
+		result.GenerateTimeMs - gpuUs/1000.0, result.GenerateTimeMs, gpuUs/1000.0)
 }

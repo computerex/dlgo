@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const llamaCLI = `C:\Users\mohd\Downloads\llama-vulkan\llama-cli.exe`
+const llamaCLI = `C:\projects\llama.cpp\build\bin\Release\llama-cli.exe`
 
 type modelSpec struct {
 	name, path string

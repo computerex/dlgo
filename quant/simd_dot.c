@@ -1791,7 +1791,7 @@ void vec_softmax(float* x, int n) {
         if (x[i] > maxVal) maxVal = x[i];
     }
 
-    // exp(x[i] - max) and sum
+    // exp(x[i] - max) and sum (accumulate in double for precision, matching llama.cpp)
     __m256 voff = _mm256_set1_ps(maxVal);
     __m256 vsum = _mm256_setzero_ps();
     i = 0;
@@ -1805,14 +1805,14 @@ void vec_softmax(float* x, int n) {
     lo = _mm_add_ps(lo, hi);
     lo = _mm_hadd_ps(lo, lo);
     lo = _mm_hadd_ps(lo, lo);
-    float sum = _mm_cvtss_f32(lo);
+    double sum = (double)_mm_cvtss_f32(lo);
     for (; i < n; i++) {
         x[i] = expf(x[i] - maxVal);
-        sum += x[i];
+        sum += (double)x[i];
     }
 
     // Normalize
-    __m256 vinv = _mm256_set1_ps(1.0f / sum);
+    __m256 vinv = _mm256_set1_ps((float)(1.0 / sum));
     i = 0;
     for (; i <= n - 8; i += 8) {
         _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), vinv));
@@ -2051,12 +2051,12 @@ void causal_attn_head(
     for (int t = 1; t < seq_len; t++) {
         if (scores[t] > maxv) maxv = scores[t];
     }
-    float sum = 0.0f;
+    double sum = 0.0;
     for (int t = 0; t < seq_len; t++) {
         scores[t] = expf(scores[t] - maxv);
-        sum += scores[t];
+        sum += (double)scores[t];
     }
-    float inv_sum = 1.0f / sum;
+    float inv_sum = (float)(1.0 / sum);
     for (int t = 0; t < seq_len; t++) {
         scores[t] *= inv_sum;
     }

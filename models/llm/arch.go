@@ -62,16 +62,20 @@ func applyArchDefaults(config *ModelConfig) {
 	if desc.EmbedScaleMode == "sqrt_dim" && config.EmbeddingDim > 0 {
 		config.EmbedScale = float32(math.Sqrt(float64(config.EmbeddingDim)))
 	}
-	// Gemma 2/3: alternating sliding window (even layers = sliding, odd layers = full)
-	if (config.Architecture == "gemma2" || config.Architecture == "gemma3") &&
+	// Gemma 2: alternating sliding window (even layers = sliding, odd layers = full)
+	if config.Architecture == "gemma2" &&
 		config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
 		config.SlidingWindowPattern = 2
 	}
-	// gpt-oss (OpenAI MoE) architecture-specific defaults matching llama.cpp
-	// Pattern: 3 sliding window layers + 1 full attention (period = 4)
+	// Gemma 3: every 6th layer is full attention, rest are SWA (matches llama.cpp default)
+	if config.Architecture == "gemma3" &&
+		config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
+		config.SlidingWindowPattern = 6
+	}
+	// gpt-oss (OpenAI MoE ISWA): alternating SWA/full (period = 2, matches llama.cpp default)
 	if config.Architecture == "gpt-oss" {
 		if config.SlidingWindow > 0 && config.SlidingWindowPattern == 0 {
-			config.SlidingWindowPattern = 4
+			config.SlidingWindowPattern = 2
 		}
 		if config.ExpertCount > 0 {
 			config.ExpertGatingFunc = 3
@@ -403,7 +407,9 @@ func formatHarmonyMessages(messages []Message, opt FormatOptions) string {
 		}
 	}
 
-	// 4. Generation prompt: force the final channel for direct content
-	b.WriteString("<|start|>assistant<|channel|>final<|message|>")
+	// 4. Generation prompt — let the model choose its channel (analysis/final).
+	// The official template uses just "<|start|>assistant" so the model can
+	// decide to reason first (analysis channel) before giving the final answer.
+	b.WriteString("<|start|>assistant")
 	return b.String()
 }
