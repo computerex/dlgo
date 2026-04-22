@@ -71,6 +71,7 @@ type LayerConf struct{}
 
 func NewLayerConf() *LayerConf                                                 { return nil }
 func (lc *LayerConf) HasInlineMoE() bool                                       { return false }
+func (lc *LayerConf) SetF32KV(v bool)                                          {}
 func (lc *LayerConf) SetMoEConf(mc *MoEFFNConf, useNative, hasSharedExpert bool) {}
 func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf) {}
 func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, bo Buf, qn, kn Buf) {}

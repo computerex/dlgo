@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
@@ -378,7 +379,7 @@ type GpuKVCache struct {
 	Len     int
 }
 
-// NewGpuKVCache allocates GPU buffers for FP16 KV cache.
+// NewGpuKVCache allocates GPU buffers for KV cache.
 // gpuLayers controls how many layers get GPU-allocated KV buffers.
 // needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
 func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) (*GpuKVCache, error) {
@@ -388,8 +389,12 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 		KVDim:   kvDim,
 		MaxSeq:  maxSeqLen,
 	}
-	// FP16 KV cache: each pair of f16 values is packed into one uint32 (2 bytes each)
-	size := uint64(maxSeqLen * kvDim * 2)
+	bytesPerElem := 2 // FP16: packed half2
+	if os.Getenv("DLGO_F32_KV") == "1" {
+		bytesPerElem = 4 // F32
+		fmt.Println("[dlgo/gpu] F32 KV cache enabled (DLGO_F32_KV=1)")
+	}
+	size := uint64(maxSeqLen * kvDim * bytesPerElem)
 	a := allocChecker{}
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		if needsKV != nil && !needsKV[l] {

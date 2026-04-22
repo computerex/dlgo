@@ -4081,19 +4081,33 @@ int gpu_forward_layer(const GpuLayerConf* lc, int pos, int seq_len, float scale,
         gpu_barrier();
         gpu_rope(lc->q, lc->k, lc->rope_cos_table, lc->rope_sin_table, num_heads, num_kv_heads, head_dim, lc->rope_dim, pos, lc->rope_neox);
         gpu_barrier();
-        gpu_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        if (lc->f32_kv) {
+            gpu_kv_store(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        } else {
+            gpu_kv_store_f16(lc->k_cache, lc->v_cache, lc->k, lc->v, pos, kv_dim);
+        }
 
         {
             gpu_barrier();
             int win_start = 0;
             if (lc->sliding_window > 0 && seq_len > lc->sliding_window)
                 win_start = seq_len - lc->sliding_window;
-            if (lc->attn_sinks) {
-                gpu_attention_f16_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                        lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+            if (lc->f32_kv) {
+                if (lc->attn_sinks) {
+                    gpu_attention_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                        lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, win_start);
+                } else {
+                    gpu_attention_tiled_f32(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                            num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+                }
             } else {
-                gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
-                                  num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+                if (lc->attn_sinks) {
+                    gpu_attention_f16_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                            lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+                } else {
+                    gpu_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
+                                      num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, lc->attn_logit_softcap, win_start);
+                }
             }
         }
 

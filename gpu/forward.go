@@ -20,6 +20,7 @@ var inlineMoEOnce sync.Once
 var cpuSSMDelta = os.Getenv("DLGO_CPU_SSM_DELTA") == "1"
 var cpuSSMFull = os.Getenv("DLGO_CPU_SSM") == "1"
 var cpuMoE = os.Getenv("DLGO_CPU_MOE") == "1"
+var f32KV = os.Getenv("DLGO_F32_KV") == "1"
 var cpuMoEOnce sync.Once
 var moeDiag = os.Getenv("DLGO_MOE_DIAG") == "1"
 var moeDiagCount int
@@ -841,6 +842,7 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
 			cosTable, sinTable,
 			ffnType, resType)
+		lc.SetF32KV(f32KV)
 
 		confs[l] = lc
 	}

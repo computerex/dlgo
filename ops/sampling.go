@@ -84,12 +84,13 @@ func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng 
 	nc := len(candidates)
 	probs := make([]float32, nc)
 	maxLogit := candidates[0].logit
-	var sum float32
+	var sumD float64
 	for i := 0; i < nc; i++ {
-		probs[i] = fastExpf(candidates[i].logit - maxLogit)
-		sum += probs[i]
+		p := float32(math.Exp(float64(candidates[i].logit - maxLogit)))
+		probs[i] = p
+		sumD += float64(p)
 	}
-	invSum := float32(1.0) / sum
+	invSum := float32(1.0 / sumD)
 	for i := range probs {
 		probs[i] *= invSum
 	}
@@ -124,17 +125,17 @@ func SampleToken(logits []float32, cfg SamplerConfig, recentTokens []int32, rng 
 		candidates = candidates[:nc]
 	}
 
-	pSum := float32(0)
+	var pSumD float64
 	for _, p := range probs {
-		pSum += p
+		pSumD += float64(p)
 	}
-	invPSum := float32(1.0) / pSum
 
-	r := rng.Float32()
-	var cumSum float32
+	r := rng.Float64()
+	var cumSumD float64
+	tgt := pSumD * r
 	for i, p := range probs {
-		cumSum += p * invPSum
-		if cumSum >= r {
+		cumSumD += float64(p)
+		if cumSumD >= tgt {
 			return candidates[i].idx
 		}
 	}

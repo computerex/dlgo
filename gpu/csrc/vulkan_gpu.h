@@ -459,6 +459,7 @@ typedef struct {
     const GpuMoEConf* moe_conf;
     int moe_use_native;  // 1=native matvec, 0=dp4a
     int moe_has_shared;  // 1=shared expert exists, Go handles shared+residual
+    int f32_kv;          // 1=use F32 KV cache (debug: DLGO_F32_KV=1)
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.

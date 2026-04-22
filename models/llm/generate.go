@@ -342,7 +342,16 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 	// multi-channel generation protocol (analysis → final), so they must NOT
 	// be registered as stop tokens — only <|return|> (the true EOS) stops generation.
 	arch := GetArchDescriptor(m.Config.Architecture)
-	if arch.ChatTemplate != "harmony" {
+	if arch.ChatTemplate == "harmony" {
+		// Harmony models: suppress <|endoftext|> and <|call|> (matching llama.cpp's
+		// -inf logit biases). These tokens should never appear in output.
+		// <|return|> (EOS) is already handled by the EOS check.
+		for _, special := range []string{"<|endoftext|>", "<|call|>"} {
+			if id, ok := tok.TokenToID[special]; ok {
+				m.Config.StopTokens = append(m.Config.StopTokens, id)
+			}
+		}
+	} else {
 		for _, special := range []string{"<|channel|>", "<|start|>", "<|message|>", "<|constrain|>", "<|call|>"} {
 			if id, ok := tok.TokenToID[special]; ok {
 				m.Config.StopTokens = append(m.Config.StopTokens, id)

@@ -743,6 +743,13 @@ func NewLayerConf() *LayerConf { return &LayerConf{} }
 // HasInlineMoE returns true if this layer handles MoE inline in C.
 func (lc *LayerConf) HasInlineMoE() bool { return lc.c.moe_conf != nil }
 
+// SetF32KV enables F32 KV cache for this layer (debug).
+func (lc *LayerConf) SetF32KV(v bool) {
+	if v {
+		lc.c.f32_kv = 1
+	}
+}
+
 func (lc *LayerConf) SetScratch(x, xNorm, q, k, v, attnOut, attnProj Buf,
 	ffnNorm, ffnIn, gate, up, hidden, ffnOut Buf) {
 	lc.c.x = C.GpuBuf(x)
