@@ -81,8 +81,8 @@ func applyArchDefaults(config *ModelConfig) {
 			config.ExpertGatingFunc = 3
 		}
 	}
-	// qwen35moe: llama.cpp hardcodes norm_w=true in build_moe_ffn
-	if config.Architecture == "qwen35moe" && config.ExpertCount > 0 {
+	// qwen3moe / qwen35moe: llama.cpp hardcodes norm_w=true in build_moe_ffn
+	if (config.Architecture == "qwen3moe" || config.Architecture == "qwen35moe") && config.ExpertCount > 0 {
 		config.ExpertWeightsNorm = true
 	}
 	// Qwen3.5 GGUF files have V heads reordered from grouped to tiled order

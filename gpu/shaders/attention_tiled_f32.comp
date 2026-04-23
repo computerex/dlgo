@@ -60,9 +60,9 @@ void main() {
         return;
     }
 
-    // Load Q into shared memory
+    // Load Q into shared memory, pre-scaled (matches llama.cpp)
     for (uint d = tid; d < hd; d += WG_SIZE) {
-        q_sh[d] = q_data[q_base + d];
+        q_sh[d] = q_data[q_base + d] * scale;
     }
     barrier();
 
@@ -75,16 +75,16 @@ void main() {
         int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
         int tile_len = tile_end - tile_start;
 
-        // Compute Q·K dot products for this tile
+        // Compute Q·K dot products for this tile (Q already pre-scaled)
         float my_score = -1.0e30;
         if (int(tid) < tile_len) {
             int t = tile_start + int(tid);
             float dot_val = 0.0;
             uint k_base = uint(t) * kvd + kv_offset;
             for (uint d = 0; d < hd; d++) {
-                dot_val += q_sh[d] * k_cache[k_base + d];
+                dot_val = fma(q_sh[d], k_cache[k_base + d], dot_val);
             }
-            my_score = dot_val * scale;
+            my_score = dot_val;
             if (softcap > 0.0) my_score = softcap * tanh(my_score / softcap);
         }
 
@@ -113,15 +113,15 @@ void main() {
         int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
         int tile_len = tile_end - tile_start;
 
-        // Recompute Q·K dot products and apply exp(score - max)
+        // Recompute Q·K dot products and apply exp(score - max) (Q already pre-scaled)
         if (int(tid) < tile_len) {
             int t = tile_start + int(tid);
             float dot_val = 0.0;
             uint k_base = uint(t) * kvd + kv_offset;
             for (uint d = 0; d < hd; d++) {
-                dot_val += q_sh[d] * k_cache[k_base + d];
+                dot_val = fma(q_sh[d], k_cache[k_base + d], dot_val);
             }
-            float score = dot_val * scale;
+            float score = dot_val;
             if (softcap > 0.0) score = softcap * tanh(score / softcap);
             tile_s[tid] = exp(score - global_max);
         } else {
@@ -145,7 +145,7 @@ void main() {
             for (int ti = 0; ti < tile_len; ti++) {
                 float w = tile_s[ti];
                 uint v_base = uint(tile_start + ti) * kvd + kv_offset;
-                acc += w * v_cache[v_base + tid];
+                acc = fma(w, v_cache[v_base + tid], acc);
             }
             sh_out[tid] += acc;
         }

@@ -321,6 +321,7 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 		cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
 		cosTable, sinTable,
 		ffnType, resType)
+	lc.SetF32KV(f32KV)
 
 	confs[l] = lc
 	}

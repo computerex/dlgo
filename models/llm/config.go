@@ -34,8 +34,9 @@ type ModelConfig struct {
 	SlidingWindowPattern int   // 0=all layers, N=alternating (every Nth layer is full)
 	BOS           int32
 	EOS           int32
-	StopTokens    []int32
-	AddBOS        bool
+	StopTokens      []int32
+	SuppressTokens  []int32 // logit = -inf before sampling (matching llama.cpp's EOG bias)
+	AddBOS          bool
 	FFNGelu       bool     // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
 	EmbedScale    float32  // non-zero = scale embeddings (Gemma: sqrt(dim))
 	ChatTemplate  string   // chat format: "chatml", "llama2", "llama3", "gemma", "phi"

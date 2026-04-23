@@ -66,8 +66,9 @@ void main() {
                 float v_lo = kvalues[qByte & 0xFu];
                 float v_hi = kvalues[qByte >> 4u];
                 uint base = b * 32u;
-                acc += d * v_lo * x_data[x_off + base + lane]
-                     + d * v_hi * x_data[x_off + base + 16u + lane];
+                float sum = fma(v_lo, x_data[x_off + base + lane], 0.0);
+                sum = fma(v_hi, x_data[x_off + base + 16u + lane], sum);
+                acc = fma(d, sum, acc);
             }
         }
 

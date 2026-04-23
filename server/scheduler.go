@@ -165,6 +165,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	pos := len(req.Tokens)
 	var recentTokens []int32
 
+	llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
 	nextToken := int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
 
 	if isStopToken(nextToken, pipe.Model.Config) {
@@ -226,6 +227,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		llm.Forward(pipe.Model, nextToken, pos, pipe.KVCache, pipe.RunState)
 		pos++
 
+		llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
 		nextToken = int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
 
 		if isStopToken(nextToken, pipe.Model.Config) {

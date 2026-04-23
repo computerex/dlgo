@@ -82,12 +82,13 @@ void main() {
             for (uint j = 0u; j < 4u; j++) {
                 float gv1 = float((grid1 >> (8u * j)) & 0xFFu);
                 float gv2 = float((grid2 >> (8u * j)) & 0xFFu);
-                float v1 = ((sign_byte & (1u << j)) != 0u) ? -db * gv1 : db * gv1;
-                float v2 = ((sign_byte & (1u << (j + 4u))) != 0u) ? -db * gv2 : db * gv2;
-                sum += v1 * x_data[pos_x_off + x_off + j] + v2 * x_data[pos_x_off + x_off + 4u + j];
+                float sg1 = ((sign_byte & (1u << j)) != 0u) ? -gv1 : gv1;
+                float sg2 = ((sign_byte & (1u << (j + 4u))) != 0u) ? -gv2 : gv2;
+                sum = fma(sg1, x_data[pos_x_off + x_off + j], sum);
+                sum = fma(sg2, x_data[pos_x_off + x_off + 4u + j], sum);
             }
 
-            acc += sum;
+            acc = fma(db, sum, acc);
         }
 
         acc = subgroupAdd(acc);

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include "iq_tables_c.h"
 
 // ── Helpers from ggml ───────────────────────────────────────────
 
@@ -742,6 +743,307 @@ float qq_dot_q6_K_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, i
 }
 
 // ══════════════════════════════════════════════════════════════════
+// IQ3_S × Q8_K dot product (256 values per super-block pair)
+// IQ3_S block: d(f16) + qs[64] + qh[8] + signs[32] + scales[4] = 110 bytes
+// Ported from llama.cpp ggml_vec_dot_iq3_s_q8_K (AVX2 path)
+// ══════════════════════════════════════════════════════════════════
+
+float qq_dot_iq3_s_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 256;
+
+    static const uint8_t k_mask1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask  = _mm256_set1_epi32(256);
+
+    typedef union {
+        __m256i  vec[2];
+        uint32_t index[16];
+    } index_t;
+
+    index_t idx;
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const uint8_t* xp = xb + i * 110;
+        const uint8_t* yp = yb + i * 292;
+
+        float y_d;
+        memcpy(&y_d, yp, 4);
+        const float d = f16_to_f32_qq(*(const uint16_t*)xp) * y_d;
+
+        const uint8_t* qs = xp + 2;
+        const uint8_t* qh = xp + 2 + 64;
+        const uint16_t* signs = (const uint16_t*)(xp + 2 + 64 + 8);
+        const uint8_t* scales = xp + 2 + 64 + 8 + 32;
+        const int8_t* q8 = (const int8_t*)(yp + 4);
+
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)qs)); qs += 16;
+            idx.vec[0] = _mm256_set1_epi32(qh[ib32+0]);
+            idx.vec[1] = _mm256_set1_epi32(qh[ib32+1]);
+            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
+            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
+            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+
+            const __m256i q2_1 = _mm256_set_epi32(
+                iq3s_grid_c[idx.index[7]], iq3s_grid_c[idx.index[6]],
+                iq3s_grid_c[idx.index[5]], iq3s_grid_c[idx.index[4]],
+                iq3s_grid_c[idx.index[3]], iq3s_grid_c[idx.index[2]],
+                iq3s_grid_c[idx.index[1]], iq3s_grid_c[idx.index[0]]);
+            const __m256i q2_2 = _mm256_set_epi32(
+                iq3s_grid_c[idx.index[15]], iq3s_grid_c[idx.index[14]],
+                iq3s_grid_c[idx.index[13]], iq3s_grid_c[idx.index[12]],
+                iq3s_grid_c[idx.index[11]], iq3s_grid_c[idx.index[10]],
+                iq3s_grid_c[idx.index[ 9]], iq3s_grid_c[idx.index[ 8]]);
+
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t)signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+
+            aux256 = _mm256_set1_epi32(signs[2] | ((uint32_t)signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+
+            signs += 4;
+
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = scales[ib32/2] & 0xf;
+            const uint16_t ls2 = scales[ib32/2] >> 4;
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls2+1));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return hsum_float_8_qq(accumf);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// IQ3_XXS × Q8_K dot product (256 values per super-block pair)
+// IQ3_XXS block: d(f16) + qs[96] = 98 bytes
+//   first 64 bytes: grid indices, last 32 bytes: scales + signs
+// Ported from llama.cpp ggml_vec_dot_iq3_xxs_q8_K (AVX2 path)
+// ══════════════════════════════════════════════════════════════════
+
+static const int8_t keven_signs_q2xs_qq[1024] = {
+     1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1,  1,
+     1,  1, -1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1, -1,
+     1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1, -1,
+     1,  1, -1, -1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1, -1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1,  1,
+     1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,
+     1,  1, -1,  1, -1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,
+     1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1,  1,
+     1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,
+     1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,
+     1,  1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1,  1,
+     1,  1,  1, -1,  1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1,  1,
+     1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,
+     1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1,  1,
+     1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1, -1,
+     1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1,  1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1, -1,
+     1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1,  1,
+     1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1,  1, -1, -1,
+     1,  1, -1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1,  1,
+     1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1,  1,
+     1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1, -1,
+     1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1,  1,
+     1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1, -1,
+     1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1, -1,
+     1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1,  1,
+     1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1,  1,
+     1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1, -1,
+     1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1, -1,
+     1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1,  1,
+     1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,
+     1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1,  1,
+     1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1,  1,
+     1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1,
+};
+
+float qq_dot_iq3_xxs_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 256;
+
+    const uint64_t* signs64 = (const uint64_t*)keven_signs_q2xs_qq;
+
+    uint32_t aux32[2];
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const uint8_t* xp = xb + i * 98;
+        const uint8_t* yp = yb + i * 292;
+
+        float y_d;
+        memcpy(&y_d, yp, 4);
+        const float d = f16_to_f32_qq(*(const uint16_t*)xp) * y_d;
+
+        const uint8_t* q3  = xp + 2;
+        const uint8_t* gas = xp + 2 + 64;
+        const int8_t* q8 = (const int8_t*)(yp + 4);
+
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q2_1 = _mm256_set_epi32(
+                iq3xxs_grid_c[q3[7]], iq3xxs_grid_c[q3[6]],
+                iq3xxs_grid_c[q3[5]], iq3xxs_grid_c[q3[4]],
+                iq3xxs_grid_c[q3[3]], iq3xxs_grid_c[q3[2]],
+                iq3xxs_grid_c[q3[1]], iq3xxs_grid_c[q3[0]]);
+            q3 += 8;
+            const __m256i q2_2 = _mm256_set_epi32(
+                iq3xxs_grid_c[q3[7]], iq3xxs_grid_c[q3[6]],
+                iq3xxs_grid_c[q3[5]], iq3xxs_grid_c[q3[4]],
+                iq3xxs_grid_c[q3[3]], iq3xxs_grid_c[q3[2]],
+                iq3xxs_grid_c[q3[1]], iq3xxs_grid_c[q3[0]]);
+            q3 += 8;
+
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i s2_1 = _mm256_set_epi64x(
+                signs64[(aux32[0] >> 21) & 127], signs64[(aux32[0] >> 14) & 127],
+                signs64[(aux32[0] >>  7) & 127], signs64[(aux32[0] >>  0) & 127]);
+            const __m256i s2_2 = _mm256_set_epi64x(
+                signs64[(aux32[1] >> 21) & 127], signs64[(aux32[1] >> 14) & 127],
+                signs64[(aux32[1] >>  7) & 127], signs64[(aux32[1] >>  0) & 127]);
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const uint16_t ls1 = aux32[0] >> 28;
+            const uint16_t ls2 = aux32[1] >> 28;
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls2+1));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.25f * hsum_float_8_qq(accumf);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// IQ4_XS × Q8_K dot product (256 values per super-block pair)
+// IQ4_XS block: d(f16) + scales_h(u16) + scales_l[4] + qs[128] = 136 bytes
+// Ported from llama.cpp ggml_vec_dot_iq4_xs_q8_K (AVX2 path)
+// ══════════════════════════════════════════════════════════════════
+
+static const int8_t kvalues_iq4nl_qq[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+static inline __m256i mul_add_epi8_qq(const __m256i x, const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return _mm256_maddubs_epi16(ax, sy);
+}
+
+float qq_dot_iq4_xs_q8_K(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 256;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl_qq);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+
+    __m256 accum = _mm256_setzero_ps();
+    for (int ibl = 0; ibl < nb; ibl++) {
+        const uint8_t* xp = xb + ibl * 136;
+        const uint8_t* yp = yb + ibl * 292;
+
+        float y_d;
+        memcpy(&y_d, yp, 4);
+        const float d = f16_to_f32_qq(*(const uint16_t*)xp) * y_d;
+
+        uint16_t sh;
+        memcpy(&sh, xp + 2, 2);
+        const uint8_t* scales_l = xp + 4;
+        const uint8_t* qs = xp + 8;
+        const int8_t* q8 = (const int8_t*)(yp + 4);
+
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib = 0; ib < 8; ib += 2) {
+            const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
+            const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q4b_1 = MM256_SET_M128I_QQ(
+                _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+            const __m256i q4b_2 = MM256_SET_M128I_QQ(
+                _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+            const __m256i p16_1 = mul_add_epi8_qq(q4b_1, q8b_1);
+            const __m256i p16_2 = mul_add_epi8_qq(q4b_2, q8b_2);
+            const int16_t ls1 = ((scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
+            const int16_t ls2 = ((scales_l[ib/2] >>  4) | ((sh << 2) & 0x30)) - 32;
+            sh >>= 4;
+            const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16(ls1));
+            const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16(ls2));
+            sumi1 = _mm256_add_epi32(p_1, sumi1);
+            sumi2 = _mm256_add_epi32(p_2, sumi2);
+        }
+        accum = _mm256_fmadd_ps(_mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accum);
+    }
+    return hsum_float_8_qq(accum);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// IQ4_NL × Q8_0 dot product (32 values per block pair)
+// IQ4_NL block: d(f16) + qs[16] = 18 bytes (same as Q4_0 layout)
+// Ported from llama.cpp (uses kvalues_iq4nl lookup table)
+// ══════════════════════════════════════════════════════════════════
+
+float qq_dot_iq4_nl_q8_0(const uint8_t* restrict xb, const uint8_t* restrict yb, int n) {
+    const int nb = n / 32;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl_qq);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const uint8_t* x = xb + i * 18;
+        const uint8_t* y = yb + i * 34;
+
+        const float d = f16_to_f32_qq(*(const uint16_t*)x) * f16_to_f32_qq(*(const uint16_t*)y);
+        const __m128i q4bits = _mm_loadu_si128((const __m128i*)(x + 2));
+        const __m256i q4b = MM256_SET_M128I_QQ(
+            _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4b)),
+            _mm_shuffle_epi8(values128, _mm_and_si128(q4bits, m4b)));
+        const __m256i q8b = _mm256_loadu_si256((const __m256i*)(y + 2));
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(
+            mul_add_epi8_qq(q4b, q8b)), acc);
+    }
+    return hsum_float_8_qq(acc);
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Batch dispatcher: quantize input once, then run Q×Q for all rows
 // ══════════════════════════════════════════════════════════════════
 
@@ -762,6 +1064,10 @@ void qq_dot_batch(const uint8_t* w_data, uint32_t w_type,
         case 12: out[r] = qq_dot_q4_K_q8_K(row, q_data, cols); break;
         case 13: out[r] = qq_dot_q5_K_q8_K(row, q_data, cols); break;
         case 14: out[r] = qq_dot_q6_K_q8_K(row, q_data, cols); break;
+        case 18: out[r] = qq_dot_iq3_xxs_q8_K(row, q_data, cols); break;
+        case 20: out[r] = qq_dot_iq4_nl_q8_0(row, q_data, cols); break;
+        case 21: out[r] = qq_dot_iq3_s_q8_K(row, q_data, cols); break;
+        case 23: out[r] = qq_dot_iq4_xs_q8_K(row, q_data, cols); break;
         default: out[r] = 0; break;
         }
     }
@@ -1487,6 +1793,10 @@ void qq_batch_gemm(const uint8_t* w_data, uint32_t w_type,
                 case 12: out_flat[(size_t)p * out_stride + r] = qq_dot_q4_K_q8_K(row, q8, cols); break;
                 case 13: out_flat[(size_t)p * out_stride + r] = qq_dot_q5_K_q8_K(row, q8, cols); break;
                 case 14: out_flat[(size_t)p * out_stride + r] = qq_dot_q6_K_q8_K(row, q8, cols); break;
+                case 18: out_flat[(size_t)p * out_stride + r] = qq_dot_iq3_xxs_q8_K(row, q8, cols); break;
+                case 20: out_flat[(size_t)p * out_stride + r] = qq_dot_iq4_nl_q8_0(row, q8, cols); break;
+                case 21: out_flat[(size_t)p * out_stride + r] = qq_dot_iq3_s_q8_K(row, q8, cols); break;
+                case 23: out_flat[(size_t)p * out_stride + r] = qq_dot_iq4_xs_q8_K(row, q8, cols); break;
                 default: out_flat[(size_t)p * out_stride + r] = 0; break;
                 }
             }
@@ -1500,8 +1810,9 @@ void qq_batch_gemm(const uint8_t* w_data, uint32_t w_type,
 int q8_buffer_size(uint32_t w_type, int n) {
     switch (w_type) {
     case 10: case 11: case 12: case 13: case 14: // K-quants
+    case 18: case 21: case 23: // IQ3_XXS, IQ3_S, IQ4_XS (use Q8_K)
         return (n / 256) * 292;
-    default: // Q4_0, Q8_0, etc.
+    default: // Q4_0, Q8_0, IQ4_NL, etc.
         return (n / 32) * 34;
     }
 }
@@ -1510,6 +1821,7 @@ int q8_buffer_size(uint32_t w_type, int n) {
 void quantize_for_type(const float* x, uint8_t* out, uint32_t w_type, int n) {
     switch (w_type) {
     case 10: case 11: case 12: case 13: case 14:
+    case 18: case 21: case 23:
         quantize_to_q8_K(x, out, n);
         break;
     default:

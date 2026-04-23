@@ -58,9 +58,9 @@ void main() {
         return;
     }
 
-    // Load Q into shared memory
+    // Load Q into shared memory, pre-scaled (matches llama.cpp)
     for (uint d = tid; d < hd; d += WG_SIZE) {
-        q_sh[d] = q_data[q_base + d];
+        q_sh[d] = q_data[q_base + d] * scale;
     }
     // Init output accumulator
     for (uint d = tid; d < hd; d += WG_SIZE) {
@@ -86,9 +86,9 @@ void main() {
             float dot_val = 0.0;
             uint k_base = uint(t) * kvd + kv_offset;
             for (uint d = 0; d < hd; d++) {
-                dot_val += q_sh[d] * k_data[k_base + d];
+                dot_val = fma(q_sh[d], k_data[k_base + d], dot_val);
             }
-            my_score = dot_val * scale;
+            my_score = dot_val;
         }
 
         // --- Step 2: Find tile max via shared memory reduction ---
@@ -141,7 +141,7 @@ void main() {
             for (int ti = 0; ti < tile_len; ti++) {
                 float w = tile_s[ti];
                 uint v_base = uint(tile_start + ti) * kvd + kv_offset;
-                acc += w * v_data[v_base + tid];
+                acc = fma(w, v_data[v_base + tid], acc);
             }
             sh_out[tid] += acc;
         }

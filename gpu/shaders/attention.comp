@@ -46,9 +46,9 @@ void main() {
     uint kv_dim4 = uint(kv_dim) >> 2;
     uint kv_off4 = kv_offset >> 2;
 
-    // Pre-load Q into shared memory as vec4
+    // Pre-load Q into shared memory as vec4, pre-scaled (matches llama.cpp)
     for (uint d4 = tid; d4 < head_dim4; d4 += 256u) {
-        q_sh[d4] = q_v4[(q_base >> 2) + d4];
+        q_sh[d4] = q_v4[(q_base >> 2) + d4] * scale;
     }
     barrier();
 
@@ -78,7 +78,7 @@ void main() {
                         dot_val += dot(q_sh[d4 + j], k_v4[k_base4 + d4 + j]);
                 }
             }
-            scores[t] = dot_val * scale;
+            scores[t] = dot_val;
         }
         barrier();
 

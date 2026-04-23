@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"strings"
@@ -1285,8 +1286,13 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		}
 	}
 
-	// Grammar-aware sampling helper
+	// Grammar-aware sampling helper (applies EOG suppression + grammar)
 	gpuGrammarSample := func(logits []float32) int {
+		for _, id := range p.CPUModel.Config.SuppressTokens {
+			if int(id) < len(logits) {
+				logits[id] = float32(math.Inf(-1))
+			}
+		}
 		if cfg.Grammar != nil {
 			cfg.Grammar.ApplyToLogits(logits, tokenPieces, eosTokens)
 		}

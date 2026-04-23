@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -359,6 +360,20 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 		}
 	}
 
+	// Suppress EOG tokens from logits (set to -inf before sampling), matching
+	// llama.cpp's conversation-mode behavior. This prevents quantization artifacts
+	// from causing premature <|endoftext|> generation (especially in thinking mode).
+	// We suppress all known EOG tokens except the primary EOS (which is handled
+	// by the stop-condition check after sampling).
+	eogCandidates := []string{
+		"<|endoftext|>", "</s>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>",
+	}
+	for _, name := range eogCandidates {
+		if id, ok := tok.TokenToID[name]; ok && id != m.Config.EOS {
+			m.Config.SuppressTokens = append(m.Config.SuppressTokens, id)
+		}
+	}
+
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
 
 	// Build sparse KV cache: only attention layers need full-context KV storage.
@@ -401,6 +416,15 @@ func (p *Pipeline) buildEOSSet() map[int32]bool {
 		eos[stop] = true
 	}
 	return eos
+}
+
+// ApplySuppressTokens sets logits to -inf for suppressed EOG tokens.
+func ApplySuppressTokens(logits []float32, suppress []int32) {
+	for _, id := range suppress {
+		if int(id) < len(logits) {
+			logits[id] = float32(math.Inf(-1))
+		}
+	}
 }
 
 // grammarSample applies grammar constraints (if any) then samples a token.
@@ -455,6 +479,7 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 	ForwardBatch(p.Model, prompt, 0, p.KVCache, p.RunState, p.BatchState)
 
 	pos := len(prompt)
+	ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 	nextToken := grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
@@ -492,6 +517,7 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 			mmap.TrimWorkingSet()
 		}
 
+		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 		nextToken = grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 		generated = append(generated, int32(nextToken))
 
@@ -593,6 +619,7 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 	var recentTokens []int32
 
 	pos := len(tokens)
+	ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 	nextToken := ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
@@ -622,6 +649,7 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 			mmap.TrimWorkingSet()
 		}
 
+		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
@@ -752,6 +780,7 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 			break
 		}
 
+		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 		nextToken := int32(ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng))
 
 		if nextToken == p.Model.Config.EOS {

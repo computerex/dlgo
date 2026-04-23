@@ -429,6 +429,7 @@ func QMultiExpertMatVec(packed *core.QuantizedTensor, slices []ExpertSlice, x []
 	}
 	cols := packed.Cols
 	bpr := quant.BytesForN(packed.Type, cols)
+	useQQ := quant.HasQQDot(packed.Type)
 
 	totalRows := 0
 	for _, s := range slices {
@@ -436,15 +437,26 @@ func QMultiExpertMatVec(packed *core.QuantizedTensor, slices []ExpertSlice, x []
 	}
 
 	if pool == nil || totalRows < 32 {
-		for _, s := range slices {
-			data := packed.Data[s.Off : s.Off+s.Rows*bpr]
-			if quant.HasSIMDDot(packed.Type) {
-				quant.SIMDDotBatch(data, packed.Type, x, cols, s.Out[:s.Rows], s.Rows, bpr)
-			} else {
-				buf := make([]float32, cols)
-				for r := 0; r < s.Rows; r++ {
-					quant.DequantizeInto(buf, data[r*bpr:(r+1)*bpr], packed.Type, cols)
-					s.Out[r] = quant.SIMDDotF32(buf, x, cols)
+		if useQQ {
+			q8Size := quant.Q8BufferSize(packed.Type, cols)
+			q8Buf := getQ8Buf(q8Size)
+			quant.QuantizeForType(x, q8Buf, packed.Type)
+			for _, s := range slices {
+				data := packed.Data[s.Off : s.Off+s.Rows*bpr]
+				quant.QQDotBatch(data, packed.Type, q8Buf, cols, s.Out[:s.Rows], s.Rows, bpr)
+			}
+			putQ8Buf(q8Buf)
+		} else {
+			for _, s := range slices {
+				data := packed.Data[s.Off : s.Off+s.Rows*bpr]
+				if quant.HasSIMDDot(packed.Type) {
+					quant.SIMDDotBatch(data, packed.Type, x, cols, s.Out[:s.Rows], s.Rows, bpr)
+				} else {
+					buf := make([]float32, cols)
+					for r := 0; r < s.Rows; r++ {
+						quant.DequantizeInto(buf, data[r*bpr:(r+1)*bpr], packed.Type, cols)
+						s.Out[r] = quant.SIMDDotF32(buf, x, cols)
+					}
 				}
 			}
 		}
@@ -452,35 +464,62 @@ func QMultiExpertMatVec(packed *core.QuantizedTensor, slices []ExpertSlice, x []
 	}
 
 	useFused := quant.HasSIMDDot(packed.Type)
-	pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
-		cumRow := 0
-		for _, s := range slices {
-			sEnd := cumRow + s.Rows
-			lo := start - cumRow
-			hi := end - cumRow
-			if lo < 0 {
-				lo = 0
+	if useQQ {
+		q8Size := quant.Q8BufferSize(packed.Type, cols)
+		q8Buf := getQ8Buf(q8Size)
+		quant.QuantizeForType(x, q8Buf, packed.Type)
+		pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
+			cumRow := 0
+			for _, s := range slices {
+				sEnd := cumRow + s.Rows
+				lo := start - cumRow
+				hi := end - cumRow
+				if lo < 0 {
+					lo = 0
+				}
+				if hi > s.Rows {
+					hi = s.Rows
+				}
+				if lo < hi {
+					n := hi - lo
+					off := s.Off + lo*bpr
+					quant.QQDotBatch(packed.Data[off:off+n*bpr], packed.Type, q8Buf, cols, s.Out[lo:hi], n, bpr)
+				}
+				cumRow = sEnd
 			}
-			if hi > s.Rows {
-				hi = s.Rows
-			}
-			if lo < hi {
-				n := hi - lo
-				off := s.Off + lo*bpr
-				if useFused {
-					quant.SIMDDotBatch(packed.Data[off:off+n*bpr], packed.Type, x, cols, s.Out[lo:hi], n, bpr)
-				} else {
-					buf := make([]float32, cols)
-					for r := lo; r < hi; r++ {
-						rOff := s.Off + r*bpr
-						quant.DequantizeInto(buf, packed.Data[rOff:rOff+bpr], packed.Type, cols)
-						s.Out[r] = quant.SIMDDotF32(buf, x, cols)
+		})
+		putQ8Buf(q8Buf)
+	} else {
+		pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
+			cumRow := 0
+			for _, s := range slices {
+				sEnd := cumRow + s.Rows
+				lo := start - cumRow
+				hi := end - cumRow
+				if lo < 0 {
+					lo = 0
+				}
+				if hi > s.Rows {
+					hi = s.Rows
+				}
+				if lo < hi {
+					n := hi - lo
+					off := s.Off + lo*bpr
+					if useFused {
+						quant.SIMDDotBatch(packed.Data[off:off+n*bpr], packed.Type, x, cols, s.Out[lo:hi], n, bpr)
+					} else {
+						buf := make([]float32, cols)
+						for r := lo; r < hi; r++ {
+							rOff := s.Off + r*bpr
+							quant.DequantizeInto(buf, packed.Data[rOff:rOff+bpr], packed.Type, cols)
+							s.Out[r] = quant.SIMDDotF32(buf, x, cols)
+						}
 					}
 				}
+				cumRow = sEnd
 			}
-			cumRow = sEnd
-		}
-	})
+		})
+	}
 }
 
 // QDualMultiExpertMatVec dispatches gate and up expert matvecs in a single parallel wave.
@@ -508,6 +547,8 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 	upBpr := quant.BytesForN(packedUp.Type, packedUp.Cols)
 	gateCols := packedGate.Cols
 	upCols := packedUp.Cols
+	gateUseQQ := quant.HasQQDot(packedGate.Type)
+	upUseQQ := quant.HasQQDot(packedUp.Type)
 	gateUseFused := quant.HasSIMDDot(packedGate.Type)
 	upUseFused := quant.HasSIMDDot(packedUp.Type)
 
@@ -516,8 +557,23 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 		gateTotal += s.Rows
 	}
 
+	var gateQ8, upQ8 []byte
+	if gateUseQQ {
+		q8Size := quant.Q8BufferSize(packedGate.Type, gateCols)
+		gateQ8 = getQ8Buf(q8Size)
+		quant.QuantizeForType(x, gateQ8, packedGate.Type)
+	}
+	if upUseQQ {
+		q8Size := quant.Q8BufferSize(packedUp.Type, upCols)
+		upQ8 = getQ8Buf(q8Size)
+		if !gateUseQQ || packedGate.Type != packedUp.Type || gateCols != upCols {
+			quant.QuantizeForType(x, upQ8, packedUp.Type)
+		} else {
+			copy(upQ8, gateQ8)
+		}
+	}
+
 	pool.dispatch(totalRows, pool.numWorkers, func(start, end int) {
-		// Gate portion: rows [0, gateTotal)
 		cumRow := 0
 		for _, s := range gateSlices {
 			sEnd := cumRow + s.Rows
@@ -532,7 +588,9 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 			if lo < hi {
 				n := hi - lo
 				off := s.Off + lo*gateBpr
-				if gateUseFused {
+				if gateUseQQ {
+					quant.QQDotBatch(packedGate.Data[off:off+n*gateBpr], packedGate.Type, gateQ8, gateCols, s.Out[lo:hi], n, gateBpr)
+				} else if gateUseFused {
 					quant.SIMDDotBatch(packedGate.Data[off:off+n*gateBpr], packedGate.Type, x, gateCols, s.Out[lo:hi], n, gateBpr)
 				} else {
 					buf := make([]float32, gateCols)
@@ -545,7 +603,6 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 			}
 			cumRow = sEnd
 		}
-		// Up portion: rows [gateTotal, totalRows)
 		for _, s := range upSlices {
 			sEnd := cumRow + s.Rows
 			lo := start - cumRow
@@ -559,7 +616,9 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 			if lo < hi {
 				n := hi - lo
 				off := s.Off + lo*upBpr
-				if upUseFused {
+				if upUseQQ {
+					quant.QQDotBatch(packedUp.Data[off:off+n*upBpr], packedUp.Type, upQ8, upCols, s.Out[lo:hi], n, upBpr)
+				} else if upUseFused {
 					quant.SIMDDotBatch(packedUp.Data[off:off+n*upBpr], packedUp.Type, x, upCols, s.Out[lo:hi], n, upBpr)
 				} else {
 					buf := make([]float32, upCols)
@@ -573,6 +632,13 @@ func QDualMultiExpertMatVec(packedGate, packedUp *core.QuantizedTensor,
 			cumRow = sEnd
 		}
 	})
+
+	if gateQ8 != nil {
+		putQ8Buf(gateQ8)
+	}
+	if upQ8 != nil {
+		putQ8Buf(upQ8)
+	}
 }
 
 // QBatchGEMM performs batch quantized matrix multiply.

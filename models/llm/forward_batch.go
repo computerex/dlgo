@@ -770,8 +770,20 @@ func batchMoEFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int, inpu
 
 		nActive := len(activeExperts)
 		totalDownRows := nActive * dim
+		useQQDown := quant.HasQQDot(layer.FFNDownExps.Type)
 		useFusedDown := quant.HasSIMDDot(layer.FFNDownExps.Type)
 		downCols := layer.FFNDownExps.Cols
+
+		var downQ8Bufs [][]byte
+		if useQQDown {
+			q8Size := quant.Q8BufferSize(layer.FFNDownExps.Type, downCols)
+			downQ8Bufs = make([][]byte, nActive)
+			for i := range activeExperts {
+				downQ8Bufs[i] = make([]byte, q8Size)
+				quant.QuantizeForType(rs.MoEHiddens[activeExperts[i]], downQ8Bufs[i], layer.FFNDownExps.Type)
+			}
+		}
+
 		pool.DispatchChunked(totalDownRows, pool.NumWorkers(), func(_, start, end int) {
 			for row := start; row < end; {
 				ei := row / dim
@@ -785,7 +797,12 @@ func batchMoEFFN(layer *Layer, bs *BatchState, rs *RunState, nPos, dim int, inpu
 				nrows := endInExpert - rowInExpert
 				downOff := idx*dim*downBpr + rowInExpert*downBpr
 				out := rs.MoEExpertOuts[e]
-				if useFusedDown {
+				if useQQDown {
+					quant.QQDotBatch(
+						layer.FFNDownExps.Data[downOff:downOff+nrows*downBpr],
+						layer.FFNDownExps.Type, downQ8Bufs[ei],
+						downCols, out[rowInExpert:endInExpert], nrows, downBpr)
+				} else if useFusedDown {
 					quant.SIMDDotBatch(
 						layer.FFNDownExps.Data[downOff:downOff+nrows*downBpr],
 						layer.FFNDownExps.Type, rs.MoEHiddens[e],

@@ -62,7 +62,7 @@ void main() {
     uint hd_half = hd / 2u;
 
     for (uint d = tid; d < hd; d += WG_SIZE) {
-        q_sh[d] = q_data[q_base + d];
+        q_sh[d] = q_data[q_base + d] * scale;
     }
     if (tid < hd) {
         sh_out[tid] = 0.0;
@@ -83,9 +83,10 @@ void main() {
             for (uint d2 = 0; d2 < hd_half; d2++) {
                 vec2 k2 = unpackHalf2x16(k_packed[k_base + d2]);
                 uint fi = d2 * 2u;
-                dot_val += q_sh[fi] * k2.x + q_sh[fi + 1u] * k2.y;
+                dot_val = fma(q_sh[fi], k2.x, dot_val);
+                dot_val = fma(q_sh[fi + 1u], k2.y, dot_val);
             }
-            tile_s[tid] = dot_val * scale;
+            tile_s[tid] = dot_val;
             if (softcap > 0.0) tile_s[tid] = softcap * tanh(tile_s[tid] / softcap);
         }
         barrier();
@@ -139,7 +140,7 @@ void main() {
                 uint v_base = uint(tile_start + ti) * kv_half + kv_off_half;
                 vec2 v2 = unpackHalf2x16(v_packed[v_base + d_pair]);
                 float v_val = (d_which == 0u) ? v2.x : v2.y;
-                acc += w * v_val;
+                acc = fma(w, v_val, acc);
             }
             sh_out[tid] += acc;
         }

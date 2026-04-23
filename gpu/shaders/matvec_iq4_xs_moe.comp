@@ -66,20 +66,21 @@ void main() {
 
             uint lo = (uint(blocks[bi].scales_l[ib32 / 2u]) >> (4u * (ib32 & 1u))) & 0xFu;
             uint hi = ((scales_h_val >> (2u * ib32)) & 3u) << 4u;
-            float dl = d * float(int(lo | hi) - 32);
 
             uint qs_off = ib32 * 16u + il * 4u;
             uint x_base = b * 256u + ib32 * 32u;
 
             float sum = 0.0;
+            float scale_int = float(int(lo | hi) - 32);
             for (uint j = 0u; j < 4u; j++) {
                 uint qbyte = uint(blocks[bi].qs[qs_off + j]);
-                float v_lo = dl * float(kvalues[qbyte & 0xFu]);
-                float v_hi = dl * float(kvalues[qbyte >> 4u]);
-                sum += v_lo * x_data[pos_x_off + x_base + il * 4u + j] + v_hi * x_data[pos_x_off + x_base + 16u + il * 4u + j];
+                float v_lo = scale_int * float(kvalues[qbyte & 0xFu]);
+                float v_hi = scale_int * float(kvalues[qbyte >> 4u]);
+                sum = fma(v_lo, x_data[pos_x_off + x_base + il * 4u + j], sum);
+                sum = fma(v_hi, x_data[pos_x_off + x_base + 16u + il * 4u + j], sum);
             }
 
-            acc += sum;
+            acc = fma(d, sum, acc);
         }
 
         acc = subgroupAdd(acc);

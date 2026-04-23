@@ -93,15 +93,16 @@ void main() {
             uint t = uint(blocks[ib].scales[8]) | (uint(blocks[ib].scales[9]) << 8) |
                 (uint(blocks[ib].scales[10]) << 16) | (uint(blocks[ib].scales[11]) << 24);
 
-            float acc = 0.0;
+            float sum_qsx = 0.0;
+            float sum_mx = 0.0;
             uint u1 = 1u;
             uint u2 = 2u;
 
             [[unroll]] for (int grp = 0; grp < 4; grp++) {
-                float sc1 = d * float(unpack_scale(i0, i1, t, grp * 2));
-                float mn1 = dmin * float(unpack_min(i0, i1, t, grp * 2));
-                float sc2 = d * float(unpack_scale(i0, i1, t, grp * 2 + 1));
-                float mn2 = dmin * float(unpack_min(i0, i1, t, grp * 2 + 1));
+                float sc1_val = float(unpack_scale(i0, i1, t, grp * 2));
+                float mn1_val = float(unpack_min(i0, i1, t, grp * 2));
+                float sc2_val = float(unpack_scale(i0, i1, t, grp * 2 + 1));
+                float mn2_val = float(unpack_min(i0, i1, t, grp * 2 + 1));
 
                 uint qbyte = uint(blocks[ib].qs[grp * 32 + int(lane)]);
                 uint qh = uint(blocks[ib].qh[int(lane)]);
@@ -113,13 +114,18 @@ void main() {
 
                 uint x1_idx = x_block + grp * 64 + lane;
                 uint x2_idx = x1_idx + 32u;
-                acc += (float(q1) * sc1 - mn1) * x_data[x1_idx];
-                acc += (float(q2) * sc2 - mn2) * x_data[x2_idx];
+                float x1 = x_data[x1_idx];
+                float x2 = x_data[x2_idx];
+
+                sum_qsx = fma(float(q1) * sc1_val, x1, sum_qsx);
+                sum_qsx = fma(float(q2) * sc2_val, x2, sum_qsx);
+                sum_mx = fma(mn1_val, x1, sum_mx);
+                sum_mx = fma(mn2_val, x2, sum_mx);
 
                 u1 <<= 2;
                 u2 <<= 2;
             }
-            temp[n] += acc;
+            temp[n] = fma(d, sum_qsx, fma(-dmin, sum_mx, temp[n]));
         }
     }
 

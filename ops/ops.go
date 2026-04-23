@@ -152,7 +152,8 @@ func fastExpf(x float32) float32 {
 }
 
 // Softmax computes softmax in-place with numerical stability.
-// Sum is accumulated in float64 to match llama.cpp's ggml_float precision.
+// Uses standard math.Exp matching llama.cpp's ggml_vec_soft_max_f32.
+// Sum is accumulated in float64 for precision.
 func Softmax(x []float32) {
 	n := len(x)
 	if n == 0 {
@@ -166,8 +167,9 @@ func Softmax(x []float32) {
 	}
 	var sum float64
 	for i := 0; i < n; i++ {
-		x[i] = fastExpf(x[i] - maxVal)
-		sum += float64(x[i])
+		val := float32(math.Exp(float64(x[i] - maxVal)))
+		x[i] = val
+		sum += float64(val)
 	}
 	invSum := float32(1.0 / sum)
 	for i := 0; i < n; i++ {
