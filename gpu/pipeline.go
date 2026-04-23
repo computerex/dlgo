@@ -1257,7 +1257,11 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	var generated []int32
 	var recentTokens []int32
 	var genText strings.Builder
-	stopStrings := gpuStopStrings()
+	template := llm.GetArchDescriptor(p.CPUModel.Config.Architecture).ChatTemplate
+	if p.CPUModel.Config.ChatTemplate != "" {
+		template = p.CPUModel.Config.ChatTemplate
+	}
+	stopStrings := gpuStopStrings(template)
 	pos := len(tokens)
 
 	// Build token pieces for grammar masking
@@ -1466,7 +1470,16 @@ func supportsFusedForwardGPU(m *llm.Model) bool {
 	return true
 }
 
-func gpuStopStrings() []string {
+func gpuStopStrings(chatTemplate string) []string {
+	if chatTemplate == "harmony" {
+		// Harmony models (GPT-OSS) use <|channel|>, <|start|>, <|message|>,
+		// <|end|>, <|constrain|> as structural protocol tokens during normal
+		// generation. Only <|return|> and <|endoftext|> are true stops.
+		return []string{
+			"<|return|>",
+			"<|endoftext|>",
+		}
+	}
 	return []string{
 		"<end_of_turn><eos>",
 		"<eos>",
