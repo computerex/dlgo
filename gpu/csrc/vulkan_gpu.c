@@ -1955,7 +1955,7 @@ int gpu_moe_matvec_native(GpuBuf out_buf, GpuBuf weights_buf,
         case QTYPE_IQ2_XXS: pipe = PIPE_MATVEC_IQ2_XXS_MOE; table_buf = g_iq_tables[IQ_TABLE_IQ2XXS]; rows_per_wg = 2; break;
         case QTYPE_IQ2_S:   pipe = PIPE_MATVEC_IQ2_S_MOE;   table_buf = g_iq_tables[IQ_TABLE_IQ2S]; break;
         case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS_MOE; break;
-        case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S_MOE;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; break;
+        case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S_MOE;   table_buf = g_iq_tables[IQ_TABLE_IQ3S]; rows_per_wg = 2; break;
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS_MOE;  rows_per_wg = 2; break;
         case 20:             pipe = PIPE_MATVEC_IQ4_NL_MOE;  rows_per_wg = 2; break;
         case 39:             pipe = PIPE_MATVEC_MXFP4_MOE;   rows_per_wg = 1; break;
