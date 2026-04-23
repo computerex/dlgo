@@ -1337,7 +1337,16 @@ int gpu_load_pipelines(void) {
 }
 
 void gpu_sync(void) {
-    if (g.initialized) vkDeviceWaitIdle_(g.device);
+    if (!g.initialized) return;
+    VkResult r = vkDeviceWaitIdle_(g.device);
+    if (r == VK_ERROR_DEVICE_LOST) {
+        fprintf(stderr, "\n[GPU FATAL] Device lost during sync (TDR fired). Exiting.\n");
+        fflush(stderr);
+        exit(95);
+    }
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "\n[GPU WARNING] vkDeviceWaitIdle returned %d\n", r);
+    }
 }
 
 void gpu_begin_batch(void) {

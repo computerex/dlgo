@@ -827,6 +827,11 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// CPU-side KV cache and run state allocations that follow.
 	mmap.TrimWorkingSet()
 
+	// Memory safety: cap working set and set Go heap limit to prevent
+	// the process from consuming all system RAM and freezing Windows.
+	EnforceWorkingSetLimit(uint64(AllocatedBytes()))
+	InitMemorySafety()
+
 	dp4aAvail := HasDp4a()
 	dp4aDisabled := os.Getenv("DLGO_NO_DP4A") == "1"
 	if dp4aAvail && !dp4aDisabled {
@@ -1043,6 +1048,7 @@ func (p *GpuPipeline) FreeAll() {
 	if p == nil {
 		return
 	}
+	StopMemoryMonitor()
 	Sync()
 	p.GpuModel.FreeAll()
 	p.RunState.FreeAll()
