@@ -25,6 +25,7 @@ type GenerateConfig struct {
 	Seed      int64
 	Stream    func(token string) // called for each generated token (nil = no streaming)
 	Grammar   *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
+	ThinkingPhase bool           // suppress EOS during <think> block (set automatically by Chat/GenerateText)
 }
 
 // DefaultGenerateConfig returns sensible defaults.
@@ -427,6 +428,18 @@ func ApplySuppressTokens(logits []float32, suppress []int32) {
 	}
 }
 
+// suppressEOSLogits sets EOS and stop token logits to -inf during thinking.
+func suppressEOSLogits(logits []float32, cfg ModelConfig) {
+	if int(cfg.EOS) < len(logits) {
+		logits[cfg.EOS] = float32(math.Inf(-1))
+	}
+	for _, st := range cfg.StopTokens {
+		if int(st) < len(logits) {
+			logits[st] = float32(math.Inf(-1))
+		}
+	}
+}
+
 // grammarSample applies grammar constraints (if any) then samples a token.
 // Uses the speculative approach: sample first, check grammar, resample if needed.
 func grammarSample(logits []float32, cfg GenerateConfig, recentTokens []int32, rng *rand.Rand,
@@ -474,15 +487,22 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 
 	var generated []int32
 	var recentTokens []int32
+	var genText strings.Builder
+	inThinkBlock := cfg.ThinkingPhase
+	thinkBudget := cfg.MaxTokens * 4 / 5
 
 	// Prefill (batch)
 	ForwardBatch(p.Model, prompt, 0, p.KVCache, p.RunState, p.BatchState)
 
 	pos := len(prompt)
 	ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+	if inThinkBlock {
+		suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+	}
 	nextToken := grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
+	genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
 
 	// Advance grammar state
 	if cfg.Grammar != nil {
@@ -518,8 +538,15 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 		}
 
 		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+		if inThinkBlock && step < thinkBudget {
+			suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+		}
 		nextToken = grammarSample(p.RunState.Logits, cfg, recentTokens, rng, cfg.Grammar, tokenPieces, eosTokens)
 		generated = append(generated, int32(nextToken))
+		genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
+		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
+			inThinkBlock = false
+		}
 
 		// Advance grammar state
 		if cfg.Grammar != nil && !eosTokens[int32(nextToken)] {
@@ -543,6 +570,10 @@ func (p *Pipeline) GenerateText(prompt string, cfg GenerateConfig) (string, floa
 	tokens := p.Tokenizer.Encode(prompt)
 	if len(tokens) == 0 {
 		return "", 0, fmt.Errorf("tokenizer produced no tokens for prompt")
+	}
+
+	if strings.HasSuffix(prompt, "<think>\n") {
+		cfg.ThinkingPhase = true
 	}
 
 	start := time.Now()
@@ -593,6 +624,10 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		return nil, fmt.Errorf("prompt too long: %d tokens (max %d)", len(tokens), p.MaxSeqLen)
 	}
 
+	if strings.HasSuffix(prompt, "<think>\n") {
+		cfg.ThinkingPhase = true
+	}
+
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	if cfg.Seed < 0 {
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -617,12 +652,19 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 	genStart := time.Now()
 	var generated []int32
 	var recentTokens []int32
+	var genText strings.Builder
+	inThinkBlock := cfg.ThinkingPhase
+	thinkBudget := cfg.MaxTokens * 4 / 5
 
 	pos := len(tokens)
 	ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+	if inThinkBlock {
+		suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+	}
 	nextToken := ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 	generated = append(generated, int32(nextToken))
 	recentTokens = append(recentTokens, int32(nextToken))
+	genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
 
 	if cfg.Stream != nil {
 		cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
@@ -650,9 +692,16 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		}
 
 		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+		if inThinkBlock && step < thinkBudget {
+			suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+		}
 		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
+		genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
+		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
+			inThinkBlock = false
+		}
 
 		if cfg.Stream != nil {
 			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
@@ -754,6 +803,10 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		return "", 0, fmt.Errorf("prompt too long: %d tokens (max %d)", len(tokens), p.MaxSeqLen)
 	}
 
+	if strings.HasSuffix(prompt, "<think>\n") {
+		cfg.ThinkingPhase = true
+	}
+
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	if cfg.Seed < 0 {
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -764,6 +817,8 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		p.RunState.SSMState.Reset()
 	}
 	stopStrings := collectStopStrings(p.Model.Config)
+	inThinkBlock := cfg.ThinkingPhase
+	thinkBudget := cfg.MaxTokens * 4 / 5
 
 	for i, tok := range tokens {
 		Forward(p.Model, tok, i, p.KVCache, p.RunState)
@@ -781,6 +836,9 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		}
 
 		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+		if inThinkBlock && step < thinkBudget {
+			suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+		}
 		nextToken := int32(ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng))
 
 		if nextToken == p.Model.Config.EOS {
@@ -802,6 +860,9 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 
 		tokenText := p.Tokenizer.DecodeToken(nextToken)
 		genText.WriteString(tokenText)
+		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
+			inThinkBlock = false
+		}
 
 		if cfg.Stream != nil {
 			cfg.Stream(tokenText)

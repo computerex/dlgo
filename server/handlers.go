@@ -190,6 +190,15 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		reasoningContent = extractedReasoning
 	}
 
+	// If thinking didn't complete (no </think> found) and content is empty,
+	// use the reasoning content as the response content. This handles cases
+	// where aggressive quantization (IQ3_XXS etc.) makes the model verbose
+	// in thinking and unable to close </think> within the token budget.
+	if fullText == "" && reasoningContent != "" {
+		fullText = reasoningContent
+		completionTokens = len(strings.Fields(reasoningContent)) // approximate
+	}
+
 	resp := ChatCompletionResponse{
 		ID:      infReq.ID,
 		Object:  "chat.completion",

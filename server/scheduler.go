@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"strings"
 	"sync"
@@ -165,14 +166,6 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	pos := len(req.Tokens)
 	var recentTokens []int32
 
-	llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
-	nextToken := int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
-
-	if isStopToken(nextToken, pipe.Model.Config) {
-		req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
-		return
-	}
-
 	stopStrings := collectStopStrings(pipe.Model.Config)
 	stopStrings = append(stopStrings, req.StopSequences...)
 
@@ -185,6 +178,20 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	thinkingEnabled := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
 	inThinkBlock := thinkingEnabled
 	var thinkingContent string
+	// Thinking budget: suppress EOS for at most 80% of max_tokens during thinking.
+	// After that, let the model naturally close </think> and produce content.
+	thinkBudget := req.Config.MaxTokens * 4 / 5
+
+	llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
+	if inThinkBlock {
+		suppressEOSLogits(pipe.RunState.Logits, pipe.Model.Config)
+	}
+	nextToken := int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
+
+	if isStopToken(nextToken, pipe.Model.Config) {
+		req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
+		return
+	}
 
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
@@ -228,6 +235,9 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		pos++
 
 		llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
+		if inThinkBlock && step < thinkBudget {
+			suppressEOSLogits(pipe.RunState.Logits, pipe.Model.Config)
+		}
 		nextToken = int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
 
 		if isStopToken(nextToken, pipe.Model.Config) {
@@ -337,6 +347,21 @@ func isStopToken(token int32, cfg llm.ModelConfig) bool {
 		}
 	}
 	return false
+}
+
+// suppressEOSLogits sets EOS and stop token logits to -inf, preventing
+// premature end-of-generation during the thinking phase. IQ3_XXS and other
+// aggressive quantizations can push EOS into the top-3 logits even when
+// the model should still be generating reasoning content.
+func suppressEOSLogits(logits []float32, cfg llm.ModelConfig) {
+	if int(cfg.EOS) < len(logits) {
+		logits[cfg.EOS] = float32(math.Inf(-1))
+	}
+	for _, st := range cfg.StopTokens {
+		if int(st) < len(logits) {
+			logits[st] = float32(math.Inf(-1))
+		}
+	}
 }
 
 func collectStopStrings(cfg llm.ModelConfig) []string {

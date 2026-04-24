@@ -1286,6 +1286,13 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		}
 	}
 
+	// Detect thinking mode: prompt ends with "<think>\n" when thinking is enabled.
+	// During the thinking phase, suppress EOS/stop tokens to prevent premature
+	// end-of-generation from quantization noise (especially IQ3_XXS/IQ2_XXS).
+	gpuInThinkBlock := strings.HasSuffix(prompt, "<think>\n")
+	thinkBudget := cfg.MaxTokens * 4 / 5
+	gpuStep := 0
+
 	// Grammar-aware sampling helper (applies EOG suppression + grammar)
 	gpuGrammarSample := func(logits []float32) int {
 		for _, id := range p.CPUModel.Config.SuppressTokens {
@@ -1293,6 +1300,18 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 				logits[id] = float32(math.Inf(-1))
 			}
 		}
+		if gpuInThinkBlock && gpuStep < thinkBudget {
+			eos := p.CPUModel.Config.EOS
+			if int(eos) < len(logits) {
+				logits[eos] = float32(math.Inf(-1))
+			}
+			for _, st := range p.CPUModel.Config.StopTokens {
+				if int(st) < len(logits) {
+					logits[st] = float32(math.Inf(-1))
+				}
+			}
+		}
+		gpuStep++
 		if cfg.Grammar != nil {
 			cfg.Grammar.ApplyToLogits(logits, tokenPieces, eosTokens)
 		}
@@ -1363,6 +1382,10 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 		tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
 		genText.WriteString(tokenText)
+
+		if gpuInThinkBlock && strings.Contains(genText.String(), "</think>") {
+			gpuInThinkBlock = false
+		}
 
 		if gpuCheckTextStop(genText.String(), stopStrings) {
 			break
