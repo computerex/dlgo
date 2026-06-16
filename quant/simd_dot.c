@@ -1219,6 +1219,7 @@ float vec_dot_iq2_xxs(const uint8_t* data, const float* x, int n) {
 
         for (int ib32 = 0; ib32 < 8; ib32++) {
             const uint8_t* grp = qs + ib32 * 8;
+            if (grp + 8 > block + 66) break;
             uint32_t aux1;
             memcpy(&aux1, grp + 4, 4);
 
