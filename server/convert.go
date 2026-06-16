@@ -51,10 +51,20 @@ func convertMessages(apiMsgs []Message, tools []Tool) []llm.Message {
 
 // convertAPIMessage converts a single API-level Message to an llm.Message.
 // It handles tool_calls, tool results, and plain role/content messages.
+// Tool calls are represented as structured ToolCallData on the message so
+// the chat template layer can apply model-specific formatting (e.g. Qwen's
+// <|tool_call|> / <|tool_response|> markers, Llama's <|python_tag|> format).
 func convertAPIMessage(m Message) llm.Message {
 	// Assistant message with tool calls
 	if len(m.ToolCalls) > 0 {
-		return formatAssistantToolCalls(m.ToolCalls)
+		tcs := make([]llm.ToolCallData, len(m.ToolCalls))
+		for i, tc := range m.ToolCalls {
+			tcs[i] = llm.ToolCallData{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			}
+		}
+		return llm.Message{Role: "assistant", ToolCalls: tcs}
 	}
 
 	// Tool result message
@@ -65,27 +75,12 @@ func convertAPIMessage(m Message) llm.Message {
 	return llm.Message{Role: m.Role, Content: m.Content}
 }
 
-// formatAssistantToolCalls formats an assistant message that contains tool calls
-// into a prompt-friendly representation. Uses a JSON format that most instruct
-// models (Qwen, Llama 3.1+ etc.) can understand.
-func formatAssistantToolCalls(tcs []ToolCall) llm.Message {
-	var parts []string
-	for _, tc := range tcs {
-		parts = append(parts, fmt.Sprintf(
-			`{"name": %q, "arguments": %s}`,
-			tc.Function.Name, tc.Function.Arguments,
-		))
-	}
-	content := strings.Join(parts, "\n")
-	return llm.Message{Role: "assistant", Content: content}
-}
-
 // formatToolDefinitions renders the OpenAI tools array into a prompt-friendly
 // system message that describes the available functions.
 func formatToolDefinitions(tools []Tool) string {
 	var b strings.Builder
 	b.WriteString("You have access to the following functions. " +
-		"To call a function, respond with a JSON object with the function name and arguments.\n\n")
+		"To call a function, respond with the function call JSON inside a <|tool_call|> block.\n\n")
 
 	for _, tool := range tools {
 		b.WriteString("### ")
@@ -105,9 +100,11 @@ func formatToolDefinitions(tools []Tool) string {
 		}
 	}
 
-	b.WriteString("When you need to call a function, respond with a JSON object " +
-		"in the format: {\"name\": \"function_name\", \"arguments\": { ... }}.\n" +
-		"Do not wrap the JSON in markdown code blocks or add extra text before or after it.")
+	b.WriteString("When you need to call a function, use this format inside a <|tool_call|> block:\n" +
+		"<|tool_call|>\n" +
+		"{\"name\": \"function_name\", \"arguments\": { ... }}\n\n" +
+		"After receiving a function result (from the <|tool_response|> block), " +
+		"respond to the user in natural language using the result.")
 	return b.String()
 }
 

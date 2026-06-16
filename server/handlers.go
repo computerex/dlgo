@@ -245,13 +245,19 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		completionTokens = len(strings.Fields(reasoningContent)) // approximate
 	}
 
-	// Try to parse tool calls from the generated text
+	// Try to parse tool calls from the generated text.
+	// When found, strip the JSON from the content and keep any remaining
+	// natural language (the model often generates both).
 	tcs := parseToolCalls(fullText)
 	if len(tcs) > 0 {
-		// The model made a function call — return tool_calls in response.
-		// When tools are available and the model responds with a function call
-		// JSON, we strip the JSON from the content and set tool_calls instead.
+		// Strip tool call JSON from the text to recover natural language
+		cleaned := toolCallRe.ReplaceAllString(fullText, "")
+		cleaned = strings.TrimSpace(cleaned)
+		// The remaining text after stripping tool calls is the content
+		cleaned = strings.TrimPrefix(cleaned, "<|tool_call|>")
+		cleaned = strings.TrimSpace(cleaned)
 		finishReason = "tool_calls"
+
 		resp := ChatCompletionResponse{
 			ID:      infReq.ID,
 			Object:  "chat.completion",
@@ -261,7 +267,7 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 				Index: 0,
 				Message: &Message{
 					Role:             "assistant",
-					Content:          "",
+					Content:          cleaned,
 					ReasoningContent: reasoningContent,
 					ToolCalls:        tcs,
 				},

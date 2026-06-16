@@ -99,10 +99,17 @@ func RegisterArchitecture(name string, desc ArchDescriptor) {
 	archRegistry[name] = desc
 }
 
-// Message represents a single chat message with role and content.
+// ToolCallData represents a single function call made by the model.
+type ToolCallData struct {
+	Name      string
+	Arguments string // JSON string of arguments
+}
+
+// Message represents a single chat message with role, content, and optional tool calls.
 type Message struct {
-	Role    string
-	Content string
+	Role      string
+	Content   string
+	ToolCalls []ToolCallData // set for assistant messages with function calls
 }
 
 // FormatOptions controls template-level formatting (e.g. reasoning effort).
@@ -230,13 +237,32 @@ func formatPlainMessages(messages []Message) string {
 
 // formatChatMLMessages formats messages using ChatML template.
 // Format: <|im_start|>role\ncontent<|im_end|>\n
+//
+// For tool calling (Qwen-native format):
+//   - assistant messages with ToolCalls use <|tool_call|> markers
+//   - tool messages use <|tool_response|> markers
 func formatChatMLMessages(messages []Message) string {
 	var b strings.Builder
 	for _, m := range messages {
 		b.WriteString("<|im_start|>")
 		b.WriteString(m.Role)
 		b.WriteString("\n")
-		b.WriteString(m.Content)
+
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			// Qwen format: each tool call wrapped in <|tool_call|> marker
+			for _, tc := range m.ToolCalls {
+				b.WriteString("<|tool_call|>\n")
+				fmt.Fprintf(&b, `{"name": %q, "arguments": %s}`, tc.Name, tc.Arguments)
+				b.WriteString("\n")
+			}
+		} else if m.Role == "tool" {
+			// Qwen format: tool result wrapped in <|tool_response|> marker
+			b.WriteString("<|tool_response|>\n")
+			b.WriteString(m.Content)
+		} else {
+			b.WriteString(m.Content)
+		}
+
 		b.WriteString("<|im_end|>\n")
 	}
 	b.WriteString("<|im_start|>assistant\n")
