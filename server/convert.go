@@ -80,7 +80,7 @@ func convertAPIMessage(m Message) llm.Message {
 func formatToolDefinitions(tools []Tool) string {
 	var b strings.Builder
 	b.WriteString("You have access to the following functions. " +
-		"To call a function, respond with the function call JSON inside a <|tool_call|> block.\n\n")
+		"To call a function, respond with JSON specifying the function name and arguments.\n\n")
 
 	for _, tool := range tools {
 		b.WriteString("### ")
@@ -100,11 +100,9 @@ func formatToolDefinitions(tools []Tool) string {
 		}
 	}
 
-	b.WriteString("When you need to call a function, use this format inside a <|tool_call|> block:\n" +
-		"<|tool_call|>\n" +
-		"{\"name\": \"function_name\", \"arguments\": { ... }}\n\n" +
-		"After receiving a function result (from the <|tool_response|> block), " +
-		"respond to the user in natural language using the result.")
+	b.WriteString("Use the function in the format: " +
+		"{\"name\": \"function_name\", \"arguments\": { ... }}\n" +
+		"After receiving a function result, respond to the user in natural language.")
 	return b.String()
 }
 

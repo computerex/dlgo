@@ -9,7 +9,7 @@ func TestFormatToolDefinitions(t *testing.T) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "get_weather",
 				Description: "Get the current weather for a location",
 				Parameters: map[string]interface{}{
@@ -40,10 +40,6 @@ func TestFormatToolDefinitions(t *testing.T) {
 		t.Error("result should contain tool description")
 	}
 
-	if !containsString(result, "tool_calls") {
-		t.Error("result should contain tool_calls format instructions")
-	}
-
 	t.Logf("Formatted tool definitions:\n%s", result)
 }
 
@@ -51,14 +47,14 @@ func TestFormatToolDefinitions_Multiple(t *testing.T) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "get_weather",
 				Description: "Get weather info",
 			},
 		},
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "search",
 				Description: "Search the web",
 			},
@@ -76,11 +72,11 @@ func TestFormatToolDefinitions_Multiple(t *testing.T) {
 	}
 }
 
-func TestBuildToolPrompt(t *testing.T) {
+func TestConvertMessages(t *testing.T) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "get_weather",
 				Description: "Get weather info",
 			},
@@ -91,7 +87,7 @@ func TestBuildToolPrompt(t *testing.T) {
 		{Role: "user", Content: "What's the weather in NYC?"},
 	}
 
-	result := buildToolPrompt(messages, tools)
+	result := convertMessages(messages, tools)
 
 	// Should have a system message prepended
 	if len(result) != 2 {
@@ -105,13 +101,17 @@ func TestBuildToolPrompt(t *testing.T) {
 	if !containsString(result[0].Content, "get_weather") {
 		t.Error("system message should contain tool definitions")
 	}
+
+	if result[1].Role != "user" {
+		t.Errorf("second message role should be 'user', got '%s'", result[1].Role)
+	}
 }
 
-func TestBuildToolPrompt_ExistingSystem(t *testing.T) {
+func TestConvertMessages_ExistingSystem(t *testing.T) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "get_weather",
 				Description: "Get weather info",
 			},
@@ -123,7 +123,7 @@ func TestBuildToolPrompt_ExistingSystem(t *testing.T) {
 		{Role: "user", Content: "What's the weather in NYC?"},
 	}
 
-	result := buildToolPrompt(messages, tools)
+	result := convertMessages(messages, tools)
 
 	// Should still have 2 messages (system message should be updated, not duplicated)
 	if len(result) != 2 {
@@ -144,12 +144,12 @@ func TestBuildToolPrompt_ExistingSystem(t *testing.T) {
 	}
 }
 
-func TestBuildToolPrompt_NoTools(t *testing.T) {
+func TestConvertMessages_NoTools(t *testing.T) {
 	messages := []Message{
 		{Role: "user", Content: "Hello"},
 	}
 
-	result := buildToolPrompt(messages, nil)
+	result := convertMessages(messages, nil)
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
@@ -157,6 +157,49 @@ func TestBuildToolPrompt_NoTools(t *testing.T) {
 
 	if result[0].Content != "Hello" {
 		t.Errorf("message content should be unchanged, got '%s'", result[0].Content)
+	}
+}
+
+func TestConvertMessages_ToolCalls(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: "What's the weather?"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:   "call_0",
+				Type: "function",
+				Function: FunctionCall{
+					Name:      "get_weather",
+					Arguments: `{"city": "Tokyo"}`,
+				},
+			}},
+		},
+		{Role: "tool", ToolCallID: "call_0", Content: "22°C, sunny"},
+	}
+
+	result := convertMessages(messages, nil)
+
+	if len(result) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(result))
+	}
+
+	// Assistant message should have ToolCalls
+	if result[1].Role != "assistant" {
+		t.Errorf("second message role should be 'assistant', got '%s'", result[1].Role)
+	}
+	if len(result[1].ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(result[1].ToolCalls))
+	}
+	if result[1].ToolCalls[0].Name != "get_weather" {
+		t.Errorf("tool call name should be 'get_weather', got '%s'", result[1].ToolCalls[0].Name)
+	}
+
+	// Tool result message
+	if result[2].Role != "tool" {
+		t.Errorf("third message role should be 'tool', got '%s'", result[2].Role)
+	}
+	if result[2].Content != "22°C, sunny" {
+		t.Errorf("third message content mismatch: %q", result[2].Content)
 	}
 }
 
@@ -168,14 +211,14 @@ func TestParseToolCalls(t *testing.T) {
 		wantName string
 	}{
 		{
-			name: "valid tool call",
-			input: `{"tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"NYC\"}"}}]}`,
+			name:     "valid simple JSON tool call",
+			input:    `{"name": "get_weather", "arguments": {"location": "NYC"}}`,
 			wantOk:   true,
 			wantName: "get_weather",
 		},
 		{
-			name: "markdown fenced tool call",
-			input: "I'll check the weather for you.\n\n" + "```" + "json\n{\"tool_calls\": [{\"id\": \"call_123\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"location\\\": \\\"NYC\\\"}\"}}]}\n" + "```",
+			name:     "tool call with <|tool_call|> prefix",
+			input:    "<|tool_call|>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}",
 			wantOk:   true,
 			wantName: "get_weather",
 		},
@@ -191,27 +234,16 @@ func TestParseToolCalls(t *testing.T) {
 			wantOk:   false,
 			wantName: "",
 		},
-		{
-			name:     "incomplete JSON",
-			input:    `{"tool_calls": [`,
-			wantOk:   false,
-			wantName: "",
-		},
-		{
-			name:     "empty tool_calls array",
-			input:    `{"tool_calls": []}`,
-			wantOk:   false,
-			wantName: "",
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			calls, ok := parseToolCalls(tt.input)
-			if ok != tt.wantOk {
-				t.Errorf("parseToolCalls() ok = %v, want %v", ok, tt.wantOk)
+			calls := parseToolCalls(tt.input)
+			gotOk := len(calls) > 0
+			if gotOk != tt.wantOk {
+				t.Errorf("parseToolCalls() found = %v, want %v", gotOk, tt.wantOk)
 			}
-			if ok && len(calls) > 0 {
+			if gotOk && len(calls) > 0 {
 				if calls[0].Function.Name != tt.wantName {
 					t.Errorf("expected function name '%s', got '%s'", tt.wantName, calls[0].Function.Name)
 				}
@@ -226,155 +258,11 @@ func TestParseToolCalls(t *testing.T) {
 	}
 }
 
-func TestIsToolCallResponse(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  bool
-	}{
-		{
-			name:  "raw JSON tool call",
-			input: `{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]}`,
-			want:  true,
-		},
-		{
-			name:  "fenced JSON tool call",
-			input: "\n" + "```" + "\n{\"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{}\"}}]}\n" + "```" + "\n",
-			want:  true,
-		},
-		{
-			name:  "plain text",
-			input: "The weather is sunny today.",
-			want:  false,
-		},
-		{
-			name:  "regular JSON",
-			input: `{"name": "John", "age": 30}`,
-			want:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isToolCallResponse(tt.input); got != tt.want {
-				t.Errorf("isToolCallResponse() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestExtractJSON(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "raw JSON",
-			input: `{"tool_calls": []}`,
-			want:  `{"tool_calls": []}`,
-		},
-		{
-			name:  "markdown fenced",
-			input: "\n" + "```" + "json\n{\"key\": \"value\"}\n" + "```",
-			want:  `{"key": "value"}`,
-		},
-		{
-			name:  "fenced with surrounding text",
-			input: "Here is the result:\n\n" + "```" + "json\n{\"key\": \"value\"}\n" + "```" + "\n\nDone.",
-			want:  `{"key": "value"}`,
-		},
-		{
-			name:  "no JSON",
-			input: "No JSON here",
-			want:  "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := extractJSON(tt.input)
-			if got != tt.want {
-				t.Errorf("extractJSON() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFormatToolResult(t *testing.T) {
-	msg := formatToolResult("call_123", "Sunny, 72°F")
-
-	if msg.Role != "tool" {
-		t.Errorf("expected role 'tool', got '%s'", msg.Role)
-	}
-
-	if msg.ToolCallID != "call_123" {
-		t.Errorf("expected tool_call_id 'call_123', got '%s'", msg.ToolCallID)
-	}
-
-	if msg.Content != "Sunny, 72°F" {
-		t.Errorf("expected content 'Sunny, 72°F', got '%s'", msg.Content)
-	}
-}
-
-func TestParseToolCalls_MissingArguments(t *testing.T) {
-	input := `{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": ""}}]}`
-
-	calls, ok := parseToolCalls(input)
-	if !ok {
-		t.Fatal("parseToolCalls should succeed")
-	}
-
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(calls))
-	}
-
-	if calls[0].Function.Name != "get_weather" {
-		t.Errorf("expected function name 'get_weather', got '%s'", calls[0].Function.Name)
-	}
-}
-
-func TestToolCallJSONRoundTrip(t *testing.T) {
-	// Test that tool calls survive JSON marshaling/unmarshaling
-	original := []ToolCall{
-		{
-			ID:   "call_abc123",
-			Type: "function",
-			Function: FuncCall{
-				Name:      "get_weather",
-				Arguments: json.RawMessage(`{"location": "NYC"}`),
-			},
-		},
-	}
-
-	data, err := json.Marshal(original)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-
-	var decoded []ToolCall
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
-	}
-
-	if len(decoded) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(decoded))
-	}
-
-	if decoded[0].ID != original[0].ID {
-		t.Errorf("ID mismatch: %s != %s", decoded[0].ID, original[0].ID)
-	}
-
-	if decoded[0].Function.Name != original[0].Function.Name {
-		t.Errorf("Name mismatch: %s != %s", decoded[0].Function.Name, original[0].Function.Name)
-	}
-}
-
 func TestFormatToolDefinitions_EmptyParams(t *testing.T) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "no_params_tool",
 				Description: "A tool with no parameters",
 			},
@@ -407,7 +295,8 @@ func findSubstring(s, substr string) bool {
 }
 
 func BenchmarkParseToolCalls(b *testing.B) {
-	input := `{"tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"NYC\"}"}}]}`
+	input := `<|tool_call|>
+{"name": "get_weather", "arguments": {"location": "NYC"}}`
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -419,7 +308,7 @@ func BenchmarkFormatToolDefinitions(b *testing.B) {
 	tools := []Tool{
 		{
 			Type: "function",
-			Function: ToolDefinition{
+			Function: Function{
 				Name:        "get_weather",
 				Description: "Get the current weather for a location",
 				Parameters: map[string]interface{}{
@@ -439,5 +328,41 @@ func BenchmarkFormatToolDefinitions(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		formatToolDefinitions(tools)
+	}
+}
+
+func TestToolCallJSONRoundTrip(t *testing.T) {
+	// Test that tool calls survive JSON marshaling/unmarshaling
+	original := []ToolCall{
+		{
+			ID:   "call_abc123",
+			Type: "function",
+			Function: FunctionCall{
+				Name:      "get_weather",
+				Arguments: `{"location": "NYC"}`,
+			},
+		},
+	}
+
+	data, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	var decoded []ToolCall
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if len(decoded) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(decoded))
+	}
+
+	if decoded[0].ID != original[0].ID {
+		t.Errorf("ID mismatch: %s != %s", decoded[0].ID, original[0].ID)
+	}
+
+	if decoded[0].Function.Name != original[0].Function.Name {
+		t.Errorf("Name mismatch: %s != %s", decoded[0].Function.Name, original[0].Function.Name)
 	}
 }

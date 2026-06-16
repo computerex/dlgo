@@ -271,14 +271,30 @@ func formatChatMLMessages(messages []Message) string {
 
 // formatLlama3Messages formats messages using LLaMA 3 template.
 // Format: <|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>
+//
+// For tool calling (LLaMA 3.1+ native format):
+//   - assistant messages with ToolCalls use <|python_tag|> marker
+//   - tool results use the ipython role
 func formatLlama3Messages(messages []Message) string {
 	var b strings.Builder
 	b.WriteString("<|begin_of_text|>")
 	for _, m := range messages {
+		role := m.Role
+		if role == "tool" {
+			// LLaMA 3.1+ uses ipython role for tool results
+			role = "ipython"
+		}
 		b.WriteString("<|start_header_id|>")
-		b.WriteString(m.Role)
+		b.WriteString(role)
 		b.WriteString("<|end_header_id|>\n\n")
-		b.WriteString(m.Content)
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				b.WriteString("<|python_tag|>")
+				fmt.Fprintf(&b, `{"name": %q, "arguments": %s}`, tc.Name, tc.Arguments)
+			}
+		} else {
+			b.WriteString(m.Content)
+		}
 		b.WriteString("<|eot_id|>")
 	}
 	b.WriteString("<|start_header_id|>assistant<|end_header_id|>\n\n")
@@ -353,14 +369,30 @@ func formatPhiMessages(messages []Message) string {
 // formatChatGLMMessages formats messages using the ChatGLM-4 / GLM-4.7 template.
 // The [gMASK]<sop> prefix is part of the Jinja2 template and must be tokenized.
 // Format: [gMASK]<sop><|role|>\ncontent...<|assistant|>\n
+//
+// For tool calling (GLM-4 native format):
+//   - assistant messages with ToolCalls embed JSON function calls
+//   - tool results use the observation role
 func formatChatGLMMessages(messages []Message) string {
 	var b strings.Builder
 	b.WriteString("[gMASK]<sop>")
 	for _, m := range messages {
+		role := m.Role
+		if role == "tool" {
+			// GLM-4/4.7 uses observation role for tool results
+			role = "observation"
+		}
 		b.WriteString("<|")
-		b.WriteString(m.Role)
+		b.WriteString(role)
 		b.WriteString("|>\n")
-		b.WriteString(m.Content)
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				fmt.Fprintf(&b, `{"name": %q, "arguments": %s}`, tc.Name, tc.Arguments)
+				b.WriteString("\n")
+			}
+		} else {
+			b.WriteString(m.Content)
+		}
 	}
 	b.WriteString("<|assistant|>\n")
 	return b.String()
@@ -369,13 +401,30 @@ func formatChatGLMMessages(messages []Message) string {
 // formatChatMLSepMessages formats messages using ChatML with <|im_sep|> separator.
 // Matches llama.cpp LLM_CHAT_TEMPLATE_PHI_4 / Qwen3 format.
 // Format: <|im_start|>role<|im_sep|>content<|im_end|>\n
+//
+// For tool calling (Qwen/Phi-native format):
+//   - assistant messages with ToolCalls use <|tool_call|> markers
+//   - tool messages use <|tool_response|> markers
 func formatChatMLSepMessages(messages []Message) string {
 	var b strings.Builder
 	for _, m := range messages {
 		b.WriteString("<|im_start|>")
 		b.WriteString(m.Role)
 		b.WriteString("<|im_sep|>")
-		b.WriteString(m.Content)
+
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				b.WriteString("<|tool_call|>\n")
+				fmt.Fprintf(&b, `{"name": %q, "arguments": %s}`, tc.Name, tc.Arguments)
+				b.WriteString("\n")
+			}
+		} else if m.Role == "tool" {
+			b.WriteString("<|tool_response|>\n")
+			b.WriteString(m.Content)
+		} else {
+			b.WriteString(m.Content)
+		}
+
 		b.WriteString("<|im_end|>\n")
 	}
 	b.WriteString("<|im_start|>assistant<|im_sep|>\n")
