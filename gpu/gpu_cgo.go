@@ -4,6 +4,7 @@ package gpu
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/csrc
+#cgo darwin CFLAGS: -I/usr/local/include
 #cgo windows CFLAGS: -IC:/VulkanSDK/1.4.341.1/Include
 #cgo windows LDFLAGS: -LC:/VulkanSDK/1.4.341.1/Lib -lvulkan-1
 

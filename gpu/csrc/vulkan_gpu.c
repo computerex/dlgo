@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 /* Performance counters */
 static double g_perf_gpu_us = 0.0;
@@ -31,7 +32,7 @@ void gpu_perf_print(void) {
 typedef HMODULE LibHandle;
 #elif defined(__APPLE__)
 #include <dlfcn.h>
-#define LOAD_VULKAN() dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL)
+#define LOAD_VULKAN() dlopen("/usr/local/lib/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL)
 #define GET_PROC(lib, name) dlsym(lib, name)
 #define CLOSE_LIB(lib) dlclose(lib)
 typedef void* LibHandle;
@@ -425,9 +426,14 @@ static void submit_and_wait(void) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g.cmd_buf;
 
+#ifdef _WIN32
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
+#else
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+#endif
 
     vkResetFences_(g.device, 1, &g.fence);
     vkQueueSubmit_(g.queue, 1, &si, g.fence);
@@ -451,8 +457,15 @@ static void submit_and_wait(void) {
         exit(95);
     }
 
+#ifdef _WIN32
     QueryPerformanceCounter(&t1);
     g_perf_gpu_us += (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart * 1e6;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed_us = (double)(ts1.tv_sec - ts0.tv_sec) * 1e6 +
+                        (double)(ts1.tv_nsec - ts0.tv_nsec) / 1e3;
+    g_perf_gpu_us += elapsed_us;
+#endif
     g_perf_submits++;
 }
 
