@@ -42,11 +42,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Convert messages
-	msgs := make([]llm.Message, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = llm.Message{Role: m.Role, Content: m.Content}
-	}
+	// Convert messages, injecting tool definitions and formatting tool results
+	msgs := convertMessages(req.Messages, req.Tools)
 
 	// Build sampler config
 	sampler := ops.DefaultSamplerConfig()
@@ -117,9 +114,14 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
+	// Buffer full text for tool call detection at the end
+	var fullText strings.Builder
+	var reasoningContent string
+
 	for ev := range infReq.Output {
 		switch ev.Type {
 		case EventToken:
+			fullText.WriteString(ev.Token)
 			chunk := ChatCompletionChunk{
 				ID:      infReq.ID,
 				Object:  "chat.completion.chunk",
@@ -135,19 +137,49 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			flusher.Flush()
 
 		case EventDone:
-			chunk := ChatCompletionChunk{
-				ID:      infReq.ID,
-				Object:  "chat.completion.chunk",
-				Created: nowUnix(),
-				Model:   modelID,
-				Choices: []ChatCompletionChoice{{
-					Index:        0,
-					Delta:        &Message{},
-					FinishReason: strPtr(ev.FinishReason),
-				}},
+			reasoningContent = ev.ReasoningContent
+			collected := fullText.String()
+
+			// Try to detect tool calls in the final output
+			tcs := parseToolCalls(collected)
+			if len(tcs) > 0 {
+				// For streaming, we send a final chunk with the tool_calls
+				// and finish_reason "tool_calls". The previously streamed
+				// content tokens are still valid (they may contain the
+				// function call JSON, which the client should ignore when
+				// tool_calls is present).
+				chunk := ChatCompletionChunk{
+					ID:      infReq.ID,
+					Object:  "chat.completion.chunk",
+					Created: nowUnix(),
+					Model:   modelID,
+					Choices: []ChatCompletionChoice{{
+						Index: 0,
+						Delta: &Message{
+							Role:             "assistant",
+							ReasoningContent: reasoningContent,
+							ToolCalls:        tcs,
+						},
+						FinishReason: strPtr("tool_calls"),
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+			} else {
+				chunk := ChatCompletionChunk{
+					ID:      infReq.ID,
+					Object:  "chat.completion.chunk",
+					Created: nowUnix(),
+					Model:   modelID,
+					Choices: []ChatCompletionChoice{{
+						Index:        0,
+						Delta:        &Message{ReasoningContent: reasoningContent},
+						FinishReason: strPtr(ev.FinishReason),
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
 			}
-			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", data)
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 
@@ -197,6 +229,40 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	if fullText == "" && reasoningContent != "" {
 		fullText = reasoningContent
 		completionTokens = len(strings.Fields(reasoningContent)) // approximate
+	}
+
+	// Try to parse tool calls from the generated text
+	tcs := parseToolCalls(fullText)
+	if len(tcs) > 0 {
+		// The model made a function call — return tool_calls in response.
+		// When tools are available and the model responds with a function call
+		// JSON, we strip the JSON from the content and set tool_calls instead.
+		finishReason = "tool_calls"
+		resp := ChatCompletionResponse{
+			ID:      infReq.ID,
+			Object:  "chat.completion",
+			Created: nowUnix(),
+			Model:   modelID,
+			Choices: []ChatCompletionChoice{{
+				Index: 0,
+				Message: &Message{
+					Role:             "assistant",
+					Content:          "",
+					ReasoningContent: reasoningContent,
+					ToolCalls:        tcs,
+				},
+				FinishReason: &finishReason,
+			}},
+			Usage: &UsageInfo{
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+		return
 	}
 
 	resp := ChatCompletionResponse{

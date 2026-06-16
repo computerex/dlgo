@@ -33,14 +33,27 @@ func cmdRun(args []string) {
 	useGPU := fs.Bool("gpu", false, "use Vulkan GPU backend")
 	noStream := fs.Bool("no-stream", false, "disable token streaming")
 
-	fs.Parse(args)
+	// Extract the model path before flag parsing.
+	// Go's flag package stops parsing at the first non-flag argument,
+	// so we identify the model path (by its file extension) and remove
+	// it from the args so flags work regardless of position.
+	var modelPath string
+	var flagArgs []string
+	for _, arg := range args {
+		if modelPath == "" && looksLikeModelPath(arg) {
+			modelPath = arg
+		} else {
+			flagArgs = append(flagArgs, arg)
+		}
+	}
 
-	if fs.NArg() < 1 {
+	fs.Parse(flagArgs)
+
+	if modelPath == "" {
 		fmt.Fprintln(os.Stderr, "Error: model path required")
 		fmt.Fprintln(os.Stderr, "Usage: dlgo run <model.gguf> [flags]")
 		os.Exit(1)
 	}
-	modelPath := fs.Arg(0)
 
 	if *threads > 0 {
 		os.Setenv("DLGO_NUM_THREADS", fmt.Sprintf("%d", *threads))

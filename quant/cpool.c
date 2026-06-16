@@ -4,7 +4,7 @@
 // Workers spin-wait with _mm_pause() for sub-µs dispatch latency.
 // Pool is lazily initialized on first matmul call.
 
-#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+#pragma GCC target("avx2,fma,f16c")
 #pragma GCC optimize("O3")
 
 #ifdef _WIN32

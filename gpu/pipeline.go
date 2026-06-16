@@ -218,7 +218,7 @@ func computeMaxGPUContext(m *llm.Model, maxSeqLen int) int {
 	}
 
 	// Round down to a nice power-of-two-ish boundary for cleaner allocation.
-	for _, nice := range []int{131072, 65536, 32768, 16384, 8192} {
+	for _, nice := range []int{1048576, 524288, 262144, 131072, 65536, 32768, 16384, 8192} {
 		if nice <= best {
 			return nice
 		}
@@ -264,7 +264,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 
 	// Per-layer KV cache cost
 	kvDim := int64(m.Config.NumKVHeads * m.Config.HeadDim)
-	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 4 // K + V buffers (FP32)
+	kvPerLayer := 2 * int64(maxSeqLen) * kvDim * 2 // K + V buffers (FP16, matches runtime allocation)
 
 	// Per-layer SSM state cost (only for SSM layers)
 	var ssmPerLayer int64

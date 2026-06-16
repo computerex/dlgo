@@ -960,6 +960,16 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 				BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
 				Barrier()
 
+			// ssmFlushInterval controls how often we flush the Vulkan command buffer
+			// during the per-token SSM loop. The SSM computation is sequential (token N
+			// depends on token N-1), so tokens cannot be batched. Without flushing, 512
+			// tokens × 24 SSM layers × ~9 dispatches = ~115K dispatches accumulate in a
+			// single command buffer. submit_and_wait() has a 10s fence timeout, and this
+			// volume can exceed it, causing a fatal crash. Flushing every N tokens keeps
+			// each submission well within the timeout (32 tokens × 9 ops = 288 dispatches,
+			// ~29ms execution, 345× safety margin).
+			const ssmFlushInterval = 32
+
 			for p := 0; p < npos; p++ {
 				off := uint64(p)
 				CopyRegion(rs.SSMQKV, 0, bs.SSMQKV, off*uint64(ssmQKVDim*4), uint64(ssmQKVDim*4))
@@ -1001,7 +1011,19 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 					Barrier()
 					CopyRegion(bs.SSMY, off*uint64(ssmNumHeads*ssmHeadVDim*4), rs.SSMY, 0, uint64(ssmNumHeads*ssmHeadVDim*4))
 					Barrier()
+
+				// Periodic flush: submit the accumulated command buffer and start a new one.
+				// This prevents the command buffer from growing to 115K+ dispatches (which
+				// exceeds the 10s GPU fence timeout). All GPU state (SSM state, batch
+				// buffers) persists in device memory across submissions, so this is safe.
+				// The cpuSSMDelta path already flushes per-token; for it, EndBatch is a
+				// no-op (g.recording is already 0).
+				if (p+1)%ssmFlushInterval == 0 && p+1 < npos {
+					EndBatch()
+					Sync()
+					BeginBatch()
 				}
+			}
 
 				BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
 

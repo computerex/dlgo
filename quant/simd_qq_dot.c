@@ -8,7 +8,7 @@
 // then compute integer dot products against quantized weight rows.
 // _mm256_maddubs_epi16 processes 32 values per instruction (vs 8 for float FMA).
 
-#pragma GCC target("avx2,fma,f16c,avx512f,avx512bw,avx512dq,avx512vl,avx512vnni")
+#pragma GCC target("avx2,fma,f16c")
 #pragma GCC optimize("O3")
 
 #include <immintrin.h>

@@ -12,7 +12,7 @@ import (
 
 func setupRunner(pipe *llm.Pipeline, useGPU bool) (generateRunner, string) {
 	if useGPU {
-		fmt.Fprintln(os.Stderr, "Warning: GPU not available (build with -tags vulkan). Using CPU.")
+		fmt.Fprintln(os.Stdout, "[GPU-STUB] GPU requested but build tag not detected. Using CPU.")
 	}
 	return &cpuRunner{pipe: pipe}, ""
 }
