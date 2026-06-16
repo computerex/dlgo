@@ -90,6 +90,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Cancel: cancel,
 	}
 
+	// When tools are provided, apply grammar-constrained decoding for
+	// non-thinking models to prevent malformed JSON at generation time.
+	if len(req.Tools) > 0 {
+		supportsThinking := llm.GetArchDescriptor(model.CPUPipeline.Model.Config.Architecture).SupportsThinking
+		if !supportsThinking {
+			g, err := ToolCallGrammar(false)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to build tool call grammar: "+err.Error(), "server_error")
+				return
+			}
+			infReq.Config.Grammar = g
+		}
+	}
+
 	if err := model.Scheduler.Submit(infReq); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "scheduler busy: "+err.Error(), "server_error")
 		return

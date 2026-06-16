@@ -182,9 +182,27 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	// After that, let the model naturally close </think> and produce content.
 	thinkBudget := req.Config.MaxTokens * 4 / 5
 
+	// Grammar setup for constrained decoding
+	var tokenPieces []string
+	var eosTokens map[int32]bool
+	if req.Config.Grammar != nil {
+		vocabSize := pipe.Tokenizer.VocabSize()
+		tokenPieces = make([]string, vocabSize)
+		for i := 0; i < vocabSize; i++ {
+			tokenPieces[i] = pipe.Tokenizer.DecodeToken(int32(i))
+		}
+		eosTokens = map[int32]bool{pipe.Model.Config.EOS: true}
+		for _, t := range pipe.Model.Config.StopTokens {
+			eosTokens[t] = true
+		}
+	}
+
 	llm.ApplySuppressTokens(pipe.RunState.Logits, pipe.Model.Config.SuppressTokens)
 	if inThinkBlock {
 		suppressEOSLogits(pipe.RunState.Logits, pipe.Model.Config)
+	}
+	if req.Config.Grammar != nil {
+		req.Config.Grammar.ApplyToLogits(pipe.RunState.Logits, tokenPieces, eosTokens)
 	}
 	nextToken := int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
 
@@ -196,6 +214,11 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	tokenText := pipe.Tokenizer.DecodeToken(nextToken)
 	var genText strings.Builder
 	genText.WriteString(tokenText)
+
+	// Advance grammar state
+	if req.Config.Grammar != nil {
+		req.Config.Grammar.AcceptToken(tokenText)
+	}
 
 	if checkTextStop(genText.String(), stopStrings) {
 		req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens}
@@ -238,6 +261,9 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		if inThinkBlock && step < thinkBudget {
 			suppressEOSLogits(pipe.RunState.Logits, pipe.Model.Config)
 		}
+		if req.Config.Grammar != nil {
+			req.Config.Grammar.ApplyToLogits(pipe.RunState.Logits, tokenPieces, eosTokens)
+		}
 		nextToken = int32(ops.SampleToken(pipe.RunState.Logits, req.Config.Sampler, recentTokens, rng))
 
 		if isStopToken(nextToken, pipe.Model.Config) {
@@ -247,6 +273,11 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		tokenText = pipe.Tokenizer.DecodeToken(nextToken)
 		req.Generated = append(req.Generated, nextToken)
 		recentTokens = append(recentTokens, nextToken)
+
+		// Advance grammar state
+		if req.Config.Grammar != nil {
+			req.Config.Grammar.AcceptToken(tokenText)
+		}
 
 		genText.WriteString(tokenText)
 		if checkTextStop(genText.String(), stopStrings) {
