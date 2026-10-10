@@ -131,30 +131,35 @@ func normalizeToPatches(img *f32Image, patch int, mean, std [3]float32) (rows in
 }
 
 // convPatches applies the 4D conv-style patch embedding. feats are in (C, Y, X)
-// HF order; the conv weight is in GGUF order [KH, KW, IC, OC] i.e. memory
-// order (Y, X, C, OC) after the convert-time permute(2,3,1,0). We compute
-// out[oc] = sum over (y, x, c) W[(y*KW + x)*IC + c][oc] * feat[c*ps*ps + y*ps + x].
+// HF order. The GGUF tensor is the torch conv weight [OC, IC, KH, KW] written
+// row-major (ne dims are reversed metadata only), so its flat index is
+// x + KW*y + KH*KW*c + KH*KW*IC*oc. That is exactly the k order of
+// ggml_compute_forward_im2col (dst_data[c*(KH*KW) + kh*KW + kw]) that
+// ggml_conv_2d's MUL_MAT dots against — there is no permute in between.
 func (e *Encoder) convPatches(feats [][]float32) [][]float32 {
 	ps := e.Config.PatchSize
 	ic := e.PatchIC
 	oc := e.Config.EmbeddingDim
 	kh, kw := e.PatchKH, e.PatchKW
 	kernel := kh * kw * ic
+	w1 := e.Patch4DW1
 	out := make([][]float32, len(feats))
 	e.parallelFor(len(feats), func(idx int) {
 		f := feats[idx]
 		acc := make([]float64, oc)
 		for y := 0; y < kh; y++ {
 			for x := 0; x < kw; x++ {
-				base := (y*kw + x) * ic
 				for c := 0; c < ic; c++ {
 					fv := float64(f[c*ps*ps+y*ps+x])
 					if fv == 0 {
 						continue
 					}
-					wRow := base + c
+					wIdx := x + kw*y + kh*kw*c
 					for o := 0; o < oc; o++ {
-						acc[o] += float64(e.Patch4DW[wRow+kernel*o]) * fv
+						acc[o] += float64(e.Patch4DW[wIdx+kernel*o]) * fv
+						if w1 != nil {
+							acc[o] += float64(w1[wIdx+kernel*o]) * fv
+						}
 					}
 				}
 			}
@@ -210,9 +215,60 @@ func (e *Encoder) PrepareImage(src image.Image) (gridH, gridW int, feats [][]flo
 		return ph, pw, feats, nil
 	}
 
+	if c.ProjectorType == "qwen3vl_merger" {
+		// Qwen VL uses dynamic resolution: resize preserving aspect ratio so
+		// each side is a multiple of patch_size*merge, within the model's
+		// pixel budget (smart_resize). No padding, no forced square.
+		tw, th := qwenSmartResize(f.W, f.H, c.PatchSize*c.SpatialMerge, c.ImageMinPixels, c.ImageMaxPixels)
+		resized := resizeBilinear(f, tw, th)
+		ph, pw, feats := normalizeToPatches(resized, c.PatchSize, c.ImageMean, c.ImageStd)
+		return ph, pw, feats, nil
+	}
+
 	resized := resizeBilinear(f, c.ImageSize, c.ImageSize)
 	ph, pw, feats := normalizeToPatches(resized, c.PatchSize, c.ImageMean, c.ImageStd)
 	return ph, pw, feats, nil
+}
+
+// qwenSmartResize mirrors Qwen-VL's smart_resize: snap each side to a multiple
+// of factor (= patch_size*merge_size) preserving aspect ratio, keeping the
+// total pixel count within [minPixels, maxPixels].
+func qwenSmartResize(w, h, factor, minPixels, maxPixels int) (int, int) {
+	if factor <= 0 {
+		factor = 32
+	}
+	if minPixels <= 0 {
+		minPixels = 8 * factor * factor
+	}
+	if maxPixels <= 0 {
+		maxPixels = 4096 * factor * factor
+	}
+	hBar := int(math.Round(float64(h)/float64(factor))) * factor
+	wBar := int(math.Round(float64(w)/float64(factor))) * factor
+	if hBar < factor {
+		hBar = factor
+	}
+	if wBar < factor {
+		wBar = factor
+	}
+	hw := hBar * wBar
+	if hw > maxPixels {
+		beta := math.Sqrt(float64(h*w) / float64(maxPixels))
+		hBar = maxInt(factor, int(math.Floor(float64(h)/beta/float64(factor)))*factor)
+		wBar = maxInt(factor, int(math.Floor(float64(w)/beta/float64(factor)))*factor)
+	} else if hw < minPixels {
+		beta := math.Sqrt(float64(minPixels) / float64(h*w))
+		hBar = int(math.Ceil(float64(h)*beta/float64(factor))) * factor
+		wBar = int(math.Ceil(float64(w)*beta/float64(factor))) * factor
+		// Round-to-nearest pass (Qwen resizes with round, then clamps up to
+		// min_pixels only when below); prevents overshoot past minPixels.
+		hRound := int(math.Round(float64(h)*beta/float64(factor))) * factor
+		wRound := int(math.Round(float64(w)*beta/float64(factor))) * factor
+		if hRound*wRound >= minPixels {
+			hBar, wBar = maxInt(factor, hRound), maxInt(factor, wRound)
+		}
+	}
+	return wBar, hBar
 }
 
 func fitInside(w, h, max int) (int, int) {

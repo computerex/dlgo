@@ -96,8 +96,12 @@ func (c *MessageContent) UnmarshalJSON(data []byte) error {
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
 				c.Images = append(c.Images, p.ImageURL.URL)
 				// Place a marker so the prompt builder can locate the image.
-				sb.WriteString("<image>")
+				// Qwen VL-style delimiters teach the model an image block is
+				// present; other models tolerate them as text. Wrapped so the
+				// embeddings replace only the inner <image> marker.
+				sb.WriteString("<|vision_start|><image><|vision_end|>")
 			}
+
 		}
 	}
 	c.Text = sb.String()

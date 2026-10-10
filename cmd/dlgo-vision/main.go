@@ -28,10 +28,12 @@ import (
 func main() {
 	mmproj := flag.String("mmproj", "", "path to mmproj GGUF (vision projector)")
 	model := flag.String("model", "", "path to text model GGUF")
-	imagePath := flag.String("image", "cb", "image file, or synthetic: white|black|gray|cb")
+	imagePath := flag.String("image", "cb", "image file, or synthetic: white|black|gray|cb|red|green|blue")
 	n := flag.Int("n", 336, "synthetic image edge size in pixels")
 	prompt := flag.String("prompt", "Describe this image in detail:\n<image>", "prompt with <image> marker")
 	maxTokens := flag.Int("max-tokens", 64, "max tokens to generate")
+	temp := flag.Float64("temp", 0, "sampling temperature (0 = greedy)")
+	seed := flag.Int64("seed", 0, "sampling seed")
 	flag.Parse()
 
 	if *mmproj == "" || *model == "" {
@@ -41,7 +43,7 @@ func main() {
 
 	var img image.Image
 	switch strings.ToLower(*imagePath) {
-	case "white", "black", "gray", "cb":
+	case "white", "black", "gray", "cb", "red", "green", "blue":
 		img = synthetic(*imagePath, *n)
 	default:
 		f, err := os.Open(*imagePath)
@@ -73,12 +75,12 @@ func main() {
 		enc.Config.ProjectorType, enc.Config.ImageSize, enc.Config.PatchSize, enc.Config.EmbeddingDim,
 		enc.Config.NumLayers, enc.Config.FFNDim)
 
-	rows, err := enc.Encode(img)
+	rows, gh, gw, err := enc.EncodeWithGrid(img)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "encode: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "image tokens=%d dim=%d\n", len(rows), len(rows[0]))
+	fmt.Fprintf(os.Stderr, "image tokens=%d dim=%d grid=%dx%d\n", len(rows), len(rows[0]), gh, gw)
 
 	p, err := llm.NewPipeline(*model, 4096)
 	if err != nil {
@@ -94,6 +96,9 @@ func main() {
 	cfg := llm.DefaultGenerateConfig()
 	cfg.MaxTokens = *maxTokens
 	cfg.ImageMarker = "<image>"
+	cfg.ImageGrids = [][2]int{{gh, gw}}
+	cfg.Sampler.Temperature = float32(*temp)
+	cfg.Seed = *seed
 
 	res, err := p.GenerateDetailedWithEmbeddings(*prompt, [][][]float32{rows}, cfg)
 	if err != nil {
@@ -122,6 +127,12 @@ func synthetic(kind string, n int) image.Image {
 					v = 0
 				}
 				img.Set(x, y, color.NRGBA{v, v, v, 255})
+			case "red":
+				img.Set(x, y, color.NRGBA{255, 0, 0, 255})
+			case "green":
+				img.Set(x, y, color.NRGBA{0, 255, 0, 255})
+			case "blue":
+				img.Set(x, y, color.NRGBA{0, 0, 255, 255})
 			}
 		}
 	}

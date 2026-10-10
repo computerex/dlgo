@@ -135,6 +135,20 @@ func UploadF32(dst Buf, src []float32) error {
 	return nil
 }
 
+// UploadF32At copies float32 data from CPU to GPU at a float32 offset within
+// an existing buffer (used to patch individual RoPE table rows for M-RoPE).
+func UploadF32At(dst Buf, offsetFloats int, src []float32) error {
+	if len(src) == 0 {
+		return nil
+	}
+	size := len(src) * 4
+	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(size), C.uint64_t(offsetFloats*4))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: upload-at failed (%d)", rc)
+	}
+	return nil
+}
+
 // UploadI32 copies int32 data from CPU to GPU.
 func UploadI32(dst Buf, src []int32) error {
 	if len(src) == 0 {

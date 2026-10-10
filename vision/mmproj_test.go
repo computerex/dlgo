@@ -21,6 +21,10 @@ type tinyCfg struct {
 	class                                  bool
 	preLN                                  bool
 	projectorOut                           int
+	// qwen selects the qwen3vl_merger pipeline in the fixture: fused QKV
+	// weights, no class token, spatial merge 2 before the projector.
+	qwen  bool
+	merge int
 }
 
 func (c tinyCfg) gridSize() int { return c.image / c.patch }
@@ -51,7 +55,6 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 	md := map[string]interface{}{
 		"general.architecture":                     "clip",
 		"clip.has_vision_encoder":                  true,
-		"clip.projector_type":                      "mlp",
 		"clip.vision.image_size":                   uint32(cfg.image),
 		"clip.vision.patch_size":                   uint32(cfg.patch),
 		"clip.vision.embedding_length":             uint32(cfg.embd),
@@ -61,6 +64,15 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 		"clip.vision.attention.layer_norm_epsilon": float32(1e-5),
 		"clip.vision.image_mean":                   []float32{0.5, 0.5, 0.5},
 		"clip.vision.image_std":                    []float32{0.5, 0.5, 0.5},
+	}
+	if cfg.qwen {
+		md["clip.projector_type"] = "qwen3vl_merger"
+		md["clip.vision.spatial_merge_size"] = uint32(2)
+		// Keep smart_resize from rescaling the tiny fixture image.
+		md["clip.vision.image_min_pixels"] = uint32(cfg.image * cfg.image)
+		md["clip.vision.image_max_pixels"] = uint32(cfg.image * cfg.image)
+	} else {
+		md["clip.projector_type"] = "mlp"
 	}
 
 	var tensors []gguf.WriteTensor
@@ -80,11 +92,30 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 	W["patch"] = patch
 	add("v.patch_embd.weight", []int64{int64(ps), int64(ps), 3, int64(cfg.embd)}, patch)
 
-	nPos := cfg.gridSize()*cfg.gridSize() + 1 // +1 always (class slot) in this fixture
+	patch1 := make([]float32, ps*ps*3*cfg.embd)
+	for i := range patch1 {
+		patch1[i] = float32(rng.NormFloat64()) * 0.1
+	}
+
+	nPos := cfg.gridSize() * cfg.gridSize()
+	if !cfg.qwen {
+		nPos++
+		if cfg.class {
+			// class slot exists only when the fixture writes a class embedding
+		} else {
+			nPos-- // no class token: table covers the patch grid exactly
+		}
+	}
 	pos := randMat("pos", nPos, cfg.embd)
 	add("v.position_embd.weight", []int64{int64(nPos), int64(cfg.embd)}, pos)
 
-	if cfg.class {
+	// Also write a bias for the qwen fixture (it always has one) and a second
+	// temporal conv so the loader's dual-conv path is exercised.
+	if cfg.qwen {
+		add("v.patch_embd.bias", []int64{int64(cfg.embd)}, randVec("pbias", cfg.embd))
+		W["patch1"] = patch1
+		add("v.patch_embd.weight.1", []int64{int64(ps), int64(ps), 3, int64(cfg.embd)}, patch1)
+	} else if cfg.class {
 		add("v.class_embd", []int64{int64(cfg.embd)}, randVec("class", cfg.embd))
 	}
 	if cfg.preLN {
@@ -101,16 +132,37 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 		add(p+"ln1.bias", []int64{int64(cfg.embd)}, randVec(q+"ln1b", cfg.embd))
 		add(p+"ln2.weight", []int64{int64(cfg.embd)}, randVec(q+"ln2w", cfg.embd))
 		add(p+"ln2.bias", []int64{int64(cfg.embd)}, randVec(q+"ln2b", cfg.embd))
-		for _, proj := range []string{"attn_q", "attn_k", "attn_v", "attn_out"} {
-			add(p+proj+".weight", []int64{int64(cfg.embd), int64(cfg.embd)}, randMat(q+proj+"w", cfg.embd, cfg.embd))
-		} // no biases for this fixture (SigLIP-like)
+		if cfg.qwen {
+			// fused QKV [3*embd, embd]
+			qkv := make([]float32, 3*cfg.embd*cfg.embd)
+			W[q+"qkvw"] = qkv
+			for j := range qkv {
+				qkv[j] = float32(rng.NormFloat64()) * 0.1
+			}
+			add(p+"attn_qkv.weight", []int64{int64(3 * cfg.embd), int64(cfg.embd)}, qkv)
+			qkvb := randVec(q+"qkvb", 3*cfg.embd)
+			add(p+"attn_qkv.bias", []int64{int64(3 * cfg.embd)}, qkvb)
+		} else {
+			for _, proj := range []string{"attn_q", "attn_k", "attn_v"} {
+				add(p+proj+".weight", []int64{int64(cfg.embd), int64(cfg.embd)}, randMat(q+proj+"w", cfg.embd, cfg.embd))
+			} // no biases for this fixture (SigLIP-like)
+		}
+		add(p+"attn_out.weight", []int64{int64(cfg.embd), int64(cfg.embd)}, randMat(q+"attn_outw", cfg.embd, cfg.embd))
 		add(p+"ffn_up.weight", []int64{int64(cfg.embd), int64(cfg.ffn)}, randMat(q+"ffnup", cfg.ffn, cfg.embd))
 		add(p+"ffn_down.weight", []int64{int64(cfg.ffn), int64(cfg.embd)}, randMat(q+"ffndown", cfg.embd, cfg.ffn))
 	}
 
-	// Projector: mm.0 (embd -> projHidden) -> GELU -> mm.2 (projHidden -> out)
+	// Projector: mm.0 (embd[*merge²] -> projHidden) -> GELU -> mm.2 (projHidden -> out)
 	projHidden := cfg.projectorOut
-	add("mm.0.weight", []int64{int64(cfg.embd), int64(projHidden)}, randMat("mm0", projHidden, cfg.embd))
+	mm0Cols := cfg.embd
+	if cfg.qwen {
+		m := cfg.merge
+		if m <= 0 {
+			m = 2
+		}
+		mm0Cols = cfg.embd * m * m
+	}
+	add("mm.0.weight", []int64{int64(mm0Cols), int64(projHidden)}, randMat("mm0", projHidden, mm0Cols))
 	add("mm.0.bias", []int64{int64(projHidden)}, randVec("mm0b", projHidden))
 	add("mm.2.weight", []int64{int64(projHidden), int64(cfg.projectorOut)}, randMat("mm2", cfg.projectorOut, projHidden))
 	add("mm.2.bias", []int64{int64(cfg.projectorOut)}, randVec("mm2b", cfg.projectorOut))
@@ -196,36 +248,91 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 		}
 	}
 
-	// 2. patch linear: out[oc] = sum_{y,x,c} W[(y*KW+x)*IC+c][oc] * f[c*ps*ps+y*ps+x]
+	// 2. patch linear: GGUF 4D conv layout [KH, KW, IC, OC] in memory order:
+	// idx = y + KW*x + KH*KW*c + KH*KW*IC*oc. Feature f is (C, Y, X). The qwen
+	// fixture also has a second temporal conv (summed in) and a bias.
 	pw := r.W["patch"]
+	pw1 := r.W["patch1"]
 	toks := make([][]float32, len(rows))
 	for i, f := range rows {
 		v := make([]float32, c.embd)
 		for y := 0; y < ps; y++ {
 			for x := 0; x < ps; x++ {
 				for ch := 0; ch < 3; ch++ {
-					wRow := (y*ps+x)*3 + ch
+					wIdx := x + ps*y + ps*ps*ch
 					fv := f[ch*ps*ps+y*ps+x]
 					for oc := 0; oc < c.embd; oc++ {
-						v[oc] += pw[wRow+(ps*ps*3)*oc] * fv
+						v[oc] += pw[wIdx+(ps*ps*3)*oc] * fv
+						if pw1 != nil {
+							v[oc] += pw1[wIdx+(ps*ps*3)*oc] * fv
+						}
 					}
 				}
 			}
 		}
+		if c.qwen {
+			for oc := range v {
+				v[oc] += r.W["pbias"][oc]
+			}
+		}
 		toks[i] = v
+	}
+	toksReordered := toks
+	if c.qwen {
+		merged := c.merge
+		if merged <= 0 {
+			merged = 2
+		}
+		toksReordered = make([][]float32, 0, len(toks))
+		for y := 0; y < grid; y += merged {
+			for x := 0; x < grid; x += merged {
+				for dy := 0; dy < merged; dy++ {
+					for dx := 0; dx < merged; dx++ {
+						toksReordered = append(toksReordered, toks[(y+dy)*grid+x+dx])
+					}
+				}
+			}
+		}
 	}
 
 	// 3. class + position
-	all := toks
-	if c.class {
-		cls := make([]float32, c.embd)
-		copy(cls, r.W["class"])
-		all = append([][]float32{cls}, toks...)
-	}
-	for i, tk := range all {
-		pe := r.W["pos"][i*c.embd : (i+1)*c.embd]
-		for d := range tk {
-			tk[d] += pe[d]
+	var all [][]float32
+	if c.qwen {
+		// Positions in raster order are added BEFORE the tile reorder: the
+		// conv output and its positions live in raster space; the reference
+		// merges afterwards (mirroring ggml, which applies the learned pos
+		// table in raster layout and shuffles it into tile order together
+		// with the tokens).
+		for i, tk := range toks {
+			pe := r.W["pos"][i*c.embd : (i+1)*c.embd]
+			for d := range tk {
+				tk[d] += pe[d]
+			}
+		}
+		all = toksReordered
+	} else {
+		all = toksReordered
+		if c.class {
+			cls := make([]float32, c.embd)
+			copy(cls, r.W["class"])
+			all = append([][]float32{cls}, toks...)
+			// class token consumes position row 0
+			for d := range cls {
+				cls[d] += r.W["pos"][d]
+			}
+			for i, tk := range toks {
+				pe := r.W["pos"][(i+1)*c.embd : (i+2)*c.embd]
+				for d := range tk {
+					tk[d] += pe[d]
+				}
+			}
+		} else {
+			for i, tk := range toks {
+				pe := r.W["pos"][i*c.embd : (i+1)*c.embd]
+				for d := range tk {
+					tk[d] += pe[d]
+				}
+			}
 		}
 	}
 
@@ -237,6 +344,39 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 
 	// 4. blocks
 	headDim := c.embd / c.heads
+	// Vision RoPE position per token (row, col). Plain CLIP path skips RoPE
+	// entirely; the qwen path rotates half-split pairs with quarter/quarter
+	// row/col axes (GGML_ROPE_TYPE_VISION). grid is already declared above.
+	applyVisionRoPE := func(vec []float32, seq int) {
+		if !c.qwen {
+			return
+		}
+		merge := c.merge
+		if merge <= 0 {
+			merge = 2
+		}
+		tile := seq / (merge * merge)
+		inTile := seq % (merge * merge)
+		ty, tx := tile/(grid/merge), tile%(grid/merge)
+		dy, dx := inTile/merge, inTile%merge
+		row, col := ty*merge+dy, tx*merge+dx
+		half := headDim / 2
+		quarter := headDim / 4
+		for h := 0; h < c.heads; h++ {
+			v := vec[h*headDim : (h+1)*headDim]
+			for i := 0; i < quarter; i++ {
+				f := float32(math.Pow(10000, -float64(4*i)/float64(headDim)))
+				th := float64(row) * float64(f)
+				cs, sn := float32(math.Cos(th)), float32(math.Sin(th))
+				a, b := v[i], v[i+half]
+				v[i], v[i+half] = a*cs-b*sn, a*sn+b*cs
+				tc := float64(col) * float64(f)
+				cs2, sn2 := float32(math.Cos(tc)), float32(math.Sin(tc))
+				a2, b2 := v[quarter+i], v[quarter+i+half]
+				v[quarter+i], v[quarter+i+half] = a2*cs2-b2*sn2, a2*sn2+b2*cs2
+			}
+		}
+	}
 	for l := 0; l < c.layers; l++ {
 		p := fmt.Sprintf("blk%d_", l)
 		n := len(all)
@@ -248,9 +388,19 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 		K := make([][]float32, n)
 		V := make([][]float32, n)
 		for i := range nrm {
-			Q[i] = r.lin(p+"attn_qw", nrm[i], c.embd, c.embd)
-			K[i] = r.lin(p+"attn_kw", nrm[i], c.embd, c.embd)
-			V[i] = r.lin(p+"attn_vw", nrm[i], c.embd, c.embd)
+			if c.qwen {
+				qkv := r.lin(p+"qkvw", nrm[i], 3*c.embd, c.embd)
+				for j := range qkv {
+					qkv[j] += r.W[p+"qkvb"][j]
+				}
+				Q[i], K[i], V[i] = qkv[:c.embd], qkv[c.embd:2*c.embd], qkv[2*c.embd:]
+			} else {
+				Q[i] = r.lin(p+"attn_qw", nrm[i], c.embd, c.embd)
+				K[i] = r.lin(p+"attn_kw", nrm[i], c.embd, c.embd)
+				V[i] = r.lin(p+"attn_vw", nrm[i], c.embd, c.embd)
+			}
+			applyVisionRoPE(Q[i], i)
+			applyVisionRoPE(K[i], i)
 		}
 		sc := float32(1 / math.Sqrt(float64(headDim)))
 		for i := range all {
@@ -299,12 +449,27 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 	}
 
 	// 5. post LN, drop class
-	out := make([][]float32, 0, len(all))
 	for _, tk := range all {
 		copy(tk, r.ln(tk, "post_ln_w", "post_ln_b"))
 	}
 	if c.class {
-		out = append(out, all[1:]...)
+		all = all[1:]
+	}
+	// For qwen the sequence is still per-patch in tile-major order; merge each
+	// consecutive merge*merge tokens into one projector row.
+	out := make([][]float32, 0, len(all))
+	if c.qwen {
+		merge := c.merge
+		if merge <= 0 {
+			merge = 2
+		}
+		for i := 0; i < len(all); i += merge * merge {
+			row := make([]float32, 0, c.embd*merge*merge)
+			for j := 0; j < merge*merge; j++ {
+				row = append(row, all[i+j]...)
+			}
+			out = append(out, row)
+		}
 	} else {
 		out = append(out, all...)
 	}
@@ -312,7 +477,7 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 	// 6. projector
 	res := make([][]float32, len(out))
 	for i, tk := range out {
-		h := r.lin("mm0", tk, c.projectorOut, c.embd)
+		h := r.lin("mm0", tk, c.projectorOut, len(tk))
 		for j := range h {
 			h[j] += r.W["mm0b"][j]
 			h[j] = 0.5 * h[j] * (1 + float32(math.Erf(float64(h[j])/math.Sqrt2)))
@@ -354,6 +519,8 @@ func TestEncodeMatchesNaiveReference(t *testing.T) {
 		{"noclass_preln", tinyCfg{embd: 8, heads: 2, layers: 1, ffn: 16, patch: 4, image: 8, class: false, preLN: true, projectorOut: 8}},
 		{"class_preln_4layer", tinyCfg{embd: 12, heads: 3, layers: 3, ffn: 24, patch: 2, image: 8, class: true, preLN: true, projectorOut: 16}},
 		{"attn_only_1layer", tinyCfg{embd: 8, heads: 2, layers: 1, ffn: 16, patch: 2, image: 8, class: true, projectorOut: 12}},
+		{"qwen3vl_merger", tinyCfg{embd: 8, heads: 2, layers: 2, ffn: 16, patch: 2, image: 8, projectorOut: 12, qwen: true, merge: 2}},
+		{"qwen3vl_1layer", tinyCfg{embd: 12, heads: 3, layers: 1, ffn: 24, patch: 2, image: 8, projectorOut: 16, qwen: true, merge: 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path, W := buildTinyMmproj(t, tc.cfg, 7)
@@ -371,8 +538,10 @@ func TestEncodeMatchesNaiveReference(t *testing.T) {
 			want := ref{cfg: tc.cfg, W: W}.Encode(pix, tc.cfg.image, tc.cfg.image)
 
 			grid := tc.cfg.gridSize()
-			if len(got) != grid*grid {
-				t.Fatalf("token count = %d, want %d", len(got), grid*grid)
+			wantTokens := grid * grid
+			_ = wantTokens
+			if len(got) != len(want) {
+				t.Fatalf("token count = %d, reference = %d", len(got), len(want))
 			}
 			if len(want) != len(got) {
 				t.Fatalf("reference token count = %d, want %d", len(want), len(got))

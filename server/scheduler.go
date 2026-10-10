@@ -54,6 +54,7 @@ type InferenceRequest struct {
 	ID              string
 	Messages        []llm.Message
 	Images          [][][]float32 // optional image embedding blocks, spliced at "<image>" markers
+	ImageGrids      [][2]int      // merged vision grid (rows, cols) per image, for Qwen M-RoPE
 	StopSequences   []string      // user-provided stop sequences from API
 	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
 	EnableThinking  *bool         // nil = auto (enabled for thinking models), false = disable

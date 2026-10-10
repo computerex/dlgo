@@ -11,6 +11,9 @@ package vision
 
 import (
 	"fmt"
+	"image"
+	"math"
+	"os"
 	"strings"
 
 	"github.com/computerex/dlgo/blas"
@@ -21,21 +24,24 @@ import (
 
 // Config holds the vision encoder hyperparameters parsed from mmproj metadata.
 type Config struct {
-	ProjectorType string // "mlp", "mlp_norm"
-	ImageSize     int    // e.g. 336
-	PatchSize     int    // e.g. 14
-	EmbeddingDim  int    // vision hidden size (e.g. 1024)
-	ProjectionDim int    // CLIP projection dim (0 = unused)
-	NumHeads      int    // attention heads
-	NumLayers     int    // transformer blocks
-	FFNDim        int    // feed-forward size
-	LayerNormEps  float32
-	ImageMean     [3]float32
-	ImageStd      [3]float32
-	MergeType     string // "flat" or "spatial_unpad"
-	SpatialMerge  int    // Qwen VL visual token merge factor (normally 2)
-	HasClassEmbed bool
-	HasPreLN      bool
+	ProjectorType  string // "mlp", "mlp_norm"
+	ImageSize      int    // e.g. 336
+	PatchSize      int    // e.g. 14
+	EmbeddingDim   int    // vision hidden size (e.g. 1024)
+	ProjectionDim  int    // CLIP projection dim (0 = unused)
+	NumHeads       int    // attention heads
+	NumLayers      int    // transformer blocks
+	FFNDim         int    // feed-forward size
+	LayerNormEps   float32
+	ImageMean      [3]float32
+	ImageStd       [3]float32
+	MergeType      string // "flat" or "spatial_unpad"
+	SpatialMerge   int    // Qwen VL visual token merge factor (normally 2)
+	ImageMinPixels int    // Qwen smart_resize lower pixel bound
+	ImageMaxPixels int    // Qwen smart_resize upper pixel bound
+	HasClassEmbed  bool
+
+	HasPreLN bool
 }
 
 // Linear is a dense layer: out[i] = sum_j W[i*Cols+j]*x[j] + b[i].
@@ -61,10 +67,11 @@ type Encoder struct {
 
 	PatchEmbed Linear    // 2D flattened layout (legacy): rows = [OC], cols = [IC*KH*KW], C-fastest
 	Patch4DW   []float32 // non-nil when 4D conv layout: GGUF order [KH, KW, IC, OC]
+	Patch4DW1  []float32 // Qwen VL temporal-merge second conv (same layout), may be nil
 	PatchKH    int
 	PatchKW    int
 	PatchIC    int
-	PatchBias  []float32 // optional
+	PatchBias  []float32 // optional (added once, after summing both convs)
 
 	PosEmbed []float32 // [n_pos, EmbeddingDim]
 	ClassEmb []float32 // optional
@@ -87,8 +94,28 @@ type Encoder struct {
 	activePosIndex []int
 	activeGridW    int
 
+	// Merged-grid dimensions of the last Encode (gridH/merge x gridW/merge).
+	// Exposed via EncodeWithGrid for Qwen M-RoPE position generation.
+	lastMergeGridH, lastMergeGridW int
+
 	// pool parallelizes the vision transformer across CPU cores.
 	pool *blas.Pool
+}
+
+// EncodeWithGrid runs Encode and additionally returns the merged vision grid
+// dimensions (rows, cols) that the returned embedding rows correspond to, in
+// row-major order. For qwen3vl_merger this is grid/merge; for other encoders
+// it is (len(rows), 1). Callers use it to build Qwen M-RoPE positions.
+func (e *Encoder) EncodeWithGrid(src image.Image) ([][]float32, int, int, error) {
+	rows, err := e.Encode(src)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	gh, gw := e.lastMergeGridH, e.lastMergeGridW
+	if gh <= 0 || gw <= 0 {
+		return rows, len(rows), 1, nil
+	}
+	return rows, gh, gw, nil
 }
 
 // LoadMmproj loads a llama.cpp mmproj GGUF vision encoder from path.
@@ -142,10 +169,19 @@ func LoadMmproj(path string) (*Encoder, error) {
 	if cfg.ProjectorType == "qwen3vl_merger" && cfg.SpatialMerge <= 0 {
 		cfg.SpatialMerge = 2
 	}
+	cfg.ImageMinPixels = toInt(md, "clip.vision.image_min_pixels")
+	cfg.ImageMaxPixels = toInt(md, "clip.vision.image_max_pixels")
 
 	mean, std := imageNormStats(md)
 	cfg.ImageMean = mean
 	cfg.ImageStd = std
+	// DLGO_VISION_RAW_NORM=1 bypasses normalization (mean=0, std=1) so raw
+	// pixel/255 values reach the conv — used for exact diffing against
+	// llama.cpp mtmd-debug, which feeds raw float images.
+	if os.Getenv("DLGO_VISION_RAW_NORM") != "" {
+		cfg.ImageMean = [3]float32{}
+		cfg.ImageStd = [3]float32{1, 1, 1}
+	}
 
 	cfg.MergeType = toString(md, "clip.vision.mm_patch_merge_type")
 	if cfg.MergeType == "" {
@@ -216,6 +252,17 @@ func LoadMmproj(path string) (*Encoder, error) {
 			return nil, err
 		}
 		enc.Patch4DW = w
+		// Qwen VL temporal merge: a second, identical-shape conv whose output
+		// is summed with the first (both temporal frames get the same image).
+		if n1 := firstExisting(tensors, "v.patch_embd.weight.1", "mm.patch_embd.weight.1"); n1 != "" {
+			w1, found, err := deq(n1)
+			if err != nil {
+				return nil, err
+			}
+			if found && len(w1) == len(w) {
+				enc.Patch4DW1 = w1
+			}
+		}
 		if enc.PatchIC != 3 {
 			return nil, fmt.Errorf("vision: patch conv input channels = %d, want 3", enc.PatchIC)
 		}
@@ -224,6 +271,7 @@ func LoadMmproj(path string) (*Encoder, error) {
 				enc.PatchKH, enc.PatchKW, cfg.PatchSize)
 		}
 	} else {
+
 		w, err := getRequired("patch_embd (2D)", patchNames...)
 		if err != nil {
 			return nil, err
@@ -241,6 +289,18 @@ func LoadMmproj(path string) (*Encoder, error) {
 		return nil, err
 	}
 	enc.PosEmbed = pos
+
+	// The loader cannot resize the learned square grid at load time because
+	// the actual patch grid depends on each image's dynamic resolution. Encode
+	// handles the mismatch by interpolating the table per token, but it needs
+	// the table to cover at least one full square grid; validate that here.
+	if cfg.ProjectorType == "qwen3vl_merger" {
+		learned := len(pos) / cfg.EmbeddingDim
+		side := int(math.Round(math.Sqrt(float64(learned))))
+		if side*side != learned || learned < (cfg.ImageSize/cfg.PatchSize)*(cfg.ImageSize/cfg.PatchSize)/4 {
+			return nil, fmt.Errorf("vision: qwen position table has %d rows, expected a square grid of at least the merged base resolution", learned)
+		}
+	}
 
 	enc.ClassEmb, _ = get("class_embd", "v.class_embd", "mm.class_embd")
 	cfg.HasClassEmbed = enc.ClassEmb != nil

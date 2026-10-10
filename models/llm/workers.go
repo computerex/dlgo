@@ -269,6 +269,93 @@ func (rs *RunState) applyRoPEWithTables(vec []float32, pos int, cos, sin []float
 	}
 }
 
+// EnableIMRoPE turns on interleaved multi-axis RoPE (Qwen3VL/Qwen3.5 IMROPE).
+// sections is the {T,H,W,E} pair-count vector; freqBase is the RoPE theta.
+func (rs *RunState) EnableIMRoPE(sections [4]int, freqBase float32) {
+	rs.useMRoPE = true
+	rs.mropeSections = sections
+	rs.mropeFreq = freqBase
+}
+
+// SetMRoPEPos sets the per-axis positions for the next forward token.
+func (rs *RunState) SetMRoPEPos(t, h, w, e int) {
+	rs.mropePos = [4]int{t, h, w, e}
+}
+
+// ClearMRoPEPos restores scalar RoPE behaviour (text tokens using the shared
+// sequence counter) until the next SetMRoPEPos.
+func (rs *RunState) ClearMRoPEPos() {
+	rs.mropePos = [4]int{-1, -1, -1, -1}
+}
+
+// SetLogicalPos sets the RoPE position for the next forward token when it
+// differs from its KV slot (Qwen M-RoPE: image blocks store n slots but the
+// logical counter advances by max(nx,ny)). -1 restores slot==position.
+func (rs *RunState) SetLogicalPos(p int) {
+	rs.logicalPos = p
+}
+
+// ropePos returns the position to use for rotary embedding: the logical
+// position when set, otherwise the KV slot.
+func (rs *RunState) ropePos(slot int) int {
+	if rs.logicalPos >= 0 {
+		return rs.logicalPos
+	}
+	return slot
+}
+
+// applyIMRoPE applies Qwen interleaved multi-axis RoPE to a single head using
+// rs.mropePos. It mirrors ggml compute_imrope_cache (rope_f32.c) exactly:
+// pairs use NEOX half-split pairing (i, i+half) where half = ropeDim/2; each
+// pair index i selects its axis via the mod-3 sector pattern; all axis angles
+// advance by theta_scale = freqBase^(-2/ropeDim) per pair.
+func (rs *RunState) applyIMRoPE(vec []float32) {
+	rd := rs.ropeDim
+	if rd <= 0 {
+		rd = rs.ropeHeadDim
+	}
+	if rd <= 0 || len(vec) < rd {
+		return
+	}
+	half := rd / 2
+	if rs.mropePos[0] < 0 {
+		return
+	}
+	thetaScale := math.Pow(float64(rs.mropeFreq), -2.0/float64(rd))
+	thetaT := float64(rs.mropePos[0])
+	thetaH := float64(rs.mropePos[1])
+	thetaW := float64(rs.mropePos[2])
+	thetaE := float64(rs.mropePos[3])
+	sectDims := rs.mropeSections[0] + rs.mropeSections[1] + rs.mropeSections[2] + rs.mropeSections[3]
+	if sectDims <= 0 {
+		return
+	}
+	for i := 0; i < half; i++ {
+		sector := i % sectDims
+		var theta float64
+		switch {
+		case sector%3 == 1 && sector < 3*rs.mropeSections[1]:
+			theta = thetaH
+		case sector%3 == 2 && sector < 3*rs.mropeSections[2]:
+			theta = thetaW
+		case sector%3 == 0 && sector < 3*rs.mropeSections[0]:
+			theta = thetaT
+		default:
+			theta = thetaE
+		}
+		c := float32(math.Cos(theta))
+		s := float32(math.Sin(theta))
+		v0 := vec[i]
+		v1 := vec[i+half]
+		vec[i] = v0*c - v1*s
+		vec[i+half] = v0*s + v1*c
+		thetaT *= thetaScale
+		thetaH *= thetaScale
+		thetaW *= thetaScale
+		thetaE *= thetaScale
+	}
+}
+
 // ApplyRoPEFast applies precomputed RoPE to vec in-place.
 // vec must be one head's worth [headDim]; pos is the token position.
 // Only the first ropeDim dimensions are rotated; the rest pass through unchanged.

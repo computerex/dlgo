@@ -52,6 +52,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var imageBlocks [][][]float32
+	var imageGrids [][2]int
 	if len(imageRefs) > 0 {
 		if s.vision == nil {
 			writeError(w, http.StatusBadRequest, "image input provided but no vision projector is loaded (start the server with -mmproj)", "invalid_request_error")
@@ -63,11 +64,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("image %d: %v", i, err), "invalid_request_error")
 				return
 			}
-			block, err := s.vision.Encode(img)
+			block, gh, gw, err := s.vision.EncodeWithGrid(img)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, fmt.Sprintf("encode image %d: %v", i, err), "server_error")
 				return
 			}
+			imageGrids = append(imageGrids, [2]int{gh, gw})
 			if len(block) > 0 && len(block[0]) != model.CPUPipeline.Model.Config.EmbeddingDim {
 				writeError(w, http.StatusBadRequest,
 					fmt.Sprintf("image embedding dim %d does not match model embedding dim %d", len(block[0]), model.CPUPipeline.Model.Config.EmbeddingDim),
@@ -111,13 +113,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		ID:              newCompletionID(),
 		Messages:        msgs,
 		Images:          imageBlocks,
+		ImageGrids:      imageGrids,
 		StopSequences:   req.Stop,
 		ReasoningEffort: req.ReasoningEffort,
 		EnableThinking:  req.EnableThinking,
 		Config: llm.GenerateConfig{
-			MaxTokens: maxTokens,
-			Sampler:   sampler,
-			Seed:      seed,
+			MaxTokens:  maxTokens,
+			Sampler:    sampler,
+			Seed:       seed,
+			ImageGrids: imageGrids,
 		},
 		Output: make(chan StreamEvent, 64),
 		Ctx:    ctx,

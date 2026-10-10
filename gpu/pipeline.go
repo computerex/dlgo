@@ -44,6 +44,18 @@ type GpuPipeline struct {
 	RoPECosTableSWA Buf // SWA-specific RoPE tables (0 if not needed)
 	RoPESinTableSWA Buf
 
+	// Qwen M-RoPE: when mropeSections is set, image-token cos/sin rows are
+	// computed on CPU and patched into the RoPE tables at the token's slot
+	// before each embedding forward.
+	mropeSections [4]int
+	mropeFreq     float32
+	mropeDim      int
+	mropeEnabled  bool
+	// cpuRoPECos/cpuRoPESin hold a CPU copy of the standard RoPE tables, used
+	// to patch slot rows for text tokens whose logical position != slot.
+	cpuRoPECos []float32
+	cpuRoPESin []float32
+
 	// Partial GPU offloading: layers [0, NumGPULayers) are on GPU,
 	// layers [NumGPULayers, NumLayers) run on CPU (RAM or mmap).
 	NumGPULayers int
@@ -703,6 +715,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	var kv *GpuKVCache
 	var ropeCosTable, ropeSinTable Buf
 	var ropeCosTableSWA, ropeSinTableSWA Buf
+	var cpuRoPECos, cpuRoPESin []float32
 	var layerConfs []*LayerConf
 	var q8_1Scratch Buf
 	var isPartial bool
@@ -770,7 +783,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				if err != nil {
 					return fmt.Errorf("upload RoPE sin table: %w", err)
 				}
+				cosTable, sinTable = cos, sin
 			}
+			cpuRoPECos, cpuRoPESin = cosTable, sinTable
 
 			// Upload SWA RoPE tables if per-layer RoPE is needed
 			if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
@@ -964,6 +979,26 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		RoPECosTableSWA: ropeCosTableSWA,
 		RoPESinTableSWA: ropeSinTableSWA,
 		CPUPipeline:     cpuPipeline,
+	}
+
+	// Keep a CPU copy of the standard RoPE tables for M-RoPE slot patching.
+	pipe.cpuRoPECos, pipe.cpuRoPESin = cpuRoPECos, cpuRoPESin
+
+	// Qwen M-RoPE: enable CPU-side row computation + table patching when the
+	// model declares rope dimension sections (Qwen3-VL / Qwen3.5 IMROPE).
+	if len(cfg.RopeDimensionSections) >= 3 {
+		for i := 0; i < 3 && i < len(cfg.RopeDimensionSections); i++ {
+			pipe.mropeSections[i] = cfg.RopeDimensionSections[i]
+		}
+		if len(cfg.RopeDimensionSections) > 3 {
+			pipe.mropeSections[3] = cfg.RopeDimensionSections[3]
+		}
+		pipe.mropeFreq = cfg.RopeFreqBase
+		pipe.mropeDim = cfg.RopeDim
+		if pipe.mropeDim <= 0 || pipe.mropeDim > cfg.HeadDim {
+			pipe.mropeDim = cfg.HeadDim
+		}
+		pipe.mropeEnabled = true
 	}
 
 	// Use fused forward when ALL layers are on GPU (including MoE models).
@@ -1213,6 +1248,74 @@ func (p *GpuPipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][
 	return p.generateSegments(prompt, tokenSegs, images, cfg)
 }
 
+// imropeRow computes the cos/sin row for one head under Qwen interleaved
+// M-RoPE, mirroring ggml compute_imrope_cache. Returns rows of half = dim/2.
+func (p *GpuPipeline) imropeRow(pt, ph, pw, pe int) (cos, sin []float32) {
+	half := p.mropeDim / 2
+	cos = make([]float32, half)
+	sin = make([]float32, half)
+	thetaScale := math.Pow(float64(p.mropeFreq), -2.0/float64(p.mropeDim))
+	thetaT := float64(pt)
+	thetaH := float64(ph)
+	thetaW := float64(pw)
+	thetaE := float64(pe)
+	sec := p.mropeSections
+	sectDims := sec[0] + sec[1] + sec[2] + sec[3]
+	for i := 0; i < half; i++ {
+		sector := i % sectDims
+		var theta float64
+		switch {
+		case sector%3 == 1 && sector < 3*sec[1]:
+			theta = thetaH
+		case sector%3 == 2 && sector < 3*sec[2]:
+			theta = thetaW
+		case sector%3 == 0 && sector < 3*sec[0]:
+			theta = thetaT
+		default:
+			theta = thetaE
+		}
+		cos[i] = float32(math.Cos(theta))
+		sin[i] = float32(math.Sin(theta))
+		thetaT *= thetaScale
+		thetaH *= thetaScale
+		thetaW *= thetaScale
+		thetaE *= thetaScale
+	}
+	return cos, sin
+}
+
+// patchMRoPERow overwrites the RoPE cos/sin table row at slot with the M-RoPE
+// row for positions (pt,ph,pw,pe). The kernel indexes cos[slot*half + i].
+func (p *GpuPipeline) patchMRoPERow(slot, pt, ph, pw, pe int) error {
+	if !p.mropeEnabled {
+		return nil
+	}
+	cos, sin := p.imropeRow(pt, ph, pw, pe)
+	half := p.mropeDim / 2
+	if err := UploadF32At(p.RoPECosTable, slot*half, cos); err != nil {
+		return err
+	}
+	return UploadF32At(p.RoPESinTable, slot*half, sin)
+}
+
+// patchScalarRow copies the standard RoPE table row at logicalPos into the slot
+// row. Used for text tokens after an image, whose logical position differs from
+// their KV slot.
+func (p *GpuPipeline) patchScalarRow(slot, logicalPos int) error {
+	if !p.mropeEnabled || slot == logicalPos {
+		return nil
+	}
+	half := p.mropeDim / 2
+	cosSrc, sinSrc := p.cpuRoPECos, p.cpuRoPESin
+	if cosSrc == nil || logicalPos < 0 || (logicalPos+1)*half > len(cosSrc) {
+		return nil
+	}
+	if err := UploadF32At(p.RoPECosTable, slot*half, cosSrc[logicalPos*half:(logicalPos+1)*half]); err != nil {
+		return err
+	}
+	return UploadF32At(p.RoPESinTable, slot*half, sinSrc[logicalPos*half:(logicalPos+1)*half])
+}
+
 // generateSegments runs the shared prefill + decode loop. tokenSegs[i] is the
 // text tokenized for segment i; images[i] (if non-nil) is spliced after it.
 func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, images [][][]float32, cfg llm.GenerateConfig) (*GenerateResult, error) {
@@ -1250,6 +1353,7 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 
 	prefillStart := time.Now()
 	pos := 0
+	slot := 0
 	if len(images) == 0 {
 		// No image splice: use the original fast batched prefill path verbatim.
 		tokens := tokenSegs[0]
@@ -1281,38 +1385,79 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, nil)
 		}
 		pos = npos
+		slot = npos
 	} else {
 		// Image splice: per-token text forward interleaved with embedding rows.
 		// (Batched prefill assumes a contiguous span from position 0, so we use
 		// the single-token path across segment boundaries.)
-		feedText := func(seg []int32) {
-			for _, tok := range seg {
-				if p.IsPartialGPU {
-					GpuForwardPartial(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-				} else if p.UseFusedForward && p.HasMoE {
-					GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-				} else if p.UseFusedForward && isHybridSSMModel(p.CPUModel) {
-					GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, []int32{tok}, p.KVCache, p.RunState,
-						p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, pos, true, nil)
-					Sync()
-				} else {
-					GpuForward(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p)
-				}
-				pos++
+		//
+		// slot indexes KV storage (advances by 1 per token); pos is the logical
+		// RoPE position. Image tokens occupy len(rows) slots but advance pos by
+		// max(ny,nx) (llama M-RoPE). For image tokens the cos/sin row at their
+		// slot is patched with the M-RoPE row; post-image text rows are patched
+		// with the standard row for their logical position.
+		gpuFwd := func(tok int32, slot int) {
+			if p.IsPartialGPU {
+				GpuForwardPartial(p.CPUModel, p.GpuModel, tok, slot, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			} else if p.UseFusedForward && p.HasMoE {
+				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, slot, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			} else if p.UseFusedForward && isHybridSSMModel(p.CPUModel) {
+				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, []int32{tok}, p.KVCache, p.RunState,
+					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, slot, true, nil)
+				Sync()
+			} else {
+				GpuForward(p.CPUModel, p.GpuModel, tok, slot, p.KVCache, p.RunState, p.LogitsBuf, p)
 			}
 		}
+		feedText := func(seg []int32) error {
+			for _, tok := range seg {
+				if err := p.patchScalarRow(slot, pos); err != nil {
+					return err
+				}
+				gpuFwd(tok, slot)
+				slot++
+				pos++
+			}
+			return nil
+		}
 		for i, seg := range tokenSegs {
-			feedText(seg)
+			if err := feedText(seg); err != nil {
+				return nil, err
+			}
 			if i < len(images) {
-				for _, row := range images[i] {
-					if err := GpuForwardEmbedding(p.CPUModel, p.GpuModel, row, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
+				var nx, ny int
+				useGrid := false
+				if i < len(cfg.ImageGrids) {
+					ny, nx = cfg.ImageGrids[i][0], cfg.ImageGrids[i][1]
+					useGrid = nx > 0 && ny > 0 && nx*ny == len(images[i])
+				}
+				pos0 := pos
+				for r, row := range images[i] {
+					if useGrid {
+						if err := p.patchMRoPERow(slot, pos0, pos0+r/nx, pos0+r%nx, pos0); err != nil {
+							return nil, err
+						}
+					} else if err := p.patchScalarRow(slot, pos); err != nil {
 						return nil, err
 					}
+					if err := GpuForwardEmbedding(p.CPUModel, p.GpuModel, row, slot, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
+						return nil, err
+					}
+					slot++
 					pos++
+				}
+				if useGrid {
+					if nx > ny {
+						pos = pos0 + nx
+					} else {
+						pos = pos0 + ny
+					}
 				}
 			}
 		}
 	}
+	// After prefill, slot == npos only when slot==pos; recompute the decode
+	// start counters so an image block's slot/pos divergence is preserved.
 	Sync()
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
 
@@ -1484,7 +1629,7 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	}
 
 	for step := 1; step < cfg.MaxTokens; step++ {
-		if pos >= p.MaxSeqLen-1 {
+		if slot >= p.MaxSeqLen-1 {
 			break
 		}
 		lastTok := int32(nextToken)
@@ -1497,16 +1642,20 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			}
 		}
 
+		if err := p.patchScalarRow(slot, pos); err != nil {
+			return nil, err
+		}
 		if p.IsPartialGPU {
-			GpuForwardPartial(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			GpuForwardPartial(p.CPUModel, p.GpuModel, lastTok, slot, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 			if step%32 == 0 {
 				mmap.TrimWorkingSet()
 			}
 		} else if p.UseFusedForward {
-			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
+			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, slot, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, slot, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
 			return nil, err
 		}
+		slot++
 		pos++
 
 		nextToken = gpuGrammarSample(p.LogitsBuf)

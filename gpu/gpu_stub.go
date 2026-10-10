@@ -24,7 +24,8 @@ func PoolSeal()            {}
 func PoolDestroy()          {}
 func ResetBufferTable()     {}
 func Upload(Buf, []byte) error             { return errNoGPU }
-func UploadF32(Buf, []float32) error       { return errNoGPU }
+func UploadF32(Buf, []float32) error        { return errNoGPU }
+func UploadF32At(Buf, int, []float32) error { return errNoGPU }
 func Download(Buf, []byte) error           { return errNoGPU }
 func DownloadF32(Buf, []float32) error     { return errNoGPU }
 func MatVec(out, w, x Buf, rows, cols int, qtype uint32) error { return errNoGPU }

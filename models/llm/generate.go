@@ -26,6 +26,10 @@ type GenerateConfig struct {
 	Grammar       *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
 	ThinkingPhase bool               // suppress EOS during  thinking block (set automatically by Chat/GenerateText)
 	ImageMarker   string             // placeholder marking image-token positions (default "<image>")
+	// ImageGrids gives the (rows, cols) of the merged vision grid for each image
+	// block, in the same order as the images slice. Required for Qwen M-RoPE so
+	// each image token gets its (t, h, w) axis positions. Empty => scalar RoPE.
+	ImageGrids [][2]int
 }
 
 // DefaultGenerateConfig returns sensible defaults.
@@ -697,10 +701,9 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		generated = append(generated, int32(nextToken))
 		recentTokens = append(recentTokens, int32(nextToken))
 		genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
-		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
+		if inThinkBlock && strings.Contains(genText.String(), " response") {
 			inThinkBlock = false
 		}
-
 		if cfg.Stream != nil {
 			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
 		}
@@ -802,18 +805,54 @@ func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]fl
 	prev := debug.SetGCPercent(2000)
 
 	// Prefill: interleave text segments and image embedding rows.
+	//
+	// slot indexes KV storage and always advances by one per token. pos is the
+	// logical RoPE/mask position: it equals slot for text, but an image block
+	// occupies len(rows) slots while advancing pos by max(ny,nx) (matching
+	// llama M-RoPE). Text is fed one token at a time here because a segment
+	// after an image has pos != slot.
 	prefillStart := time.Now()
-	pos := 0
+	slot, pos := 0, 0
 	for i, seg := range tokenSegs {
 		if len(seg) > 0 {
-			ForwardBatch(p.Model, seg, pos, p.KVCache, p.RunState, p.BatchState)
-			pos += len(seg)
-		}
-		if i < len(images) {
-			for _, row := range images[i] {
-				ForwardEmbedding(p.Model, row, pos, p.KVCache, p.RunState)
+			for _, tok := range seg {
+				p.RunState.ClearMRoPEPos()
+				p.RunState.SetLogicalPos(pos)
+				Forward(p.Model, tok, slot, p.KVCache, p.RunState)
+				slot++
 				pos++
 			}
+		}
+		if i < len(images) {
+			// Qwen M-RoPE: each image token i (row-major over the merged grid,
+			// ny rows x nx cols) uses positions t=pos0, h=pos0+row, w=pos0+col.
+			var nx, ny int
+			useGrid := false
+			if i < len(cfg.ImageGrids) {
+				ny, nx = cfg.ImageGrids[i][0], cfg.ImageGrids[i][1]
+				useGrid = nx > 0 && ny > 0 && nx*ny == len(images[i])
+			}
+			pos0 := pos
+			for r, row := range images[i] {
+				if useGrid {
+					p.RunState.SetMRoPEPos(pos0, pos0+r/nx, pos0+r%nx, pos0)
+				} else {
+					p.RunState.ClearMRoPEPos()
+					p.RunState.SetLogicalPos(pos)
+				}
+				ForwardEmbedding(p.Model, row, slot, p.KVCache, p.RunState)
+				slot++
+				pos++
+			}
+			if useGrid {
+				if nx > ny {
+					pos = pos0 + nx
+				} else {
+					pos = pos0 + ny
+				}
+			}
+			p.RunState.ClearMRoPEPos()
+			p.RunState.SetLogicalPos(-1)
 		}
 	}
 	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
@@ -839,7 +878,7 @@ func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]fl
 	}
 
 	for step := 1; step < cfg.MaxTokens; step++ {
-		if pos >= p.MaxSeqLen-1 {
+		if slot >= p.MaxSeqLen-1 {
 			break
 		}
 		lastTok := int32(nextToken)
@@ -852,7 +891,10 @@ func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]fl
 			}
 		}
 
-		Forward(p.Model, lastTok, pos, p.KVCache, p.RunState)
+		p.RunState.ClearMRoPEPos()
+		p.RunState.SetLogicalPos(pos)
+		Forward(p.Model, lastTok, slot, p.KVCache, p.RunState)
+		slot++
 		pos++
 
 		if step%32 == 0 {

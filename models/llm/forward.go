@@ -53,6 +53,22 @@ type RunState struct {
 	ropeCosSWA []float32
 	ropeSinSWA []float32
 
+	// Multi-axis RoPE (M-RoPE / IMROPE) for Qwen-VL style models. When
+	// useMRoPE is true and mropePos[0] >= 0, the per-axis positions
+	// mropePos = {t, h, w, e} for the current token are used instead of the
+	// scalar pos for rotary embedding.
+	useMRoPE bool
+	mropePos [4]int
+	// mropeSections is {T, H, W, E} pair counts (e.g. Qwen3.5 = [11, 11, 10, 0]).
+	mropeSections [4]int
+	// mropeFreq is the RoPE frequency base used to build per-axis angles.
+	mropeFreq float32
+
+	// logicalPos decouples the RoPE/mask position from the KV slot when they
+	// differ (Qwen M-RoPE image blocks occupy n slots but advance the logical
+	// counter by max(nx,ny)). -1 means "same as the KV slot".
+	logicalPos int
+
 	// SSM (Gated Delta Net) scratch buffers — nil for pure transformer models
 	SSMRun   *SSMRunState
 	SSMState *memory.SSMStateCache
@@ -107,6 +123,8 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		Scores:     make([]float32, maxSeqLen),
 		HeadScores: headScores,
 		Pool:       blas.DefaultPool(),
+		logicalPos: -1,
+		mropePos:   [4]int{-1, -1, -1, -1},
 	}
 	if cfg.RopeScaleType == 2 && cfg.RopeScaleFactor > 0 {
 		rs.PrecomputeYaRNRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase,
@@ -116,6 +134,19 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
 	}
 	rs.SetRopeNeox(cfg.RopeNeox)
+
+	// Interleaved multi-axis RoPE (Qwen3-VL / Qwen3.5). Off by default; the
+	// generation path enables per-token positions only for image rows.
+	if len(cfg.RopeDimensionSections) >= 3 {
+		var sec [4]int
+		for i := 0; i < 3 && i < len(cfg.RopeDimensionSections); i++ {
+			sec[i] = cfg.RopeDimensionSections[i]
+		}
+		if len(cfg.RopeDimensionSections) > 3 {
+			sec[3] = cfg.RopeDimensionSections[3]
+		}
+		rs.EnableIMRoPE(sec, cfg.RopeFreqBase)
+	}
 
 	if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
 		rs.PrecomputeSWARoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBaseSWA)
@@ -449,24 +480,32 @@ func ForwardAttention(
 		}
 	}
 
-	if rs.ropeCos != nil {
+	if rs.useMRoPE && rs.mropePos[0] >= 0 {
+		for h := 0; h < numHeads; h++ {
+			rs.applyIMRoPE(rs.Q[h*headDim : (h+1)*headDim])
+		}
+		for h := 0; h < numKVHeads; h++ {
+			rs.applyIMRoPE(rs.K[h*headDim : (h+1)*headDim])
+		}
+	} else if rs.ropeCos != nil {
+		rpos := rs.ropePos(pos)
 		useSWA := layer.Spec.SlidingWindow > 0 && rs.ropeCosSWA != nil
 		cos, sin := rs.ropeCos, rs.ropeSin
 		if useSWA {
 			cos, sin = rs.ropeCosSWA, rs.ropeSinSWA
 		}
 		for h := 0; h < numHeads; h++ {
-			rs.applyRoPEWithTables(rs.Q[h*headDim:(h+1)*headDim], pos, cos, sin)
+			rs.applyRoPEWithTables(rs.Q[h*headDim:(h+1)*headDim], rpos, cos, sin)
 		}
 		for h := 0; h < numKVHeads; h++ {
-			rs.applyRoPEWithTables(rs.K[h*headDim:(h+1)*headDim], pos, cos, sin)
+			rs.applyRoPEWithTables(rs.K[h*headDim:(h+1)*headDim], rpos, cos, sin)
 		}
 	} else {
 		ropeBase := cfg.RopeFreqBase
 		if layer.Spec.SlidingWindow > 0 && cfg.RopeFreqBaseSWA > 0 {
 			ropeBase = cfg.RopeFreqBaseSWA
 		}
-		ops.ApplyRoPEBatch(rs.Q, numHeads, rs.K, numKVHeads, pos, headDim, ropeBase, cfg.RopeNeox)
+		ops.ApplyRoPEBatch(rs.Q, numHeads, rs.K, numKVHeads, rs.ropePos(pos), headDim, ropeBase, cfg.RopeNeox)
 	}
 
 	if diagL {

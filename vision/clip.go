@@ -51,7 +51,32 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		posIndex[i] = i
 	}
 	traceSum("conv", tokens)
+	learnedOff := 0
+	if e.ClassEmb != nil {
+		learnedOff = 1
+	}
+	qwen := false
 	if e.Config.ProjectorType == "qwen3vl_merger" {
+		qwen = true
+		// ggml applies the learned absolute position table in RASTER order to
+		// the conv output and shuffles it into tile order together with the
+		// tokens. Add positions on `tokens` (raster) before reordering. For
+		// non-square grids the table is interpolated with align-corners
+		// bilinear, matching ggml UPSCALE (GGML_SCALE_FLAG_ALIGN_CORNERS).
+		learnedGrid := nPos
+		posGrid := int(math.Round(math.Sqrt(float64(learnedGrid))))
+		direct := posGrid*posGrid == learnedGrid
+		for i, tok := range tokens {
+			var pe []float32
+			if direct && gridH == posGrid && gridW == posGrid {
+				pe = e.PosEmbed[i*e.Config.EmbeddingDim : (i+1)*e.Config.EmbeddingDim]
+			} else {
+				pe = e.interpolatePos(i, gridH, gridW, posGrid, learnedOff)
+			}
+			for d := range tok {
+				tok[d] += pe[d]
+			}
+		}
 		embd, posIndex = reorderMergeTiles(tokens, gridH, gridW, e.Config.SpatialMerge)
 		e.activePosIndex, e.activeGridW = posIndex, gridW
 	} else {
@@ -64,46 +89,33 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		copy(cls, e.ClassEmb)
 		embd = append([][]float32{cls}, tokens...)
 	}
-	if len(embd) > nPos {
-		return nil, fmt.Errorf("vision: %d tokens exceed %d position embeddings", len(embd), nPos)
-	}
-
-	// Position embeddings: add per position; for non-square grids (spatial
-	// unpad) interpolate the learned square grid bilinearly, skipping the
-	// class slot when present. Qwen3 VL applies its M-RoPE in attention; its
-	// learned absolute position table remains indexed in normal grid order.
-	learnedOff := 0
-	if e.ClassEmb != nil {
-		learnedOff = 1
-	}
-	learnedGrid := nPos - learnedOff
-	posGrid := int(math.Round(math.Sqrt(float64(learnedGrid))))
-	directGrid := posGrid*posGrid == learnedGrid
-	for i, tok := range embd {
-		var pe []float32
-		switch {
-		case e.ClassEmb != nil && i == 0:
-			pe = e.PosEmbed[0:e.Config.EmbeddingDim]
-		case directGrid && gridH == posGrid && gridW == posGrid:
-			pos := i
-			if e.activePosIndex != nil {
-				pos = e.activePosIndex[i]
+	if qwen {
+		// Positions are already applied (and the sequence reordered).
+	} else {
+		// Position embeddings: add per position; for non-square grids (spatial
+		// unpad) interpolate the learned square grid bilinearly, skipping the
+		// class slot when present.
+		learnedGrid := nPos - learnedOff
+		posGrid := int(math.Round(math.Sqrt(float64(learnedGrid))))
+		directGrid := posGrid*posGrid == learnedGrid
+		for i, tok := range embd {
+			var pe []float32
+			switch {
+			case e.ClassEmb != nil && i == 0:
+				pe = e.PosEmbed[0:e.Config.EmbeddingDim]
+			case directGrid && gridH == posGrid && gridW == posGrid:
+				pe = e.PosEmbed[i*e.Config.EmbeddingDim : (i+1)*e.Config.EmbeddingDim]
+			default:
+				pos := i
+				if pos >= gridH*gridW {
+					pos = gridH*gridW - 1
+				}
+				pe = e.interpolatePos(pos, gridH, gridW, posGrid, 0)
 			}
-			pe = e.PosEmbed[pos*e.Config.EmbeddingDim : (pos+1)*e.Config.EmbeddingDim]
-		default:
-			// Qwen's sequence is tile-major, whereas learned positions are a
-			// raster grid. Interpolation must use the original raster position,
-			// not the current sequence slot (which only agrees for the first
-			// 2x2 tile).
-			pos := i
-			if e.activePosIndex != nil {
-				pos = e.activePosIndex[i]
-			}
-			pe = e.interpolatePos(pos, gridH, gridW, posGrid, learnedOff)
-		}
-		if pe != nil {
-			for d := range tok {
-				tok[d] += pe[d]
+			if pe != nil {
+				for d := range tok {
+					tok[d] += pe[d]
+				}
 			}
 		}
 	}
@@ -145,12 +157,18 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 	// Qwen3 VL merges each 2x2 patch block, in raster order, before its
 	// two-layer merger MLP. This turns a 48x48 patch grid into 24x24 LLM rows.
 	rowsOut := x
+	e.lastMergeGridH, e.lastMergeGridW = 0, 0
 	if e.Config.ProjectorType == "qwen3vl_merger" {
 		var err error
+		m := e.Config.SpatialMerge
+		if m <= 0 {
+			m = 2
+		}
 		rowsOut, err = mergeSpatial2x2(x, gridH, gridW, e.Config.SpatialMerge)
 		if err != nil {
 			return nil, err
 		}
+		e.lastMergeGridH, e.lastMergeGridW = gridH/m, gridW/m
 	} else if e.Config.MergeType == "spatial_unpad" {
 		rowsOut = e.unpadGrid(x, gridH, gridW)
 	} else if e.ImageNewline != nil && gridH > 1 {
