@@ -396,6 +396,29 @@ func TestEncodeMatchesNaiveReference(t *testing.T) {
 	}
 }
 
+func TestMergeSpatial2x2UsesTileMajorOrder(t *testing.T) {
+	// Qwen's ViT operates in 2x2 tile-major order. A 4x4 source grid is
+	// reordered as [0,1,4,5, 2,3,6,7, ...]; merger rows must preserve each
+	// consecutive tile rather than treating the reordered data as raster.
+	src := make([][]float32, 16)
+	for i := range src {
+		src[i] = []float32{float32(i)}
+	}
+	tiled, _ := reorderMergeTiles(src, 4, 4, 2)
+	got, err := mergeSpatial2x2(tiled, 4, 4, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]float32{{0, 1, 4, 5}, {2, 3, 6, 7}, {8, 9, 12, 13}, {10, 11, 14, 15}}
+	for i := range want {
+		for j := range want[i] {
+			if got[i][j] != want[i][j] {
+				t.Fatalf("row %d col %d = %v, want %v (got=%v)", i, j, got[i][j], want[i][j], got[i])
+			}
+		}
+	}
+}
+
 func TestEncodeDeterministic(t *testing.T) {
 	cfg := tinyCfg{embd: 8, heads: 2, layers: 2, ffn: 16, patch: 2, image: 8, class: true, projectorOut: 12}
 	path, _ := buildTinyMmproj(t, cfg, 11)

@@ -50,12 +50,15 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 	for i := range posIndex {
 		posIndex[i] = i
 	}
+	traceSum("conv", tokens)
 	if e.Config.ProjectorType == "qwen3vl_merger" {
 		embd, posIndex = reorderMergeTiles(tokens, gridH, gridW, e.Config.SpatialMerge)
 		e.activePosIndex, e.activeGridW = posIndex, gridW
 	} else {
 		e.activePosIndex, e.activeGridW = nil, 0
 	}
+	traceSum("reorder", embd)
+
 	if e.ClassEmb != nil {
 		cls := make([]float32, len(e.ClassEmb))
 		copy(cls, e.ClassEmb)
@@ -96,6 +99,12 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 			}
 		}
 	}
+	traceSum("pos_embd", embd)
+	if traceEnabled() {
+		for i := 0; i < 4 && i < len(embd); i++ {
+			fmt.Fprintf(os.Stdout, "TRACE inp t%d first3=%v last3=%v\n", i, embd[i][:3], embd[i][len(embd[i])-3:])
+		}
+	}
 
 	// Pre-LN (SigLIP-style encoders).
 	if e.PreLNW != nil {
@@ -110,6 +119,7 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		if err := e.forwardLayer(&e.Layers[li], x); err != nil {
 			return nil, fmt.Errorf("vision: block %d: %w", li, err)
 		}
+		traceSum(fmt.Sprintf("blk%d", li), x)
 	}
 	mark("blocks")
 
@@ -117,6 +127,7 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 	for _, tok := range x {
 		layerNormInPlace(tok, e.PostLNW, e.PostLNB, e.Config.LayerNormEps)
 	}
+	traceSum("post_ln", x)
 
 	// Drop class token output.
 	if e.ClassEmb != nil {
@@ -140,10 +151,41 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 
 	// Projector (parallel over tokens).
 	out := make([][]float32, len(rowsOut))
-	e.parallelFor(len(rowsOut), func(i int) {
-		out[i] = e.project(rowsOut[i])
-	})
+	if traceEnabled() {
+		// Traced path: sequential, printing per-stage values for bisecting
+		// against llama.cpp common_debug_cb_eval output.
+		var sumUp, sumDown float64
+		for i, row := range rowsOut {
+			raw := e.MM0.MulVecBias(row)
+			h := geluVec(raw)
+			out[i] = e.MM2.MulVecBias(h)
+			if i == 0 {
+				fmt.Fprintf(os.Stdout, "TRACE token0 postln[:3]  %v\n", row[:3])
+				fmt.Fprintf(os.Stdout, "TRACE token0 mm0[:3]     %v\n", raw[:3])
+				fmt.Fprintf(os.Stdout, "TRACE token0 gelu[:3]    %v\n", h[:3])
+				fmt.Fprintf(os.Stdout, "TRACE token0 out[:3]     %v\n", out[i][:3])
+			}
+			if traceEnabled() && i >= 0 && i < 4 {
+				fmt.Fprintf(os.Stdout, "TRACE token%d postln     first3=%v last3=%v\n", i, row[:3], row[len(row)-3:])
+			}
+
+			for _, v := range h {
+				sumUp += float64(v)
+			}
+			for _, v := range out[i] {
+				sumDown += float64(v)
+			}
+		}
+		fmt.Fprintf(os.Stdout, "TRACE %-18s sum=%.6f n=%d\n", "proj_gelu", sumUp, len(rowsOut)*3072)
+		fmt.Fprintf(os.Stdout, "TRACE %-18s sum=%.6f n=%d\n", "proj_out", sumDown, len(rowsOut)*len(out[0]))
+	} else {
+		e.parallelFor(len(rowsOut), func(i int) {
+			out[i] = e.project(rowsOut[i])
+		})
+	}
+
 	mark("projector")
+	traceSum("projector", out)
 	return out, nil
 }
 
@@ -168,8 +210,11 @@ func reorderMergeTiles(x [][]float32, gridH, gridW, merge int) ([][]float32, []i
 	return out, idx
 }
 
-// mergeSpatial2x2 concatenates patches in each merge-by-merge tile. Qwen's
-// projector expects order (top-left, top-right, bottom-left, bottom-right).
+// mergeSpatial2x2 concatenates patches in each merge-by-merge tile. Its input
+// is already in Qwen's tile-major order (from reorderMergeTiles), so every
+// consecutive merge*merge entries are one tile in projector order:
+// (top-left, top-right, bottom-left, bottom-right). Do not index it as a
+// raster grid here: doing so crosses tile boundaries after the first tile.
 func mergeSpatial2x2(x [][]float32, gridH, gridW, merge int) ([][]float32, error) {
 	if merge <= 0 {
 		merge = 2
@@ -178,19 +223,14 @@ func mergeSpatial2x2(x [][]float32, gridH, gridW, merge int) ([][]float32, error
 		return nil, fmt.Errorf("vision: cannot merge %dx%d grid with factor %d", gridH, gridW, merge)
 	}
 	d := len(x[0])
-	out := make([][]float32, 0, len(x)/(merge*merge))
-	for y := 0; y < gridH; y += merge {
-		for z := 0; z < gridW; z += merge {
-			row := make([]float32, d*merge*merge)
-			at := 0
-			for dy := 0; dy < merge; dy++ {
-				for dx := 0; dx < merge; dx++ {
-					copy(row[at:at+d], x[(y+dy)*gridW+z+dx])
-					at += d
-				}
-			}
-			out = append(out, row)
+	tileSize := merge * merge
+	out := make([][]float32, 0, len(x)/tileSize)
+	for tile := 0; tile < len(x); tile += tileSize {
+		row := make([]float32, d*tileSize)
+		for i := 0; i < tileSize; i++ {
+			copy(row[i*d:(i+1)*d], x[tile+i])
 		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -271,26 +311,28 @@ func insertNewlines(x [][]float32, gridH, gridW int, newline []float32) [][]floa
 	return out
 }
 
-// applyQwenVisionRoPE applies Qwen's 2-D vision M-RoPE. Head dimensions are
-// partitioned evenly into four sections: row, column, row, column. GGML's
-// vision RoPE rotates first-half/second-half pairs inside each section.
+// applyQwenVisionRoPE applies Qwen's 2-D vision rotary embedding, matching
+// GGML_ROPE_TYPE_VISION / HF Qwen2VL VisionRotaryEmbedding: within each head,
+// element pairs (j, j+dim/2) for j in [0, dim/2) are rotated; the first
+// quarter of pairs uses the row position, the second quarter the column
+// position, with frequency 10000^(-4*j_local/dim).
 func applyQwenVisionRoPE(x []float32, heads, headDim, row, col int) {
+	half := headDim / 2
 	quarter := headDim / 4
 	for h := 0; h < heads; h++ {
 		v := x[h*headDim : (h+1)*headDim]
-		for sec := 0; sec < 4; sec++ {
-			p := row
-			if sec%2 == 1 {
-				p = col
-			}
-			base := sec * quarter
-			half := quarter / 2
-			for i := 0; i < half; i++ {
-				theta := float64(p) / math.Pow(10000, float64(2*i)/float64(quarter))
-				c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
-				a, b := v[base+i], v[base+half+i]
-				v[base+i], v[base+half+i] = a*c-b*s, a*s+b*c
-			}
+		for i := 0; i < quarter; i++ {
+			f := math.Pow(10000, -float64(4*i)/float64(headDim))
+			// row pair: (v[i], v[i+half])
+			th := float64(row) * f
+			c, s := float32(math.Cos(th)), float32(math.Sin(th))
+			a, b := v[i], v[i+half]
+			v[i], v[i+half] = a*c-b*s, a*s+b*c
+			// col pair: (v[quarter+i], v[quarter+i+half])
+			tc := float64(col) * f
+			c2, s2 := float32(math.Cos(tc)), float32(math.Sin(tc))
+			a2, b2 := v[quarter+i], v[quarter+i+half]
+			v[quarter+i], v[quarter+i+half] = a2*c2-b2*s2, a2*s2+b2*c2
 		}
 	}
 }
@@ -325,8 +367,14 @@ func (e *Encoder) forwardLayer(l *Layer, x [][]float32) error {
 		for i := 0; i < n; i++ {
 			pos := e.activePosIndex[i]
 			row, col := pos/e.activeGridW, pos%e.activeGridW
+			if traceEnabled() && i < 2 {
+				fmt.Fprintf(os.Stdout, "TRACE q_pre  t%d h0 first3=%v last3=%v\n", i, qf[i*d:i*d+3], qf[i*d+headDim-3:i*d+headDim])
+			}
 			applyQwenVisionRoPE(qf[i*d:(i+1)*d], heads, headDim, row, col)
 			applyQwenVisionRoPE(kf[i*d:(i+1)*d], heads, headDim, row, col)
+			if traceEnabled() && i < 2 {
+				fmt.Fprintf(os.Stdout, "TRACE q_post t%d h0 first3=%v last3=%v (row=%d col=%d)\n", i, qf[i*d:i*d+3], qf[i*d+headDim-3:i*d+headDim], row, col)
+			}
 		}
 	}
 

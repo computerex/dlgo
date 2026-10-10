@@ -21,32 +21,36 @@ type ModelConfig struct {
 	RMSNormEps    float32
 	RopeFreqBase  float32
 	RopeNeox      bool
-	RopeDim       int      // partial RoPE: 0 = full headDim, else only first RopeDim dims
-	RopeScaleType int      // 0=none, 1=linear, 2=yarn
-	RopeScaleFactor    float32 // scaling factor for extended context
-	RopeOrigMaxPos     int     // original max position embeddings (for YaRN)
-	RopeYaRNBetaFast   float32 // YaRN beta_fast (default 32)
-	RopeYaRNBetaSlow   float32 // YaRN beta_slow (default 1)
-	RopeYaRNExtFactor  float32 // YaRN ext_factor: 0=disable ramp, 1=full ramp (default 1)
-	RopeYaRNAttnFactor float32 // YaRN attn_factor: magnitude scaling base (default 1)
-	RopeFreqBaseSWA    float32 // Separate RoPE frequency base for SWA layers (0 = same as RopeFreqBase)
-	SlidingWindow      int     // sliding window attention size (0 = disabled)
-	SlidingWindowPattern int   // 0=all layers, N=alternating (every Nth layer is full)
-	BOS           int32
-	EOS           int32
-	StopTokens      []int32
-	SuppressTokens  []int32 // logit = -inf before sampling (matching llama.cpp's EOG bias)
-	AddBOS          bool
-	FFNGelu       bool     // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
-	EmbedScale    float32  // non-zero = scale embeddings (Gemma: sqrt(dim))
-	ChatTemplate  string   // chat format: "chatml", "llama2", "llama3", "gemma", "phi"
+	RopeDim       int // partial RoPE: 0 = full headDim, else only first RopeDim dims
+	// RopeDimensionSections enables Qwen-VL M-RoPE. The first three values
+	// partition rotary pairs across temporal, height, and width coordinates.
+	// Empty means ordinary 1-D RoPE.
+	RopeDimensionSections []int
+	RopeScaleType         int     // 0=none, 1=linear, 2=yarn
+	RopeScaleFactor       float32 // scaling factor for extended context
+	RopeOrigMaxPos        int     // original max position embeddings (for YaRN)
+	RopeYaRNBetaFast      float32 // YaRN beta_fast (default 32)
+	RopeYaRNBetaSlow      float32 // YaRN beta_slow (default 1)
+	RopeYaRNExtFactor     float32 // YaRN ext_factor: 0=disable ramp, 1=full ramp (default 1)
+	RopeYaRNAttnFactor    float32 // YaRN attn_factor: magnitude scaling base (default 1)
+	RopeFreqBaseSWA       float32 // Separate RoPE frequency base for SWA layers (0 = same as RopeFreqBase)
+	SlidingWindow         int     // sliding window attention size (0 = disabled)
+	SlidingWindowPattern  int     // 0=all layers, N=alternating (every Nth layer is full)
+	BOS                   int32
+	EOS                   int32
+	StopTokens            []int32
+	SuppressTokens        []int32 // logit = -inf before sampling (matching llama.cpp's EOG bias)
+	AddBOS                bool
+	FFNGelu               bool    // true = GeGLU (Gemma), false = SwiGLU (LLaMA/Qwen)
+	EmbedScale            float32 // non-zero = scale embeddings (Gemma: sqrt(dim))
+	ChatTemplate          string  // chat format: "chatml", "llama2", "llama3", "gemma", "phi"
 
 	// Gemma 2 soft-capping
 	AttnLogitSoftcap  float32 // 0=disabled; >0 = tanh(logit/cap)*cap before softmax
 	FinalLogitSoftcap float32 // 0=disabled; >0 = tanh(logit/cap)*cap on final logits
 
 	// Qwen3.5 hybrid Mamba/Attention
-	FullAttentionInterval int  // 0 = all attention; N = every Nth layer is attention
+	FullAttentionInterval int // 0 = all attention; N = every Nth layer is attention
 	SSMConvKernel         int
 	SSMInnerSize          int
 	SSMStateSize          int
@@ -55,13 +59,13 @@ type ModelConfig struct {
 	SSMTiledVOrder        bool // true = GGUF V heads in tiled order (Qwen3.5); false = grouped (Qwen3Next)
 
 	// MoE (Mixture of Experts)
-	ExpertCount          int     // 0 = dense (no MoE); >0 = number of experts per layer
-	ExpertUsedCount      int     // top-K experts selected per token
-	ExpertFFNDim         int     // hidden dim per expert
-	SharedExpertFFNDim   int     // hidden dim for shared expert (0 = no shared expert)
-	ExpertGatingFunc     int     // 0=none, 1=softmax, 2=sigmoid, 3=softmax_weight (top-k raw then softmax)
-	ExpertWeightsNorm    bool    // normalize selected expert weights by sum
-	ExpertWeightsScale   float32 // scale factor for expert weights (0 = no scaling)
+	ExpertCount        int     // 0 = dense (no MoE); >0 = number of experts per layer
+	ExpertUsedCount    int     // top-K experts selected per token
+	ExpertFFNDim       int     // hidden dim per expert
+	SharedExpertFFNDim int     // hidden dim for shared expert (0 = no shared expert)
+	ExpertGatingFunc   int     // 0=none, 1=softmax, 2=sigmoid, 3=softmax_weight (top-k raw then softmax)
+	ExpertWeightsNorm  bool    // normalize selected expert weights by sum
+	ExpertWeightsScale float32 // scale factor for expert weights (0 = no scaling)
 
 	// MLA (Multi-head Latent Attention) — DeepSeek-V2/GLM-4
 	QLORARank         int // Q compression rank (attn_q_a output dim)
@@ -101,32 +105,32 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	}
 
 	c := ModelConfig{
-		Architecture:  arch,
-		VocabSize:     vocabSize,
-		ContextLength: metaInt(md, arch+".context_length", 2048),
-		EmbeddingDim:  metaInt(md, arch+".embedding_length", 0),
-		NumLayers:     metaInt(md, arch+".block_count", 0),
-		FFNDim:        metaInt(md, arch+".feed_forward_length", 0),
-		NumHeads:      metaInt(md, arch+".attention.head_count", 0),
-		NumKVHeads:    metaInt(md, arch+".attention.head_count_kv", 0),
-		HeadDim:       metaInt(md, arch+".attention.key_length", 0),
-		RMSNormEps:    normEps,
-		RopeFreqBase:       metaFloat(md, arch+".rope.freq_base", 10000.0),
-		RopeScaleType:      parseRopeScaleType(md, arch),
-		RopeScaleFactor:    metaFloat(md, arch+".rope.scaling.factor", 0),
-		RopeOrigMaxPos:     metaInt(md, arch+".rope.scaling.original_context_length", 0),
-		RopeYaRNBetaFast:   metaFloat(md, arch+".rope.scaling.yarn.beta_fast", 32.0),
-		RopeYaRNBetaSlow:   metaFloat(md, arch+".rope.scaling.yarn.beta_slow", 1.0),
-		RopeYaRNExtFactor:  metaFloat(md, arch+".rope.scaling.yarn.ext_factor", 1.0),
-		RopeYaRNAttnFactor: metaFloat(md, arch+".rope.scaling.yarn.attn_factor", 1.0),
-		RopeFreqBaseSWA:    metaFloat(md, arch+".rope.freq_base_swa", 0),
-		SlidingWindow:      metaInt(md, arch+".attention.sliding_window", 0),
+		Architecture:         arch,
+		VocabSize:            vocabSize,
+		ContextLength:        metaInt(md, arch+".context_length", 2048),
+		EmbeddingDim:         metaInt(md, arch+".embedding_length", 0),
+		NumLayers:            metaInt(md, arch+".block_count", 0),
+		FFNDim:               metaInt(md, arch+".feed_forward_length", 0),
+		NumHeads:             metaInt(md, arch+".attention.head_count", 0),
+		NumKVHeads:           metaInt(md, arch+".attention.head_count_kv", 0),
+		HeadDim:              metaInt(md, arch+".attention.key_length", 0),
+		RMSNormEps:           normEps,
+		RopeFreqBase:         metaFloat(md, arch+".rope.freq_base", 10000.0),
+		RopeScaleType:        parseRopeScaleType(md, arch),
+		RopeScaleFactor:      metaFloat(md, arch+".rope.scaling.factor", 0),
+		RopeOrigMaxPos:       metaInt(md, arch+".rope.scaling.original_context_length", 0),
+		RopeYaRNBetaFast:     metaFloat(md, arch+".rope.scaling.yarn.beta_fast", 32.0),
+		RopeYaRNBetaSlow:     metaFloat(md, arch+".rope.scaling.yarn.beta_slow", 1.0),
+		RopeYaRNExtFactor:    metaFloat(md, arch+".rope.scaling.yarn.ext_factor", 1.0),
+		RopeYaRNAttnFactor:   metaFloat(md, arch+".rope.scaling.yarn.attn_factor", 1.0),
+		RopeFreqBaseSWA:      metaFloat(md, arch+".rope.freq_base_swa", 0),
+		SlidingWindow:        metaInt(md, arch+".attention.sliding_window", 0),
 		SlidingWindowPattern: metaInt(md, arch+".attention.sliding_window_pattern", 0),
-		AttnLogitSoftcap:  metaFloat(md, arch+".attn_logit_softcapping", 0),
-		FinalLogitSoftcap: metaFloat(md, arch+".final_logit_softcapping", 0),
-		BOS:                int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
-		EOS:           int32(metaInt(md, "tokenizer.ggml.eos_token_id", 2)),
-		AddBOS:        metaBool(md, "tokenizer.ggml.add_bos_token", true),
+		AttnLogitSoftcap:     metaFloat(md, arch+".attn_logit_softcapping", 0),
+		FinalLogitSoftcap:    metaFloat(md, arch+".final_logit_softcapping", 0),
+		BOS:                  int32(metaInt(md, "tokenizer.ggml.bos_token_id", 1)),
+		EOS:                  int32(metaInt(md, "tokenizer.ggml.eos_token_id", 2)),
+		AddBOS:               metaBool(md, "tokenizer.ggml.add_bos_token", true),
 
 		FullAttentionInterval: metaInt(md, arch+".full_attention_interval", 0),
 		SSMConvKernel:         metaInt(md, arch+".ssm.conv_kernel", 4),
@@ -176,6 +180,7 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		c.HeadDim = c.EmbeddingDim / c.NumHeads
 	}
 	c.RopeDim = metaInt(md, arch+".rope.dimension_count", 0)
+	c.RopeDimensionSections = metaIntSlice(md, arch+".rope.dimension_sections")
 	if c.QLORARank > 0 {
 		c.QKRopeDim = c.RopeDim
 		// key_length_mla is the TOTAL per-head Q/K dim (nope + rope);
@@ -189,8 +194,6 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	}
 
 	applyArchDefaults(&c)
-
-	
 
 	// Parse stop tokens from GGUF metadata
 	if eosArr, ok := md["tokenizer.ggml.eos_token_id"].([]interface{}); ok {
@@ -253,6 +256,39 @@ func metaInt(md map[string]interface{}, key string, def int) int {
 		return i
 	}
 	return def
+}
+
+func metaIntSlice(md map[string]interface{}, key string) []int {
+	v, ok := md[key]
+	if !ok {
+		return nil
+	}
+	var src []interface{}
+	switch x := v.(type) {
+	case []interface{}:
+		src = x
+	case []uint32:
+		src = make([]interface{}, len(x))
+		for i := range x {
+			src[i] = x[i]
+		}
+	case []int32:
+		src = make([]interface{}, len(x))
+		for i := range x {
+			src[i] = x[i]
+		}
+	default:
+		return nil
+	}
+	out := make([]int, len(src))
+	for i, x := range src {
+		var valid bool
+		out[i], valid = toInt(x)
+		if !valid || out[i] < 0 {
+			return nil
+		}
+	}
+	return out
 }
 
 func toInt(v interface{}) (int, bool) {
