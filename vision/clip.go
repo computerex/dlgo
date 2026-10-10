@@ -43,6 +43,19 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 	// Class token prepend (always position 0 when present).
 	nPos := len(e.PosEmbed) / e.Config.EmbeddingDim
 	embd := tokens
+	// Qwen3 VL runs attention in 2x2-tile order so each consecutive group is
+	// later consumed by its merger. Keep the source-grid index for absolute and
+	// rotary positions.
+	posIndex := make([]int, len(tokens))
+	for i := range posIndex {
+		posIndex[i] = i
+	}
+	if e.Config.ProjectorType == "qwen3vl_merger" {
+		embd, posIndex = reorderMergeTiles(tokens, gridH, gridW, e.Config.SpatialMerge)
+		e.activePosIndex, e.activeGridW = posIndex, gridW
+	} else {
+		e.activePosIndex, e.activeGridW = nil, 0
+	}
 	if e.ClassEmb != nil {
 		cls := make([]float32, len(e.ClassEmb))
 		copy(cls, e.ClassEmb)
@@ -54,7 +67,8 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 
 	// Position embeddings: add per position; for non-square grids (spatial
 	// unpad) interpolate the learned square grid bilinearly, skipping the
-	// class slot when present.
+	// class slot when present. Qwen3 VL applies its M-RoPE in attention; its
+	// learned absolute position table remains indexed in normal grid order.
 	learnedOff := 0
 	if e.ClassEmb != nil {
 		learnedOff = 1
@@ -68,7 +82,11 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		case e.ClassEmb != nil && i == 0:
 			pe = e.PosEmbed[0:e.Config.EmbeddingDim]
 		case directGrid && gridH == posGrid && gridW == posGrid:
-			pe = e.PosEmbed[i*e.Config.EmbeddingDim : (i+1)*e.Config.EmbeddingDim]
+			pos := i
+			if e.activePosIndex != nil {
+				pos = e.activePosIndex[i]
+			}
+			pe = e.PosEmbed[pos*e.Config.EmbeddingDim : (pos+1)*e.Config.EmbeddingDim]
 		default:
 			pe = e.interpolatePos(i, gridH, gridW, posGrid, learnedOff)
 		}
@@ -105,10 +123,16 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		x = x[1:]
 	}
 
-	// Spatial unpad: trim padded patch rows/cols and insert newline embeddings
-	// at end of each row (llava-1.6), before the projector.
+	// Qwen3 VL merges each 2x2 patch block, in raster order, before its
+	// two-layer merger MLP. This turns a 48x48 patch grid into 24x24 LLM rows.
 	rowsOut := x
-	if e.Config.MergeType == "spatial_unpad" {
+	if e.Config.ProjectorType == "qwen3vl_merger" {
+		var err error
+		rowsOut, err = mergeSpatial2x2(x, gridH, gridW, e.Config.SpatialMerge)
+		if err != nil {
+			return nil, err
+		}
+	} else if e.Config.MergeType == "spatial_unpad" {
 		rowsOut = e.unpadGrid(x, gridH, gridW)
 	} else if e.ImageNewline != nil && gridH > 1 {
 		rowsOut = insertNewlines(x, gridH, gridW, e.ImageNewline)
@@ -120,6 +144,54 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		out[i] = e.project(rowsOut[i])
 	})
 	mark("projector")
+	return out, nil
+}
+
+// reorderMergeTiles makes consecutive tokens represent each merge tile. This
+// is the order Qwen3 VL uses both during ViT attention and merger projection.
+func reorderMergeTiles(x [][]float32, gridH, gridW, merge int) ([][]float32, []int) {
+	if merge <= 0 {
+		merge = 2
+	}
+	out := make([][]float32, 0, len(x))
+	idx := make([]int, 0, len(x))
+	for y := 0; y < gridH; y += merge {
+		for z := 0; z < gridW; z += merge {
+			for dy := 0; dy < merge; dy++ {
+				for dx := 0; dx < merge; dx++ {
+					i := (y+dy)*gridW + z + dx
+					out, idx = append(out, x[i]), append(idx, i)
+				}
+			}
+		}
+	}
+	return out, idx
+}
+
+// mergeSpatial2x2 concatenates patches in each merge-by-merge tile. Qwen's
+// projector expects order (top-left, top-right, bottom-left, bottom-right).
+func mergeSpatial2x2(x [][]float32, gridH, gridW, merge int) ([][]float32, error) {
+	if merge <= 0 {
+		merge = 2
+	}
+	if gridH%merge != 0 || gridW%merge != 0 || len(x) != gridH*gridW {
+		return nil, fmt.Errorf("vision: cannot merge %dx%d grid with factor %d", gridH, gridW, merge)
+	}
+	d := len(x[0])
+	out := make([][]float32, 0, len(x)/(merge*merge))
+	for y := 0; y < gridH; y += merge {
+		for z := 0; z < gridW; z += merge {
+			row := make([]float32, d*merge*merge)
+			at := 0
+			for dy := 0; dy < merge; dy++ {
+				for dx := 0; dx < merge; dx++ {
+					copy(row[at:at+d], x[(y+dy)*gridW+z+dx])
+					at += d
+				}
+			}
+			out = append(out, row)
+		}
+	}
 	return out, nil
 }
 
@@ -199,6 +271,30 @@ func insertNewlines(x [][]float32, gridH, gridW int, newline []float32) [][]floa
 	return out
 }
 
+// applyQwenVisionRoPE applies Qwen's 2-D vision M-RoPE. Head dimensions are
+// partitioned evenly into four sections: row, column, row, column. GGML's
+// vision RoPE rotates first-half/second-half pairs inside each section.
+func applyQwenVisionRoPE(x []float32, heads, headDim, row, col int) {
+	quarter := headDim / 4
+	for h := 0; h < heads; h++ {
+		v := x[h*headDim : (h+1)*headDim]
+		for sec := 0; sec < 4; sec++ {
+			p := row
+			if sec%2 == 1 {
+				p = col
+			}
+			base := sec * quarter
+			half := quarter / 2
+			for i := 0; i < half; i++ {
+				theta := float64(p) / math.Pow(10000, float64(2*i)/float64(quarter))
+				c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
+				a, b := v[base+i], v[base+half+i]
+				v[base+i], v[base+half+i] = a*c-b*s, a*s+b*c
+			}
+		}
+	}
+}
+
 func (e *Encoder) forwardLayer(l *Layer, x [][]float32) error {
 	n := len(x)
 	d := e.Config.EmbeddingDim
@@ -225,6 +321,14 @@ func (e *Encoder) forwardLayer(l *Layer, x [][]float32) error {
 	e.gemmBT(l.AttnQ.W, l.AttnQ.B, nf, qf, n, d, d)
 	e.gemmBT(l.AttnK.W, l.AttnK.B, nf, kf, n, d, d)
 	e.gemmBT(l.AttnV.W, l.AttnV.B, nf, vf, n, d, d)
+	if e.Config.ProjectorType == "qwen3vl_merger" {
+		for i := 0; i < n; i++ {
+			pos := e.activePosIndex[i]
+			row, col := pos/e.activeGridW, pos%e.activeGridW
+			applyQwenVisionRoPE(qf[i*d:(i+1)*d], heads, headDim, row, col)
+			applyQwenVisionRoPE(kf[i*d:(i+1)*d], heads, headDim, row, col)
+		}
+	}
 
 	// Bidirectional attention per query token (parallel).
 	af := make([]float32, n*d)

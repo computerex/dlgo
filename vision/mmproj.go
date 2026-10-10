@@ -33,6 +33,7 @@ type Config struct {
 	ImageMean     [3]float32
 	ImageStd      [3]float32
 	MergeType     string // "flat" or "spatial_unpad"
+	SpatialMerge  int    // Qwen VL visual token merge factor (normally 2)
 	HasClassEmbed bool
 	HasPreLN      bool
 }
@@ -82,6 +83,10 @@ type Encoder struct {
 	// trim padded patch rows/cols deterministically.
 	lastContentW, lastContentH int
 
+	// Qwen3 VL's tiled token order and corresponding source-grid positions.
+	activePosIndex []int
+	activeGridW    int
+
 	// pool parallelizes the vision transformer across CPU cores.
 	pool *blas.Pool
 }
@@ -108,12 +113,12 @@ func LoadMmproj(path string) (*Encoder, error) {
 		cfg.ProjectorType = toString(md, "clip.vision.projector_type")
 	}
 	switch cfg.ProjectorType {
-	case "mlp", "mlp_norm", "":
+	case "mlp", "mlp_norm", "qwen3vl_merger", "":
 		if cfg.ProjectorType == "" {
 			cfg.ProjectorType = "mlp" // legacy files omit the key
 		}
 	default:
-		return nil, fmt.Errorf("vision: unsupported projector type %q (v1 supports mlp, mlp_norm)", cfg.ProjectorType)
+		return nil, fmt.Errorf("vision: unsupported projector type %q", cfg.ProjectorType)
 	}
 
 	cfg.ImageSize = toInt(md, "clip.vision.image_size")
@@ -133,6 +138,10 @@ func LoadMmproj(path string) (*Encoder, error) {
 		return nil, fmt.Errorf("vision: missing core clip.vision.* hyperparameters")
 	}
 	cfg.ProjectionDim = toInt(md, "clip.vision.projection_dim")
+	cfg.SpatialMerge = toInt(md, "clip.vision.spatial_merge_size")
+	if cfg.ProjectorType == "qwen3vl_merger" && cfg.SpatialMerge <= 0 {
+		cfg.SpatialMerge = 2
+	}
 
 	mean, std := imageNormStats(md)
 	cfg.ImageMean = mean
@@ -294,14 +303,30 @@ func LoadMmproj(path string) (*Encoder, error) {
 			lin.B, _ = get(what+" bias", strings.TrimSuffix(w1, ".weight")+".bias", strings.TrimSuffix(w2, ".weight")+".bias")
 			return lin, nil
 		}
-		if l.AttnQ, err = readLin(fmt.Sprintf("blk%d attn_q", i), pfx+"attn_q.weight", lpfx+"attn_q.weight", dim, dim); err != nil {
-			return nil, err
-		}
-		if l.AttnK, err = readLin(fmt.Sprintf("blk%d attn_k", i), pfx+"attn_k.weight", lpfx+"attn_k.weight", dim, dim); err != nil {
-			return nil, err
-		}
-		if l.AttnV, err = readLin(fmt.Sprintf("blk%d attn_v", i), pfx+"attn_v.weight", lpfx+"attn_v.weight", dim, dim); err != nil {
-			return nil, err
+		if cfg.ProjectorType == "qwen3vl_merger" {
+			// Qwen VL stores a single [Q|K|V] output projection.
+			qkv, err := readLin(fmt.Sprintf("blk%d attn_qkv", i), pfx+"attn_qkv.weight", lpfx+"attn_qkv.weight", 3*dim, dim)
+			if err != nil {
+				return nil, err
+			}
+			split := func(off int) Linear {
+				lin := Linear{W: qkv.W[off*dim*dim : (off+1)*dim*dim], Rows: dim, Cols: dim}
+				if qkv.B != nil {
+					lin.B = qkv.B[off*dim : (off+1)*dim]
+				}
+				return lin
+			}
+			l.AttnQ, l.AttnK, l.AttnV = split(0), split(1), split(2)
+		} else {
+			if l.AttnQ, err = readLin(fmt.Sprintf("blk%d attn_q", i), pfx+"attn_q.weight", lpfx+"attn_q.weight", dim, dim); err != nil {
+				return nil, err
+			}
+			if l.AttnK, err = readLin(fmt.Sprintf("blk%d attn_k", i), pfx+"attn_k.weight", lpfx+"attn_k.weight", dim, dim); err != nil {
+				return nil, err
+			}
+			if l.AttnV, err = readLin(fmt.Sprintf("blk%d attn_v", i), pfx+"attn_v.weight", lpfx+"attn_v.weight", dim, dim); err != nil {
+				return nil, err
+			}
 		}
 		if l.AttnOut, err = readLin(fmt.Sprintf("blk%d attn_out", i), pfx+"attn_out.weight", lpfx+"attn_out.weight", dim, dim); err != nil {
 			return nil, err
@@ -359,7 +384,12 @@ func LoadMmproj(path string) (*Encoder, error) {
 	if e0, ok, err := readProj(0); err != nil {
 		return nil, err
 	} else if ok {
-		e0.Rows, e0.Cols = len(e0.W)/dim, dim
+		if cfg.ProjectorType == "qwen3vl_merger" {
+			ti := tensors["mm.0.weight"]
+			e0.Rows, e0.Cols = inferDimensions(ti.Dimensions)
+		} else {
+			e0.Rows, e0.Cols = len(e0.W)/dim, dim
+		}
 		enc.MM0 = e0
 	}
 	if e1, ok, err := readProj(1); err != nil {
@@ -374,11 +404,16 @@ func LoadMmproj(path string) (*Encoder, error) {
 	if e2, ok, err := readProj(2); err != nil {
 		return nil, err
 	} else if ok {
-		inDim := dim
-		if enc.MM0.W != nil {
-			inDim = enc.MM0.Rows
+		if cfg.ProjectorType == "qwen3vl_merger" {
+			ti := tensors["mm.2.weight"]
+			e2.Rows, e2.Cols = inferDimensions(ti.Dimensions)
+		} else {
+			inDim := dim
+			if enc.MM0.W != nil {
+				inDim = enc.MM0.Rows
+			}
+			e2.Rows, e2.Cols = len(e2.W)/inDim, inDim
 		}
-		e2.Rows, e2.Cols = len(e2.W)/inDim, inDim
 		enc.MM2 = e2
 	} else {
 		outIdx = 3
@@ -442,7 +477,11 @@ func (e *Encoder) validate() error {
 // produces (the exact count varies for spatial_unpad models by aspect ratio).
 func (e *Encoder) NumImageTokens() int {
 	c := &e.Config
-	return (c.ImageSize / c.PatchSize) * (c.ImageSize / c.PatchSize)
+	n := (c.ImageSize / c.PatchSize) * (c.ImageSize / c.PatchSize)
+	if c.SpatialMerge > 1 {
+		n /= c.SpatialMerge * c.SpatialMerge
+	}
+	return n
 }
 
 func imageNormStats(md map[string]interface{}) ([3]float32, [3]float32) {
