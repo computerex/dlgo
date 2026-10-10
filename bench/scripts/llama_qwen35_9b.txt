@@ -1,0 +1,65 @@
+﻿llama-cli.exe : ggml_vulkan: Found 2 Vulkan devices:
+At C:\Users\mohd\AppData\Local\Temp\ps-script-9b5ae4bb-a2dc-48d8-a17c-64e40fb2fe36.ps1:86 char:1
++ & "C:\projects\llama.cpp\build\bin\Release\llama-cli.exe" -m "C:\mode ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_vulkan: Found 2 Vulkan devices::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ggml_vulkan: 0 = NVIDIA GeForce RTX 4070 Ti SUPER (NVIDIA) | uma: 0 | fp16: 1 | bf16: 1 | warp size: 32 | shared 
+memory: 49152 | int dot: 1 | matrix cores: NV_coopmat2
+ggml_vulkan: 1 = AMD Radeon(TM) Graphics (AMD proprietary driver) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 32 | 
+shared memory: 32768 | int dot: 1 | matrix cores: none
+
+Loading model... 
+
+
+ΓûäΓûä ΓûäΓûä
+ΓûêΓûê ΓûêΓûê
+ΓûêΓûê ΓûêΓûê  ΓûÇΓûÇΓûêΓûä ΓûêΓûêΓûêΓûäΓûêΓûêΓûêΓûä  ΓûÇΓûÇΓûêΓûä    ΓûäΓûêΓûêΓûêΓûê ΓûêΓûêΓûêΓûêΓûä ΓûêΓûêΓûêΓûêΓûä
+ΓûêΓûê ΓûêΓûê ΓûäΓûêΓûÇΓûêΓûê ΓûêΓûê ΓûêΓûê ΓûêΓûê ΓûäΓûêΓûÇΓûêΓûê    ΓûêΓûê    ΓûêΓûê ΓûêΓûê ΓûêΓûê ΓûêΓûê
+ΓûêΓûê ΓûêΓûê ΓûÇΓûêΓûäΓûêΓûê ΓûêΓûê ΓûêΓûê ΓûêΓûê ΓûÇΓûêΓûäΓûêΓûê ΓûêΓûê ΓûÇΓûêΓûêΓûêΓûê ΓûêΓûêΓûêΓûêΓûÇ ΓûêΓûêΓûêΓûêΓûÇ
+                                    ΓûêΓûê    ΓûêΓûê
+                                    ΓûÇΓûÇ    ΓûÇΓûÇ
+
+build      : b1-9ef7523
+model      : Qwen3.5-9B-Q3_K_M.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read               add a text file
+
+
+> Write a detailed essay about the history of artificial intelligence, covering its origins in the 1950s, key milestones, and modern developments. Be thorough and specific.
+
+[Start thinking]
+Here's a thinking process that leads to the essay on the history of artificial intelligence:
+
+1.  **Deconstruct the Request:**
+    *   **Topic:** History of Artificial Intelligence (AI).
+    *   **Scope:** Origins (1950s), Key Milestones, Modern Developments.
+    *   **Tone:** Detailed, thorough, specific.
+    *   **Format:** Essay.
+
+2.  **Outline the Structure:**
+    *   **Introduction:** Define AI, state its significance, and set the timeline (from 1950s to present).
+    *   **The Dawn of AI (1940s-1950s):** Early concepts, Turing Test, Dartmouth Conference.
+    *   **The First Winter (1956-1974):** Early optimism, symbolic AI, limitations, funding cuts.
+    *   **The Second Winter & Expert Systems (1974-1980s):** Shift to practical applications, expert systems, knowledge representation.
+    *   **The AI Spring (1980s-1990s):** Logic programming, neural networks resurgence, connectionism.
+    *   **The Machine Learning Era (1990s-2000s):** Statistical methods, support vector machines, early deep learning.
+    *   **The Deep Learning Revolution (2010s-Present):** GPUs, Big Data, Transformers, Generative AI.
+    *   **Ethics and Future:** Current challenges, alignment, future outlook.
+    *   **Conclusion:** Summarize the journey and reflect on the trajectory.
+
+3.  **Drafting Content - Section by Section:**
+
+    *   *Introduction:* Start with the definition. Mention Alan Turing. Hook the reader with the idea of machines thinking.
+    *   *Origins:* Mention McCulloch-Pitts neuron (1943). Turing's 1950 paper "Computing Machinery and Intelligence." The 1956 Dartmouth Conference (McCarthy, Minsky, etc.) ΓÇô this is the birth of the term "Artificial Intelligence."
+    *   *First Winter:* Why did it fail? Hardware limitations, complexity of human reasoning. The "Good Old-Fashioned AI" (GOFAI).
+    *   *Expert Systems:*
+
+[ Prompt: 666.2 t/s | Generation: 89.9 t/s ]
+

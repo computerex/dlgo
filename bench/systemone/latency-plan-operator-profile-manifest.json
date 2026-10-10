@@ -1,0 +1,13 @@
+{
+  "variant": "latency-plan-operator-profile",
+  "env": {
+    "DLGO_GEMM_Q3K": "1",
+    "DLGO_SSM_BATCH": "1",
+    "DLGO_SSM_REC_T32": "0",
+    "DLGO_SSM_TIME": "1",
+    "DLGO_SSM_TIME_CHUNKS": "23"
+  },
+  "profile": true,
+  "runs": 1,
+  "nonce_seed": "latency-plan-paired-v1"
+}

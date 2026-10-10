@@ -103,14 +103,14 @@ func (m *LLM) Benchmark(prompt string, opts ...Option) (*BenchmarkResult, error)
 	}
 
 	return &BenchmarkResult{
-		Text:          result.Text,
-		TokensPerSec:  result.TokensPerSec,
-		PrefillMs:     result.PrefillTimeMs,
-		GenerateMs:    result.GenerateTimeMs,
-		TotalMs:       totalMs,
-		PromptTokens:  result.PromptTokens,
-		OutputTokens:  result.TotalTokens,
-		Architecture:  m.pipeline.Model.Config.Architecture,
+		Text:         result.Text,
+		TokensPerSec: result.TokensPerSec,
+		PrefillMs:    result.PrefillTimeMs,
+		GenerateMs:   result.GenerateTimeMs,
+		TotalMs:      totalMs,
+		PromptTokens: result.PromptTokens,
+		OutputTokens: result.TotalTokens,
+		Architecture: m.pipeline.Model.Config.Architecture,
 	}, nil
 }
 
@@ -128,6 +128,56 @@ func (m *LLM) ModelInfo() ModelInfo {
 		ContextLen:   cfg.ContextLength,
 		ChatTemplate: cfg.ChatTemplate,
 	}
+}
+
+// Choice is one allowed typed answer for a System One question.
+type Choice = llm.Choice
+
+// SystemOneQuestion describes a closed-set, typed decision.
+type SystemOneQuestion = llm.SystemOneQuestion
+
+// SystemOneConfig controls System One confidence and prompting behavior.
+type SystemOneConfig = llm.SystemOneConfig
+
+// ChoiceScore is the likelihood and normalized probability of one choice.
+type ChoiceScore = llm.ChoiceScore
+
+// SystemOneResult is the typed result of a System One decision.
+type SystemOneResult = llm.SystemOneResult
+
+// SystemOne evaluates a typed closed-set decision without sampling generated
+// text. It pre-fills the state once and scores each permitted answer code.
+func (m *LLM) SystemOne(state string, question SystemOneQuestion, cfg SystemOneConfig) (*SystemOneResult, error) {
+	return m.pipeline.SystemOne(state, question, cfg)
+}
+
+// SystemOneNoul is the Jev-style yes/no primitive. Value is "yes" or "no".
+// When readout is non-nil the trained one-pass decision head is used.
+func (m *LLM) SystemOneNoul(state string, prompt string, cfg SystemOneConfig, readout *SystemOneReadout) (*SystemOneResult, error) {
+	return m.pipeline.SystemOneNoul(state, prompt, cfg, readout)
+}
+
+// SystemOneScore is the Jev-style numeric-score primitive. The [min,max] range
+// is discretized into integer buckets; Value is the chosen integer as a string.
+// When readout is non-nil the trained one-pass decision head is used.
+func (m *LLM) SystemOneScore(state string, prompt string, min, max int, cfg SystemOneConfig, readout *SystemOneReadout) (*SystemOneResult, error) {
+	return m.pipeline.SystemOneScore(state, prompt, min, max, cfg, readout)
+}
+
+// SystemOneReadout is a trained native System One classifier head for a frozen
+// GGUF backbone. It is independent of normal text generation weights.
+type SystemOneReadout = llm.SystemOneReadout
+
+// LoadSystemOneReadout loads a native System One readout artifact compatible
+// with this model's hidden dimension.
+func (m *LLM) LoadSystemOneReadout(path string) (*SystemOneReadout, error) {
+	return llm.LoadSystemOneReadout(path, m.pipeline.Model.Config.EmbeddingDim)
+}
+
+// SystemOneWithReadout evaluates a decision through the trained one-pass
+// classifier head, avoiding generated text and candidate continuations.
+func (m *LLM) SystemOneWithReadout(state string, question SystemOneQuestion, cfg SystemOneConfig, readout *SystemOneReadout) (*SystemOneResult, error) {
+	return m.pipeline.SystemOneWithReadout(state, question, cfg, readout)
 }
 
 // Whisper wraps a loaded Whisper model for speech-to-text.

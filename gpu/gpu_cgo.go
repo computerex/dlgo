@@ -932,6 +932,53 @@ func BatchMatVec(out, weights, x Buf, rows, cols, npos int, qtype uint32) error 
 	return nil
 }
 
+// SetGemmQ3K forces the opt-in Q3_K batched GEMM availability, bypassing the
+// DLGO_GEMM_Q3K env cache. Test-only hook; not part of the inference path.
+func SetGemmQ3K(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_gemm_q3k(v)
+}
+
+// gemmQ3KRecovered is a test-only entry point; inference never selects this candidate.
+func gemmQ3KRecovered(out, weights, x Buf, rows, cols, npos int) error {
+	rc := C.gpu_gemm_q3k_recovered(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x), C.int(rows), C.int(cols), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("Q3_K recovery dispatch failed: %d", rc)
+	}
+	return nil
+}
+
+// SetAttentionBarrier selects the opt-in barrier-reduced batched attention for tests.
+func SetAttentionBarrier(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_barrier(v)
+}
+
+// SetAttentionKV4 selects the opt-in KV-grouped batched attention for tests.
+func SetAttentionKV4(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_kv4(v)
+}
+
+// SetSSMRecT32 forces the 32-lane SSM recurrence variant selection,
+// bypassing the DLGO_SSM_REC_T32 env cache. Test-only hook.
+func SetSSMRecT32(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_ssm_rec_t32(v)
+}
+
 // CopyRegion copies a region between GPU buffers.
 func CopyRegion(dst Buf, dstOff uint64, src Buf, srcOff, size uint64) error {
 	rc := C.gpu_copy_region(C.GpuBuf(dst), C.uint64_t(dstOff),
@@ -1022,12 +1069,28 @@ func SSMPreprocess(alpha, beta, ssma, dtBias, qkv Buf, numHeads, headKDim, keyDi
 	return nil
 }
 
-// SSMDeltaRule performs the delta rule state update and output computation.
+// SSMDeltaRule fuses decay, compensated prediction, rounded state update, and
+// compensated output in one dispatch. Alpha is log-decay, as in SSMDecay.
+// Supports 1..128 key/value dimensions; larger keys use ssmRecurrence fallback.
 func SSMDeltaRule(state, qkv, alpha, beta, y Buf, numHeads, headKDim, headVDim, keyDim int) error {
 	rc := C.gpu_ssm_delta_rule(C.GpuBuf(state), C.GpuBuf(qkv), C.GpuBuf(alpha),
 		C.GpuBuf(beta), C.GpuBuf(y), C.int(numHeads), C.int(headKDim), C.int(headVDim), C.int(keyDim))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: ssm_delta_rule failed (%d)", rc)
+	}
+	return nil
+}
+
+// ssmBatchStage records one of the four batched prefill stages.
+func ssmBatchStage(stage int, b0, b1, b2, b3, b4 Buf, heads, kd, vd, keyDim, convK, npos int, eps float32, hasBias bool) error {
+	bias := 0
+	if hasBias {
+		bias = 1
+	}
+	rc := C.gpu_ssm_batch_stage(C.int(stage), C.GpuBuf(b0), C.GpuBuf(b1), C.GpuBuf(b2), C.GpuBuf(b3), C.GpuBuf(b4),
+		C.int(heads), C.int(kd), C.int(vd), C.int(keyDim), C.int(convK), C.int(npos), C.float(eps), C.int(bias))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: ssm batch stage %d failed (%d)", stage, rc)
 	}
 	return nil
 }

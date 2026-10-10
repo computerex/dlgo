@@ -1,0 +1,30 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "type": "multi",
+  "state": "You are in a Pokemon battle. The opponent's active Pokemon is Blastoise, a Water-type turtle that uses powerful Water attacks. Your active Pokemon is Charizard, a Fire/Flying-type at half health. Your party is: Charizard (Fire/Flying), Pikachu (Electric), Gengar (Ghost/Poison), and Snorlax (Normal).",
+  "questions": {
+    "switch": {
+      "type": "choice",
+      "criteria": {
+        "pikachu": "Electric-type Pokemon; Electric attacks deal super-effective damage to Water Pokemon.",
+        "gengar": "Ghost/Poison-type Pokemon; its attacks have no type advantage against Water.",
+        "snorlax": "Normal-type Pokemon; its attacks have no type advantage against Water."
+      },
+      "instructions": "Which party member should you switch in to gain the best type advantage against the opponent's Water-type Blastoise?"
+    },
+    "move_type": {
+      "type": "choice",
+      "criteria": {
+        "electric": "Electric moves deal super-effective (double) damage to Water Pokemon.",
+        "fire": "Fire moves deal resisted (half) damage to Water Pokemon.",
+        "water": "Water moves deal neutral damage to Water Pokemon."
+      },
+      "instructions": "Which move type deals the most damage to the opponent's Water-type Blastoise?"
+    },
+    "charizard_water_weak": {
+      "type": "noul",
+      "instructions": "Is your active Charizard, a Fire/Flying-type, weak to the opponent's Water attacks?"
+    }
+  }
+}

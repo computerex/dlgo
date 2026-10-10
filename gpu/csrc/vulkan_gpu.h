@@ -184,6 +184,17 @@ typedef enum {
     PIPE_MATVEC_IQ3_S_DP4A_MOE,
     PIPE_ATTENTION_TILED_SINKS,
     PIPE_MATVEC_Q5_1,
+    PIPE_SSM_CONV1D_BATCH,
+    PIPE_SSM_PREPROCESS_BATCH,
+    PIPE_SSM_RECURRENCE_BATCH,
+    PIPE_SSM_NORM_GATE_BATCH,
+    // Q3_K batched GEMM (opt-in via DLGO_GEMM_Q3K; see gpu_batch_matvec).
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_GEMM_Q3K_TILED,
+    PIPE_SSM_RECURRENCE_BATCH_T32,
+    PIPE_ATTENTION_TILED_BARRIER,
+    PIPE_ATTENTION_TILED_KV4,
+    PIPE_GEMM_Q3K_RECOVERED,
     PIPE_COUNT
 } PipelineID;
 
@@ -383,6 +394,11 @@ int gpu_gemm_q5k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                  int rows, int cols, int npos);
 int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                  int rows, int cols, int npos);
+int gpu_gemm_q3k_tiled(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                       int rows, int cols, int npos);
+
+// Test-only: force Q3_K GEMM availability (0=off, 1=on). Not used by inference.
+void gpu_set_gemm_q3k(int on);
 
 // Synchronize: wait for all GPU work to complete
 void gpu_sync(void);

@@ -1,0 +1,213 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Fused Q3_K-weight x FP32-input tiled GEMM (no tensor cores).
+//
+// A = input,  FP32,  shape [M x K]  row-major  (tokens x inner)
+// B = weight, Q3_K,  shape [N x K]  row-major  (rows x inner)
+// C = output, FP32,  shape [M x N]  row-major  (tokens x rows)
+//   stored as C[m * N + n]
+//
+// This replaces the per-token Q3_K matvec fallback (matvec_q3_k.comp), which
+// re-reads the weight matrix once per token (gl_WorkGroupID.y = token). Here
+// the Q3_K tile is dequantized to FP32 in shared memory ONCE and reused across
+// the whole token tile.
+//
+// Dequantization is ported verbatim from quant/q3_k.go (DequantizeQ3_K), which
+// matches llama.cpp:
+//   is = local_k / 16                            (scale group; 16 elements)
+//   dl = d * (scales[is] - 32)                   (6-bit scale, biased by 32)
+//   qs_byte = (local_k / 128) * 32 + (local_k % 32)
+//   v  = (qs[qs_byte] >> (2*((local_k/32)%4))) & 3 ; v -= 4 if hmask bit clear
+//   w  = dl * v
+// The 16 six-bit scales are unpacked from the 12-byte `scales` array using the
+// same 4-word recombination as quant/q3_k.go.
+//
+// WorkGroupID.x = token tile (M dimension)
+// WorkGroupID.y = row tile   (N dimension)
+// Push constants: M (npos), N (rows), K (cols), out_stride (rows).
+//
+// NOTE: Q3_K blocks are 110 bytes (not divisible by 4). The scalar layout is
+// used so the struct stride is exactly 110; cols must be a multiple of 256.
+
+#define TM 64u
+#define TN 64u
+#define TK 32u
+
+#define THREAD_M 4u
+#define THREAD_N 4u
+
+layout(local_size_x = 256) in;
+
+struct block_q3_k {
+    uint8_t hmask[32];
+    uint8_t qs[64];
+    uint8_t scales[12];
+    float16_t d;
+};
+
+layout(set = 0, binding = 0) writeonly buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer B { block_q3_k data_b[]; };
+layout(set = 0, binding = 2) readonly buffer A { float data_a_f32[]; };
+
+layout(push_constant) uniform Params {
+    int M;          // npos (tokens)
+    int N;          // rows (output dim, may be chunk size)
+    int K;          // cols (inner dim)
+    int out_stride; // output stride in N dimension (= total rows)
+};
+
+// Shared staging. smA holds the FP32 input tile; smB holds the dequantized
+// Q3_K weight tile as FP32.
+shared float smA[TM][TK + 1u];
+shared float smB[TN][TK + 1u];
+
+// Extract the 16 six-bit sub-block scales into a `sc` array. Ports the packing
+// in quant/q3_k.go (and llama.cpp dequantize_row_q3_K) exactly.
+void extract_scales(uint ib, out int sc[16]) {
+    uint a0 = uint(data_b[ib].scales[0]) | (uint(data_b[ib].scales[1]) << 8) |
+        (uint(data_b[ib].scales[2]) << 16) | (uint(data_b[ib].scales[3]) << 24);
+    uint a1 = uint(data_b[ib].scales[4]) | (uint(data_b[ib].scales[5]) << 8) |
+        (uint(data_b[ib].scales[6]) << 16) | (uint(data_b[ib].scales[7]) << 24);
+    uint a2 = uint(data_b[ib].scales[8]) | (uint(data_b[ib].scales[9]) << 8) |
+        (uint(data_b[ib].scales[10]) << 16) | (uint(data_b[ib].scales[11]) << 24);
+
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+
+    uint tmp = a2;
+    uint o0 = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    uint o1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    uint o2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    uint o3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+
+    uint words[4] = uint[4](o0, o1, o2, o3);
+    for (int i = 0; i < 16; i++) {
+        sc[i] = int((words[i / 4] >> uint((i % 4) * 8)) & 0xFFu);
+    }
+}
+
+// Dequantize element `local_k` (0..255) of Q3_K row `gn` at K offset `gk`.
+float dequant_q3k(uint gn, uint gk, uint cols) {
+    uint num_sb = cols >> 8;             // 256-element super-blocks per row
+    uint block_k = gk >> 8;
+    uint local_k = gk & 255u;
+    uint ib = gn * num_sb + block_k;     // block index into data_b
+
+    float d_all = float(data_b[ib].d);
+
+    int sc[16];
+    extract_scales(ib, sc);
+    // 16 scale groups of 16 elements: is = local_k / 16.
+    float dl = d_all * float(sc[local_k >> 4] - 32);
+
+    // qs byte = (local_k / 128) * 32 + (local_k % 32); 2-bit field = (local_k/32)%4.
+    uint q_idx = (local_k >> 7) * 32u + (local_k & 31u);
+    int v = int((uint(data_b[ib].qs[q_idx]) >> uint(((local_k >> 5) & 3u) * 2u)) & 0x03u);
+    // hmask byte = local_k % 32; bit = local_k / 32 (0..7).
+    uint hbyte = uint(data_b[ib].hmask[local_k & 31u]);
+    if ((hbyte & (1u << (local_k >> 5))) == 0u) {
+        v -= 4;
+    }
+    return dl * float(v);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;  // 0..255
+    uint bm = gl_WorkGroupID.x * TM;    // token tile start
+    uint bn = gl_WorkGroupID.y * TN;    // row tile start
+
+    uint tx = tid & 15u;
+    uint ty = tid >> 4;
+
+    uint um = uint(M);
+    uint un = uint(N);
+    uint uk = uint(K);
+
+    float acc[THREAD_M][THREAD_N];
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++)
+        [[unroll]] for (uint j = 0u; j < THREAD_N; j++)
+            acc[i][j] = 0.0;
+
+    for (uint k0 = 0u; k0 < uk; k0 += TK) {
+        // ----- Load smA: TM x TK, FP32 input -----
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            uint idx = s * 256u + tid;
+            uint r = idx >> 5;
+            uint c = idx & 31u;
+            uint gm = bm + r;
+            uint gk = k0 + c;
+            float val = 0.0;
+            if (gm < um && gk < uk)
+                val = data_a_f32[gm * uk + gk];
+            smA[r][c] = val;
+        }
+
+        // ----- Load smB: TN x TK, dequantized Q3_K -> FP32 -----
+        [[unroll]] for (uint s = 0u; s < 8u; s++) {
+            uint idx = s * 256u + tid;
+            uint r = idx >> 5;    // row in tile -> output row
+            uint c = idx & 31u;   // col in tile -> K dimension
+            uint gn = bn + r;
+            uint gk = k0 + c;
+            float val = 0.0;
+            if (gn < un && gk < uk)
+                val = dequant_q3k(gn, gk, uk);
+            smB[r][c] = val;
+        }
+
+        barrier();
+
+        uint rm = ty * THREAD_M;
+        uint rn = tx * THREAD_N;
+
+        [[unroll]] for (uint k = 0u; k < TK; k++) {
+            float a0 = smA[rm + 0u][k];
+            float a1 = smA[rm + 1u][k];
+            float a2 = smA[rm + 2u][k];
+            float a3 = smA[rm + 3u][k];
+
+            float b0 = smB[rn + 0u][k];
+            float b1 = smB[rn + 1u][k];
+            float b2 = smB[rn + 2u][k];
+            float b3 = smB[rn + 3u][k];
+
+            acc[0][0] = fma(a0, b0, acc[0][0]);
+            acc[0][1] = fma(a0, b1, acc[0][1]);
+            acc[0][2] = fma(a0, b2, acc[0][2]);
+            acc[0][3] = fma(a0, b3, acc[0][3]);
+            acc[1][0] = fma(a1, b0, acc[1][0]);
+            acc[1][1] = fma(a1, b1, acc[1][1]);
+            acc[1][2] = fma(a1, b2, acc[1][2]);
+            acc[1][3] = fma(a1, b3, acc[1][3]);
+            acc[2][0] = fma(a2, b0, acc[2][0]);
+            acc[2][1] = fma(a2, b1, acc[2][1]);
+            acc[2][2] = fma(a2, b2, acc[2][2]);
+            acc[2][3] = fma(a2, b3, acc[2][3]);
+            acc[3][0] = fma(a3, b0, acc[3][0]);
+            acc[3][1] = fma(a3, b1, acc[3][1]);
+            acc[3][2] = fma(a3, b2, acc[3][2]);
+            acc[3][3] = fma(a3, b3, acc[3][3]);
+        }
+
+        barrier();
+    }
+
+    uint rm = ty * THREAD_M;
+    uint rn = tx * THREAD_N;
+    uint ustride = uint(out_stride);
+
+    [[unroll]] for (uint i = 0u; i < THREAD_M; i++) {
+        uint gm = bm + rm + i;
+        if (gm >= um) continue;
+        [[unroll]] for (uint j = 0u; j < THREAD_N; j++) {
+            uint gn = bn + rn + j;
+            if (gn >= un) continue;
+            out_data[gm * ustride + gn] = acc[i][j];
+        }
+    }
+}

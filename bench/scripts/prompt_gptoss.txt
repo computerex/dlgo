@@ -1,0 +1,11 @@
+<|start|>system<|message|>You are a helpful assistant.
+Knowledge cutoff: 2024-06
+Current date: 2026-04-21
+
+Reasoning: medium
+
+# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions
+
+You are a helpful assistant.
+
+<|end|><|start|>user<|message|>Write a comprehensive tutorial on building a REST API with Python Flask. Cover project setup, routing, request handling, database integration with SQLAlchemy, authentication with JWT tokens, error handling, testing, deployment, and best practices. Include complete code examples for each section.<|end|><|start|>assistant

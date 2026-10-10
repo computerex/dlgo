@@ -1,0 +1,86 @@
+{
+  "url": "http://127.0.0.1:8097/v1/systemone",
+  "request_sha256": "425f0404f881fc31f1a518d3e4a37d415e78b362b20da88d6b86b78b8a0f506f",
+  "model": "qwen35-9b",
+  "readout": "systemone-train/artifacts/qwen35-9b-q3-readout-v2-uni.json",
+  "question_count": 3,
+  "runs": [
+    {
+      "cold_ms": 26541.882500052452,
+      "warm_ms": 851.1568999383599,
+      "input_tokens": 10812,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=26517.917700",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=849.565300",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.025007657305266957,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9995992335504447,
+          "probabilities": {
+            "electric": 0.999732822366963,
+            "fire": 1.4258570064193563e-05,
+            "water": 0.00025291906297275727
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5057487856114613,
+          "probabilities": {
+            "gengar": 0.3067618490829213,
+            "pikachu": 0.6704991904076408,
+            "snorlax": 0.02273896050943775
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.025007657305266957,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9995992335504447,
+          "probabilities": {
+            "electric": 0.999732822366963,
+            "fire": 1.4258570064193563e-05,
+            "water": 0.00025291906297275727
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5057487856114613,
+          "probabilities": {
+            "gengar": 0.3067618490829213,
+            "pikachu": 0.6704991904076408,
+            "snorlax": 0.02273896050943775
+          },
+          "type": "choice"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 26541.882500052452,
+      "p50_ms": 26541.882500052452,
+      "p95_ms": 26541.882500052452,
+      "p99_ms": 26541.882500052452,
+      "samples": 1
+    },
+    "warm": {
+      "mean_ms": 851.1568999383599,
+      "p50_ms": 851.1568999383599,
+      "p95_ms": 851.1568999383599,
+      "p99_ms": 851.1568999383599,
+      "samples": 1
+    }
+  }
+}

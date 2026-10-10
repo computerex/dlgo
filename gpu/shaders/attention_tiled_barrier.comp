@@ -1,0 +1,101 @@
+// Opt-in FP16 tiled attention: same arithmetic/reduction order as attention_tiled.
+// Remove unnecessary barriers and shared-memory broadcasts. Every invocation
+// already maintains identical running_sum; max/sum tree outputs are synchronized
+// by their final barrier. No subgroup-size assumptions or changed tile sizes.
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+layout(set=0,binding=0) buffer Out { float attn_out[]; };
+layout(set=0,binding=1) readonly buffer Q { float q_data[]; };
+layout(set=0,binding=2) readonly buffer K { uint k_packed[]; };
+layout(set=0,binding=3) readonly buffer V { uint v_packed[]; };
+layout(push_constant) uniform Params {
+ int num_heads; int num_kv_heads; int head_dim; int kv_dim;
+ int seq_len; float scale; float softcap;
+};
+#define WG_SIZE 256
+#define TILE_SIZE 256
+shared float q_sh[256];
+shared float tile_s[TILE_SIZE];
+shared float reduce_buf[WG_SIZE];
+shared float sh_out[256];
+void main() {
+ uint head=gl_WorkGroupID.x, pos_id=gl_WorkGroupID.y;
+ if(head>=uint(num_heads)) return;
+ uint tid=gl_LocalInvocationID.x;
+ uint kv_head=head/(uint(num_heads)/uint(num_kv_heads));
+ uint hd=uint(head_dim), q_dim=uint(num_heads)*hd;
+ uint q_base=pos_id*q_dim+head*hd;
+ int actual_seq_len=seq_len+int(pos_id);
+ if(actual_seq_len<=0) {
+  if(tid<hd) attn_out[pos_id*q_dim+head*hd+tid]=0.0;
+  return;
+ }
+ uint kv_half=uint(kv_dim)/2u, kv_off_half=(kv_head*hd)/2u, hd_half=hd/2u;
+ for(uint d=tid;d<hd;d+=WG_SIZE) q_sh[d]=q_data[q_base+d]*scale;
+ if(tid<hd) sh_out[tid]=0.0;
+ barrier();
+ float running_max=-1.0e30, running_sum=0.0;
+ for(int tile_start=0;tile_start<actual_seq_len;tile_start+=TILE_SIZE) {
+  int tile_len=min(tile_start+TILE_SIZE,actual_seq_len)-tile_start;
+  float local_max=-1.0e30;
+  if(int(tid)<tile_len) {
+   uint k_base=uint(tile_start+int(tid))*kv_half+kv_off_half;
+   float dot_val=0.0;
+   for(uint d2=0;d2<hd_half;d2++) {
+    vec2 k2=unpackHalf2x16(k_packed[k_base+d2]);
+    dot_val=fma(q_sh[d2*2u],k2.x,dot_val);
+    dot_val=fma(q_sh[d2*2u+1u],k2.y,dot_val);
+   }
+   if(softcap>0.0) dot_val=softcap*tanh(dot_val/softcap);
+   tile_s[tid]=dot_val;
+   // No barrier needed: this invocation owns its score and reduction slot.
+   local_max=dot_val;
+  }
+  reduce_buf[tid]=local_max;
+  barrier();
+  [[unroll]] for(uint s=WG_SIZE/2u;s>0u;s>>=1u) {
+   if(tid<s) reduce_buf[tid]=max(reduce_buf[tid],reduce_buf[tid+s]);
+   barrier();
+  }
+  float tile_max=reduce_buf[0];
+  // Protect reduction storage until every invocation has read tile_max.
+  barrier();
+  float new_max=max(running_max,tile_max);
+  float correction=exp(running_max-new_max);
+  if(tid<hd) sh_out[tid]*=correction;
+  // Previously lane 0 broadcast this identical scalar through reduce_buf.
+  running_sum=running_sum*correction;
+  float local_sum=0.0;
+  if(int(tid)<tile_len) {
+   float w=exp(tile_s[tid]-new_max);
+   tile_s[tid]=w;
+   local_sum=w;
+  }
+  reduce_buf[tid]=local_sum;
+  barrier();
+  [[unroll]] for(uint s=WG_SIZE/2u;s>0u;s>>=1u) {
+   if(tid<s) reduce_buf[tid]+=reduce_buf[tid+s];
+   barrier();
+  }
+  running_sum+=reduce_buf[0];
+  // Keep this barrier: next tile must not overwrite the sum before all readers.
+  barrier();
+  if(tid<hd) {
+   uint d_pair=tid/2u, d_which=tid&1u;
+   float acc=0.0;
+   for(int ti=0;ti<tile_len;ti++) {
+    float w=tile_s[ti];
+    uint v_base=uint(tile_start+ti)*kv_half+kv_off_half;
+    vec2 v2=unpackHalf2x16(v_packed[v_base+d_pair]);
+    float v_val=(d_which==0u)?v2.x:v2.y;
+    acc=fma(w,v_val,acc);
+   }
+   sh_out[tid]+=acc;
+  }
+  barrier();
+  running_max=new_max;
+ }
+ float inv_sum=(running_sum>0.0)?1.0/running_sum:0.0;
+ if(tid<hd) attn_out[pos_id*q_dim+head*hd+tid]=sh_out[tid]*inv_sum;
+}

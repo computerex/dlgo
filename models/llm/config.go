@@ -154,8 +154,17 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	if c.EmbeddingDim == 0 {
 		return c, fmt.Errorf("missing %s.embedding_length", arch)
 	}
-	if c.NumLayers == 0 {
-		return c, fmt.Errorf("missing %s.block_count", arch)
+	if c.NumLayers <= 0 {
+		return c, fmt.Errorf("missing or invalid %s.block_count", arch)
+	}
+	// GGUF block_count includes trailing multi-token prediction (MTP) blocks.
+	// Ordinary inference uses only the decoder trunk, not the next-token heads.
+	if v, ok := md[arch+".nextn_predict_layers"]; ok {
+		nextN, valid := toInt(v)
+		if !valid || nextN < 0 || nextN >= c.NumLayers {
+			return c, fmt.Errorf("invalid %s.nextn_predict_layers: %v (block_count=%d)", arch, v, c.NumLayers)
+		}
+		c.NumLayers -= nextN
 	}
 	if c.NumHeads == 0 {
 		return c, fmt.Errorf("missing %s.attention.head_count", arch)

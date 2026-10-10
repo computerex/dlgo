@@ -1,0 +1,9 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v7-gp.json",
+  "type": "score",
+  "state": "Our production database is down and every customer request is failing. We are losing revenue each minute.",
+  "instructions": "On a scale from 0 (no urgency) to 10 (maximum urgency), how urgent is this?",
+  "min": 0,
+  "max": 10
+}

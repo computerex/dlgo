@@ -320,42 +320,114 @@ func (t *Tokenizer) splitOnSpecialTokensBPE(text string) []string {
 }
 
 func (t *Tokenizer) textToInitialTokensBPE(text string) []string {
-	var tokens []string
-	for _, b := range []byte(text) {
-		tokens = append(tokens, string(t.byteToUnicode[b]))
+	tokens := make([]string, len(text))
+	for i := 0; i < len(text); i++ {
+		tokens[i] = string(t.byteToUnicode[text[i]])
 	}
 	return tokens
 }
 
+// bpeMergeEntry is one candidate merge in the heap-based BPE loop: merge the
+// adjacent pair (pos, next) at the given rank. Ties break to the lower pos,
+// replicating the previous full-rescan behavior (lowest rank, then leftmost).
+type bpeMergeEntry struct {
+	rank int
+	pos  int
+	next int
+}
+
+type bpeMergeHeap []bpeMergeEntry
+
+func (h bpeMergeHeap) Len() int { return len(h) }
+func (h bpeMergeHeap) Less(i, j int) bool {
+	if h[i].rank != h[j].rank {
+		return h[i].rank < h[j].rank
+	}
+	return h[i].pos < h[j].pos
+}
+func (h bpeMergeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *bpeMergeHeap) Push(x interface{}) { *h = append(*h, x.(bpeMergeEntry)) }
+func (h *bpeMergeHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// applyBPE repeatedly merges the adjacent pair with the lowest merge rank
+// (ties -> leftmost) until no ranked pair remains. It is output-identical to
+// the previous full-rescan implementation but runs in O(n log n): a linked
+// list tracks adjacency, a min-heap orders candidate merges, and stale heap
+// entries (pairs invalidated by neighboring merges) are skipped on pop. Merge
+// ranks are unique per pair in a well-formed BPE vocab, so a stale entry can
+// never pass the adjacency + rank recheck of a different live pair.
 func (t *Tokenizer) applyBPE(symbols []string) []string {
-	for {
-		if len(symbols) < 2 {
-			break
+	n := len(symbols)
+	if n < 2 {
+		return symbols
+	}
+	prev := make([]int, n)
+	next := make([]int, n)
+	alive := make([]bool, n)
+	for i := 0; i < n; i++ {
+		prev[i] = i - 1
+		if i+1 < n {
+			next[i] = i + 1
+		} else {
+			next[i] = -1
 		}
-		bestRank := -1
-		bestIdx := -1
-		for i := 0; i < len(symbols)-1; i++ {
-			pair := [2]string{symbols[i], symbols[i+1]}
-			if rank, ok := t.MergeRanks[pair]; ok {
-				if bestRank == -1 || rank < bestRank {
-					bestRank = rank
-					bestIdx = i
-				}
+		alive[i] = true
+	}
+	h := make(bpeMergeHeap, 0, n)
+	for i := 0; i+1 < n; i++ {
+		if rank, ok := t.MergeRanks[[2]string{symbols[i], symbols[i+1]}]; ok {
+			h = append(h, bpeMergeEntry{rank: rank, pos: i, next: i + 1})
+		}
+	}
+	heap.Init(&h)
+
+	aliveCount := n
+	for h.Len() > 0 && aliveCount >= 2 {
+		e := heap.Pop(&h).(bpeMergeEntry)
+		// Staleness checks: the pair must still be adjacent and still carry
+		// the recorded rank. Merges only ever change symbols at the merged
+		// position, invalidating neighboring pair entries.
+		if !alive[e.pos] || e.next < 0 || !alive[e.next] || next[e.pos] != e.next {
+			continue
+		}
+		if rank, ok := t.MergeRanks[[2]string{symbols[e.pos], symbols[e.next]}]; !ok || rank != e.rank {
+			continue
+		}
+		// Merge next into pos.
+		symbols[e.pos] = symbols[e.pos] + symbols[e.next]
+		alive[e.next] = false
+		nxt := next[e.next]
+		next[e.pos] = nxt
+		if nxt != -1 {
+			prev[nxt] = e.pos
+		}
+		aliveCount--
+		// New candidate pairs created by the merge.
+		if p := prev[e.pos]; p != -1 {
+			if rank, ok := t.MergeRanks[[2]string{symbols[p], symbols[e.pos]}]; ok {
+				heap.Push(&h, bpeMergeEntry{rank: rank, pos: p, next: e.pos})
 			}
 		}
-		if bestIdx == -1 {
-			break
+		if nxt != -1 {
+			if rank, ok := t.MergeRanks[[2]string{symbols[e.pos], symbols[nxt]}]; ok {
+				heap.Push(&h, bpeMergeEntry{rank: rank, pos: e.pos, next: nxt})
+			}
 		}
-		merged := symbols[bestIdx] + symbols[bestIdx+1]
-		newSymbols := make([]string, 0, len(symbols)-1)
-		newSymbols = append(newSymbols, symbols[:bestIdx]...)
-		newSymbols = append(newSymbols, merged)
-		if bestIdx+2 < len(symbols) {
-			newSymbols = append(newSymbols, symbols[bestIdx+2:]...)
-		}
-		symbols = newSymbols
 	}
-	return symbols
+
+	out := make([]string, 0, aliveCount)
+	for i := 0; i < n; i++ {
+		if alive[i] {
+			out = append(out, symbols[i])
+		}
+	}
+	return out
 }
 
 func (t *Tokenizer) encodeSPM(text string, result []int32) []int32 {

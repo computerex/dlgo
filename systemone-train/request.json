@@ -1,0 +1,1 @@
+{"state":"The payment was taken after I canceled my membership.","instructions":"Which team should handle this customer message?","criteria":{"billing":"Billing, charges, refunds, invoices, subscriptions, or payments.","technical":"Technical software, device, service, or product malfunction.","account":"Account access, identity, password, login, or authentication issue."}}

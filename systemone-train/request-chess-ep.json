@@ -1,0 +1,11 @@
+{
+  "model": "qwen35-9b",
+  "readout": "systemone-train/artifacts/qwen35-9b-q3-readout-v1-gpu.json",
+  "state": "You are analyzing a game of standard international chess. The position is: White king on e1, White rook on a1, White pawn on e4; Black king on e8, Black queen on d8, Black knight on g8. It is White to move. Standard FIDE rules apply.",
+  "questions": {
+    "en_passant": {
+      "type": "noul",
+      "instructions": "In standard chess, immediately after an enemy pawn advances two squares and lands directly beside your pawn on the same rank, that pawn may capture it as if it had moved only one square. Is this capture (en passant) a legal move?"
+    }
+  }
+}

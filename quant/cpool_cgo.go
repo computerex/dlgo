@@ -83,12 +83,25 @@ func CPoolShutdown() {
 	C.cpool_shutdown()
 }
 
+// The C thread pool is a process-global singleton with per-worker task slots,
+// so only one dispatch may be in flight at a time. Callers must serialize via
+// cpoolMu.
+//
+// NOTE: enabling this pool was measured to REGRESS System One CPU feature
+// extraction (more cores spinning, slower wall-clock — the workload is
+// memory-bandwidth-bound, so extra threads add contention). It stays disabled
+// on the hot path until that is properly addressed. The mutex and the pool
+// plumbing remain so a future caller can opt in safely.
+var cpoolMu sync.Mutex
+
 func CPoolHas() bool      { return false }
 func CPoolBatchHas() bool { return false }
 
 func CPoolQQMatVec(wData []byte, wType uint32, x []float32, cols int,
 	out []float32, nrows, bpr int, q8Buf []byte) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_matvec(
 		(*C.uint8_t)(unsafe.Pointer(&wData[0])),
 		C.uint32_t(wType),
@@ -103,6 +116,8 @@ func CPoolQQMatVec(wData []byte, wType uint32, x []float32, cols int,
 func CPoolFusedMatVec(wData []byte, wType uint32, x []float32, cols int,
 	out []float32, nrows, bpr int) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_fused_matvec(
 		(*C.uint8_t)(unsafe.Pointer(&wData[0])),
 		C.uint32_t(wType),
@@ -119,6 +134,8 @@ func CPoolQQDualMatVec(
 	x []float32, cols int, q8Buf []byte,
 ) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_dual_matvec(
 		(*C.uint8_t)(unsafe.Pointer(&w1[0])), C.uint32_t(t1), C.int(r1), C.int(bpr1), (*C.float)(unsafe.Pointer(&o1[0])),
 		(*C.uint8_t)(unsafe.Pointer(&w2[0])), C.uint32_t(t2), C.int(r2), C.int(bpr2), (*C.float)(unsafe.Pointer(&o2[0])),
@@ -130,6 +147,8 @@ func CPoolQQDualMatVec(
 func CPoolQQBatchGEMM(wData []byte, wType uint32, q8Flat []byte, q8Stride, nInputs, cols int,
 	outFlat []float32, nrows, outStride, bpr int) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_batch_gemm(
 		(*C.uint8_t)(unsafe.Pointer(&wData[0])),
 		C.uint32_t(wType),
@@ -147,6 +166,8 @@ func CPoolQQDualBatchGEMM(
 	q8Flat []byte, q8Stride, nInputs, cols, outStride1, outStride2 int,
 ) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_dual_batch_gemm(
 		(*C.uint8_t)(unsafe.Pointer(&w1[0])), C.uint32_t(t1), C.int(r1), C.int(bpr1), (*C.float)(unsafe.Pointer(&o1[0])),
 		(*C.uint8_t)(unsafe.Pointer(&w2[0])), C.uint32_t(t2), C.int(r2), C.int(bpr2), (*C.float)(unsafe.Pointer(&o2[0])),
@@ -162,6 +183,8 @@ func CPoolQQTripleBatchGEMM(
 	q8Flat []byte, q8Stride, nInputs, cols, outStride1, outStride2, outStride3 int,
 ) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_triple_batch_gemm(
 		(*C.uint8_t)(unsafe.Pointer(&w1[0])), C.uint32_t(t1), C.int(r1), C.int(bpr1), (*C.float)(unsafe.Pointer(&o1[0])),
 		(*C.uint8_t)(unsafe.Pointer(&w2[0])), C.uint32_t(t2), C.int(r2), C.int(bpr2), (*C.float)(unsafe.Pointer(&o2[0])),
@@ -178,6 +201,8 @@ func CPoolQQTripleMatVec(
 	x []float32, cols int, q8Buf []byte,
 ) {
 	cpoolEnsure()
+	cpoolMu.Lock()
+	defer cpoolMu.Unlock()
 	C.cpool_qq_triple_matvec(
 		(*C.uint8_t)(unsafe.Pointer(&w1[0])), C.uint32_t(t1), C.int(r1), C.int(bpr1), (*C.float)(unsafe.Pointer(&o1[0])),
 		(*C.uint8_t)(unsafe.Pointer(&w2[0])), C.uint32_t(t2), C.int(r2), C.int(bpr2), (*C.float)(unsafe.Pointer(&o2[0])),

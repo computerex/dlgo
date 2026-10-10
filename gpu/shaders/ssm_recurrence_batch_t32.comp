@@ -1,0 +1,68 @@
+#version 450
+// Multi-token fused recurrence, tiled across the value dimension.
+// One workgroup per (head, value tile). Each lane owns value columns (stride
+// TILE lanes) and keeps its K-dim columns of recurrent state in registers for
+// the whole token loop, so state traffic is one load/store per chunk instead
+// of per token. Q/K rows for the current token are staged in shared memory.
+// Arithmetic order per (lane, value column) is identical to the previous
+// TILE=16 version: same decay/lr, same ordered Kahan prediction and output
+// sums. With TILE=32 each lane owns exactly one value column; the register
+// column count and operation order per column are unchanged, so results are
+// bit-identical to the TILE=16 kernel (values are simply distributed across
+// more lanes). Workgroups are full 32-lane subgroups, halving wave waste.
+layout(local_size_x = 32) in;
+layout(set=0,binding=0) buffer State {float state_data[];};
+layout(set=0,binding=1) readonly buffer QKV {float qkv[];};
+layout(set=0,binding=2) readonly buffer Alpha {float alpha_data[];};
+layout(set=0,binding=3) readonly buffer Beta {float beta_data[];};
+layout(set=0,binding=4) buffer Y {float y_data[];};
+layout(push_constant) uniform Params {int num_heads;int head_k_dim;int head_v_dim;int key_dim;int npos;};
+const int MAX_KD = 128;
+const uint TILE = 32u;
+shared float sQ[MAX_KD];
+shared float sK[MAX_KD];
+void main(){
+ uint h = gl_WorkGroupID.x;
+ uint tile = gl_WorkGroupID.y;
+ uint lane = gl_LocalInvocationID.x;
+ if(h >= uint(num_heads)) return;
+ uint j = tile*TILE + lane;
+ bool isValid = j < uint(head_v_dim);
+ uint group = h % uint(key_dim/head_k_dim);
+ uint sOff = h*uint(head_k_dim*head_v_dim);
+ uint rowStride = uint(2*key_dim + num_heads*head_v_dim);
+ precise float col[MAX_KD];
+ if(isValid){ for(int i=0;i<head_k_dim;i++) col[i]=state_data[sOff+uint(i*head_v_dim)+j]; }
+ for(int token=0; token<npos; token++){
+  uint off = uint(token)*rowStride;
+  uint qOff = off + group*uint(head_k_dim);
+  uint kOff = off + uint(key_dim) + group*uint(head_k_dim);
+  uint vOff = off + uint(2*key_dim) + h*uint(head_v_dim);
+  for(int i=int(lane); i<head_k_dim; i+=int(TILE)){ sQ[i]=qkv[qOff+uint(i)]; sK[i]=qkv[kOff+uint(i)]; }
+  barrier();
+  float decay = exp(alpha_data[token*num_heads + int(h)]);
+  float lr = beta_data[token*num_heads + int(h)];
+  if(isValid){
+   for(int i=0;i<head_k_dim;i++) col[i]*=decay;
+   precise float pred=0.0,comp=0.0;
+   for(int i=0;i<head_k_dim;i++){
+    precise float product=col[i]*sK[i];
+    precise float y=product-comp;
+    precise float t=pred+y;
+    comp=(t-pred)-y; pred=t;
+   }
+   precise float delta=lr*(qkv[vOff+j]-pred);
+   for(int i=0;i<head_k_dim;i++){ precise float product=sK[i]*delta; col[i]+=product; }
+   precise float dot=0.0,dotComp=0.0;
+   for(int i=0;i<head_k_dim;i++){
+    precise float product=col[i]*sQ[i];
+    precise float y=product-dotComp;
+    precise float t=dot+y;
+    dotComp=(t-dot)-y; dot=t;
+   }
+   y_data[uint(token)*uint(num_heads*head_v_dim)+h*uint(head_v_dim)+j]=dot;
+  }
+  barrier();
+ }
+ if(isValid){ for(int i=0;i<head_k_dim;i++) state_data[sOff+uint(i*head_v_dim)+j]=col[i]; }
+}

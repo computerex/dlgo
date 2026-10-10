@@ -1,0 +1,13 @@
+{
+  "variant": "latency-plan-recovered-on",
+  "env": {
+    "DLGO_GEMM_Q3K": "1",
+    "DLGO_SSM_BATCH": "1",
+    "DLGO_SSM_REC_T32": "0",
+    "DLGO_ATTN_BARRIER": "0",
+    "DLGO_GEMM_Q3K_RECOVERED": "1"
+  },
+  "profile": false,
+  "runs": 3,
+  "nonce_seed": "latency-plan-paired-v1"
+}

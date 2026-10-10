@@ -1,0 +1,11 @@
+{
+  "name": "tinyllama-Q4_0",
+  "text": "Artificial intelligence (AI) is a field of computer science that aims to create intelligent machines that can perform tasks and tasks more efficiently than humans. The concept of AI dates back to the 1950s, when research",
+  "tok_s": 408.7739234938725,
+  "prefill_ms": 5535.837,
+  "generate_ms": 122.317,
+  "total_tokens": 50,
+  "prompt_tokens": 45,
+  "gpu_layers": 22,
+  "dp4a": true
+}

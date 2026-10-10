@@ -1,0 +1,2 @@
+# Standard-library-only scripts currently require no third-party packages.
+# Keep the external teacher credential in DEEPSEEK_API_KEY, never in this file.

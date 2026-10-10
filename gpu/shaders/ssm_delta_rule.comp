@@ -1,7 +1,8 @@
 #version 450
 
-// SSM Delta Rule (fused, legacy — kept for backwards compat).
-// The decomposed path (ssm_decay/predict/update/output) is preferred.
+// Fused recurrence: same exp(alpha), rounded update, and ordered compensated
+// sums as ssm_decay/predict/update/output. One lane owns one state column.
+// Host guards head_k_dim <= 128 and head_v_dim <= 128.
 
 layout(local_size_x = 128) in;
 
@@ -24,7 +25,7 @@ void main() {
 
     if (h >= num_heads || j >= head_v_dim) return;
 
-    float decay = alpha_data[h];
+    float decay = exp(alpha_data[h]);
     float lr = beta_data[h];
 
     int num_kv_groups = key_dim / head_k_dim;
@@ -41,9 +42,13 @@ void main() {
     }
 
     precise float pred = 0.0;
+    precise float predComp = 0.0;
     for (int i = 0; i < head_k_dim; i++) {
         precise float product = col[i] * qkv[kOff + uint(i)];
-        pred += product;
+        precise float y = product - predComp;
+        precise float t = pred + y;
+        predComp = (t - pred) - y;
+        pred = t;
     }
 
     precise float delta = lr * (qkv[vOff + j] - pred);
@@ -58,9 +63,13 @@ void main() {
     }
 
     precise float dot = 0.0;
+    precise float dotComp = 0.0;
     for (int i = 0; i < head_k_dim; i++) {
         precise float product = col[i] * qkv[qOff + uint(i)];
-        dot += product;
+        precise float y = product - dotComp;
+        precise float t = dot + y;
+        dotComp = (t - dot) - y;
+        dot = t;
     }
     y_data[h * uint(head_v_dim) + j] = dot;
 }

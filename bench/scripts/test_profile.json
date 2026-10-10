@@ -1,0 +1,11 @@
+{
+  "name": "Qwen3.5-9B-Q3_K_M",
+  "text": "Here's a thinking process that leads to the essay on the history of artificial intelligence:\n\n1.  **Deconstruct the Request:**\n    *   **Topic:** History of Artificial Intelligence (AI).\n    *   **Format:** Detailed essay",
+  "tok_s": 67.07951874470072,
+  "prefill_ms": 316.834,
+  "generate_ms": 745.384,
+  "total_tokens": 50,
+  "prompt_tokens": 31,
+  "gpu_layers": 32,
+  "dp4a": true
+}

@@ -30,14 +30,19 @@ type StreamEvent struct {
 	ReasoningContent string // thinking block content (set on EventDone)
 	FinishReason     string
 	PromptTokens     int
-	Error            string
+	// GeneratedTokens is the total number of tokens the model generated,
+	// including thinking tokens that were buffered and never emitted as
+	// EventToken. Set on EventDone; usage accounting must use this rather
+	// than counting EventToken events.
+	GeneratedTokens int
+	Error           string
 }
 
 // RequestStatus tracks where a request is in the pipeline.
 type RequestStatus int
 
 const (
-	StatusWaiting    RequestStatus = iota
+	StatusWaiting RequestStatus = iota
 	StatusPrefilling
 	StatusDecoding
 	StatusDone
@@ -48,13 +53,13 @@ const (
 type InferenceRequest struct {
 	ID              string
 	Messages        []llm.Message
-	StopSequences   []string      // user-provided stop sequences from API
-	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
-	EnableThinking  *bool         // nil = auto (enabled for thinking models), false = disable
+	StopSequences   []string // user-provided stop sequences from API
+	ReasoningEffort string   // "low", "medium", "high" (default: "medium")
+	EnableThinking  *bool    // nil = auto (enabled for thinking models), false = disable
 	Config          llm.GenerateConfig
-	Tokens          []int32       // prompt tokens after formatting
-	Generated       []int32       // output tokens so far
-	Position        int           // current sequence position
+	Tokens          []int32 // prompt tokens after formatting
+	Generated       []int32 // output tokens so far
+	Position        int     // current sequence position
 	Status          RequestStatus
 	Output          chan StreamEvent
 	Ctx             context.Context
@@ -65,11 +70,12 @@ type InferenceRequest struct {
 // It processes requests sequentially for now, with the framework
 // ready for continuous batching in the future.
 type Scheduler struct {
-	mu       sync.Mutex
-	model    *LoadedModel
-	submit   chan *InferenceRequest
-	stop     chan struct{}
-	wg       sync.WaitGroup
+	inferenceOnce sync.Once
+	inferenceGate chan struct{}
+	model         *LoadedModel
+	submit        chan *InferenceRequest
+	stop          chan struct{}
+	wg            sync.WaitGroup
 }
 
 // NewScheduler creates and starts a scheduler for the given model.
@@ -100,6 +106,47 @@ func (s *Scheduler) Stop() {
 	s.wg.Wait()
 }
 
+// WithInferenceLock runs fn while holding the scheduler's inference lock.
+// System One evaluation drives the same pipelines (KV cache, run state, GPU
+// command buffers) as the generation loop, so the two paths must be mutually
+// exclusive per model; this serializes System One requests against generation.
+func (s *Scheduler) WithInferenceLock(fn func() error) error {
+	return s.WithInferenceLockContext(context.Background(), fn)
+}
+
+// acquireInference waits without spawning a goroutine. Lazy initialization also
+// keeps a zero-value Scheduler usable by callers of WithInferenceLock.
+func (s *Scheduler) acquireInference(ctx context.Context) error {
+	s.inferenceOnce.Do(func() { s.inferenceGate = make(chan struct{}, 1) })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.inferenceGate <- struct{}{}:
+		// Cancellation and acquisition may become ready simultaneously.
+		if err := ctx.Err(); err != nil {
+			s.releaseInference()
+			return err
+		}
+		return nil
+	}
+}
+
+func (s *Scheduler) releaseInference() { <-s.inferenceGate }
+
+// WithInferenceLockContext shares generation's gate and skips fn if the
+// context is canceled while waiting. Active work must observe ctx itself;
+// the gate cannot safely release pipeline ownership before fn returns.
+func (s *Scheduler) WithInferenceLockContext(ctx context.Context, fn func() error) error {
+	if err := s.acquireInference(ctx); err != nil {
+		return err
+	}
+	defer s.releaseInference()
+	return fn()
+}
+
 func (s *Scheduler) loop() {
 	defer s.wg.Done()
 	for {
@@ -115,8 +162,10 @@ func (s *Scheduler) loop() {
 func (s *Scheduler) processRequest(req *InferenceRequest) {
 	defer close(req.Output)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireInference(req.Ctx); err != nil {
+		return
+	}
+	defer s.releaseInference()
 
 	m := s.model
 
@@ -304,7 +353,7 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		thinkingContent = strings.TrimSpace(genText.String())
 	}
 
-	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent}
+	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent, GeneratedTokens: len(req.Generated)}
 }
 
 func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
@@ -365,6 +414,7 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		FinishReason:     finishReason,
 		PromptTokens:     result.PromptTokens,
 		ReasoningContent: thinkingContent,
+		GeneratedTokens:  result.TotalTokens,
 	}
 }
 

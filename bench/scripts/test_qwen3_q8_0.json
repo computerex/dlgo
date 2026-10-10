@@ -1,0 +1,11 @@
+{
+  "name": "qwen3-0.6b-q8_0",
+  "text": "Okay, the user wants a short poem about the ocean. Let me start by thinking about the key elements of an ocean. It's vast, mysterious, full of life, and has many features like waves, tides, currents, maybe some creatures.\n\nI need to capture that imagery in a poetic way. Maybe use metaphors related to nature or emotions. Words like \"waves,\" \"tide,\" \"currents\" come to mind. Also, think about the feeling of being underwater or the beauty around it.\n\nStructure-wise, a simple rhyme scheme might work. Maybe ABAB or AABB. Let me try to draft lines. Start with something about the ocean's depth, then mention its mysteries, then life, and end with a sense of",
+  "tok_s": 324.22267613396883,
+  "prefill_ms": 31.809,
+  "generate_ms": 462.645,
+  "total_tokens": 150,
+  "prompt_tokens": 28,
+  "gpu_layers": 28,
+  "dp4a": true
+}

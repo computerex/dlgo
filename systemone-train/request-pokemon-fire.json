@@ -1,0 +1,12 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "type": "choice",
+  "state": "You are in a Pokemon battle. The opponent's active Pokemon is Charizard, a Fire/Flying-type dragon. Your active Pokemon is Onix, a Rock/Ground-type snake. Your party is: Onix (Rock/Ground), Starmie (Water/Psychic), Arcanine (Fire), and Dugtrio (Ground).",
+  "prompt": "Which party member should you switch in to gain the best type advantage against the opponent's Fire-type Charizard?",
+  "criteria": {
+    "starmie": "Water/Psychic-type Pokemon; Water attacks deal super-effective damage to Fire Pokemon and Water resists Fire attacks.",
+    "arcanine": "Fire-type Pokemon; Fire attacks deal resisted damage to Fire Pokemon.",
+    "dugtrio": "Ground-type Pokemon; Ground attacks deal neutral damage to Fire/Flying and Ground does not resist Fire."
+  }
+}

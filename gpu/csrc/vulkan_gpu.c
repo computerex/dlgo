@@ -1336,6 +1336,8 @@ int gpu_load_pipelines(void) {
 
     for (int i = 0; i < total; i++) {
         const ShaderInfo* si = &shader_registry[i];
+        /* This recovery experiment is unused on non-coopmat devices. */
+        if (i == PIPE_GEMM_Q3K_RECOVERED && !g.has_coopmat) continue;
         if (!si->code || si->code_size == 0) continue;
         int rc = create_compute_pipeline(i, si->code, si->code_size,
                                          si->num_buffers, si->push_const_size);
@@ -2626,6 +2628,11 @@ int gpu_gemm_q6k_f32(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos);
 int gpu_gemm_q4k_dequant_coopmat(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                                   int rows, int cols, int npos);
+int gpu_gemm_q3k_tiled(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                       int rows, int cols, int npos);
+static int gemm_q3k_available(void);
+static int gemm_q3k_recovered_selected(void);
+static int gpu_gemm_q3k_recovered(GpuBuf out, GpuBuf weights, GpuBuf x, int rows, int cols, int npos);
 
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos, int qtype) {
@@ -2656,6 +2663,16 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     }
     if (qtype == QTYPE_Q6_K && npos > 1) {
         return gpu_gemm_q6k_f32(out_buf, weights_buf, x_buf, rows, cols, npos);
+    }
+    /* Opt-in Q3_K batched GEMM (DLGO_GEMM_Q3K=1). Default off: the matvec
+     * fallback below stays byte-for-byte the default behavior. Only engages for
+     * whole 256-element super-blocks; otherwise falls through to the matvec.
+     * DLGO_GEMM_Q3K_RECOVERED=1 additionally selects the cooperative-matrix
+     * recovery candidate (numerically validated relL2 ~2.6e-4; not default). */
+    if (qtype == QTYPE_Q3_K && npos > 1 && gemm_q3k_available() && (cols & 255) == 0) {
+        if (gemm_q3k_recovered_selected())
+            return gpu_gemm_q3k_recovered(out_buf, weights_buf, x_buf, rows, cols, npos);
+        return gpu_gemm_q3k_tiled(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
 
     PipelineID pipe;
@@ -3418,6 +3435,93 @@ int gpu_gemm_q6k_f32(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     return dispatch_compute(&dp);
 }
 
+/* Fused Q3_K x FP32 tiled GEMM (no tensor cores). Dequantizes Q3_K tiles to
+ * FP32 in shared memory, reusing each weight tile across the token tile instead
+ * of re-reading it per token (the matvec fallback's cost). Tile: TM=64 tokens x
+ * TN=64 rows, 256 threads.
+ *
+ * Push constants carry (M, N, K, out_stride) = (npos, rows, cols, rows); the
+ * shared (M,N,K,out_stride) layout matches gemm_f16.comp exactly. */
+static int g_gemm_q3k_enabled = -1;
+static int gemm_q3k_available(void) {
+    if (g_gemm_q3k_enabled < 0) {
+        const char* env = getenv("DLGO_GEMM_Q3K");
+        g_gemm_q3k_enabled = (env && env[0] == '1') ? 1 : 0;
+    }
+    return g_gemm_q3k_enabled;
+}
+
+/* Test hook: force the Q3_K GEMM availability independent of env caching.
+ * Not part of the inference path; used only by GPU numerical tests. */
+void gpu_set_gemm_q3k(int on) {
+    g_gemm_q3k_enabled = on ? 1 : 0;
+}
+
+/* Opt-in recovered cooperative-matrix Q3_K GEMM (DLGO_GEMM_Q3K_RECOVERED=1).
+ * Requires DLGO_GEMM_Q3K=1 and a coopmat device; validated relL2 ~2.6e-4. */
+static int g_gemm_q3k_recovered = -1;
+static int gemm_q3k_recovered_selected(void) {
+    if (!g.has_coopmat) return 0;
+    if (g_gemm_q3k_recovered < 0) {
+        const char* e = getenv("DLGO_GEMM_Q3K_RECOVERED");
+        g_gemm_q3k_recovered = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_gemm_q3k_recovered;
+}
+
+/* Opt-in 32-lane SSM recurrence variant (DLGO_SSM_REC_T32=1). Same math and
+ * buffer layout as the 16-lane kernel; full 32-lane workgroups. */
+static int g_ssm_rec_t32 = -1;
+static int ssm_rec_t32_selected(void) {
+    if (g_ssm_rec_t32 < 0) {
+        const char* e = getenv("DLGO_SSM_REC_T32");
+        g_ssm_rec_t32 = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_ssm_rec_t32;
+}
+
+/* Test hook: force the 32-lane SSM recurrence selection. */
+void gpu_set_ssm_rec_t32(int on) {
+    g_ssm_rec_t32 = on ? 1 : 0;
+}
+
+int gpu_gemm_q3k_tiled(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                       int rows, int cols, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    /* Q3_K super-block is 256 elements; require whole super-blocks in K. */
+    if (cols <= 0 || (cols & 255) != 0) return GPU_ERR_DISPATCH;
+
+    struct { int M; int N; int K; int out_stride; } pc = {npos, rows, cols, rows};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GEMM_Q3K_TILED;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (npos + 63) / 64;  /* TM = 64 tokens */
+    dp.groups_y = (rows + 63) / 64;  /* TN = 64 rows */
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+/* Recovery candidate exposed for numerical tests only; never selected by inference. */
+int gpu_gemm_q3k_recovered(GpuBuf out, GpuBuf weights, GpuBuf x, int rows, int cols, int npos) {
+    if (!g.initialized || !g.has_coopmat) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (rows <= 0 || cols <= 0 || (cols & 255) || npos <= 0) return GPU_ERR_DISPATCH;
+    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GEMM_Q3K_RECOVERED;
+    dp.bufs[0] = out; dp.bufs[1] = weights; dp.bufs[2] = x;
+    dp.num_bufs = 3; dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = ((rows + 63) / 64) * ((npos + 63) / 64);
+    dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_dequantize(GpuBuf out_f32_buf, GpuBuf quant_buf, int n, int qtype) {
     // TODO: implement dequantize shaders
     return GPU_ERR_SHADER;
@@ -3629,6 +3733,30 @@ int gpu_attention_f16_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, Gp
     return dispatch_compute(&dp);
 }
 
+/* Experimental barrier-reduced attention: default and single-token paths unchanged. */
+static int g_attention_barrier = -1;
+void gpu_set_attention_barrier(int on) { g_attention_barrier = on ? 1 : 0; }
+static int attention_barrier_selected(void) {
+    if (g_attention_barrier < 0) {
+        const char* e = getenv("DLGO_ATTN_BARRIER");
+        g_attention_barrier = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_attention_barrier;
+}
+
+/* Opt-in KV-grouped attention (DLGO_ATTN_KV4=1): one workgroup per
+ * (kv_head, position) covering the 4 q-heads that share the KV. 4x less KV
+ * cache traffic. Dots/PV chains and softmax trees keep baseline order. */
+static int g_attention_kv4 = -1;
+static int attention_kv4_selected(void) {
+    if (g_attention_kv4 < 0) {
+        const char* e = getenv("DLGO_ATTN_KV4");
+        g_attention_kv4 = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_attention_kv4;
+}
+void gpu_set_attention_kv4(int on) { g_attention_kv4 = on ? 1 : 0; }
+
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
                             int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
@@ -3637,12 +3765,18 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
     struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
         {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
     DispatchParams dp = {0};
-    dp.pipe = PIPE_ATTENTION_TILED;
+    if (attention_kv4_selected() && num_heads == 4 * num_kv_heads) {
+        dp.pipe = PIPE_ATTENTION_TILED_KV4;
+        dp.groups_x = num_kv_heads;
+    } else {
+        dp.pipe = PIPE_ATTENTION_TILED;
+        dp.groups_x = num_heads;
+    }
     dp.bufs[0] = out; dp.bufs[1] = q;
     dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
     dp.num_bufs = 4;
     dp.push_data = &pc; dp.push_size = sizeof(pc);
-    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
+    dp.groups_y = npos; dp.groups_z = 1;
     return dispatch_compute(&dp);
 }
 
@@ -3789,6 +3923,10 @@ int gpu_ssm_preprocess(GpuBuf alpha, GpuBuf beta, GpuBuf ssma, GpuBuf dt_bias,
 
 int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
                        GpuBuf y, int num_heads, int head_k_dim, int head_v_dim, int key_dim) {
+    /* Fixed private column array and one 128-lane workgroup per head. */
+    if (num_heads <= 0 || head_k_dim <= 0 || head_k_dim > 128 ||
+        head_v_dim <= 0 || head_v_dim > 128 || key_dim <= 0 ||
+        key_dim % head_k_dim != 0) return GPU_ERR_DISPATCH;
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
@@ -3800,6 +3938,40 @@ int gpu_ssm_delta_rule(GpuBuf state, GpuBuf qkv, GpuBuf alpha, GpuBuf beta,
     dp.num_bufs = 5;
     dp.push_data = &pc; dp.push_size = sizeof(pc);
     dp.groups_x = num_heads; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+/* Batched SSM stages. All dimensions/strides checked by the Go wrapper. */
+int gpu_ssm_batch_stage(int stage, GpuBuf b0, GpuBuf b1, GpuBuf b2, GpuBuf b3, GpuBuf b4,
+                        int heads, int kd, int vd, int key_dim, int conv_k, int npos,
+                        float eps, int has_bias) {    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (heads <= 0 || kd <= 0 || kd > 128 || vd <= 0 || vd > 128 ||
+        key_dim <= 0 || key_dim % kd != 0 || key_dim / kd > heads ||
+        conv_k <= 0 || npos <= 0 || npos > 512 || stage < 0 || stage > 3)
+        return GPU_ERR_DISPATCH;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    int conv_pc[3] = {2*key_dim+heads*vd, conv_k, npos};
+    struct { int heads, kd, key_dim; float eps; int has_bias, vd; }
+        pre_pc = {heads, kd, key_dim, eps, has_bias, vd};
+    int rec_pc[5] = {heads, kd, vd, key_dim, npos};
+    struct { int vd; float eps; int heads; } norm_pc = {vd, eps, heads};
+    DispatchParams dp = {0};
+    dp.pipe = (PipelineID)(PIPE_SSM_CONV1D_BATCH + stage);
+    /* Opt-in 32-lane SSM recurrence variant (DLGO_SSM_REC_T32=1): same math
+     * and buffer layout as the 16-lane kernel, full-subgroup workgroups.
+     * Default remains the original 16-lane dispatch. */
+    int rec_t32 = 0;
+    if (stage == 2) rec_t32 = ssm_rec_t32_selected();
+    if (rec_t32) dp.pipe = PIPE_SSM_RECURRENCE_BATCH_T32;
+    dp.bufs[0]=b0; dp.bufs[1]=b1; dp.bufs[2]=b2; dp.bufs[3]=b3; dp.bufs[4]=b4;
+    dp.num_bufs = stage == 0 ? 4 : stage == 3 ? 3 : 5;
+    dp.groups_x = stage == 0 ? (conv_pc[0]+255)/256 : heads;
+    dp.groups_y = (stage == 1 || stage == 3) ? npos : (stage == 2 ? ((vd + (rec_t32 ? 31 : 15)) / (rec_t32 ? 32 : 16)) : 1);
+    dp.groups_z = 1;
+    if (stage == 0) { dp.push_data=conv_pc; dp.push_size=sizeof(conv_pc); }
+    if (stage == 1) { dp.push_data=&pre_pc; dp.push_size=sizeof(pre_pc); }
+    if (stage == 2) { dp.push_data=rec_pc; dp.push_size=sizeof(rec_pc); }
+    if (stage == 3) { dp.push_data=&norm_pc; dp.push_size=sizeof(norm_pc); }
     return dispatch_compute(&dp);
 }
 

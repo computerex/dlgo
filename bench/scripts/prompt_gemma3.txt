@@ -1,0 +1,5 @@
+<start_of_turn>user
+You are a helpful assistant.
+
+Write a comprehensive tutorial on building a REST API with Python Flask. Cover project setup, routing, request handling, database integration with SQLAlchemy, authentication with JWT tokens, error handling, testing, deployment, and best practices. Include complete code examples for each section.<end_of_turn>
+<start_of_turn>model

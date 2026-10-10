@@ -1,0 +1,12 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v7-gp.json",
+  "state": "I have a slight sore throat and runny nose but no fever, and I can go to work as usual.",
+  "instructions": "What level of care does this symptom report need?",
+  "criteria": {
+    "emergency": "Life-threatening; call emergency services now.",
+    "urgent_care": "Needs same-day professional attention.",
+    "routine": "Can wait for a scheduled appointment.",
+    "self_care": "Safe home care is appropriate."
+  }
+}

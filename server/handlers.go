@@ -218,6 +218,9 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		case EventDone:
 			promptTokens = ev.PromptTokens
 			reasoningContent = ev.ReasoningContent
+			if ev.GeneratedTokens > 0 {
+				completionTokens = ev.GeneratedTokens
+			}
 			if ev.FinishReason != "" {
 				finishReason = ev.FinishReason
 			}
@@ -242,7 +245,9 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	// in thinking and unable to close </think> within the token budget.
 	if fullText == "" && reasoningContent != "" {
 		fullText = reasoningContent
-		completionTokens = len(strings.Fields(reasoningContent)) // approximate
+		if completionTokens == 0 {
+			completionTokens = len(strings.Fields(reasoningContent)) // approximate fallback
+		}
 	}
 
 	// Try to parse tool calls from the generated text.
@@ -341,4 +346,3 @@ func stripThinkTags(text string) (content string, reasoning string) {
 	}
 	return text, ""
 }
-

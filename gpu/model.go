@@ -86,7 +86,7 @@ type GpuLayer struct {
 	Wk           *GpuTensor
 	Wv           *GpuTensor
 	Wo           *GpuTensor
-	Bq, Bk, Bv  Buf
+	Bq, Bk, Bv   Buf
 	Bo           Buf
 	AttnQNorm    Buf
 	AttnKNorm    Buf
@@ -112,12 +112,12 @@ type GpuLayer struct {
 	FFNDownExpsBias Buf // [expertCount*dim] packed expert down bias
 
 	// MoE shared expert weights
-	FFNGateShared *GpuTensor // [sharedFFNDim × dim]
-	FFNUpShared   *GpuTensor // [sharedFFNDim × dim]
-	FFNDownShared *GpuTensor // [dim × sharedFFNDim]
-	FFNRouterShared Buf      // [dim] shared expert gate (float32)
-	IsMoE         bool
-	MoEOnGPU      bool       // true if expert weights are on GPU
+	FFNGateShared   *GpuTensor // [sharedFFNDim × dim]
+	FFNUpShared     *GpuTensor // [sharedFFNDim × dim]
+	FFNDownShared   *GpuTensor // [dim × sharedFFNDim]
+	FFNRouterShared Buf        // [dim] shared expert gate (float32)
+	IsMoE           bool
+	MoEOnGPU        bool // true if expert weights are on GPU
 
 	AttnSinks Buf // [num_heads] learned sink logits (0 if not used)
 
@@ -140,13 +140,13 @@ type GpuLayer struct {
 
 // GpuModel holds all model weights on the GPU.
 type GpuModel struct {
-	TokenEmbed   *GpuTensor
-	OutputNorm   Buf
+	TokenEmbed     *GpuTensor
+	OutputNorm     Buf
 	OutputNormBias Buf
-	Output       *GpuTensor
-	OutputBias   Buf
-	Layers       []GpuLayer
-	NumGPULayers int // actual number of layers uploaded to GPU (may be < requested)
+	Output         *GpuTensor
+	OutputBias     Buf
+	Layers         []GpuLayer
+	NumGPULayers   int // actual number of layers uploaded to GPU (may be < requested)
 }
 
 // GpuRunState holds GPU buffers for intermediate activations during inference.
@@ -179,24 +179,24 @@ type GpuRunState struct {
 	QGate Buf // [qDim] attention gate values
 
 	// MoE scratch buffers (allocated on first use)
-	MoELogits    Buf   // [expertCount] router logits
-	MoETopKIdx   Buf   // [expertUsedCount] top-K indices (float-encoded)
-	MoETopKW     Buf   // [expertUsedCount] top-K weights
+	MoELogits  Buf // [expertCount] router logits
+	MoETopKIdx Buf // [expertUsedCount] top-K indices (float-encoded)
+	MoETopKW   Buf // [expertUsedCount] top-K weights
 	// Per-expert parallel buffers (one per active expert for batched dispatch)
-	MoEGates     []Buf // [expertUsedCount][expertFFNDim]
-	MoEUps       []Buf // [expertUsedCount][expertFFNDim]
-	MoEHiddens   []Buf // [expertUsedCount][expertFFNDim]
-	MoEOuts      []Buf // [expertUsedCount][dim]
-	MoEShGate   Buf // [sharedFFNDim] shared expert gate
-	MoEShUp     Buf // [sharedFFNDim] shared expert up
-	MoEShHidden Buf // [sharedFFNDim] shared expert hidden
-	MoEShOut    Buf // [dim] shared expert output
+	MoEGates    []Buf // [expertUsedCount][expertFFNDim]
+	MoEUps      []Buf // [expertUsedCount][expertFFNDim]
+	MoEHiddens  []Buf // [expertUsedCount][expertFFNDim]
+	MoEOuts     []Buf // [expertUsedCount][dim]
+	MoEShGate   Buf   // [sharedFFNDim] shared expert gate
+	MoEShUp     Buf   // [sharedFFNDim] shared expert up
+	MoEShHidden Buf   // [sharedFFNDim] shared expert hidden
+	MoEShOut    Buf   // [dim] shared expert output
 
 	// dp4a acceleration for MoE expert projections
-	MoEQ8_1Scratch      Buf    // Q8_1 quantized input (dim) for dp4a gate/up projections
-	MoEQ8_1DownPacked   Buf    // packed Q8_1 buffer [nUsed * q8_blocks(expDim) * 36]
-	MoEQ8_1DownBufs     []Buf  // per-expert Q8_1 scratch (expDim) for dp4a down projections (fallback)
-	MoEUseDp4a          bool   // true if dp4a should be used for MoE expert projections
+	MoEQ8_1Scratch    Buf   // Q8_1 quantized input (dim) for dp4a gate/up projections
+	MoEQ8_1DownPacked Buf   // packed Q8_1 buffer [nUsed * q8_blocks(expDim) * 36]
+	MoEQ8_1DownBufs   []Buf // per-expert Q8_1 scratch (expDim) for dp4a down projections (fallback)
+	MoEUseDp4a        bool  // true if dp4a should be used for MoE expert projections
 
 	// Fused MoE dp4a buffers (interleaved [nUsed * dim/expDim])
 	MoEGateScratch   Buf // [nUsed * expDim] interleaved gate outputs
@@ -377,22 +377,27 @@ type GpuKVCache struct {
 	KVDim   int
 	MaxSeq  int
 	Len     int
+	// BytesPerElem is 4 when the F32 KV cache is enabled (DLGO_F32_KV=1),
+	// otherwise 2 (packed FP16). State snapshot/restore needs the element
+	// size to compute byte spans of the used region.
+	BytesPerElem int
 }
 
 // NewGpuKVCache allocates GPU buffers for KV cache.
 // gpuLayers controls how many layers get GPU-allocated KV buffers.
 // needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
 func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) (*GpuKVCache, error) {
-	c := &GpuKVCache{
-		KeyBufs: make([]Buf, totalLayers),
-		ValBufs: make([]Buf, totalLayers),
-		KVDim:   kvDim,
-		MaxSeq:  maxSeqLen,
-	}
 	bytesPerElem := 2 // FP16: packed half2
 	if os.Getenv("DLGO_F32_KV") == "1" {
 		bytesPerElem = 4 // F32
 		fmt.Println("[dlgo/gpu] F32 KV cache enabled (DLGO_F32_KV=1)")
+	}
+	c := &GpuKVCache{
+		KeyBufs:      make([]Buf, totalLayers),
+		ValBufs:      make([]Buf, totalLayers),
+		KVDim:        kvDim,
+		MaxSeq:       maxSeqLen,
+		BytesPerElem: bytesPerElem,
 	}
 	size := uint64(maxSeqLen * kvDim * bytesPerElem)
 	a := allocChecker{}

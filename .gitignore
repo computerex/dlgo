@@ -50,6 +50,11 @@ bench/results/
 frontend/dist/
 frontend/node_modules/
 
+# System One local secrets and generated training artifacts
+systemone-train/.env
+systemone-train/data/generated/
+systemone-train/artifacts/
+
 # Misc
 *.log
 *.prof

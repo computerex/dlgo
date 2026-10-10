@@ -1,0 +1,235 @@
+{
+  "url": "http://127.0.0.1:8094/v1/systemone",
+  "request_sha256": "7296209ba674e3ff0c6d20a0a3a4845dd4d19db33a3997f254fec1e76fd20f43",
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "question_count": 1,
+  "runs": [
+    {
+      "cold_ms": 137.4311000108719,
+      "warm_ms": 31.680000014603138,
+      "input_tokens": 170,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=118.467300",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.802500",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8644919419492232,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8644919419492232,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 134.63380001485348,
+      "warm_ms": 53.751900093629956,
+      "input_tokens": 164,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=116.768100",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=31.016500",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8459979835389967,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8459979835389967,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 130.2729998715222,
+      "warm_ms": 31.518200179561973,
+      "input_tokens": 169,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=115.148100",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.780000",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8891264916274839,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8891264916274839,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 117.11280001327395,
+      "warm_ms": 31.229799846187234,
+      "input_tokens": 170,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=116.347200",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.406200",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8229528295192409,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8229528295192409,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 128.07960016652942,
+      "warm_ms": 32.103999983519316,
+      "input_tokens": 168,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=114.154500",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=31.215700",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8544759459560747,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8544759459560747,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 137.9309999756515,
+      "warm_ms": 55.71320001035929,
+      "input_tokens": 171,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=113.922800",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.450400",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8610137972734387,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8610137972734387,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 128.37110017426312,
+      "warm_ms": 31.189600005745888,
+      "input_tokens": 169,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=113.345400",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.578400",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.836345566538481,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.836345566538481,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 112.41569998674095,
+      "warm_ms": 52.95629985630512,
+      "input_tokens": 170,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=111.559600",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.767500",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8937121986279386,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8937121986279386,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 114.77810004726052,
+      "warm_ms": 31.170899979770184,
+      "input_tokens": 167,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=113.958300",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.399700",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8450922402628986,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8450922402628986,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 113.70410001836717,
+      "warm_ms": 31.94469981826842,
+      "input_tokens": 172,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=112.789500",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=30.963100",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8697259693501965,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.8697259693501965,
+          "type": "noul"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 125.47303002793342,
+      "p50_ms": 128.07960016652942,
+      "p95_ms": 137.9309999756515,
+      "p99_ms": 137.9309999756515,
+      "samples": 10
+    },
+    "warm": {
+      "mean_ms": 38.32585997879505,
+      "p50_ms": 31.680000014603138,
+      "p95_ms": 55.71320001035929,
+      "p99_ms": 55.71320001035929,
+      "samples": 10
+    }
+  }
+}

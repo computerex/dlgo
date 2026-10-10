@@ -64,6 +64,7 @@ func SwiGLU_OAI_At(o, g, u Buf, oo, go_, uo, n int, a, l float32) error         
 func QuantizeQ8_1At(q Buf, qo int, f Buf, fo, n int) error                         { return errNoGPU }
 func BeginBatch()                            {}
 func EndBatch()                              {}
+func SetGemmQ3K(bool)                        {}
 func Barrier()                               {}
 func AddRMSNorm(no, so, a, b, w Buf, n int, eps float32) error { return errNoGPU }
 

@@ -29,6 +29,10 @@ $shaders = @(
     @{name="ssm_conv1d_silu"; file="ssm_conv1d_silu.comp"},
     @{name="ssm_preprocess"; file="ssm_preprocess.comp"},
     @{name="ssm_delta_rule"; file="ssm_delta_rule.comp"},
+    @{name="ssm_conv1d_batch"; file="ssm_conv1d_batch.comp"},
+    @{name="ssm_preprocess_batch"; file="ssm_preprocess_batch.comp"},
+    @{name="ssm_recurrence_batch"; file="ssm_recurrence_batch.comp"},
+    @{name="ssm_norm_gate_batch"; file="ssm_norm_gate_batch.comp"},
     @{name="ssm_decay"; file="ssm_decay.comp"},
     @{name="ssm_predict"; file="ssm_predict.comp"},
     @{name="ssm_update"; file="ssm_update.comp"},
@@ -124,7 +128,12 @@ $shaders = @(
     @{name="matvec_iq4_nl_dp4a_moe"; file="matvec_iq4_nl_dp4a_moe.comp"},
     @{name="matvec_iq3_s_dp4a_moe"; file="matvec_iq3_s_dp4a_moe.comp"},
     @{name="attention_tiled_sinks"; file="attention_tiled_sinks.comp"},
-    @{name="matvec_q5_1"; file="matvec_q5_1.comp"}
+    @{name="matvec_q5_1"; file="matvec_q5_1.comp"},
+    @{name="gemm_q3k_tiled"; file="gemm_q3k_tiled.comp"},
+    @{name="ssm_recurrence_batch_t32"; file="ssm_recurrence_batch_t32.comp"},
+    @{name="attention_tiled_barrier"; file="attention_tiled_barrier.comp"},
+    @{name="attention_tiled_kv4"; file="attention_tiled_kv4.comp"},
+    @{name="gemm_q3k_coopmat_recovered"; file="gemm_q3k_coopmat_recovered.comp"; target="vulkan1.3"}
 )
 
 $header = @"
@@ -138,10 +147,10 @@ $header = @"
 "@
 
 foreach ($s in $shaders) {
-    $spvFile = "$($s.name).spv"
+    $spvFile = Join-Path $PSScriptRoot "$($s.name).spv"
     $env = if ($s.target) { $s.target } else { "vulkan1.2" }
     Write-Host "Compiling $($s.file) -> $spvFile ($env)"
-    & glslc --target-env=$env -O $s.file -o $spvFile
+    & glslc --target-env=$env -O (Join-Path $PSScriptRoot $s.file) -o $spvFile
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Failed to compile $($s.file)"
         exit 1
@@ -307,16 +316,25 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_iq3_s_dp4a_moe", spv_matvec_iq3_s_dp4a_moe, spv_matvec_iq3_s_dp4a_moe_size, 5, 20}, // PIPE_MATVEC_IQ3_S_DP4A_MOE
     {"attention_tiled_sinks", spv_attention_tiled_sinks, spv_attention_tiled_sinks_size, 5, 28}, // PIPE_ATTENTION_TILED_SINKS
     {"matvec_q5_1", spv_matvec_q5_1, spv_matvec_q5_1_size, 3, 8}, // PIPE_MATVEC_Q5_1
+    {"ssm_conv1d_batch", spv_ssm_conv1d_batch, spv_ssm_conv1d_batch_size, 4, 12},
+    {"ssm_preprocess_batch", spv_ssm_preprocess_batch, spv_ssm_preprocess_batch_size, 5, 24},
+    {"ssm_recurrence_batch", spv_ssm_recurrence_batch, spv_ssm_recurrence_batch_size, 5, 20},
+    {"ssm_norm_gate_batch", spv_ssm_norm_gate_batch, spv_ssm_norm_gate_batch_size, 3, 12},
+    {"gemm_q3k_tiled", spv_gemm_q3k_tiled, spv_gemm_q3k_tiled_size, 3, 16}, // PIPE_GEMM_Q3K_TILED
+    {"ssm_recurrence_batch_t32", spv_ssm_recurrence_batch_t32, spv_ssm_recurrence_batch_t32_size, 5, 20}, // PIPE_SSM_RECURRENCE_BATCH_T32
+    {"attention_tiled_barrier", spv_attention_tiled_barrier, spv_attention_tiled_barrier_size, 4, 28}, // PIPE_ATTENTION_TILED_BARRIER
+    {"attention_tiled_kv4", spv_attention_tiled_kv4, spv_attention_tiled_kv4_size, 4, 28}, // PIPE_ATTENTION_TILED_KV4
+    {"gemm_q3k_coopmat_recovered", spv_gemm_q3k_coopmat_recovered, spv_gemm_q3k_coopmat_recovered_size, 3, 12}, // PIPE_GEMM_Q3K_RECOVERED
 };
 
 #endif // DLGO_SHADERS_SPIRV_H
 "@
 
-$header | Out-File -FilePath "..\csrc\shaders_spirv.h" -Encoding ascii
+$header | Out-File -FilePath (Join-Path $PSScriptRoot '..\csrc\shaders_spirv.h') -Encoding ascii
 Write-Host "Generated csrc/shaders_spirv.h"
 
 # Touch vulkan_gpu.c so Go's CGo build cache detects the shader change.
 # Go tracks .c file modification times but not transitively-included .h files,
 # so without this, `go build` may silently reuse stale cached shader data.
-(Get-Item "..\csrc\vulkan_gpu.c").LastWriteTime = Get-Date
+(Get-Item (Join-Path $PSScriptRoot '..\csrc\vulkan_gpu.c')).LastWriteTime = Get-Date
 Write-Host "Touched csrc/vulkan_gpu.c (cache invalidation)"

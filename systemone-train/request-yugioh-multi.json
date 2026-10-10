@@ -1,0 +1,79 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "state": "You are dueling in Yu-Gi-Oh. Your field has one face-up Attack Position monster (Summoned Skull, Level 6, 2500 ATK, DARK Fiend). Your hand contains: Blue-Eyes White Dragon (Level 8, LIGHT Dragon, 3000 ATK), Monster Reborn, Mystical Space Typhoon, Dark Hole, and Effect Veiler. Your opponent controls one face-up Attack Position monster (a 1800 ATK Warrior) and one Set Spell/Trap Card. Both players have 8000 Life Points. It is your Main Phase 1 and you have not yet Normal Summoned this turn.",
+  "questions": {
+    "blue_eyes_normal_summon": {
+      "type": "noul",
+      "instructions": "You control exactly one monster. You have Blue-Eyes White Dragon, a Level 8 monster, in your hand. Can you Normal Summon Blue-Eyes White Dragon this turn?"
+    },
+    "monster_reborn_opponent_gy": {
+      "type": "noul",
+      "instructions": "Does the card Monster Reborn allow you to Special Summon a monster from your opponent's Graveyard?"
+    },
+    "destroys_all_monsters": {
+      "type": "choice",
+      "instructions": "Which card destroys all monsters on the field?",
+      "criteria": {
+        "dark_hole": "Dark Hole - destroys all monsters on the field.",
+        "raigeki": "Raigeki - destroys all monsters your opponent controls.",
+        "mystical_space_typhoon": "Mystical Space Typhoon - destroys one Spell or Trap Card."
+      }
+    },
+    "summoning_method": {
+      "type": "choice",
+      "instructions": "Which Summoning method requires a Tuner monster plus non-Tuner monsters whose Levels add up to the Synchro Monster's Level?",
+      "criteria": {
+        "synchro": "Synchro Summon",
+        "xyz": "Xyz Summon",
+        "fusion": "Fusion Summon",
+        "link": "Link Summon"
+      }
+    },
+    "blue_eyes_attribute": {
+      "type": "choice",
+      "instructions": "What is Blue-Eyes White Dragon's Attribute?",
+      "criteria": {
+        "light": "LIGHT",
+        "dark": "DARK",
+        "earth": "EARTH"
+      }
+    },
+    "mirror_force_condition": {
+      "type": "noul",
+      "instructions": "Does Mirror Force destroy your opponent's monsters only when they declare an attack while those monsters are in Attack Position?"
+    },
+    "hand_trap_negate_effect": {
+      "type": "choice",
+      "instructions": "Which card is a hand trap that negates a monster's effect by sending itself from the hand to the Graveyard?",
+      "criteria": {
+        "effect_veiler": "Effect Veiler",
+        "jinzo": "Jinzo",
+        "mirror_force": "Mirror Force"
+      }
+    },
+    "normal_spell_opponent_turn": {
+      "type": "noul",
+      "instructions": "Can you activate a Normal Spell Card during your opponent's turn?"
+    },
+    "negate_spell_half_lp": {
+      "type": "choice",
+      "instructions": "Which card can negate the activation of a Spell or Trap Card by paying half your Life Points?",
+      "criteria": {
+        "solemn_judgment": "Solemn Judgment",
+        "mystical_space_typhoon": "Mystical Space Typhoon",
+        "dark_hole": "Dark Hole"
+      }
+    },
+    "attack_strength_score": {
+      "type": "score",
+      "instructions": "How strong is a 3000 ATK monster relative to typical Yu-Gi-Oh monsters?",
+      "criteria": [
+        "Weak: below average ATK.",
+        "Average: similar to most Level 4 monsters.",
+        "Strong: above most monsters but not the highest.",
+        "Very strong: among the highest ATK values in the game."
+      ]
+    }
+  }
+}

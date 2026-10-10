@@ -1,0 +1,12 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "type": "choice",
+  "state": "You are in a Pokemon battle. The opponent's active Pokemon is Pikachu, an Electric-type mouse that uses Electric attacks. Your active Pokemon is Gengar, a Ghost/Poison-type. Your party is: Gengar (Ghost/Poison), Onix (Rock/Ground), Butterfree (Bug/Flying), and Primeape (Fighting).",
+  "prompt": "Which party member should you switch in to best handle the opponent's Electric-type Pikachu?",
+  "criteria": {
+    "onix": "Rock/Ground-type Pokemon; as a Ground-type it is immune to Electric attacks.",
+    "butterfree": "Bug/Flying-type Pokemon; Flying takes super-effective damage from Electric attacks.",
+    "primeape": "Fighting-type Pokemon; it takes neutral damage from Electric attacks."
+  }
+}

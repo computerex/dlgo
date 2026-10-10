@@ -1,0 +1,11 @@
+{
+  "variant": "latency-plan-t16",
+  "env": {
+    "DLGO_GEMM_Q3K": "1",
+    "DLGO_SSM_BATCH": "1",
+    "DLGO_SSM_REC_T32": "0"
+  },
+  "profile": false,
+  "runs": 30,
+  "nonce_seed": "latency-plan-paired-v1"
+}

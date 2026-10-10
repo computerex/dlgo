@@ -17,15 +17,14 @@ import (
 	"github.com/computerex/dlgo/ops"
 )
 
-
 // GenerateConfig controls text generation behavior.
 type GenerateConfig struct {
-	MaxTokens int
-	Sampler   ops.SamplerConfig
-	Seed      int64
-	Stream    func(token string) // called for each generated token (nil = no streaming)
-	Grammar   *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
-	ThinkingPhase bool           // suppress EOS during <think> block (set automatically by Chat/GenerateText)
+	MaxTokens     int
+	Sampler       ops.SamplerConfig
+	Seed          int64
+	Stream        func(token string) // called for each generated token (nil = no streaming)
+	Grammar       *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
+	ThinkingPhase bool               // suppress EOS during <think> block (set automatically by Chat/GenerateText)
 }
 
 // DefaultGenerateConfig returns sensible defaults.
@@ -111,7 +110,7 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 	// for HeadScores, Scores, RoPE tables which are small).
 	rsBytes := (3*dim + 2*qDim + 2*kvDim + 3*ffnDim + vocabSize) * 4
 	rsBytes += int64(cfg.NumHeads) * seq * 4 // HeadScores[numHeads][maxSeqLen]
-	rsBytes += seq * 4                         // Scores[maxSeqLen]
+	rsBytes += seq * 4                       // Scores[maxSeqLen]
 	ropeDim := int64(cfg.RopeDim)
 	if ropeDim <= 0 || ropeDim > int64(cfg.HeadDim) {
 		ropeDim = int64(cfg.HeadDim)
@@ -120,7 +119,7 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 
 	if nUsed > 0 && expDim > 0 {
 		rsBytes += nUsed * expDim * 4 * 4 // gates, ups, hiddens, outs per expert
-		rsBytes += nUsed * dim * 4         // expert output buffers
+		rsBytes += nUsed * dim * 4        // expert output buffers
 	}
 
 	// SSM state (recurrent state maintained in RunState, not BatchState)
@@ -186,22 +185,21 @@ func max64(a, b int64) int64 {
 	return b
 }
 
-// newSparseKVCache creates a KV cache that only allocates full-size entries
-// for attention layers. SSM layers get a minimal 1-slot cache (they use their
-// own recurrent SSMState and never access the KV cache during inference).
-// This reduces RAM usage significantly for hybrid SSM+attention models.
+// newSparseKVCache creates caches for every layer. Hybrid SSM layers maintain
+// their sequence state in SSMState, but ForwardBatch's shared preparation path
+// stores projected KV rows before dispatching to the layer-specific core, so a
+// full-size cache is required for correct batched prefill.
 func newSparseKVCache(cfg ModelConfig, maxSeqLen, kvDim int) *memory.MultiLayerKVCache {
 	kv := &memory.MultiLayerKVCache{
 		Layers: make([]*memory.KVCache, cfg.NumLayers),
 	}
 	for l := 0; l < cfg.NumLayers; l++ {
-		if ssmLayerIndex(l, cfg) {
-			// SSM layer: allocate a minimal 1-slot cache (never accessed during
-			// forward pass, but keeps slice indexing safe).
-			kv.Layers[l] = memory.NewKVCache(1, 1)
-		} else {
-			kv.Layers[l] = memory.NewKVCache(maxSeqLen, kvDim)
-		}
+		// SSM layers do not consume attention KV data during token-by-token
+		// decoding, but ForwardBatch's common attention preparation currently
+		// stores into every layer's cache before selecting the layer core. Keep a
+		// full-size cache here so batched prefill remains safe for hybrid models.
+		// The recurrent SSM state is still the authoritative sequence state.
+		kv.Layers[l] = memory.NewKVCache(maxSeqLen, kvDim)
 	}
 	return kv
 }
@@ -377,9 +375,8 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
 
-	// Build sparse KV cache: only attention layers need full-context KV storage.
-	// SSM layers maintain their own recurrent state (SSMState) — allocating a
-	// full-size KV cache for them wastes significant RAM (4x for Qwen3.5 0.8B).
+	// Build KV cache. Hybrid SSM layers still require full-size entries during
+	// ForwardBatch preparation; their recurrent SSM state remains separate.
 	kv := newSparseKVCache(m.Config, maxSeqLen, kvDim)
 	rs := NewRunState(m.Config, maxSeqLen)
 
@@ -605,13 +602,13 @@ func (p *Pipeline) ChatMessages(messages []Message, cfg GenerateConfig) (string,
 
 // GenerateResult holds detailed output from a generation run.
 type GenerateResult struct {
-	Text          string
-	Tokens        []int32
-	TokensPerSec  float64
-	PrefillTimeMs float64
+	Text           string
+	Tokens         []int32
+	TokensPerSec   float64
+	PrefillTimeMs  float64
 	GenerateTimeMs float64
-	TotalTokens   int
-	PromptTokens  int
+	TotalTokens    int
+	PromptTokens   int
 }
 
 // GenerateDetailed is like GenerateText but returns detailed timing information.
@@ -820,6 +817,15 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 	inThinkBlock := cfg.ThinkingPhase
 	thinkBudget := cfg.MaxTokens * 4 / 5
 
+	// Grammar masking needs the decoded representation of every vocabulary token.
+	// Build it once per request, not once per generated token.
+	var tokenPieces []string
+	var eosTokens map[int32]bool
+	if cfg.Grammar != nil {
+		tokenPieces = p.buildTokenPieces()
+		eosTokens = p.buildEOSSet()
+	}
+
 	for i, tok := range tokens {
 		Forward(p.Model, tok, i, p.KVCache, p.RunState)
 	}
@@ -838,6 +844,9 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
 		if inThinkBlock && step < thinkBudget {
 			suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+		}
+		if cfg.Grammar != nil {
+			cfg.Grammar.ApplyToLogits(p.RunState.Logits, tokenPieces, eosTokens)
 		}
 		nextToken := int32(ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng))
 
@@ -862,6 +871,10 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		genText.WriteString(tokenText)
 		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
 			inThinkBlock = false
+		}
+
+		if cfg.Grammar != nil {
+			cfg.Grammar.AcceptToken(tokenText)
 		}
 
 		if cfg.Stream != nil {

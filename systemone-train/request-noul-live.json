@@ -1,0 +1,7 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v7-gp.json",
+  "type": "noul",
+  "state": "I was charged twice for my subscription this month and the amount is wrong.",
+  "instructions": "Does this message describe a billing problem?"
+}

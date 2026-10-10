@@ -82,6 +82,14 @@ func (a *gpuPipelineAdapter) GenerateDetailed(prompt string, cfg llm.GenerateCon
 	}, nil
 }
 
+func (a *gpuPipelineAdapter) SystemOneWithReadout(state string, q llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) (*llm.SystemOneResult, error) {
+	return a.pipe.SystemOneWithReadout(state, q, cfg, readout)
+}
+
+func (a *gpuPipelineAdapter) SystemOneMulti(state string, questions []llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) ([]*llm.SystemOneResult, error) {
+	return a.pipe.SystemOneMulti(state, questions, cfg, readout)
+}
+
 func (a *gpuPipelineAdapter) Free() {
 	if a.pipe != nil {
 		a.pipe.FreeAll()

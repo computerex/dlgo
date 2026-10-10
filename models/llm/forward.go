@@ -21,20 +21,20 @@ func vecNorm(v []float32) float32 {
 
 // RunState holds pre-allocated buffers for inference, avoiding per-token allocations.
 type RunState struct {
-	X        []float32 // [dim] current activation
-	XNorm    []float32 // [dim] normalized activation
-	Q        []float32 // [qDim] query projection
-	K        []float32 // [kvDim] key projection
-	V        []float32 // [kvDim] value projection
-	AttnOut  []float32 // [qDim] attention output
-	AttnProj []float32 // [dim] output projection
-	FFNIn    []float32 // [dim] FFN input (after residual)
-	FFNNorm  []float32 // [dim] FFN normalized
-	Gate     []float32 // [ffnDim] gate projection
-	Up       []float32 // [ffnDim] up projection
-	Hidden   []float32 // [ffnDim] gated hidden
-	FFNOut   []float32 // [dim] FFN output
-	Logits   []float32 // [vocabSize] output logits
+	X          []float32   // [dim] current activation
+	XNorm      []float32   // [dim] normalized activation
+	Q          []float32   // [qDim] query projection
+	K          []float32   // [kvDim] key projection
+	V          []float32   // [kvDim] value projection
+	AttnOut    []float32   // [qDim] attention output
+	AttnProj   []float32   // [dim] output projection
+	FFNIn      []float32   // [dim] FFN input (after residual)
+	FFNNorm    []float32   // [dim] FFN normalized
+	Gate       []float32   // [ffnDim] gate projection
+	Up         []float32   // [ffnDim] up projection
+	Hidden     []float32   // [ffnDim] gated hidden
+	FFNOut     []float32   // [dim] FFN output
+	Logits     []float32   // [vocabSize] output logits
 	Scores     []float32   // [maxSeqLen] attention scores scratch (legacy)
 	HeadScores [][]float32 // [numHeads][maxSeqLen] per-head score buffers for parallel attention
 
@@ -69,9 +69,9 @@ type RunState struct {
 	MoEShOut      []float32   // [dim] shared expert output
 
 	// MLA (Multi-head Latent Attention) scratch buffers
-	MLAQComp    []float32 // [qLORARank] compressed Q intermediate
+	MLAQComp     []float32 // [qLORARank] compressed Q intermediate
 	MLAQAbsorbed []float32 // [numHeads * kvLORARank] absorbed key vectors per head
-	MLAAttnKV   []float32 // [numHeads * kvLORARank] weighted KV sum per head
+	MLAAttnKV    []float32 // [numHeads * kvLORARank] weighted KV sum per head
 
 	// Worker pool for parallel matmul
 	Pool *blas.Pool
@@ -200,19 +200,31 @@ func isSSMLayer(l int, cfg ModelConfig) bool {
 
 // Forward performs a single-token forward pass through the model.
 func Forward(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
-	return ForwardRange(m, token, pos, 0, m.Config.NumLayers, kv, rs)
+	return forwardRange(m, token, pos, 0, m.Config.NumLayers, kv, rs, true)
+}
+
+// ForwardHidden processes one token and returns a copy of its final normalized
+// hidden state without the expensive full-vocabulary output projection. It is
+// used by native System One decision readouts.
+func ForwardHidden(m *Model, token int32, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
+	forwardRange(m, token, pos, 0, m.Config.NumLayers, kv, rs, false)
+	return append([]float32(nil), rs.X...)
 }
 
 // ForwardFromLayer resumes forward pass from a given layer.
 // rs.X must already contain the hidden state from the previous layer.
 func ForwardFromLayer(m *Model, startLayer, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
-	return ForwardRange(m, -1, pos, startLayer, m.Config.NumLayers, kv, rs)
+	return forwardRange(m, -1, pos, startLayer, m.Config.NumLayers, kv, rs, true)
 }
 
 // ForwardRange performs a forward pass through layers [startLayer, endLayer).
 // If startLayer == 0, token embedding is done. If endLayer == numLayers,
 // the final norm and output projection are included.
 func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
+	return forwardRange(m, token, pos, startLayer, endLayer, kv, rs, true)
+}
+
+func forwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memory.MultiLayerKVCache, rs *RunState, projectLogits bool) []float32 {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
 	headDim := cfg.HeadDim
@@ -317,8 +329,12 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 
 		if DebugForward {
 			coreStr := "ATN"
-			if spec.Core == CoreSSM { coreStr = "SSM" }
-			if spec.Core == CoreMLA { coreStr = "MLA" }
+			if spec.Core == CoreSSM {
+				coreStr = "SSM"
+			}
+			if spec.Core == CoreMLA {
+				coreStr = "MLA"
+			}
 			fmt.Printf("  L%02d [%s] xnorm=%.4f attn=%.4f ffn=%.4f x=%.4f\n",
 				l, coreStr, vecNorm(rs.XNorm), vecNorm(rs.AttnProj), vecNorm(rs.FFNOut), vecNorm(rs.X))
 		}
@@ -333,6 +349,12 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 		ops.LayerNorm(rs.X[:dim], rs.X[:dim], m.OutputNorm, m.OutputNormBias, cfg.RMSNormEps)
 	} else {
 		ops.RMSNormInPlace(rs.X[:dim], m.OutputNorm, cfg.RMSNormEps)
+	}
+
+	// At this point rs.X contains the final normalized hidden state. Native
+	// System One readouts consume it directly and avoid the full-vocabulary head.
+	if !projectLogits {
+		return rs.X
 	}
 
 	// Logits

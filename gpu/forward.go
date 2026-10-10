@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/core"
@@ -24,6 +26,75 @@ var f32KV = os.Getenv("DLGO_F32_KV") == "1"
 var cpuMoEOnce sync.Once
 var moeDiag = os.Getenv("DLGO_MOE_DIAG") == "1"
 var moeDiagCount int
+
+var ssmTimeOn = os.Getenv("DLGO_SSM_TIME") == "1"
+var ssmTimeChunksLeft = ssmTimeEnvInt("DLGO_SSM_TIME_CHUNKS", 3)
+
+// Indices 0-3 are whole-block totals; 4-13 are diagnostic sub-operators.
+var ssmTimeTot [14]time.Duration
+var ssmTimeReported bool
+
+func ssmTimeEnvInt(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// DLGO_SSM_TIME=1 profiles the hybrid batch prefill by Sync-bracketing each
+// cost category for the first few chunks. Diagnostic only: the extra
+// submissions distort absolute numbers slightly but identify the dominant
+// bucket. Categories: 0=embed/upload, 1=SSM block, 2=attention block, 3=FFN.
+// ssmTimeActive reports whether this chunk should be counted, and consumes the
+// chunk budget once. Called once per chunk from the prefill loop. The report
+// prints after the budget is exhausted.
+func ssmTimeActive(batchChunk bool) bool {
+	if !ssmTimeOn || ssmTimeReported || !batchChunk {
+		return false
+	}
+	if ssmTimeChunksLeft <= 0 {
+		return false
+	}
+	ssmTimeChunksLeft--
+	return true
+}
+
+// Report after completing the final counted chunk, not before executing it.
+func ssmTimeFinishChunk(counted bool) {
+	if counted && ssmTimeChunksLeft == 0 && !ssmTimeReported {
+		ssmTimeReported = true
+		total := ssmTimeTot[0] + ssmTimeTot[1] + ssmTimeTot[2] + ssmTimeTot[3]
+		fmt.Fprintf(os.Stderr, "[dlgo/gpu][ssm-time] counted batch chunks: embed=%s ssm=%s attn=%s ffn=%s (categorized=%s)\n",
+			ssmTimeTot[0].Round(time.Microsecond), ssmTimeTot[1].Round(time.Microsecond),
+			ssmTimeTot[2].Round(time.Microsecond), ssmTimeTot[3].Round(time.Microsecond),
+			total.Round(time.Microsecond))
+		for i, name := range []string{"ssm-projections", "ssm-conv", "ssm-preprocess", "ssm-recurrence", "ssm-norm", "ssm-output", "attn-qkv", "attn-norm-rope-store", "attn-score-softmax-pv", "attn-gate-output"} {
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu][ssm-time-op] %s=%s\n", name, ssmTimeTot[i+4].Round(time.Microsecond))
+		}
+	}
+}
+
+// ssmTimeBegin/End bracket one category with submit+wait so the measurement
+// includes GPU execution. Diagnostic only.
+func ssmTimeBegin(count bool) (int64, bool) {
+	if !count {
+		return 0, false
+	}
+	Sync()
+	return time.Now().UnixNano(), true
+}
+
+func ssmTimeEnd(idx int, start int64, on bool) {
+	if !on {
+		return
+	}
+	EndBatch()
+	Sync()
+	ssmTimeTot[idx] += time.Duration(time.Now().UnixNano() - start)
+	BeginBatch()
+}
 
 // cpuDeltaRuleBufs holds pre-allocated CPU-side buffers for the CPU delta rule fallback.
 type cpuDeltaRuleBufs struct {
@@ -258,72 +329,72 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
-		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
-			gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
-		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
-		if gl.AttnSinks != 0 {
-			lc.SetAttnSinks(gl.AttnSinks)
+			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+				gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
+			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+			if gl.AttnSinks != 0 {
+				lc.SetAttnSinks(gl.AttnSinks)
+			}
+			if layer.Spec.SlidingWindow > 0 {
+				lc.SetSlidingWindow(layer.Spec.SlidingWindow)
+			}
+			if cfg.AttnLogitSoftcap > 0 {
+				lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
+			}
 		}
-		if layer.Spec.SlidingWindow > 0 {
-			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
-		}
-		if cfg.AttnLogitSoftcap > 0 {
-			lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
-		}
-	}
 
-	if gl.IsMoE {
-		ffnNorm := gl.FFNNorm
-		postAttnNorm := gl.PostAttnNorm
-		if layer.Spec.Residual == llm.ResPostAttnFFN {
-			ffnNorm = gl.PostAttnNorm
-			postAttnNorm = 0
+		if gl.IsMoE {
+			ffnNorm := gl.FFNNorm
+			postAttnNorm := gl.PostAttnNorm
+			if layer.Spec.Residual == llm.ResPostAttnFFN {
+				ffnNorm = gl.PostAttnNorm
+				postAttnNorm = 0
+			}
+			lc.SetFFNMoE(ffnNorm, postAttnNorm)
+
+			// Inline MoE conf is set up lazily on first forward (after scratch alloc)
+		} else {
+			var ffnGate *GpuTensor
+			if gl.FFNGate != nil {
+				ffnGate = gl.FFNGate
+			}
+			ffnNorm := gl.FFNNorm
+			postAttnNorm := gl.PostAttnNorm
+			if layer.Spec.Residual == llm.ResPostAttnFFN {
+				ffnNorm = gl.PostAttnNorm
+				postAttnNorm = 0
+			}
+			lc.SetFFN(ffnNorm, ffnGate, gl.FFNUp, gl.FFNDown,
+				postAttnNorm, gl.PostFFNNorm)
 		}
-		lc.SetFFNMoE(ffnNorm, postAttnNorm)
 
-		// Inline MoE conf is set up lazily on first forward (after scratch alloc)
-	} else {
-		var ffnGate *GpuTensor
-		if gl.FFNGate != nil {
-			ffnGate = gl.FFNGate
+		ffnType := 0
+		switch layer.Spec.FFN {
+		case llm.FFNSwiGLU:
+			ffnType = 0
+		case llm.FFNGeGLU:
+			ffnType = 1
+		case llm.FFNPlain:
+			ffnType = 2
+		case llm.FFNMoE, llm.FFNMoESwiOAI:
+			ffnType = 3
 		}
-		ffnNorm := gl.FFNNorm
-		postAttnNorm := gl.PostAttnNorm
-		if layer.Spec.Residual == llm.ResPostAttnFFN {
-			ffnNorm = gl.PostAttnNorm
-			postAttnNorm = 0
+		resType := 0
+		if layer.Spec.Residual == llm.ResParallel {
+			resType = 1
 		}
-		lc.SetFFN(ffnNorm, ffnGate, gl.FFNUp, gl.FFNDown,
-			postAttnNorm, gl.PostFFNNorm)
-	}
 
-	ffnType := 0
-	switch layer.Spec.FFN {
-	case llm.FFNSwiGLU:
-		ffnType = 0
-	case llm.FFNGeGLU:
-		ffnType = 1
-	case llm.FFNPlain:
-		ffnType = 2
-	case llm.FFNMoE, llm.FFNMoESwiOAI:
-		ffnType = 3
-	}
-	resType := 0
-	if layer.Spec.Residual == llm.ResParallel {
-		resType = 1
-	}
+		cosTable, sinTable := pipe.RoPECosTable, pipe.RoPESinTable
+		if layer.Spec.SlidingWindow > 0 && pipe.RoPECosTableSWA != 0 {
+			cosTable, sinTable = pipe.RoPECosTableSWA, pipe.RoPESinTableSWA
+		}
+		lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
+			cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
+			cosTable, sinTable,
+			ffnType, resType)
+		lc.SetF32KV(f32KV)
 
-	cosTable, sinTable := pipe.RoPECosTable, pipe.RoPESinTable
-	if layer.Spec.SlidingWindow > 0 && pipe.RoPECosTableSWA != 0 {
-		cosTable, sinTable = pipe.RoPECosTableSWA, pipe.RoPESinTableSWA
-	}
-	lc.SetConfig(dim, headDim, numHeads, numKVHeads, kvDim,
-		cfg.RMSNormEps, cfg.RopeDim, cfg.RopeNeox,
-		cosTable, sinTable,
-		ffnType, resType)
-	lc.SetF32KV(f32KV)
-
-	confs[l] = lc
+		confs[l] = lc
 	}
 	return confs
 }
@@ -390,10 +461,10 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 			for l := 0; l < cfg.NumLayers; l++ {
 				gl := &gm.Layers[l]
 				layer := &m.Layers[l]
-			if layerConfs[l] != nil && gl.IsMoE && gl.MoEOnGPU && rs.MoEGateScratch != 0 {
-				mc, useNative := buildMoEConf(gl, layer, rs, cfg)
-				layerConfs[l].SetMoEConf(mc, useNative, false)
-			}
+				if layerConfs[l] != nil && gl.IsMoE && gl.MoEOnGPU && rs.MoEGateScratch != 0 {
+					mc, useNative := buildMoEConf(gl, layer, rs, cfg)
+					layerConfs[l].SetMoEConf(mc, useNative, false)
+				}
 			}
 		}
 	})
@@ -445,13 +516,8 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 					BeginBatch()
 					UploadF32(rs.SSMY, cb.y[:valueDim])
 				} else {
-					SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
-					Barrier()
-					SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-					Barrier()
-					SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-					Barrier()
-					SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+					ssmRecurrence(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMPred, rs.SSMY,
+						ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
 				}
 				Barrier()
 				SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
@@ -512,46 +578,46 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 		}
 		ForwardLayer(layerConfs[l], pos, seqLen, scale, nextAttnNorm)
 
-	if gl.IsMoE && pipe != nil && pipe.HasMoE {
-		inlineMoE := layerConfs[l].HasInlineMoE()
-		forceCPU := cpuMoE && pipe.CPURunState != nil
-		if inlineMoE && !forceCPU {
-			// C-side handled MoE experts + shared expert + residual — nothing to do here.
-			if moeDiag && pos == 0 && pipe.CPURunState != nil {
-				runMoEDiag(l, pos, layer, rs, cfg, pipe.CPURunState)
-			}
-		} else if gl.MoEOnGPU && !forceCPU {
-			GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
-			Barrier()
-			if nextAttnNorm != 0 {
-				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+		if gl.IsMoE && pipe != nil && pipe.HasMoE {
+			inlineMoE := layerConfs[l].HasInlineMoE()
+			forceCPU := cpuMoE && pipe.CPURunState != nil
+			if inlineMoE && !forceCPU {
+				// C-side handled MoE experts + shared expert + residual â€” nothing to do here.
+				if moeDiag && pos == 0 && pipe.CPURunState != nil {
+					runMoEDiag(l, pos, layer, rs, cfg, pipe.CPURunState)
+				}
+			} else if gl.MoEOnGPU && !forceCPU {
+				GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
+				Barrier()
+				if nextAttnNorm != 0 {
+					AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+				} else {
+					Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				}
 			} else {
-				Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
-			}
-		} else {
-			Sync()
-			cpuRS := pipe.CPURunState
-			if forceCPU {
-				DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
-			} else {
-				DownloadF32(rs.FFNIn, cpuRS.FFNIn)
-				ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
-			}
-			llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
-			BeginBatch()
-			UploadF32(rs.FFNOut, cpuRS.FFNOut)
-			Barrier()
-			if nextAttnNorm != 0 {
-				AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
-			} else {
-				Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				Sync()
+				cpuRS := pipe.CPURunState
+				if forceCPU {
+					DownloadF32(rs.FFNNorm, cpuRS.FFNNorm)
+				} else {
+					DownloadF32(rs.FFNIn, cpuRS.FFNIn)
+					ops.RMSNorm(cpuRS.FFNNorm, cpuRS.FFNIn, layer.FFNNorm, cfg.RMSNormEps)
+				}
+				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+				BeginBatch()
+				UploadF32(rs.FFNOut, cpuRS.FFNOut)
+				Barrier()
+				if nextAttnNorm != 0 {
+					AddRMSNorm(rs.XNorm, rs.X, rs.FFNIn, rs.FFNOut, nextAttnNorm, dim, cfg.RMSNormEps)
+				} else {
+					Add(rs.X, rs.FFNIn, rs.FFNOut, dim)
+				}
 			}
 		}
 	}
-}
 
-Barrier()
-RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
+	Barrier()
+	RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 	Barrier()
 	output := gm.Output
 	if output == nil {
@@ -647,13 +713,8 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 				BeginBatch()
 				UploadF32(rs.SSMY, cb.y[:valueDim])
 			} else {
-				SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
-				Barrier()
-				SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-				Barrier()
-				SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-				Barrier()
-				SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				ssmRecurrence(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMPred, rs.SSMY,
+					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
 			}
 			Barrier()
 			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
@@ -666,9 +727,15 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			MatVec(rs.V, gl.Wv.Buf, rs.XNorm, gl.Wv.Rows, gl.Wv.Cols, gl.Wv.Type)
 			Barrier()
 			DeinterleaveQGate(rs.QFull, rs.Q, rs.QGate, numHeads, headDim)
-			if gl.Bq != 0 { Add(rs.Q, rs.Q, gl.Bq, numHeads*headDim) }
-			if gl.Bk != 0 { Add(rs.K, rs.K, gl.Bk, kvDim) }
-			if gl.Bv != 0 { Add(rs.V, rs.V, gl.Bv, kvDim) }
+			if gl.Bq != 0 {
+				Add(rs.Q, rs.Q, gl.Bq, numHeads*headDim)
+			}
+			if gl.Bk != 0 {
+				Add(rs.K, rs.K, gl.Bk, kvDim)
+			}
+			if gl.Bv != 0 {
+				Add(rs.V, rs.V, gl.Bv, kvDim)
+			}
 			if layer.Spec.QKNorm {
 				Barrier()
 				RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps)
@@ -710,7 +777,7 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 			inlineMoE2 := layerConfs[l].HasInlineMoE()
 			forceCPU2 := cpuMoE && pipe.CPURunState != nil
 			if inlineMoE2 && !forceCPU2 {
-				// C-side handled MoE experts + shared expert + residual — nothing to do here.
+				// C-side handled MoE experts + shared expert + residual â€” nothing to do here.
 			} else if gl.MoEOnGPU && !forceCPU2 {
 				GpuForwardMoEFFN(gl, layer, rs, cfg, false, 0, 0)
 				Barrier()
@@ -749,7 +816,7 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 	// --- Phase 3: CPU layers ---
 	llm.ForwardFromLayer(m, numGPU, pos, pipe.CPUKVCache, pipe.CPURunState)
 
-	// Logits are now in CPURunState.Logits — copy to output buffer
+	// Logits are now in CPURunState.Logits â€” copy to output buffer
 	copy(logitsBuf, pipe.CPURunState.Logits)
 }
 
@@ -782,26 +849,26 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
-		lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
-			gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
-		lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
-		if gl.AttnSinks != 0 {
-			lc.SetAttnSinks(gl.AttnSinks)
+			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+				gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
+			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+			if gl.AttnSinks != 0 {
+				lc.SetAttnSinks(gl.AttnSinks)
+			}
+			if layer.Spec.SlidingWindow > 0 {
+				lc.SetSlidingWindow(layer.Spec.SlidingWindow)
+			}
+			if cfg.AttnLogitSoftcap > 0 {
+				lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
+			}
 		}
-		if layer.Spec.SlidingWindow > 0 {
-			lc.SetSlidingWindow(layer.Spec.SlidingWindow)
-		}
-		if cfg.AttnLogitSoftcap > 0 {
-			lc.SetAttnLogitSoftcap(cfg.AttnLogitSoftcap)
-		}
-	}
 
-	if gl.IsMoE {
-		ffnNorm := gl.FFNNorm
-		postAttnNorm := gl.PostAttnNorm
-		if layer.Spec.Residual == llm.ResPostAttnFFN {
-			ffnNorm = gl.PostAttnNorm
-			postAttnNorm = 0
+		if gl.IsMoE {
+			ffnNorm := gl.FFNNorm
+			postAttnNorm := gl.PostAttnNorm
+			if layer.Spec.Residual == llm.ResPostAttnFFN {
+				ffnNorm = gl.PostAttnNorm
+				postAttnNorm = 0
 			}
 			lc.SetFFNMoE(ffnNorm, postAttnNorm)
 		} else {
@@ -851,9 +918,13 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 }
 
 // GpuForwardPrefillBatch processes all prompt tokens in a single batched pass.
+// GpuForwardPrefillBatch performs batched prefill for pure-attention models.
+// If hiddenBuf is non-nil it must have room for dim floats: the vocabulary
+// projection is skipped and the normalized final hidden state (System One
+// readout features) is downloaded into hiddenBuf instead of logits.
 func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
 	kv *GpuKVCache, rs *GpuRunState, bs *GpuBatchState, logitsBuf []float32,
-	batchLayerConfs []*LayerConf) {
+	batchLayerConfs []*LayerConf, hiddenBuf []float32) {
 
 	npos := len(tokens)
 	cfg := m.Config
@@ -870,7 +941,6 @@ func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
 			}
 		}
 	}
-
 	BeginBatch()
 	UploadF32(bs.X, xBatch)
 
@@ -892,6 +962,12 @@ func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
 	Barrier()
 	RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 	Barrier()
+	if hiddenBuf != nil {
+		// Hidden-state extraction (System One readout features): skip the
+		// vocabulary projection and download the normalized final hidden.
+		_ = DownloadF32(rs.X, hiddenBuf)
+		return
+	}
 	output := gm.Output
 	if output == nil {
 		output = gm.TokenEmbed
@@ -902,9 +978,13 @@ func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
 
 // GpuForwardPrefillBatchHybrid performs batched prefill for hybrid SSM+attention models.
 // Attention layers (including GatedQ) and SSM matmuls are batched; SSM recurrence is per-position.
+// If hiddenBuf is non-nil it must have room for dim floats: on the last chunk
+// the vocabulary projection is skipped and the normalized final hidden state
+// (System One readout features) is downloaded into hiddenBuf instead of logits.
 func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 	kv *GpuKVCache, rs *GpuRunState, bs *GpuBatchState, logitsBuf []float32,
-	batchLayerConfs []*LayerConf, pipe *GpuPipeline, startPos int, lastChunk bool) {
+	batchLayerConfs []*LayerConf, pipe *GpuPipeline, startPos int, lastChunk bool,
+	hiddenBuf []float32) {
 
 	npos := len(tokens)
 	cfg := m.Config
@@ -930,7 +1010,18 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		ssmConvK = cfg.SSMConvKernel
 	}
 
+	// Non-aliasing convolution output reused across layers; OOM uses fallback.
+	var ssmProcessed Buf
+	if pipe.HasSSM && ssmBatchSupported(ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, npos) {
+		ssmProcessed = Alloc(uint64(npos * ssmQKVDim * 4))
+		if ssmProcessed != 0 {
+			defer Free(ssmProcessed)
+		}
+	}
+	chunkTimed := ssmTimeActive(ssmProcessed != 0)
+	defer ssmTimeFinishChunk(chunkTimed)
 	xBatch := make([]float32, npos*dim)
+	embedStart, embedOn := ssmTimeBegin(chunkTimed)
 	for i, tok := range tokens {
 		_ = m.TokenEmbed.DequantizeRow(int(tok), xBatch[i*dim:(i+1)*dim])
 		if cfg.EmbedScale != 0 {
@@ -942,6 +1033,7 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 
 	BeginBatch()
 	UploadF32(bs.X, xBatch)
+	ssmTimeEnd(0, embedStart, embedOn)
 
 	if m.Layers[0].Spec.Norm == llm.NormRMS {
 		Barrier()
@@ -953,37 +1045,53 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		gl := &gm.Layers[l]
 
 		if layer.Spec.Core == llm.CoreSSM && pipe.HasSSM {
-				Barrier()
-				BatchMatVec(bs.SSMQKV, gl.SSMInProj.Buf, bs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, npos, gl.SSMInProj.Type)
-				BatchMatVec(bs.SSMZ, gl.SSMGate.Buf, bs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, npos, gl.SSMGate.Type)
-				BatchMatVec(bs.SSMAlpha, gl.SSMAlpha.Buf, bs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, npos, gl.SSMAlpha.Type)
-				BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
-				Barrier()
+			tStart, tOn := ssmTimeBegin(chunkTimed)
+			Barrier()
+			BatchMatVec(bs.SSMQKV, gl.SSMInProj.Buf, bs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, npos, gl.SSMInProj.Type)
+			BatchMatVec(bs.SSMZ, gl.SSMGate.Buf, bs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, npos, gl.SSMGate.Type)
+			BatchMatVec(bs.SSMAlpha, gl.SSMAlpha.Buf, bs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, npos, gl.SSMAlpha.Type)
+			BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
+			ssmTimeEnd(4, tStart, tOn)
+			Barrier()
 
 			// ssmFlushInterval controls how often we flush the Vulkan command buffer
 			// during the per-token SSM loop. The SSM computation is sequential (token N
 			// depends on token N-1), so tokens cannot be batched. Without flushing, 512
-			// tokens × 24 SSM layers × ~9 dispatches = ~115K dispatches accumulate in a
+			// tokens Ã— 24 SSM layers Ã— ~9 dispatches = ~115K dispatches accumulate in a
 			// single command buffer. submit_and_wait() has a 10s fence timeout, and this
 			// volume can exceed it, causing a fatal crash. Flushing every N tokens keeps
-			// each submission well within the timeout (32 tokens × 9 ops = 288 dispatches,
-			// ~29ms execution, 345× safety margin).
-			const ssmFlushInterval = 32
+			// each submission well within the timeout.
+			// 128 tokens Ã— ~12 SSM dispatches = ~1.5K dispatches per submission
+			// (~150ms GPU execution at the measured ~1Âµs/dispatch, 60Ã— inside the
+			// fence timeout). Every full Sync is a submit+wait round trip; at
+			// interval 32 a 10.7K-token prefill issued ~6K round trips and was
+			// CPU-submit-bound (~110 tok/s). Measured 2026-09-29: interval 128
+			// cuts prefill time ~4Ã— with identical outputs (determinism checked
+			// by the seam/hidden parity tests).
+			const ssmFlushInterval = 128
 
-			for p := 0; p < npos; p++ {
-				off := uint64(p)
-				CopyRegion(rs.SSMQKV, 0, bs.SSMQKV, off*uint64(ssmQKVDim*4), uint64(ssmQKVDim*4))
-				CopyRegion(rs.SSMZ, 0, bs.SSMZ, off*uint64(ssmNumHeads*ssmHeadVDim*4), uint64(ssmNumHeads*ssmHeadVDim*4))
-				CopyRegion(rs.SSMAlpha, 0, bs.SSMAlpha, off*uint64(ssmNumHeads*4), uint64(ssmNumHeads*4))
-				CopyRegion(rs.SSMBeta, 0, bs.SSMBeta, off*uint64(ssmNumHeads*4), uint64(ssmNumHeads*4))
+			if ssmProcessed != 0 {
+				if err := ssmBatchPrefillTimed(bs.SSMQKV, ssmProcessed, bs.SSMAlpha, bs.SSMBeta, bs.SSMZ, bs.SSMY,
+					gl.SSMState, gl.SSMConvBuf, gl.SSMConv1dW, gl.SSMA, gl.SSMDtBias, gl.SSMNorm,
+					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim, ssmConvK, npos, cfg.RMSNormEps, chunkTimed); err != nil {
+					panic(err) // This void forward API already treats GPU dispatch failure as fatal.
+				}
 				Barrier()
-				SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
+			} else {
+				for p := 0; p < npos; p++ {
+					off := uint64(p)
+					CopyRegion(rs.SSMQKV, 0, bs.SSMQKV, off*uint64(ssmQKVDim*4), uint64(ssmQKVDim*4))
+					CopyRegion(rs.SSMZ, 0, bs.SSMZ, off*uint64(ssmNumHeads*ssmHeadVDim*4), uint64(ssmNumHeads*ssmHeadVDim*4))
+					CopyRegion(rs.SSMAlpha, 0, bs.SSMAlpha, off*uint64(ssmNumHeads*4), uint64(ssmNumHeads*4))
+					CopyRegion(rs.SSMBeta, 0, bs.SSMBeta, off*uint64(ssmNumHeads*4), uint64(ssmNumHeads*4))
+					Barrier()
+					SSMConv1dSiLU(rs.SSMQKV, gl.SSMConvBuf, gl.SSMConv1dW, ssmQKVDim, ssmConvK)
 					Barrier()
 					hasDtBias := gl.SSMDtBias != 0
 					SSMPreprocess(rs.SSMAlpha, rs.SSMBeta, gl.SSMA, gl.SSMDtBias, rs.SSMQKV,
 						ssmNumHeads, ssmHeadKDim, ssmKeyDim, cfg.RMSNormEps, hasDtBias)
 					Barrier()
-				if cpuSSMDelta && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
+					if cpuSSMDelta && pipe.CPURunState != nil && pipe.CPURunState.SSMState != nil {
 						valueDim := ssmNumHeads * ssmHeadVDim
 						cb := ensureCPUDeltaBufs(ssmQKVDim, ssmNumHeads, valueDim)
 						EndBatch()
@@ -998,13 +1106,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 						BeginBatch()
 						UploadF32(rs.SSMY, cb.y[:valueDim])
 					} else {
-						SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
-						Barrier()
-						SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-						Barrier()
-						SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-						Barrier()
-						SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+						ssmRecurrence(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMPred, rs.SSMY,
+							ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
 					}
 					Barrier()
 					SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
@@ -1012,27 +1115,39 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 					CopyRegion(bs.SSMY, off*uint64(ssmNumHeads*ssmHeadVDim*4), rs.SSMY, 0, uint64(ssmNumHeads*ssmHeadVDim*4))
 					Barrier()
 
-				// Periodic flush: submit the accumulated command buffer and start a new one.
-				// This prevents the command buffer from growing to 115K+ dispatches (which
-				// exceeds the 10s GPU fence timeout). All GPU state (SSM state, batch
-				// buffers) persists in device memory across submissions, so this is safe.
-				// The cpuSSMDelta path already flushes per-token; for it, EndBatch is a
-				// no-op (g.recording is already 0).
-				if (p+1)%ssmFlushInterval == 0 && p+1 < npos {
-					EndBatch()
-					Sync()
-					BeginBatch()
+					// Periodic flush: submit the accumulated command buffer and start a new one.
+					// This prevents the command buffer from growing to 115K+ dispatches (which
+					// exceeds the 10s GPU fence timeout). All GPU state (SSM state, batch
+					// buffers) persists in device memory across submissions, so this is safe.
+					// The cpuSSMDelta path already flushes per-token; for it, EndBatch is a
+					// no-op (g.recording is already 0).
+					if (p+1)%ssmFlushInterval == 0 && p+1 < npos {
+						EndBatch()
+						Sync()
+						BeginBatch()
+					}
 				}
 			}
 
-				BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
+			outStart, outOn := ssmTimeBegin(chunkTimed)
+			BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
+			ssmTimeEnd(9, outStart, outOn)
+			ssmTimeEnd(1, tStart, tOn)
 
 		} else if layer.Spec.GatedQ && pipe.HasGatedQ {
-			// GatedQ attention: fully batched Q/K/V, deinterleave, bias, QKnorm, RoPE, KV store, attention, sigmoid gate
+			// GatedQ attention: fully batched Q/K/V, deinterleave, bias, QKnorm, RoPE, KV store, attention, sigmoid gate.
+			// Every data-dependent dispatch pair needs an explicit barrier: Vulkan
+			// compute dispatches recorded without barriers may execute
+			// concurrently, and a missing barrier here produced nondeterministic
+			// KV/attention corruption (run-to-run state divergence, borderline
+			// decision flips, and the GPU-vs-CPU accuracy gap).
+			tStart, tOn := ssmTimeBegin(chunkTimed)
 			Barrier()
 			BatchMatVec(bs.QFull, gl.Wq.Buf, bs.XNorm, gl.Wq.Rows, gl.Wq.Cols, npos, gl.Wq.Type)
 			BatchMatVec(bs.K, gl.Wk.Buf, bs.XNorm, gl.Wk.Rows, gl.Wk.Cols, npos, gl.Wk.Type)
 			BatchMatVec(bs.V, gl.Wv.Buf, bs.XNorm, gl.Wv.Rows, gl.Wv.Cols, npos, gl.Wv.Type)
+			ssmTimeEnd(10, tStart, tOn)
+			opStart, opOn := ssmTimeBegin(chunkTimed)
 			Barrier()
 			DeinterleaveQGate(bs.QFull, bs.Q, bs.QGate, numHeads*npos, headDim)
 			if gl.Bq != 0 {
@@ -1040,27 +1155,38 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 				BatchAddBias(bs.Q, gl.Bq, bs.AttnOut, qDim, npos)
 			}
 			if gl.Bk != 0 {
+				Barrier()
 				BatchAddBias(bs.K, gl.Bk, bs.AttnOut, kvDim, npos)
 			}
 			if gl.Bv != 0 {
+				Barrier()
 				BatchAddBias(bs.V, gl.Bv, bs.AttnOut, kvDim, npos)
 			}
 			if layer.Spec.QKNorm {
 				Barrier()
 				RMSNormHeads(bs.Q, gl.AttnQNorm, numHeads*npos, headDim, cfg.RMSNormEps)
+				Barrier()
 				RMSNormHeads(bs.K, gl.AttnKNorm, numKVHeads*npos, headDim, cfg.RMSNormEps)
 			}
 			Barrier()
 			bCos, bSin := ropeTablesForLayer(pipe, m.Layers[l].Spec)
 			BatchRoPE(bs.Q, bs.K, bCos, bSin, numHeads, numKVHeads, headDim, cfg.RopeDim, startPos,
 				cfg.RopeNeox, npos)
+			Barrier()
 			BatchKVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V, startPos, kvDim, npos)
+			ssmTimeEnd(11, opStart, opOn)
+			opStart, opOn = ssmTimeBegin(chunkTimed)
+			Barrier()
 			BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos)
+			ssmTimeEnd(12, opStart, opOn)
+			opStart, opOn = ssmTimeBegin(chunkTimed)
 			Barrier()
 			SigmoidGate(bs.AttnOut, bs.QGate, qDim*npos)
 			Barrier()
 			BatchMatVec(bs.AttnProj, gl.Wo.Buf, bs.AttnOut, gl.Wo.Rows, gl.Wo.Cols, npos, gl.Wo.Type)
+			ssmTimeEnd(13, opStart, opOn)
+			ssmTimeEnd(2, tStart, tOn)
 
 		} else if layer.Spec.Core == llm.CoreMLA && pipe.HasMLA {
 			// MLA: run per-position on CPU (sequential KV cache dependency)
@@ -1086,7 +1212,9 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		if l < cfg.NumLayers-1 {
 			nextAttnNorm = gm.Layers[l+1].AttnNorm
 		}
+		ffnStart, ffnOn := ssmTimeBegin(chunkTimed)
 		ForwardLayerBatch(batchLayerConfs[l], npos, startPos, scale, nextAttnNorm)
+		ssmTimeEnd(3, ffnStart, ffnOn)
 
 		if gl.IsMoE && pipe.HasMoE {
 			// Batch prefill MoE: download raw FFNIn, recompute norm on CPU with f64 precision
@@ -1118,13 +1246,31 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		Barrier()
 		RMSNorm(rs.X, rs.X, gm.OutputNorm, dim, cfg.RMSNormEps)
 		Barrier()
+		if hiddenBuf != nil {
+			// Hidden-state extraction (System One readout features): skip the
+			// vocabulary projection and download the normalized final hidden.
+			_ = DownloadF32(rs.X, hiddenBuf)
+			return
+		}
 		output := gm.Output
 		if output == nil {
 			output = gm.TokenEmbed
 		}
 		MatVec(rs.Logits, output.Buf, rs.X, output.Rows, output.Cols, output.Type)
 		DownloadF32(rs.Logits, logitsBuf)
+		return
 	}
+
+	// Non-final chunk: submit the batch before returning. The caller's next
+	// chunk uploads new embeddings into the shared batch buffers; without an
+	// explicit submission those transfer commands are recorded into the SAME
+	// command buffer as this chunk's compute, and Vulkan does not order
+	// transfer ops against preceding compute without a barrier â€” the upload
+	// can overwrite bs.X/bs.XNorm while this chunk's shaders are still
+	// reading them, corrupting the residual chain and the KV/SSM state.
+	// (EndBatch submits and waits; Sync is belt-and-braces.)
+	EndBatch()
+	Sync()
 }
 
 // GpuForward performs a single-token forward pass entirely on GPU.
@@ -1236,13 +1382,10 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				BeginBatch()
 				UploadF32(rs.SSMY, cb.y[:valueDim])
 			} else {
-				SSMDecay(gl.SSMState, rs.SSMAlpha, ssmNumHeads, ssmHeadKDim, ssmHeadVDim)
-				Barrier()
-				SSMPredict(gl.SSMState, rs.SSMQKV, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-				Barrier()
-				SSMUpdate(gl.SSMState, rs.SSMQKV, rs.SSMBeta, rs.SSMPred, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
-				Barrier()
-				SSMOutput(gl.SSMState, rs.SSMQKV, rs.SSMY, ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim)
+				if err := ssmRecurrence(gl.SSMState, rs.SSMQKV, rs.SSMAlpha, rs.SSMBeta, rs.SSMPred, rs.SSMY,
+					ssmNumHeads, ssmHeadKDim, ssmHeadVDim, ssmKeyDim); err != nil {
+					return fmt.Errorf("layer %d ssm recurrence: %w", l, err)
+				}
 			}
 			Barrier()
 			SSMNormGate(rs.SSMY, rs.SSMZ, gl.SSMNorm, ssmNumHeads, ssmHeadVDim, cfg.RMSNormEps)
@@ -1496,61 +1639,61 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 				}
 			}
 		} else {
-		switch spec.Residual {
-		case llm.ResStandard:
-			Barrier()
-			if gl.PostAttnNorm != 0 {
-				if err := RMSNorm(rs.AttnProj, rs.AttnProj, gl.PostAttnNorm, dim, cfg.RMSNormEps); err != nil {
-					return fmt.Errorf("layer %d post-attn norm: %w", l, err)
+			switch spec.Residual {
+			case llm.ResStandard:
+				Barrier()
+				if gl.PostAttnNorm != 0 {
+					if err := RMSNorm(rs.AttnProj, rs.AttnProj, gl.PostAttnNorm, dim, cfg.RMSNormEps); err != nil {
+						return fmt.Errorf("layer %d post-attn norm: %w", l, err)
+					}
+					Barrier()
+				}
+				if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.FFNNorm, dim, cfg.RMSNormEps); err != nil {
+					return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
 				}
 				Barrier()
-			}
-			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.FFNNorm, dim, cfg.RMSNormEps); err != nil {
-				return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
-			}
-			Barrier()
-			if err := gpuForwardFFN(layer, gl, rs, rs.FFNNorm, dim, cfg); err != nil {
-				return fmt.Errorf("layer %d ffn: %w", l, err)
-			}
-			Barrier()
-			if gl.PostFFNNorm != 0 {
-				if err := RMSNorm(rs.FFNOut, rs.FFNOut, gl.PostFFNNorm, dim, cfg.RMSNormEps); err != nil {
-					return fmt.Errorf("layer %d post-ffn norm: %w", l, err)
+				if err := gpuForwardFFN(layer, gl, rs, rs.FFNNorm, dim, cfg); err != nil {
+					return fmt.Errorf("layer %d ffn: %w", l, err)
 				}
 				Barrier()
-			}
-			if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
-				return fmt.Errorf("layer %d residual add: %w", l, err)
-			}
+				if gl.PostFFNNorm != 0 {
+					if err := RMSNorm(rs.FFNOut, rs.FFNOut, gl.PostFFNNorm, dim, cfg.RMSNormEps); err != nil {
+						return fmt.Errorf("layer %d post-ffn norm: %w", l, err)
+					}
+					Barrier()
+				}
+				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
+					return fmt.Errorf("layer %d residual add: %w", l, err)
+				}
 
-		case llm.ResPostAttnFFN:
-			Barrier()
-			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.PostAttnNorm, dim, cfg.RMSNormEps); err != nil {
-				return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
-			}
-			Barrier()
-			if err := gpuForwardFFN(layer, gl, rs, rs.FFNNorm, dim, cfg); err != nil {
-				return fmt.Errorf("layer %d ffn: %w", l, err)
-			}
-			Barrier()
-			if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
-				return fmt.Errorf("layer %d residual add: %w", l, err)
-			}
+			case llm.ResPostAttnFFN:
+				Barrier()
+				if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.PostAttnNorm, dim, cfg.RMSNormEps); err != nil {
+					return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
+				}
+				Barrier()
+				if err := gpuForwardFFN(layer, gl, rs, rs.FFNNorm, dim, cfg); err != nil {
+					return fmt.Errorf("layer %d ffn: %w", l, err)
+				}
+				Barrier()
+				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
+					return fmt.Errorf("layer %d residual add: %w", l, err)
+				}
 
-		case llm.ResParallel:
-			Barrier()
-			if err := gpuForwardFFN(layer, gl, rs, rs.XNorm, dim, cfg); err != nil {
-				return fmt.Errorf("layer %d ffn: %w", l, err)
+			case llm.ResParallel:
+				Barrier()
+				if err := gpuForwardFFN(layer, gl, rs, rs.XNorm, dim, cfg); err != nil {
+					return fmt.Errorf("layer %d ffn: %w", l, err)
+				}
+				Barrier()
+				if err := Add(rs.X, rs.X, rs.AttnProj, dim); err != nil {
+					return fmt.Errorf("layer %d parallel add attn: %w", l, err)
+				}
+				Barrier()
+				if err := Add(rs.X, rs.X, rs.FFNOut, dim); err != nil {
+					return fmt.Errorf("layer %d parallel add ffn: %w", l, err)
+				}
 			}
-			Barrier()
-			if err := Add(rs.X, rs.X, rs.AttnProj, dim); err != nil {
-				return fmt.Errorf("layer %d parallel add attn: %w", l, err)
-			}
-			Barrier()
-			if err := Add(rs.X, rs.X, rs.FFNOut, dim); err != nil {
-				return fmt.Errorf("layer %d parallel add ffn: %w", l, err)
-			}
-		}
 		} // end else (non-MoE)
 
 		if diagL {
@@ -1684,7 +1827,6 @@ func supportsGPUQType(qtype uint32) bool {
 	}
 }
 
-
 func hasDp4aQType(qtype uint32) bool {
 	switch qtype {
 	case 2, 6, 8, 10, 39: // Q4_0, Q5_0, Q8_0, Q3_K, MXFP4
@@ -1806,7 +1948,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	}
 
 	// Native fused path: works for ALL quant types (no Q8_1 quantization).
-	// Keeps everything on GPU — no Sync() or CPU round-trip.
+	// Keeps everything on GPU â€” no Sync() or CPU round-trip.
 	useNativeFused := rs.MoEGateScratch != 0 && !diagL && !noFusedMoE
 	if useNativeFused {
 		return gpuForwardMoEFFNNative(gl, layer, rs, cfg, dim, expDim, nUsed,
@@ -1960,7 +2102,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 }
 
 // gpuForwardMoEFFNFused runs the MoE FFN entirely on GPU using dp4a MoE shader variants.
-// No Sync() or CPU round-trip for expert indices — everything stays on GPU.
+// No Sync() or CPU round-trip for expert indices â€” everything stays on GPU.
 // Uses C-side fused dispatch (single CGo call) to eliminate per-step CGo overhead.
 func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig,
 	dim, expDim, nUsed int, gateGpu, upGpu *GpuTensor, bpr, downBpr int, fused, isOAI bool) error {
@@ -1999,7 +2141,7 @@ func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg 
 }
 
 // gpuForwardMoEFFNNative runs the MoE FFN entirely on GPU using native matvec.
-// No Sync() or CPU round-trip — everything stays on GPU.
+// No Sync() or CPU round-trip â€” everything stays on GPU.
 // Works for ALL quant types (IQ, K-quant, etc.) without Q8_1 quantization.
 func gpuForwardMoEFFNNative(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.ModelConfig,
 	dim, expDim, nUsed int, gateGpu, upGpu *GpuTensor, bpr, downBpr int, fused, isOAI bool) error {
@@ -2325,4 +2467,3 @@ func topKIndicesF32(vals []float32, k int) ([]int, []float32) {
 	}
 	return indices, weights
 }
-

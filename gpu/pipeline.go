@@ -3,11 +3,13 @@
 package gpu
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/computerex/dlgo/core"
@@ -48,11 +50,93 @@ type GpuPipeline struct {
 	IsPartialGPU bool // true when some layers are on CPU
 
 	// CPU-side state for hybrid MoE or partial GPU offloading
-	CPURunState  *llm.RunState
-	CPUKVCache   *memory.MultiLayerKVCache // KV cache for CPU layers
+	CPURunState   *llm.RunState
+	CPUKVCache    *memory.MultiLayerKVCache // KV cache for CPU layers
 	CPUBatchState *llm.BatchState           // batch state for CPU prefill
 
 	AllCPUAttn bool // true if ALL GPU layers use CPU attention fallback
+
+	// hasCPUAttn is true when ANY GPU layer needs the CPU attention fallback;
+	// batched prefill cannot serve those layers, so System One hidden
+	// extraction refuses to run on such models.
+	hasCPUAttn bool
+
+	// CPUPipeline is the wrapped CPU pipeline, kept so System One multi can
+	// degrade wide questions to CPU continuation scoring.
+	CPUPipeline *llm.Pipeline
+
+	// prefixCache holds device-side state snapshots keyed by the shared
+	// System One prefix text, so repeated decisions over the same state
+	// (the common document-briefing pattern) skip the long prefill entirely.
+	// Entries are owned by the pipeline and freed on eviction or FreeAll.
+	// Inference and snapshot lifetime require external serialization (the
+	// server's inference gate). The mutex protects metadata only; it does not
+	// make concurrent pipeline inference or eviction safe.
+	prefixCacheMu sync.Mutex
+	prefixCache   []prefixCacheEntry
+}
+
+// prefixCacheMaxEntries caps cached prefixes. Each entry holds a KV+SSM
+// snapshot for the cached prefix length (order ~100-200 MB for a 10K-token
+// document), so this stays well inside a consumer GPU's spare VRAM.
+const prefixCacheMaxEntries = 4
+
+type prefixCacheEntry struct {
+	key       [32]byte // sha256 of the prefix text
+	prefixLen int      // prefix token count the snapshot was taken at
+	snap      *GpuStateSnapshot
+	lastUsed  time.Time
+}
+
+// lookupPrefixCache returns the cached snapshot for this exact prefix, or nil.
+func (p *GpuPipeline) lookupPrefixCache(key [32]byte, prefixLen int) *GpuStateSnapshot {
+	p.prefixCacheMu.Lock()
+	defer p.prefixCacheMu.Unlock()
+	for i := range p.prefixCache {
+		e := &p.prefixCache[i]
+		if e.key == key && e.prefixLen == prefixLen {
+			e.lastUsed = time.Now()
+			return e.snap
+		}
+	}
+	return nil
+}
+
+// storePrefixCache inserts (or refreshes) a snapshot, evicting the
+// least-recently-used entry past the cap. Ownership of snap passes to the
+// cache; it must not be freed by the caller.
+func (p *GpuPipeline) storePrefixCache(key [32]byte, prefixLen int, snap *GpuStateSnapshot) {
+	p.prefixCacheMu.Lock()
+	defer p.prefixCacheMu.Unlock()
+	for i := range p.prefixCache {
+		if p.prefixCache[i].key == key && p.prefixCache[i].prefixLen == prefixLen {
+			p.prefixCache[i].snap.Free()
+			p.prefixCache[i].snap = snap
+			p.prefixCache[i].lastUsed = time.Now()
+			return
+		}
+	}
+	if len(p.prefixCache) >= prefixCacheMaxEntries {
+		oldest := 0
+		for i := range p.prefixCache {
+			if p.prefixCache[i].lastUsed.Before(p.prefixCache[oldest].lastUsed) {
+				oldest = i
+			}
+		}
+		p.prefixCache[oldest].snap.Free()
+		p.prefixCache = append(p.prefixCache[:oldest], p.prefixCache[oldest+1:]...)
+	}
+	p.prefixCache = append(p.prefixCache, prefixCacheEntry{key: key, prefixLen: prefixLen, snap: snap, lastUsed: time.Now()})
+}
+
+// freePrefixCache releases every cached snapshot.
+func (p *GpuPipeline) freePrefixCache() {
+	p.prefixCacheMu.Lock()
+	defer p.prefixCacheMu.Unlock()
+	for i := range p.prefixCache {
+		p.prefixCache[i].snap.Free()
+	}
+	p.prefixCache = nil
 }
 
 // MaxVRAMBytes caps the VRAM the GPU pipeline may use. 0 = no cap (use all free).
@@ -879,6 +963,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		RoPESinTable:    ropeSinTable,
 		RoPECosTableSWA: ropeCosTableSWA,
 		RoPESinTableSWA: ropeSinTableSWA,
+		CPUPipeline:     cpuPipeline,
 	}
 
 	// Use fused forward when ALL layers are on GPU (including MoE models).
@@ -961,6 +1046,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			pipe.AllCPUAttn = true
 		}
 	}
+	pipe.hasCPUAttn = hasCPUAttn
 
 	// Allocate CPU-side state if needed (partial GPU, MoE, MLA, CPU attn, or hybrid SSM).
 	needCPUState := isPartial || cfg.ExpertCount > 0 || pipe.HasMLA || hasCPUAttn || (pipe.HasSSM && (cpuSSMDelta || cpuSSMFull))
@@ -1041,7 +1127,6 @@ func (p *GpuPipeline) ResetState() {
 	}
 }
 
-
 // FreeAll releases all GPU resources held by this pipeline.
 // Sync is called first to ensure no in-flight commands reference these buffers,
 // which allows the Vulkan driver to immediately reclaim the device memory.
@@ -1051,6 +1136,7 @@ func (p *GpuPipeline) FreeAll() {
 	}
 	StopMemoryMonitor()
 	Sync()
+	p.freePrefixCache()
 	p.GpuModel.FreeAll()
 	p.RunState.FreeAll()
 	p.KVCache.FreeAll()
@@ -1091,7 +1177,6 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	p.ResetState()
 
-	mcfg := p.CPUModel.Config
 	npos := len(tokens)
 
 	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
@@ -1104,40 +1189,8 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		batchSize = prefillChunkSize
 	}
 
-	if p.BatchState == nil || p.BatchState.Npos < batchSize {
-		if p.BatchState != nil {
-			p.BatchState.Free()
-		}
-		dim := mcfg.EmbeddingDim
-		qDim := mcfg.NumHeads * mcfg.HeadDim
-		kvDim := mcfg.NumKVHeads * mcfg.HeadDim
-		ffnDim := mcfg.FFNDim
-		var bsErr error
-		p.BatchState, bsErr = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
-		if bsErr != nil {
-			return nil, fmt.Errorf("gpu: prefill batch alloc: %w", bsErr)
-		}
-		p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p, p.BatchState, p.KVCache)
-		if p.HasGatedQ {
-			if err := p.BatchState.AllocGatedQBatch(batchSize, qDim); err != nil {
-				return nil, fmt.Errorf("gpu: prefill GatedQ batch alloc: %w", err)
-			}
-		}
-		if p.HasSSM {
-			numHeads := mcfg.SSMTimeStepRank
-			numKVGroups := mcfg.SSMGroupCount
-			if numKVGroups <= 0 {
-				numKVGroups = numHeads
-			}
-			headVDim := mcfg.SSMInnerSize / numHeads
-			headKDim := mcfg.SSMStateSize
-			keyDim := numKVGroups * headKDim
-			qkvDim := keyDim*2 + numHeads*headVDim
-			valueDim := numHeads * headVDim
-			if err := p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads); err != nil {
-				return nil, fmt.Errorf("gpu: prefill SSM batch alloc: %w", err)
-			}
-		}
+	if err := p.ensurePrefillBatchState(batchSize); err != nil {
+		return nil, err
 	}
 
 	prefillStart := time.Now()
@@ -1166,12 +1219,12 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 				chunkTokens := tokens[startPos:end]
 				isLast := end >= npos
 				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, chunkTokens, p.KVCache, p.RunState,
-					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, startPos, isLast)
+					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, startPos, isLast, nil)
 				Sync()
 			}
 		} else {
 			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-				p.BatchState, p.LogitsBuf, p.BatchLayerConfs)
+				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, nil)
 		}
 	}
 	Sync()
@@ -1424,6 +1477,495 @@ done:
 		TotalTokens:    len(generated),
 		PromptTokens:   len(tokens),
 	}, nil
+}
+
+// ensurePrefillBatchState allocates or grows the batched-prefill buffers and
+// layer confs for batchSize tokens. GenerateDetailed and System One hidden
+// extraction share it so both paths pay the allocation only once.
+func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
+	if p.BatchState != nil && p.BatchState.Npos >= batchSize {
+		return nil
+	}
+	if p.BatchState != nil {
+		p.BatchState.Free()
+	}
+	mcfg := p.CPUModel.Config
+	dim := mcfg.EmbeddingDim
+	qDim := mcfg.NumHeads * mcfg.HeadDim
+	kvDim := mcfg.NumKVHeads * mcfg.HeadDim
+	ffnDim := mcfg.FFNDim
+	var bsErr error
+	p.BatchState, bsErr = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
+	if bsErr != nil {
+		return fmt.Errorf("gpu: prefill batch alloc: %w", bsErr)
+	}
+	p.BatchLayerConfs = BuildBatchLayerConfs(p.CPUModel, p.GpuModel, p, p.BatchState, p.KVCache)
+	if p.HasGatedQ {
+		if err := p.BatchState.AllocGatedQBatch(batchSize, qDim); err != nil {
+			return fmt.Errorf("gpu: prefill GatedQ batch alloc: %w", err)
+		}
+	}
+	if p.HasSSM {
+		numHeads := mcfg.SSMTimeStepRank
+		numKVGroups := mcfg.SSMGroupCount
+		if numKVGroups <= 0 {
+			numKVGroups = numHeads
+		}
+		headVDim := mcfg.SSMInnerSize / numHeads
+		headKDim := mcfg.SSMStateSize
+		keyDim := numKVGroups * headKDim
+		qkvDim := keyDim*2 + numHeads*headVDim
+		valueDim := numHeads * headVDim
+		if err := p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads); err != nil {
+			return fmt.Errorf("gpu: prefill SSM batch alloc: %w", err)
+		}
+	}
+	return nil
+}
+
+// SystemOneHidden extracts the final normalized hidden state for a compiled
+// System One prompt entirely on GPU: one batched prefill with the vocabulary
+// projection skipped, mirroring llm.Pipeline.SystemOneHidden. It requires a
+// fully-GPU, non-MoE model (the batched prefill path has no MoE or CPU-attention
+// fallback for hidden extraction).
+func (p *GpuPipeline) SystemOneHidden(state string, q llm.SystemOneQuestion, cfg llm.SystemOneConfig) ([]float32, []llm.Choice, int, error) {
+	if err := cfg.Err(); err != nil {
+		return nil, nil, 0, err
+	}
+	if p.HasMoE || p.IsPartialGPU || p.hasCPUAttn {
+		return nil, nil, 0, fmt.Errorf("gpu: System One hidden extraction requires a fully-GPU non-MoE model without CPU-attention layers")
+	}
+	prompt, choices, err := llm.CompileSystemOnePrompt(p.CPUModel.Config, state, q, cfg)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	tokens := p.Tokenizer.Encode(prompt)
+	if len(tokens) == 0 {
+		return nil, nil, 0, fmt.Errorf("tokenizer produced no tokens")
+	}
+	if len(tokens) >= p.MaxSeqLen {
+		return nil, nil, 0, fmt.Errorf("prompt too long: %d tokens (max %d)", len(tokens), p.MaxSeqLen)
+	}
+
+	p.ResetState()
+
+	mcfg := p.CPUModel.Config
+	dim := mcfg.EmbeddingDim
+	npos := len(tokens)
+	hidden := make([]float32, dim)
+
+	if isHybridSSMModel(p.CPUModel) {
+		// Chunked prefill with the hidden download on the final chunk.
+		const prefillChunkSize = 512
+		batchSize := npos
+		if batchSize > prefillChunkSize {
+			batchSize = prefillChunkSize
+		}
+		if err := p.ensurePrefillBatchState(batchSize); err != nil {
+			return nil, nil, 0, fmt.Errorf("gpu: systemone batch alloc: %w", err)
+		}
+		for startPos := 0; startPos < npos; startPos += prefillChunkSize {
+			if err := cfg.Err(); err != nil {
+				return nil, nil, 0, err
+			}
+			end := startPos + prefillChunkSize
+			if end > npos {
+				end = npos
+			}
+			chunkTokens := tokens[startPos:end]
+			isLast := end >= npos
+			GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, chunkTokens, p.KVCache, p.RunState,
+				p.BatchState, nil, p.BatchLayerConfs, p, startPos, isLast, hidden)
+			Sync()
+		}
+	} else {
+		// Pure-attention model: single batched prefill covering every token.
+		if err := p.ensurePrefillBatchState(npos); err != nil {
+			return nil, nil, 0, fmt.Errorf("gpu: systemone batch alloc: %w", err)
+		}
+		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
+			p.BatchState, nil, p.BatchLayerConfs, hidden)
+		Sync()
+	}
+
+	// A failed download would leave the buffer all zeros; RMSNorm output can
+	// never legitimately be all-zero, so treat that as an extraction failure.
+	nonZero := false
+	for _, v := range hidden {
+		if v != 0 {
+			nonZero = true
+			break
+		}
+	}
+	if !nonZero {
+		return nil, nil, 0, fmt.Errorf("gpu: hidden extraction produced an all-zero state")
+	}
+	return hidden, choices, npos, nil
+}
+
+// SystemOneWithReadout evaluates a closed-set question on GPU: batched prefill
+// extracts the final hidden state without the vocabulary projection, then the
+// trained linear readout is applied on CPU (a tiny matmul over the downloaded
+// features). Results use the same normalization and abstention rules as the
+// CPU engine.
+func (p *GpuPipeline) SystemOneWithReadout(state string, q llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) (*llm.SystemOneResult, error) {
+	if readout == nil {
+		return nil, fmt.Errorf("System One readout is nil")
+	}
+	if d := readout.NormalizeDevice(); d != "gpu" && d != "any" {
+		return nil, fmt.Errorf("System One readout was trained on %s features; the GPU engine requires a gpu or any-device readout", readout.NormalizeDevice())
+	}
+	start := time.Now()
+	hidden, choices, promptTokens, err := p.SystemOneHidden(state, q, cfg)
+	if err != nil {
+		return nil, err
+	}
+	prefillMs := float64(time.Since(start).Microseconds()) / 1000.0
+	result, err := llm.ApplySystemOneReadout(q, choices, hidden, readout, cfg, promptTokens, prefillMs)
+	if err != nil {
+		return nil, err
+	}
+	result.Engine = "gpu"
+	return result, nil
+}
+
+// SystemOneMulti evaluates several questions against the same state on GPU.
+// When the model supports state branching (fully-GPU, non-MoE, no CPU-attention
+// fallback, no CPU-side SSM state, hybrid SSM batch path), the shared prompt
+// prefix (system + state) is prefilled exactly once, the KV/SSM state is
+// snapshotted on device, and each question runs only its short suffix from a
+// restored copy of that state — mirroring the CPU SystemOneMulti contract.
+// Questions wider than the readout's option count degrade to CPU continuation
+// scoring; questions whose suffix does not concatenate at the token boundary
+// (a BPE merge spanning the prefix/suffix seam) fall back to a standalone
+// per-question prefill, so results are always identical to evaluating the
+// question alone. Results are returned in caller question order.
+func (p *GpuPipeline) SystemOneMulti(state string, questions []llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) ([]*llm.SystemOneResult, error) {
+	if err := cfg.Err(); err != nil {
+		return nil, err
+	}
+	if len(questions) == 0 {
+		return nil, fmt.Errorf("SystemOneMulti requires at least one question")
+	}
+	if readout != nil {
+		if d := readout.NormalizeDevice(); d != "gpu" && d != "any" {
+			return nil, fmt.Errorf("System One readout was trained on %s features; the GPU engine requires a gpu or any-device readout", readout.NormalizeDevice())
+		}
+	}
+	if p.HasMoE || p.IsPartialGPU || p.hasCPUAttn || p.CPURunState != nil || !isHybridSSMModel(p.CPUModel) {
+		return p.systemOneMultiPerQuestion(state, questions, cfg, readout)
+	}
+
+	// Compile every question up front so validation errors surface before any
+	// expensive work, and resolve per-question suffix tokenizations.
+	type compiledQuestion struct {
+		suffixTokens []int32
+		choices      []llm.Choice
+		question     llm.SystemOneQuestion
+	}
+	compiled := make([]compiledQuestion, len(questions))
+	prefix := ""
+	var prefixTokens []int32
+	for i, q := range questions {
+		if len(q.Choices) < 2 {
+			return nil, fmt.Errorf("question %d (%q): System One requires at least two choices", i, q.ID)
+		}
+		if q.Prompt == "" {
+			return nil, fmt.Errorf("question %d (%q): prompt is empty", i, q.ID)
+		}
+		qPrefix, qSuffix, choices, err := llm.CompileSystemOneParts(state, q, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("question %d (%q): %w", i, q.ID, err)
+		}
+		if i == 0 {
+			prefix = qPrefix
+			prefixTokens = p.Tokenizer.Encode(prefix)
+			if len(prefixTokens) == 0 {
+				return nil, fmt.Errorf("System One tokenizer produced no prefix tokens")
+			}
+			if len(prefixTokens) >= p.MaxSeqLen {
+				return nil, fmt.Errorf("System One prefix too long: %d tokens (max %d)", len(prefixTokens), p.MaxSeqLen)
+			}
+		} else if qPrefix != prefix {
+			// All questions must share the same system+state prefix.
+			return nil, fmt.Errorf("question %d (%q): inconsistent prompt prefix", i, q.ID)
+		}
+		suffixTokens := p.Tokenizer.Encode(qSuffix)
+		if len(suffixTokens) == 0 {
+			return nil, fmt.Errorf("question %d (%q): tokenizer produced no suffix tokens", i, q.ID)
+		}
+		if len(prefixTokens)+len(suffixTokens) >= p.MaxSeqLen {
+			return nil, fmt.Errorf("question %d (%q): prompt too long: %d tokens (max %d)", i, q.ID, len(prefixTokens)+len(suffixTokens), p.MaxSeqLen)
+		}
+		compiled[i] = compiledQuestion{suffixTokens: suffixTokens, choices: choices, question: q}
+	}
+
+	// Token-boundary safety: tokenizing prefix and suffix separately must
+	// produce exactly the token stream of the concatenated prompt. A BPE merge
+	// spanning the seam would make the shared KV state invalid for the suffix.
+	// Seam-local check: only a bounded window of bytes around the seam can be
+	// affected by merges that cross it (BPE merges have bounded length, bounded
+	// by the longest merge in the vocab); encoding the full prefix again per
+	// question is O(N) tokenization work per question and dominated long-state
+	// multi requests. We encode the concatenation of the seam window and
+	// compare against separately-encoded prefix-window and suffix tokens; if
+	// anything mismatches we conservatively mark the question token-unsafe
+	// (standalone fallback), preserving correctness.
+	for i := range compiled {
+		_, qSuffix, _, err := llm.CompileSystemOneParts(state, questions[i], cfg)
+		if err != nil {
+			return nil, fmt.Errorf("question %d (%q): %w", i, questions[i].ID, err)
+		}
+		compiled[i].suffixTokens = p.checkSeamBoundary(prefix, prefixTokens, qSuffix)
+	}
+
+	// Prefill the shared prefix once.
+	maxSuffix := 0
+	for i := range compiled {
+		if compiled[i].suffixTokens != nil && len(compiled[i].suffixTokens) > maxSuffix {
+			maxSuffix = len(compiled[i].suffixTokens)
+		}
+	}
+	// Prefix prefill is chunked: allocating batch scratch for the entire
+	// document wastes VRAM and first-request time without doing larger GEMMs.
+	batchNeeded := len(prefixTokens)
+	if batchNeeded > 512 {
+		batchNeeded = 512
+	}
+	if maxSuffix > batchNeeded {
+		batchNeeded = maxSuffix
+	}
+	if err := p.ensurePrefillBatchState(batchNeeded); err != nil {
+		return nil, fmt.Errorf("gpu: systemone multi batch alloc: %w", err)
+	}
+
+	// Shared-prefix state: serve from the prefix cache when this exact state
+	// was prefilled recently (repeated decisions over the same document skip
+	// the long prefill entirely), otherwise prefill once and cache the
+	// snapshot. The snapshot is cache-owned on both paths — do not free it.
+	// Numerical safety: a cache hit restores byte-identical KV/SSM/conv state
+	// and sets KVCache.Len; positions beyond the prefix are overwritten by
+	// each suffix pass before they are ever read, so restored-from-cache
+	// results are bit-identical to a fresh prefill (verified by the parity
+	// tests and the cached-vs-fresh regression test).
+	var snap *GpuStateSnapshot
+	// A cache lookup does not imply its KV prefix is live: generation or
+	// another decision request may have replaced it. Fresh prefill does.
+	prefixResident := false
+	var sharedPrefillMs float64
+	prefixKey := sha256.Sum256([]byte(prefix))
+	if cached := p.lookupPrefixCache(prefixKey, len(prefixTokens)); cached != nil {
+		snap = cached
+	} else {
+		p.ResetState()
+		prefillStart := time.Now()
+		const prefillChunkSize = 512
+		for startPos := 0; startPos < len(prefixTokens); startPos += prefillChunkSize {
+			if err := cfg.Err(); err != nil {
+				return nil, err
+			}
+			end := startPos + prefillChunkSize
+			if end > len(prefixTokens) {
+				end = len(prefixTokens)
+			}
+			GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, prefixTokens[startPos:end], p.KVCache, p.RunState,
+				p.BatchState, nil, p.BatchLayerConfs, p, startPos, false, nil)
+			Sync()
+		}
+		sharedPrefillMs = float64(time.Since(prefillStart).Microseconds()) / 1000.0
+		if err := cfg.Err(); err != nil {
+			return nil, err
+		}
+		s, err := p.SnapshotState(len(prefixTokens))
+		if err != nil {
+			return nil, fmt.Errorf("gpu: systemone multi state snapshot: %w", err)
+		}
+		p.storePrefixCache(prefixKey, len(prefixTokens), s)
+		snap = s
+		prefixResident = true
+	}
+
+	results := make([]*llm.SystemOneResult, len(questions))
+	for i, cq := range compiled {
+		if err := cfg.Err(); err != nil {
+			return nil, err
+		}
+		// Per-question graceful degradation: the trained readout covers a
+		// fixed number of answer slots; questions wider than that fall back
+		// to generic continuation scoring instead of failing the request.
+		effectiveReadout := readout
+		degraded := false
+		if readout != nil && len(cq.choices) > readout.MaxOptions {
+			effectiveReadout = nil
+			degraded = true
+		}
+		if effectiveReadout == nil {
+			// Degraded (too wide) or readout-less: CPU continuation scoring.
+			if p.CPUPipeline == nil {
+				return nil, fmt.Errorf("question %d (%q): no CPU pipeline available for continuation scoring", i, cq.question.ID)
+			}
+			r, err := p.CPUPipeline.SystemOne(state, cq.question, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("question %d (%q): %w", i, cq.question.ID, err)
+			}
+			r.Degraded = readout != nil
+			r.Engine = "cpu"
+			r.SharedPrefillTimeMs = sharedPrefillMs
+			results[i] = r
+			continue
+		}
+		if cq.suffixTokens == nil {
+			// Standalone prefill replaces prefix KV; the next branch must
+			// restore the full snapshot, not just recurrent state.
+			prefixResident = false
+			// Token-boundary mismatch: evaluate this question standalone.
+			r, err := p.SystemOneWithReadout(state, cq.question, cfg, effectiveReadout)
+			if err != nil {
+				return nil, fmt.Errorf("question %d (%q): %w", i, cq.question.ID, err)
+			}
+			r.SharedPrefillTimeMs = sharedPrefillMs
+			r.Degraded = degraded
+			results[i] = r
+			continue
+		}
+
+		// Suffix passes append KV beyond the immutable prefix. Once that
+		// prefix is resident, branch only the recurrent state instead of
+		// copying the entire document KV again for every question.
+		var restoreErr error
+		if prefixResident {
+			restoreErr = p.RestoreRecurrentState(snap)
+		} else {
+			restoreErr = p.RestoreState(snap)
+		}
+		if restoreErr != nil {
+			return nil, fmt.Errorf("question %d (%q): %w", i, cq.question.ID, restoreErr)
+		}
+		prefixResident = true
+		suffixStart := time.Now()
+		hidden := make([]float32, p.CPUModel.Config.EmbeddingDim)
+		GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, cq.suffixTokens, p.KVCache, p.RunState,
+			p.BatchState, nil, p.BatchLayerConfs, p, len(prefixTokens), true, hidden)
+		Sync()
+		suffixMs := float64(time.Since(suffixStart).Microseconds()) / 1000.0
+
+		// A failed download would leave the buffer all zeros; RMSNorm output
+		// can never legitimately be all-zero.
+		nonZero := false
+		for _, v := range hidden {
+			if v != 0 {
+				nonZero = true
+				break
+			}
+		}
+		if !nonZero {
+			return nil, fmt.Errorf("gpu: question %d (%q): hidden extraction produced an all-zero state", i, cq.question.ID)
+		}
+		r, err := llm.ApplySystemOneReadout(cq.question, cq.choices, hidden, effectiveReadout, cfg, len(prefixTokens)+len(cq.suffixTokens), suffixMs)
+		if err != nil {
+			return nil, fmt.Errorf("question %d (%q): %w", i, cq.question.ID, err)
+		}
+		r.SharedPrefillTimeMs = sharedPrefillMs
+		r.Engine = "gpu"
+		results[i] = r
+	}
+	return results, nil
+}
+
+// seamCheckTokens is how many trailing prefix tokens the seam-local boundary
+// check re-encodes. BPE merges are pairwise and only ever span the immediate
+// seam; a chain of such merges consumes one more token per link, so a window
+// of this many tokens vastly exceeds any real cross-seam chain.
+const seamCheckTokens = 16
+
+// checkSeamBoundary verifies that encode(prefix)+encode(suffix) is exactly
+// encode(prefix+suffix) by re-encoding only a token-aligned window at the end
+// of the prefix plus the suffix. It returns the suffix tokens, or nil when the
+// seam cannot be proven safe (the caller then evaluates the question
+// standalone).
+//
+// Correctness argument: take the last K prefix tokens and decode them to their
+// exact bytes W. Because W starts at a token boundary of the prefix's final
+// segmentation, no BPE merge pairs across that boundary (a spanning merge
+// would have produced a token spanning it), so BPE's merges strictly inside W
+// happen identically whether or not the rest of the prefix is present — hence
+// encode(W) == tail tokens. Now encode(W+suffix): any cross-seam merge or
+// merge chain alters the joined token stream within the window, making it
+// differ from tail+suffixTokens. If it does not differ, the full-text encoding
+// equals encode(prefix)+encode(suffix) everywhere: bytes left of the window
+// tokenize identically (their merges are all strictly inside that region and
+// unaffected), and the window+suffix region is checked exactly.
+func (p *GpuPipeline) checkSeamBoundary(prefix string, prefixTokens []int32, suffix string) []int32 {
+	suffixTokens := p.Tokenizer.Encode(suffix)
+	if len(suffixTokens) == 0 || len(prefixTokens) == 0 {
+		return nil
+	}
+	k := seamCheckTokens
+	if k > len(prefixTokens) {
+		k = len(prefixTokens)
+	}
+	tail := prefixTokens[len(prefixTokens)-k:]
+	windowText := p.Tokenizer.Decode(append([]int32(nil), tail...))
+	if windowText == "" {
+		return nil
+	}
+	// Insurance: the window must re-encode to exactly the tail tokens (holds
+	// by boundary independence for well-formed vocabularies; fall back to the
+	// standalone path if this tokenizer behaves unexpectedly).
+	wt := p.Tokenizer.Encode(windowText)
+	if len(wt) != len(tail) {
+		return nil
+	}
+	for i := range wt {
+		if wt[i] != tail[i] {
+			return nil
+		}
+	}
+	joined := p.Tokenizer.Encode(windowText + suffix)
+	want := append(append([]int32(nil), tail...), suffixTokens...)
+	if len(joined) != len(want) {
+		return nil
+	}
+	for i := range joined {
+		if joined[i] != want[i] {
+			return nil
+		}
+	}
+	return suffixTokens
+}
+
+// systemOneMultiPerQuestion evaluates each question with an independent full
+// prefill. This is the fallback for models the shared-prefill path cannot
+// serve (MoE, partial GPU, CPU-attention layers, CPU-side SSM state, or
+// non-hybrid batch paths that prefill from position 0).
+func (p *GpuPipeline) systemOneMultiPerQuestion(state string, questions []llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) ([]*llm.SystemOneResult, error) {
+	results := make([]*llm.SystemOneResult, len(questions))
+	for i, q := range questions {
+		if err := cfg.Err(); err != nil {
+			return nil, err
+		}
+		useGPU := readout != nil && len(q.Choices) <= readout.MaxOptions
+		if !useGPU {
+			// Degraded (too wide) or readout-less: CPU continuation scoring.
+			if p.CPUPipeline == nil {
+				return nil, fmt.Errorf("question %d (%q): no CPU pipeline available for continuation scoring", i, q.ID)
+			}
+			r, err := p.CPUPipeline.SystemOne(state, q, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("question %d (%q): %w", i, q.ID, err)
+			}
+			r.Degraded = readout != nil
+			r.Engine = "cpu"
+			results[i] = r
+			continue
+		}
+		r, err := p.SystemOneWithReadout(state, q, cfg, readout)
+		if err != nil {
+			return nil, fmt.Errorf("question %d (%q): %w", i, q.ID, err)
+		}
+		results[i] = r
+	}
+	return results, nil
 }
 
 // supportsBatchPrefillGPU gates the batched prefill path.

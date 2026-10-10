@@ -1,0 +1,11 @@
+{
+  "name": "smollm2-360m-q8_0",
+  "text": "In the vast expanse of the ocean's blue,\nA world so vast and deep, it seems to hold.\nThe waves gently caress the sandy shore,\nAs the sun sets low in the sky above.\n\nThe sea is a mysterious place,\nWhere secrets are hidden beneath its surface.\nIt whispers tales of ancient times,\nAnd holds mysteries that only time can tell.\n\nThe tides ebb and flow with power,\nAs the moon's gentle touch awakens the day.\nThe ocean's depths are home to many,\nA realm where life thrives and death does not abide.\n\nIn this vast and wondrous place,\nWe find beauty, wonder, and peace.\nThe ocean's song",
+  "tok_s": 270.71560964252905,
+  "prefill_ms": 5695.835,
+  "generate_ms": 554.087,
+  "total_tokens": 150,
+  "prompt_tokens": 27,
+  "gpu_layers": 32,
+  "dp4a": true
+}

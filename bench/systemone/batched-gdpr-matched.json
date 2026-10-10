@@ -1,0 +1,479 @@
+{
+  "url": "http://127.0.0.1:8094/v1/systemone",
+  "request_sha256": "946acf8f047f2467c8506607bd4583b07679aaea88606b12b9bb6704dfde3b40",
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "question_count": 13,
+  "runs": [
+    {
+      "cold_ms": 6663.522900082171,
+      "warm_ms": 830.7199999690056,
+      "input_tokens": 10818,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=6642.270400",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=829.866400",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "applies_non_eu": {
+          "noul": 0.9594550991389961,
+          "type": "noul"
+        },
+        "breach_72h": {
+          "noul": 0.5502979350364999,
+          "type": "noul"
+        },
+        "compliance_burden": {
+          "confidence": 0.9785564224472605,
+          "legend": {
+            "0": "Negligible: no meaningful obligations.",
+            "1": "Light: a few notices and disclosures.",
+            "2": "Moderate: documented processes and some dedicated roles for larger processors.",
+            "3": "Heavy: records, impact assessments, officers, and breach procedures for many organisations.",
+            "4": "Extreme: obligations so demanding that ordinary organisations cannot fully comply."
+          },
+          "probabilities": {
+            "0": 0.00392873791700287,
+            "1": 0.000893396232594142,
+            "2": 0.004471709603471763,
+            "3": 0.9828451379578084,
+            "4": 0.007861018289122841
+          },
+          "score": 2.989816302469454,
+          "type": "score"
+        },
+        "criminal_penalties": {
+          "noul": 0.10889651941644703,
+          "type": "noul"
+        },
+        "data_portability": {
+          "noul": 0.7389283029686858,
+          "type": "noul"
+        },
+        "dpo_all_orgs": {
+          "noul": 0.1430989952127255,
+          "type": "noul"
+        },
+        "individual_rights": {
+          "confidence": 0.8238170844966421,
+          "legend": {
+            "0": "None: individuals get no rights over their data.",
+            "1": "Weak: a right to be informed, but little control.",
+            "2": "Moderate: access and correction rights, but limited means to act on them.",
+            "3": "Strong: access, erasure, portability, and objection rights, with enforcement behind them."
+          },
+          "probabilities": {
+            "0": 0.006296651816099471,
+            "1": 0.009953435478795939,
+            "2": 0.11588709933262296,
+            "3": 0.8678628133724816
+          },
+          "score": 2.8453160742614867,
+          "type": "score"
+        },
+        "instrument_type": {
+          "choice": "Regulation",
+          "confidence": 0.9902338124813815,
+          "probabilities": {
+            "Directive": 0.0018215930870997385,
+            "Recommendation": 0.0005084726827938405,
+            "Regulation": 0.9926753593610361,
+            "Treaty": 0.004994574869070286
+          },
+          "type": "choice"
+        },
+        "max_fine": {
+          "choice": "TenM_or_2pct",
+          "confidence": 0.8856958193055752,
+          "probabilities": {
+            "FixedCap": 0.0021140593125210773,
+            "NoFines": 0.0011620634036010634,
+            "TenM_or_2pct": 0.9142718644791814,
+            "TwentyM_or_4pct": 0.08245201280469645
+          },
+          "type": "choice"
+        },
+        "penalty_severity": {
+          "confidence": 0.568203063111352,
+          "legend": {
+            "0": "None: no penalties of any kind.",
+            "1": "Symbolic: small fixed fines unlikely to change behavior.",
+            "2": "Substantial: fines large enough to matter to most companies.",
+            "3": "Severe: fines scaled to global revenue, material even to the largest companies."
+          },
+          "probabilities": {
+            "0": 0.013388347831021772,
+            "1": 0.006044034223906301,
+            "2": 0.676152297333514,
+            "3": 0.3044153206115579
+          },
+          "score": 2.2715945907256083,
+          "type": "score"
+        },
+        "pre_ticked_consent": {
+          "noul": 0.11415383787682053,
+          "type": "noul"
+        },
+        "right_erasure": {
+          "noul": 0.7415341127761749,
+          "type": "noul"
+        },
+        "us_federal_law": {
+          "noul": 0.24646900800102833,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "applies_non_eu": {
+          "noul": 0.9594550991389961,
+          "type": "noul"
+        },
+        "breach_72h": {
+          "noul": 0.5502979350364999,
+          "type": "noul"
+        },
+        "compliance_burden": {
+          "confidence": 0.9785564224472605,
+          "legend": {
+            "0": "Negligible: no meaningful obligations.",
+            "1": "Light: a few notices and disclosures.",
+            "2": "Moderate: documented processes and some dedicated roles for larger processors.",
+            "3": "Heavy: records, impact assessments, officers, and breach procedures for many organisations.",
+            "4": "Extreme: obligations so demanding that ordinary organisations cannot fully comply."
+          },
+          "probabilities": {
+            "0": 0.00392873791700287,
+            "1": 0.000893396232594142,
+            "2": 0.004471709603471763,
+            "3": 0.9828451379578084,
+            "4": 0.007861018289122841
+          },
+          "score": 2.989816302469454,
+          "type": "score"
+        },
+        "criminal_penalties": {
+          "noul": 0.10889651941644703,
+          "type": "noul"
+        },
+        "data_portability": {
+          "noul": 0.7389283029686858,
+          "type": "noul"
+        },
+        "dpo_all_orgs": {
+          "noul": 0.1430989952127255,
+          "type": "noul"
+        },
+        "individual_rights": {
+          "confidence": 0.8238170844966421,
+          "legend": {
+            "0": "None: individuals get no rights over their data.",
+            "1": "Weak: a right to be informed, but little control.",
+            "2": "Moderate: access and correction rights, but limited means to act on them.",
+            "3": "Strong: access, erasure, portability, and objection rights, with enforcement behind them."
+          },
+          "probabilities": {
+            "0": 0.006296651816099471,
+            "1": 0.009953435478795939,
+            "2": 0.11588709933262296,
+            "3": 0.8678628133724816
+          },
+          "score": 2.8453160742614867,
+          "type": "score"
+        },
+        "instrument_type": {
+          "choice": "Regulation",
+          "confidence": 0.9902338124813815,
+          "probabilities": {
+            "Directive": 0.0018215930870997385,
+            "Recommendation": 0.0005084726827938405,
+            "Regulation": 0.9926753593610361,
+            "Treaty": 0.004994574869070286
+          },
+          "type": "choice"
+        },
+        "max_fine": {
+          "choice": "TenM_or_2pct",
+          "confidence": 0.8856958193055752,
+          "probabilities": {
+            "FixedCap": 0.0021140593125210773,
+            "NoFines": 0.0011620634036010634,
+            "TenM_or_2pct": 0.9142718644791814,
+            "TwentyM_or_4pct": 0.08245201280469645
+          },
+          "type": "choice"
+        },
+        "penalty_severity": {
+          "confidence": 0.568203063111352,
+          "legend": {
+            "0": "None: no penalties of any kind.",
+            "1": "Symbolic: small fixed fines unlikely to change behavior.",
+            "2": "Substantial: fines large enough to matter to most companies.",
+            "3": "Severe: fines scaled to global revenue, material even to the largest companies."
+          },
+          "probabilities": {
+            "0": 0.013388347831021772,
+            "1": 0.006044034223906301,
+            "2": 0.676152297333514,
+            "3": 0.3044153206115579
+          },
+          "score": 2.2715945907256083,
+          "type": "score"
+        },
+        "pre_ticked_consent": {
+          "noul": 0.11415383787682053,
+          "type": "noul"
+        },
+        "right_erasure": {
+          "noul": 0.7415341127761749,
+          "type": "noul"
+        },
+        "us_federal_law": {
+          "noul": 0.24646900800102833,
+          "type": "noul"
+        }
+      }
+    },
+    {
+      "cold_ms": 6644.332600058988,
+      "warm_ms": 836.8595000356436,
+      "input_tokens": 10817,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=6643.596600",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=836.124400",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "applies_non_eu": {
+          "noul": 0.9632895217797254,
+          "type": "noul"
+        },
+        "breach_72h": {
+          "noul": 0.5610650553258743,
+          "type": "noul"
+        },
+        "compliance_burden": {
+          "confidence": 0.9776471986688815,
+          "legend": {
+            "0": "Negligible: no meaningful obligations.",
+            "1": "Light: a few notices and disclosures.",
+            "2": "Moderate: documented processes and some dedicated roles for larger processors.",
+            "3": "Heavy: records, impact assessments, officers, and breach procedures for many organisations.",
+            "4": "Extreme: obligations so demanding that ordinary organisations cannot fully comply."
+          },
+          "probabilities": {
+            "0": 0.004413721021764176,
+            "1": 0.0008407850603694051,
+            "2": 0.004462025053752632,
+            "3": 0.9821177589351052,
+            "4": 0.00816570992900856
+          },
+          "score": 2.9887809516892245,
+          "type": "score"
+        },
+        "criminal_penalties": {
+          "noul": 0.12323199308445253,
+          "type": "noul"
+        },
+        "data_portability": {
+          "noul": 0.7563492225471908,
+          "type": "noul"
+        },
+        "dpo_all_orgs": {
+          "noul": 0.14561584250606727,
+          "type": "noul"
+        },
+        "individual_rights": {
+          "confidence": 0.8252902757774123,
+          "legend": {
+            "0": "None: individuals get no rights over their data.",
+            "1": "Weak: a right to be informed, but little control.",
+            "2": "Moderate: access and correction rights, but limited means to act on them.",
+            "3": "Strong: access, erasure, portability, and objection rights, with enforcement behind them."
+          },
+          "probabilities": {
+            "0": 0.0074879325119805,
+            "1": 0.010484349165304408,
+            "2": 0.11306001148965573,
+            "3": 0.8689677068330592
+          },
+          "score": 2.8435074926437935,
+          "type": "score"
+        },
+        "instrument_type": {
+          "choice": "Regulation",
+          "confidence": 0.9903340283752585,
+          "probabilities": {
+            "Directive": 0.0019849430002408224,
+            "Recommendation": 0.0005101506157374566,
+            "Regulation": 0.9927505212814439,
+            "Treaty": 0.0047543851025778966
+          },
+          "type": "choice"
+        },
+        "max_fine": {
+          "choice": "TenM_or_2pct",
+          "confidence": 0.8807180061270623,
+          "probabilities": {
+            "FixedCap": 0.0024647247372584203,
+            "NoFines": 0.0011381521333246652,
+            "TenM_or_2pct": 0.9105385045952967,
+            "TwentyM_or_4pct": 0.08585861853412009
+          },
+          "type": "choice"
+        },
+        "penalty_severity": {
+          "confidence": 0.5471045801212551,
+          "legend": {
+            "0": "None: no penalties of any kind.",
+            "1": "Symbolic: small fixed fines unlikely to change behavior.",
+            "2": "Substantial: fines large enough to matter to most companies.",
+            "3": "Severe: fines scaled to global revenue, material even to the largest companies."
+          },
+          "probabilities": {
+            "0": 0.01434910223729907,
+            "1": 0.005445774645880365,
+            "2": 0.6603284350909413,
+            "3": 0.31987668802587926
+          },
+          "score": 2.285732708905401,
+          "type": "score"
+        },
+        "pre_ticked_consent": {
+          "noul": 0.12992685490594305,
+          "type": "noul"
+        },
+        "right_erasure": {
+          "noul": 0.73291029639156,
+          "type": "noul"
+        },
+        "us_federal_law": {
+          "noul": 0.2698647504097859,
+          "type": "noul"
+        }
+      },
+      "warm_answers": {
+        "applies_non_eu": {
+          "noul": 0.9632895217797254,
+          "type": "noul"
+        },
+        "breach_72h": {
+          "noul": 0.5610650553258743,
+          "type": "noul"
+        },
+        "compliance_burden": {
+          "confidence": 0.9776471986688815,
+          "legend": {
+            "0": "Negligible: no meaningful obligations.",
+            "1": "Light: a few notices and disclosures.",
+            "2": "Moderate: documented processes and some dedicated roles for larger processors.",
+            "3": "Heavy: records, impact assessments, officers, and breach procedures for many organisations.",
+            "4": "Extreme: obligations so demanding that ordinary organisations cannot fully comply."
+          },
+          "probabilities": {
+            "0": 0.004413721021764176,
+            "1": 0.0008407850603694051,
+            "2": 0.004462025053752632,
+            "3": 0.9821177589351052,
+            "4": 0.00816570992900856
+          },
+          "score": 2.9887809516892245,
+          "type": "score"
+        },
+        "criminal_penalties": {
+          "noul": 0.12323199308445253,
+          "type": "noul"
+        },
+        "data_portability": {
+          "noul": 0.7563492225471908,
+          "type": "noul"
+        },
+        "dpo_all_orgs": {
+          "noul": 0.14561584250606727,
+          "type": "noul"
+        },
+        "individual_rights": {
+          "confidence": 0.8252902757774123,
+          "legend": {
+            "0": "None: individuals get no rights over their data.",
+            "1": "Weak: a right to be informed, but little control.",
+            "2": "Moderate: access and correction rights, but limited means to act on them.",
+            "3": "Strong: access, erasure, portability, and objection rights, with enforcement behind them."
+          },
+          "probabilities": {
+            "0": 0.0074879325119805,
+            "1": 0.010484349165304408,
+            "2": 0.11306001148965573,
+            "3": 0.8689677068330592
+          },
+          "score": 2.8435074926437935,
+          "type": "score"
+        },
+        "instrument_type": {
+          "choice": "Regulation",
+          "confidence": 0.9903340283752585,
+          "probabilities": {
+            "Directive": 0.0019849430002408224,
+            "Recommendation": 0.0005101506157374566,
+            "Regulation": 0.9927505212814439,
+            "Treaty": 0.0047543851025778966
+          },
+          "type": "choice"
+        },
+        "max_fine": {
+          "choice": "TenM_or_2pct",
+          "confidence": 0.8807180061270623,
+          "probabilities": {
+            "FixedCap": 0.0024647247372584203,
+            "NoFines": 0.0011381521333246652,
+            "TenM_or_2pct": 0.9105385045952967,
+            "TwentyM_or_4pct": 0.08585861853412009
+          },
+          "type": "choice"
+        },
+        "penalty_severity": {
+          "confidence": 0.5471045801212551,
+          "legend": {
+            "0": "None: no penalties of any kind.",
+            "1": "Symbolic: small fixed fines unlikely to change behavior.",
+            "2": "Substantial: fines large enough to matter to most companies.",
+            "3": "Severe: fines scaled to global revenue, material even to the largest companies."
+          },
+          "probabilities": {
+            "0": 0.01434910223729907,
+            "1": 0.005445774645880365,
+            "2": 0.6603284350909413,
+            "3": 0.31987668802587926
+          },
+          "score": 2.285732708905401,
+          "type": "score"
+        },
+        "pre_ticked_consent": {
+          "noul": 0.12992685490594305,
+          "type": "noul"
+        },
+        "right_erasure": {
+          "noul": 0.73291029639156,
+          "type": "noul"
+        },
+        "us_federal_law": {
+          "noul": 0.2698647504097859,
+          "type": "noul"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 6653.927750070579,
+      "p50_ms": 6644.332600058988,
+      "p95_ms": 6663.522900082171,
+      "p99_ms": 6663.522900082171,
+      "samples": 2
+    },
+    "warm": {
+      "mean_ms": 833.7897500023246,
+      "p50_ms": 830.7199999690056,
+      "p95_ms": 836.8595000356436,
+      "p99_ms": 836.8595000356436,
+      "samples": 2
+    }
+  }
+}

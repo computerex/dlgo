@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x=256) in;
+layout(set=0,binding=0) buffer Alpha {float alpha_data[];};
+layout(set=0,binding=1) buffer Beta {float beta_data[];};
+layout(set=0,binding=2) readonly buffer A {float ssma_data[];};
+layout(set=0,binding=3) readonly buffer Bias {float dt_bias[];};
+layout(set=0,binding=4) buffer QKV {float qkv[];};
+layout(push_constant) uniform Params {
+ int num_heads; int head_k_dim; int key_dim; float rms_eps; int has_dt_bias; int head_v_dim;
+};
+shared float sdata[256];
+void main() {
+ uint tid=gl_LocalInvocationID.x;
+ uint h=gl_WorkGroupID.x;
+ uint token=gl_WorkGroupID.y;
+ uint ah=token*uint(num_heads)+h;
+ uint off=token*uint(2*key_dim+num_heads*head_v_dim);
+ if(tid==0) {
+  float a=alpha_data[ah];
+  if(has_dt_bias!=0) a+=dt_bias[h];
+  float sp=(a>20.0)?a:log(1.0+exp(a));
+  alpha_data[ah]=ssma_data[h]*sp;
+  float b=beta_data[ah];
+  beta_data[ah]=1.0/(1.0+exp(-b));
+ }
+ int groups=key_dim/head_k_dim;
+ if(int(h)<groups) {
+  uint qBase=off+h*uint(head_k_dim);
+  float sq=0.0;
+  for(int i=int(tid);i<head_k_dim;i+=256) {float v=qkv[qBase+uint(i)];sq+=v*v;}
+  sdata[tid]=sq;barrier();
+  for(uint s=128;s>0;s>>=1){if(tid<s)sdata[tid]+=sdata[tid+s];barrier();}
+  float l2ScaleQ=inversesqrt(max(sdata[0],rms_eps));barrier();
+  for(int i=int(tid);i<head_k_dim;i+=256)qkv[qBase+uint(i)]*=l2ScaleQ;
+  barrier();
+  float qScale=1.0/sqrt(float(head_k_dim));
+  for(int i=int(tid);i<head_k_dim;i+=256)qkv[qBase+uint(i)]*=qScale;
+  uint kBase=off+uint(key_dim)+h*uint(head_k_dim);
+  float sk=0.0;
+  for(int i=int(tid);i<head_k_dim;i+=256){float v=qkv[kBase+uint(i)];sk+=v*v;}
+  sdata[tid]=sk;barrier();
+  for(uint s=128;s>0;s>>=1){if(tid<s)sdata[tid]+=sdata[tid+s];barrier();}
+  float scaleK=inversesqrt(max(sdata[0],rms_eps));barrier();
+  for(int i=int(tid);i<head_k_dim;i+=256)qkv[kBase+uint(i)]*=scaleK;
+ }
+}

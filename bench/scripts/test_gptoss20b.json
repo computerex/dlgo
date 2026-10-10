@@ -1,0 +1,11 @@
+{
+  "name": "gpt-oss-20b-Q3_K_M",
+  "text": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nf\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nIn\n\n\n\n\n\n\n\n\n\n\n\n\n\nA\n\n\n\n\n\n\n\n\n\n\n\n\n\nS\n\n\n\n\n\n\n\n\n\n\n\n\n\nE\n\n\n\n\n\n\n\n\n\n\n\n\n\n---\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n...\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nG\n\n\n\n\n\n\n\n\n\n\n\n\n\nI\n\n\n\n\n\n\n\n\n\n\n\n\n\nC\n\n\n\n\n\n\n\n\n\n\n\n\n\nB\n\n\n\n\n\n\n\n\n\n\n\n\n\nP\n\n\n\n\n\n\n\n\n\n\n\n\n\nAs\n\n\n\n\n\n\n\n\n\n\n\n\n\nM\n\n\n\n\n\n\n\n\n\n\n\n\n\nN\n\n\n\n\n\n\n\n\n\n\n\n\n\nSo\n\n\n\n\n\n\n\n\n\n\n\n\n\nIs\n\n\n\n\n\n\n\n\n\n\n\n\n\nL\n\n\n\n\n\n\n\n\n\n\n\n\n\nTh\n\n\n\n\n\n\n\n\n\n\n\n\n\nAp\n\n\n\n\n\n\n\n\n\n\n\n\n\nW\n\n\n\n\n\n\n\n\n\n\n\n\n\nF\n\n\n\n\n\n\n\n\n\n\n\n\n\nAt\n\n\n\n\n\n\n\n\n\n\n\n\n\nT\n\n\n\n\n\n\n\n\n\n\n\n\n\n?\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n1\n\n\n\n\n\n\n\n\n\n\n\n\n\nR\n\n\n\n\n\n\n\n\n\n\n\n\n\n:\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\ns\n\n\n\n\n\n\n\n\n\n\n\n\n\n)\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n,\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nH\n\n\n\n\n\n\n\n\n\n\n\n\n\n,\n\n\n\n\n\n\n\n\n\n\n\n\n\nK\n\n\n\n\n\n\n\n\n\n\n\n\n\nD\n\n\n\n\n\n\n\n\n\n\n\n\n\nFirst\n\n\n\n\n\n\n\n\n\n\n\n\n\n\"\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n0\n\n\n\n\n\n\n\n\n\n\n\n\n\nWe\n\n\n\n\n\n\n\n\n\n\n\n\n\n?\n\n\n\n\n\n\n\n\n\n\n\n\n\n2\n\n\n\n\n\n\n\n\n\n\n\n\n\nTo\n\n\n\n\n\n\n\n\n\n\n\n\n\n3\n\n\n\n\n\n\n\n\n\n\n\n\n\nO\n\n\n\n\n\n\n\n\n\n\n\n\n\nIf\n\n\n\n\n\n\n\n\n\n\n\n\n\nWith\n\n\n\n\n\n\n\n\n\n\n\n\n\nBut\n\n\n\n\n\n\n\n\n\n\n\n\n\ni\n\n\n\n\n\n\n\n\n\n\n\n\n\n\u003e\n\n\n\n\n\n\n\n\n\n\n\n\n\n.\n\n\n\n\n\n\n\n\n\n\n\n\n\ning\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\na\n\n\n\n\n\n\n\n\n\n\n\n\n\nV\n\n\n\n\n\n\n\n\n\n\n\n\n\nX\n\n\n\n\n\n\n\n\n\n\n\n\n\nNow\n\n\n\n\n\n\n\n\n\n\n\n\n\nOf\n\n\n\n\n\n\n\n\n\n\n\n\n\nTime\n\n\n\n\n\n\n\n\n\n\n\n\n\nRe",
+  "tok_s": 97.92658091692967,
+  "prefill_ms": 1079.425,
+  "generate_ms": 5105.866,
+  "total_tokens": 500,
+  "prompt_tokens": 108,
+  "gpu_layers": 24,
+  "dp4a": true
+}

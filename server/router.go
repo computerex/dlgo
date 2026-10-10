@@ -33,6 +33,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/v1/models/available", s.cors(s.handleAvailableModels))
 	s.mux.HandleFunc("/v1/chats", s.cors(s.handleChats))
 	s.mux.HandleFunc("/v1/chats/", s.cors(s.handleChatDetail))
+	s.mux.HandleFunc("/v1/systemone", s.cors(s.handleSystemOne))
 	s.mux.HandleFunc("/health", s.cors(s.handleHealth))
 }
 

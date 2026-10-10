@@ -1,0 +1,19 @@
+#version 450
+// Separate raw input/output prevents cross-token in-place overwrite races.
+layout(local_size_x=256) in;
+layout(set=0,binding=0) readonly buffer Input { float raw[]; };
+layout(set=0,binding=1) buffer Output { float qkv[]; };
+layout(set=0,binding=2) buffer ConvState { float conv_buf[]; };
+layout(set=0,binding=3) readonly buffer Weights { float conv_w[]; };
+layout(push_constant) uniform Params { int channels; int conv_k; int npos; };
+void main() {
+ uint c=gl_GlobalInvocationID.x;
+ if(c>=channels) return;
+ for(int p=0;p<npos;p++) {
+  for(int t=0;t<conv_k-1;t++) conv_buf[t*channels+c]=conv_buf[(t+1)*channels+c];
+  conv_buf[(conv_k-1)*channels+c]=raw[p*channels+c];
+  float acc=0.0;
+  for(int k=0;k<conv_k;k++) acc+=conv_buf[k*channels+c]*conv_w[int(c)*conv_k+k];
+  qkv[p*channels+c]=acc/(1.0+exp(-acc));
+ }
+}

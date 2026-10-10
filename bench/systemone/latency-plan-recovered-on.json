@@ -1,0 +1,208 @@
+{
+  "url": "http://127.0.0.1:8097/v1/systemone",
+  "request_sha256": "425f0404f881fc31f1a518d3e4a37d415e78b362b20da88d6b86b78b8a0f506f",
+  "model": "qwen35-9b",
+  "readout": "systemone-train/artifacts/qwen35-9b-q3-readout-v2-uni.json",
+  "question_count": 3,
+  "runs": [
+    {
+      "cold_ms": 24802.06779995933,
+      "warm_ms": 855.6737001053989,
+      "input_tokens": 10812,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=24801.464900",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=832.265200",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.02494635907419157,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9995993986388105,
+          "probabilities": {
+            "electric": 0.9997329324258737,
+            "fire": 1.4257177802890542e-05,
+            "water": 0.00025281039632337463
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5048535023576437,
+          "probabilities": {
+            "gengar": 0.30728736282490493,
+            "pikachu": 0.6699023349050959,
+            "snorlax": 0.022810302269999114
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.02494635907419157,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9995993986388105,
+          "probabilities": {
+            "electric": 0.9997329324258737,
+            "fire": 1.4257177802890542e-05,
+            "water": 0.00025281039632337463
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5048535023576437,
+          "probabilities": {
+            "gengar": 0.30728736282490493,
+            "pikachu": 0.6699023349050959,
+            "snorlax": 0.022810302269999114
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 24924.5801998768,
+      "warm_ms": 850.704199867323,
+      "input_tokens": 10811,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=24911.672200",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=838.480800",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.01906706460481938,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996739803486416,
+          "probabilities": {
+            "electric": 0.9997826535657611,
+            "fire": 1.1235986549804367e-05,
+            "water": 0.00020611044768894103
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5369181239099781,
+          "probabilities": {
+            "gengar": 0.2854986296663555,
+            "pikachu": 0.6912787492733187,
+            "snorlax": 0.023222621060325847
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.01906706460481938,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996739803486416,
+          "probabilities": {
+            "electric": 0.9997826535657611,
+            "fire": 1.1235986549804367e-05,
+            "water": 0.00020611044768894103
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5369181239099781,
+          "probabilities": {
+            "gengar": 0.2854986296663555,
+            "pikachu": 0.6912787492733187,
+            "snorlax": 0.023222621060325847
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 24940.321400063112,
+      "warm_ms": 850.3774001728743,
+      "input_tokens": 10810,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=24921.062800",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=831.991400",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.02018422839927622,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996002151760706,
+          "probabilities": {
+            "electric": 0.999733476784047,
+            "fire": 1.4396591283916685e-05,
+            "water": 0.00025212662466883183
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.41294538929154334,
+          "probabilities": {
+            "gengar": 0.3660186655444778,
+            "pikachu": 0.6086302595276956,
+            "snorlax": 0.025351074927826567
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.02018422839927622,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996002151760706,
+          "probabilities": {
+            "electric": 0.999733476784047,
+            "fire": 1.4396591283916685e-05,
+            "water": 0.00025212662466883183
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.41294538929154334,
+          "probabilities": {
+            "gengar": 0.3660186655444778,
+            "pikachu": 0.6086302595276956,
+            "snorlax": 0.025351074927826567
+          },
+          "type": "choice"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 24888.989799966414,
+      "p50_ms": 24924.5801998768,
+      "p95_ms": 24940.321400063112,
+      "p99_ms": 24940.321400063112,
+      "samples": 3
+    },
+    "warm": {
+      "mean_ms": 852.2517667151988,
+      "p50_ms": 850.704199867323,
+      "p95_ms": 855.6737001053989,
+      "p99_ms": 855.6737001053989,
+      "samples": 3
+    }
+  }
+}

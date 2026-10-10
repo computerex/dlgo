@@ -1,0 +1,11 @@
+{
+  "name": "Qwen3.5-2B-Q4_K_M",
+  "text": "Let me think about how to approach this coding problem.\n\nProblem: Write a detailed essay about the history of artificial intelligence\n\nApproach: 1. Research and research the key milestones in AI development, from early theoretical foundations through modern deep learning breakthrough",
+  "tok_s": 159.0351022277637,
+  "prefill_ms": 102.985,
+  "generate_ms": 314.396,
+  "total_tokens": 50,
+  "prompt_tokens": 31,
+  "gpu_layers": 24,
+  "dp4a": true
+}

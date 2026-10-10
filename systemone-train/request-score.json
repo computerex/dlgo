@@ -1,0 +1,7 @@
+{
+  "state": "The user says their production database is down and all customers are affected. Revenue is being lost every minute.",
+  "instructions": "How urgent is this request?",
+  "type": "score",
+  "min": 0,
+  "max": 10
+}

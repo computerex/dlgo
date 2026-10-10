@@ -1,0 +1,11 @@
+{
+  "name": "tinyllama-q4_0",
+  "text": "The waves crash, a symphony of sound\nA melody that fills the air with grace\nThe ocean's rhythm is a constant flow\nA never-ending stream of life and light\n\nThe tides ebb and flow, a cycle of time\nA dance of change, a journey to be seen\nThe ocean's power is immense, a force to be reckoned with\nA masterpiece of nature, a work of art to behold\n\nThe sun sets on the horizon, a golden hue\nA reminder of the beauty that lies beyond\nThe ocean's vastness, a canvas for all to see\nA masterpiece, a work of art that will endure.",
+  "tok_s": 394.0818949784974,
+  "prefill_ms": 41.94,
+  "generate_ms": 378.094,
+  "total_tokens": 149,
+  "prompt_tokens": 39,
+  "gpu_layers": 22,
+  "dp4a": true
+}

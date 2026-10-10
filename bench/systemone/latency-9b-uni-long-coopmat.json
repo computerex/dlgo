@@ -1,0 +1,330 @@
+{
+  "url": "http://127.0.0.1:8097/v1/systemone",
+  "request_sha256": "425f0404f881fc31f1a518d3e4a37d415e78b362b20da88d6b86b78b8a0f506f",
+  "model": "qwen35-9b",
+  "readout": "systemone-train/artifacts/qwen35-9b-q3-readout-v2-uni.json",
+  "question_count": 3,
+  "runs": [
+    {
+      "cold_ms": 21728.924799943343,
+      "warm_ms": 721.4615999255329,
+      "input_tokens": 10809,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=21703.148900",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=719.795300",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.021612930104116062,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996984612976474,
+          "probabilities": {
+            "electric": 0.9997989741984316,
+            "fire": 1.1315247749846669e-05,
+            "water": 0.0001897105538184998
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.4376983696418125,
+          "probabilities": {
+            "gengar": 0.35277679223749314,
+            "pikachu": 0.625132246427875,
+            "snorlax": 0.022090961334631717
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.021612930104116062,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996984612976474,
+          "probabilities": {
+            "electric": 0.9997989741984316,
+            "fire": 1.1315247749846669e-05,
+            "water": 0.0001897105538184998
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.4376983696418125,
+          "probabilities": {
+            "gengar": 0.35277679223749314,
+            "pikachu": 0.625132246427875,
+            "snorlax": 0.022090961334631717
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 21677.767100045457,
+      "warm_ms": 722.4685999099165,
+      "input_tokens": 10808,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=21662.850500",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=721.354900",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.019943567381260602,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.999692106270847,
+          "probabilities": {
+            "electric": 0.999794737513898,
+            "fire": 1.1450845512655682e-05,
+            "water": 0.00019381164058928908
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.2688277821334102,
+          "probabilities": {
+            "gengar": 0.4632111560846389,
+            "pikachu": 0.5125518547556068,
+            "snorlax": 0.024236989159754224
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.019943567381260602,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.999692106270847,
+          "probabilities": {
+            "electric": 0.999794737513898,
+            "fire": 1.1450845512655682e-05,
+            "water": 0.00019381164058928908
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.2688277821334102,
+          "probabilities": {
+            "gengar": 0.4632111560846389,
+            "pikachu": 0.5125518547556068,
+            "snorlax": 0.024236989159754224
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 21661.632500123233,
+      "warm_ms": 736.4336000755429,
+      "input_tokens": 10812,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=21637.362500",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=718.914200",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.020364674205799023,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996384843561703,
+          "probabilities": {
+            "electric": 0.9997589895707801,
+            "fire": 1.3621891728704125e-05,
+            "water": 0.0002273885374911472
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5158938980030701,
+          "probabilities": {
+            "gengar": 0.3027979287040158,
+            "pikachu": 0.6772625986687134,
+            "snorlax": 0.01993947262727064
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.020364674205799023,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996384843561703,
+          "probabilities": {
+            "electric": 0.9997589895707801,
+            "fire": 1.3621891728704125e-05,
+            "water": 0.0002273885374911472
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5158938980030701,
+          "probabilities": {
+            "gengar": 0.3027979287040158,
+            "pikachu": 0.6772625986687134,
+            "snorlax": 0.01993947262727064
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 21741.866699885577,
+      "warm_ms": 722.1347000449896,
+      "input_tokens": 10810,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=21726.591000",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=721.463300",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.023374062762575285,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.999556925034228,
+          "probabilities": {
+            "electric": 0.9997046166894853,
+            "fire": 1.5665782522510728e-05,
+            "water": 0.0002797175279921617
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5752370949031873,
+          "probabilities": {
+            "gengar": 0.2594526458000334,
+            "pikachu": 0.7168247299354582,
+            "snorlax": 0.02372262426450826
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.023374062762575285,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.999556925034228,
+          "probabilities": {
+            "electric": 0.9997046166894853,
+            "fire": 1.5665782522510728e-05,
+            "water": 0.0002797175279921617
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.5752370949031873,
+          "probabilities": {
+            "gengar": 0.2594526458000334,
+            "pikachu": 0.7168247299354582,
+            "snorlax": 0.02372262426450826
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 21905.56149999611,
+      "warm_ms": 728.1964002177119,
+      "input_tokens": 10810,
+      "cold_server_timing": "queue;dur=0.000000, decision;dur=21904.780400",
+      "warm_server_timing": "queue;dur=0.000000, decision;dur=727.427200",
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.018683638490938348,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996307366339707,
+          "probabilities": {
+            "electric": 0.9997538244226472,
+            "fire": 1.2391611115393708e-05,
+            "water": 0.00023378396623750566
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.4045470184415567,
+          "probabilities": {
+            "gengar": 0.3721036713932748,
+            "pikachu": 0.6030313456277044,
+            "snorlax": 0.02486498297902071
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.018683638490938348,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "electric",
+          "confidence": 0.9996307366339707,
+          "probabilities": {
+            "electric": 0.9997538244226472,
+            "fire": 1.2391611115393708e-05,
+            "water": 0.00023378396623750566
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.4045470184415567,
+          "probabilities": {
+            "gengar": 0.3721036713932748,
+            "pikachu": 0.6030313456277044,
+            "snorlax": 0.02486498297902071
+          },
+          "type": "choice"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 21743.150519998744,
+      "p50_ms": 21728.924799943343,
+      "p95_ms": 21905.56149999611,
+      "p99_ms": 21905.56149999611,
+      "samples": 5
+    },
+    "warm": {
+      "mean_ms": 726.1389800347388,
+      "p50_ms": 722.4685999099165,
+      "p95_ms": 736.4336000755429,
+      "p99_ms": 736.4336000755429,
+      "samples": 5
+    }
+  }
+}

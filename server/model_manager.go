@@ -27,6 +27,14 @@ type LoadedModel struct {
 // The actual implementation is in model_manager_gpu.go (vulkan build).
 type GpuPipelineInterface interface {
 	GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*llm.GenerateResult, error)
+	// SystemOneWithReadout evaluates one closed-set question on GPU (GPU
+	// feature extraction + trained readout). Implementations may return an
+	// error when the model cannot run the GPU decision path; callers fall
+	// back to the CPU engine.
+	SystemOneWithReadout(state string, q llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) (*llm.SystemOneResult, error)
+	// SystemOneMulti evaluates several questions against one state on GPU,
+	// degrading questions wider than the readout to CPU continuation scoring.
+	SystemOneMulti(state string, questions []llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) ([]*llm.SystemOneResult, error)
 	Free()
 }
 

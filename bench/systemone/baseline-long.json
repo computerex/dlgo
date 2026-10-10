@@ -1,0 +1,143 @@
+{
+  "url": "http://127.0.0.1:8093/v1/systemone",
+  "request_sha256": "425f0404f881fc31f1a518d3e4a37d415e78b362b20da88d6b86b78b8a0f506f",
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "question_count": 3,
+  "runs": [
+    {
+      "cold_ms": 17088.661700021476,
+      "warm_ms": 486.40070017427206,
+      "input_tokens": 10810,
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.24112894591446096,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "fire",
+          "confidence": 0.17141230181441558,
+          "probabilities": {
+            "electric": 0.11029096240439118,
+            "fire": 0.4476082012096104,
+            "water": 0.44210083638599834
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.7400860040619401,
+          "probabilities": {
+            "gengar": 0.023823283446703782,
+            "pikachu": 0.8267240027079601,
+            "snorlax": 0.1494527138453362
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.24112894591446096,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "fire",
+          "confidence": 0.17141230181441558,
+          "probabilities": {
+            "electric": 0.11029096240439118,
+            "fire": 0.4476082012096104,
+            "water": 0.44210083638599834
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.7400860040619401,
+          "probabilities": {
+            "gengar": 0.023823283446703782,
+            "pikachu": 0.8267240027079601,
+            "snorlax": 0.1494527138453362
+          },
+          "type": "choice"
+        }
+      }
+    },
+    {
+      "cold_ms": 16840.73570021428,
+      "warm_ms": 443.48659995011985,
+      "input_tokens": 10810,
+      "answers_identical": true,
+      "degraded_questions": 0,
+      "cold_answers": {
+        "charizard_water_weak": {
+          "noul": 0.23357225919310814,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "fire",
+          "confidence": 0.2163969936731479,
+          "probabilities": {
+            "electric": 0.11540219470157463,
+            "fire": 0.4775979957820986,
+            "water": 0.40699980951632686
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.7686645930523528,
+          "probabilities": {
+            "gengar": 0.024020369715017517,
+            "pikachu": 0.8457763953682352,
+            "snorlax": 0.1302032349167471
+          },
+          "type": "choice"
+        }
+      },
+      "warm_answers": {
+        "charizard_water_weak": {
+          "noul": 0.23357225919310814,
+          "type": "noul"
+        },
+        "move_type": {
+          "choice": "fire",
+          "confidence": 0.2163969936731479,
+          "probabilities": {
+            "electric": 0.11540219470157463,
+            "fire": 0.4775979957820986,
+            "water": 0.40699980951632686
+          },
+          "type": "choice"
+        },
+        "switch": {
+          "choice": "pikachu",
+          "confidence": 0.7686645930523528,
+          "probabilities": {
+            "gengar": 0.024020369715017517,
+            "pikachu": 0.8457763953682352,
+            "snorlax": 0.1302032349167471
+          },
+          "type": "choice"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "cold": {
+      "mean_ms": 16964.69870011788,
+      "p50_ms": 16840.73570021428,
+      "p95_ms": 17088.661700021476,
+      "p99_ms": 17088.661700021476,
+      "samples": 2
+    },
+    "warm": {
+      "mean_ms": 464.94365006219596,
+      "p50_ms": 443.48659995011985,
+      "p95_ms": 486.40070017427206,
+      "p99_ms": 486.40070017427206,
+      "samples": 2
+    }
+  }
+}

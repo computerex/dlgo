@@ -1,0 +1,14 @@
+{
+  "variant": "t32-off",
+  "env": {
+    "DLGO_GEMM_Q3K": "1",
+    "DLGO_SSM_BATCH": "1",
+    "DLGO_SSM_REC_T32": "0",
+    "DLGO_GEMM_Q3K_RECOVERED": "0",
+    "DLGO_ATTN_KV4": "0"
+  },
+  "profile": false,
+  "runs": 3,
+  "request": "long-request.json",
+  "nonce_seed": "latency-plan-paired-v1"
+}

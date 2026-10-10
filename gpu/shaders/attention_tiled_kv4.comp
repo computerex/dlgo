@@ -1,0 +1,172 @@
+// Opt-in KV-grouped tiled attention (DLGO_ATTN_KV4=1). Requires
+// num_heads == 4 * num_kv_heads (Qwen3.5-9B: 16/4).
+//
+// One workgroup covers ALL 4 q-heads sharing one kv_head: each K/V element is
+// fetched from L2/DRAM once per 4 heads instead of once per head -> 4x less KV
+// traffic, which dominates the score/PV phase on long context. No K/V shared
+// staging (keeps baseline occupancy; shared usage ~13 KB).
+//
+// Bit-identical to attention_tiled.comp by construction: each head's QK dot is
+// one ascending fp32 fma chain per position; softmax uses the same 256-thread
+// tree per head (all 256 threads run every phase, looping heads h=0..3 in a
+// constant-bound loop; uniform control flow keeps barriers legal); PV per dim
+// is one ascending position chain. Only the workgroup mapping changed.
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Out { float attn_out[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_data[]; };
+layout(set = 0, binding = 2) readonly buffer K { uint k_packed[]; };
+layout(set = 0, binding = 3) readonly buffer V { uint v_packed[]; };
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+    int kv_dim;
+    int seq_len;
+    float scale;
+    float softcap;
+};
+#define WG_SIZE 256
+#define TILE_SIZE 256
+#define HEADS_PER_KV 4
+#define THREADS_PER_HEAD (WG_SIZE / HEADS_PER_KV)  // 64
+
+shared float q4_sh[HEADS_PER_KV][256];         // 4 KB
+shared float tile_s4[HEADS_PER_KV][TILE_SIZE]; // 4 KB
+shared float sh_out4[HEADS_PER_KV][256];       // 4 KB
+shared float reduce_buf[WG_SIZE];              // 1 KB
+
+void main() {
+    uint kv_head = gl_WorkGroupID.x;
+    uint pos_id = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = uint(head_dim);
+    uint kvd = uint(kv_dim);
+    uint q_dim = uint(num_heads) * hd;
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    if (kv_mul != HEADS_PER_KV) return;
+
+    uint my_lane = tid % THREADS_PER_HEAD;  // 0..63
+    int actual_seq_len = seq_len + int(pos_id);
+    if (actual_seq_len <= 0) {
+        if (tid < hd) {
+            for (uint h = 0u; h < HEADS_PER_KV; h++) {
+                uint hh = kv_head * HEADS_PER_KV + h;
+                attn_out[pos_id * q_dim + hh * hd + tid] = 0.0;
+            }
+        }
+        return;
+    }
+
+    uint kv_half = kvd / 2u;
+    uint kv_off_half = (kv_head * hd) / 2u;
+    uint hd_half = hd / 2u;
+
+    // Load the 4 heads' Q, pre-scaled (same semantics as baseline).
+    for (uint idx = tid; idx < HEADS_PER_KV * hd; idx += WG_SIZE) {
+        uint h = idx / hd;
+        uint d = idx % hd;
+        uint head = kv_head * HEADS_PER_KV + h;
+        q4_sh[h][d] = q_data[pos_id * q_dim + head * hd + d] * scale;
+    }
+    for (uint idx = tid; idx < HEADS_PER_KV * hd; idx += WG_SIZE) {
+        sh_out4[idx / hd][idx % hd] = 0.0;
+    }
+
+    float run_max[HEADS_PER_KV];
+    float run_sum[HEADS_PER_KV];
+    for (uint h = 0u; h < HEADS_PER_KV; h++) {
+        run_max[h] = -1.0e30;
+        run_sum[h] = 0.0;
+    }
+
+    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+        int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
+        int tile_len = tile_end - tile_start;
+
+        // Phase 1: QK. Per head, its 64 threads own positions
+        // tile_start + lane + 64k; each dot is one ascending packed-pair chain.
+        for (uint h = 0u; h < HEADS_PER_KV; h++) {
+            for (int t = tile_start + int(my_lane); t < tile_end; t += THREADS_PER_HEAD) {
+                uint k_base = uint(t) * kv_half + kv_off_half;
+                float dot_val = 0.0;
+                for (uint d2 = 0u; d2 < hd_half; d2++) {
+                    vec2 k2 = unpackHalf2x16(k_packed[k_base + d2]);
+                    dot_val = fma(q4_sh[h][d2 * 2u], k2.x, dot_val);
+                    dot_val = fma(q4_sh[h][d2 * 2u + 1u], k2.y, dot_val);
+                }
+                if (softcap > 0.0) dot_val = softcap * tanh(dot_val / softcap);
+                tile_s4[h][t - tile_start] = dot_val;
+            }
+        }
+        barrier();
+
+        // Phases 2-6 per head with ALL 256 threads: identical tree shape and
+        // order to the baseline kernel, hence bit-identical softmax and PV.
+        for (uint h = 0u; h < HEADS_PER_KV; h++) {
+            float local_max = -1.0e30;
+            if (int(tid) < tile_len) local_max = tile_s4[h][tid];
+            reduce_buf[tid] = local_max;
+            barrier();
+            [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+                if (tid < s) reduce_buf[tid] = max(reduce_buf[tid], reduce_buf[tid + s]);
+                barrier();
+            }
+            float tile_max = reduce_buf[0];
+            barrier();
+
+            float new_max = max(run_max[h], tile_max);
+            float correction = exp(run_max[h] - new_max);
+            if (tid < hd) {
+                sh_out4[h][tid] *= correction;
+            }
+            if (tid == 0u) {
+                reduce_buf[0] = run_sum[h] * correction;
+            }
+            barrier();
+            run_sum[h] = reduce_buf[0];
+
+            if (int(tid) < tile_len) {
+                tile_s4[h][tid] = exp(tile_s4[h][tid] - new_max);
+            }
+            barrier();
+
+            float local_sum = 0.0;
+            if (int(tid) < tile_len) local_sum = tile_s4[h][tid];
+            reduce_buf[tid] = local_sum;
+            barrier();
+            [[unroll]] for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
+                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+                barrier();
+            }
+            run_sum[h] += reduce_buf[0];
+            barrier();
+
+            if (tid < hd) {
+                uint d = tid;
+                uint d_pair = d / 2u;
+                uint d_which = d & 1u;
+                float acc = 0.0;
+                for (int ti = 0; ti < tile_len; ti++) {
+                    float w = tile_s4[h][ti];
+                    uint v_base = uint(tile_start + ti) * kv_half + kv_off_half;
+                    vec2 v2 = unpackHalf2x16(v_packed[v_base + d_pair]);
+                    float v_val = (d_which == 0u) ? v2.x : v2.y;
+                    acc = fma(w, v_val, acc);
+                }
+                sh_out4[h][tid] += acc;
+            }
+            barrier();
+            run_max[h] = new_max;
+        }
+    }
+
+    for (uint idx = tid; idx < HEADS_PER_KV * hd; idx += WG_SIZE) {
+        uint h = idx / hd;
+        uint d = idx % hd;
+        uint head = kv_head * HEADS_PER_KV + h;
+        float inv_sum = (run_sum[h] > 0.0) ? (1.0 / run_sum[h]) : 0.0;
+        attn_out[pos_id * q_dim + head * hd + d] = sh_out4[h][d] * inv_sum;
+    }
+}

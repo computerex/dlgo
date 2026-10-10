@@ -1,0 +1,13 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v7-gp.json",
+  "state": "Our landlord raised the rent in the middle of the fixed-term lease and says we have to accept it or leave within two weeks.",
+  "instructions": "Which legal area does this question involve?",
+  "criteria": {
+    "employment": "Workplace, hiring, or termination matters.",
+    "housing": "Leases, tenancy, or landlord disputes.",
+    "family": "Marriage, divorce, custody, or guardianship.",
+    "consumer": "Purchases, warranties, or consumer protection.",
+    "immigration": "Visas, residency, or citizenship."
+  }
+}

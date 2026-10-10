@@ -20,6 +20,8 @@ func main() {
 		cmdServer(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "systemone":
+		cmdSystemOne(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Printf("dlgo v%s\n", version)
 	case "help", "--help", "-h":
@@ -55,6 +57,7 @@ Usage:
   dlgo run <model.gguf> [flags]    Start interactive chat (like ollama)
   dlgo server [flags]              Start API server with web UI
   dlgo info <model.gguf>           Show model metadata
+  dlgo systemone [flags]           Run one native System One decision
   dlgo version                     Print version
   dlgo help                        Show this help
 

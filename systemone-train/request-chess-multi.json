@@ -1,0 +1,82 @@
+{
+  "model": "qwen35",
+  "readout": "systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json",
+  "state": "You are analyzing a game of standard international chess. The position is: White king on e1, White rook on a1, White pawn on e4; Black king on e8, Black queen on d8, Black knight on g8. It is White to move. Standard FIDE rules apply.",
+  "questions": {
+    "knight_move": {
+      "type": "choice",
+      "instructions": "How does a knight move on an empty board?",
+      "criteria": {
+        "l_shape": "In an L shape: two squares in one direction then one square perpendicular.",
+        "diagonal": "Any number of squares diagonally.",
+        "straight": "Any number of squares in a straight line.",
+        "one_any": "Exactly one square in any direction."
+      }
+    },
+    "castling_condition": {
+      "type": "noul",
+      "instructions": "In the given position, can White castle kingside this turn?",
+      "note": "White has no kingside rook and no f1/g1 pieces set up; the h1 rook is absent. Also the king has not moved but there is no h1 rook to castle with."
+    },
+    "pawn_first_move": {
+      "type": "noul",
+      "instructions": "Can a pawn move two squares forward on its very first move from its starting rank?",
+      "note": "Yes - a pawn may advance two squares from its starting square if both squares are empty."
+    },
+    "check_def": {
+      "type": "choice",
+      "instructions": "What does it mean for a king to be 'in check'?",
+      "criteria": {
+        "attacked": "The king is currently attacked by at least one enemy piece.",
+        "captured": "The king has been captured.",
+        "pinned": "The king is pinned to another piece.",
+        "stalemated": "The king has no legal moves."
+      }
+    },
+    "promotion_rank": {
+      "type": "choice",
+      "instructions": "To which rank must a White pawn reach to promote?",
+      "criteria": {
+        "rank8": "The 8th rank.",
+        "rank1": "The 1st rank.",
+        "rank5": "The 5th rank.",
+        "any": "Any rank."
+      }
+    },
+    "en_passant": {
+      "type": "noul",
+      "instructions": "Is capturing en passant a legal move in standard international chess?",
+      "note": "Yes - en passant is available immediately after an enemy pawn makes a two-square advance adjacent to your pawn."
+    },
+    "stalemate_result": {
+      "type": "choice",
+      "instructions": "If a player has no legal move but their king is not in check, what is the result?",
+      "criteria": {
+        "draw": "The game is a draw (stalemate).",
+        "loss": "The player with no moves loses.",
+        "win": "The player with no moves wins.",
+        "continue": "The game continues."
+      }
+    },
+    "value_queen": {
+      "type": "noul",
+      "instructions": "Is a queen generally considered more valuable than a rook?",
+      "note": "Yes - queen is worth about 9 pawns, rook about 5."
+    },
+    "bishop_color": {
+      "type": "noul",
+      "instructions": "Can a bishop ever change the color of the squares it moves on during a game?",
+      "note": "No - a bishop stays on one color for the whole game."
+    },
+    "board_score": {
+      "type": "score",
+      "instructions": "How strong is a queen relative to the other chess pieces (in standard point values)?",
+      "criteria": [
+        "Weak: worth about as much as a pawn.",
+        "Below average: worth about as much as a knight.",
+        "Strong: worth more than a bishop but slightly less than a rook.",
+        "Very strong: worth substantially more than any other single piece."
+      ]
+    }
+  }
+}

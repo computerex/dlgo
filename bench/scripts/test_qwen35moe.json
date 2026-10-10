@@ -1,0 +1,11 @@
+{
+  "name": "Qwen3.5-35B-A3B-Q3_K_M",
+  "text": "Write a detailed essay about the history of artificial intelligence, covering its origins in the 1950s, key milestones, and modern developments. Be thorough and specific.",
+  "tok_s": 2.9681700860398306,
+  "prefill_ms": 19447.438,
+  "generate_ms": 12128.685,
+  "total_tokens": 36,
+  "prompt_tokens": 56,
+  "gpu_layers": 40,
+  "dp4a": true
+}
