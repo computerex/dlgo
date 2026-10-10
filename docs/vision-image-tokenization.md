@@ -45,6 +45,42 @@ The projector output dimension must equal the target model's embedding length:
 
 A LLaVA-1.5-7B projector outputs **4096**, so it fits Qwen3.5-9B directly.
 
+## Server (OpenAI-compatible multimodal input)
+
+Start the server with a vision projector; image requests then go through the GPU path:
+
+```sh
+dlgo-server -gpu -ctx 8192 -model Qwen3.5-9B-Q3_K_M.gguf \
+  -mmproj mmproj-llava15-7b-f16.gguf -port 8097
+```
+
+Send an OpenAI-style content array (the image part inserts an `<image>` marker):
+
+```json
+{"model":"...","messages":[{"role":"user","content":[
+  {"type":"text","text":"Describe this image."},
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+]}]}
+```
+
+`image_url.url` accepts a `data:` base64 URI, a local path / `file://`, or an
+`http(s)://` URL. Without `-mmproj` (or on a CPU-only model) image requests
+return a clear error.
+
+## Performance
+
+Real `mmproj-llava15-7b-f16.gguf` (623 MB, CLIP ViT-L/14, 576 image tokens × 4096):
+
+| Stage | before | after |
+|-------|-------:|------:|
+| encoder (single image, CPU) | 21.9s | 5.0s |
+| end-to-end 9B HTTP request (596 prompt tokens) | 34.3s | 14.9s |
+
+The encoder speedup comes from batched SIMD-dot projections and token-parallel
+forward. The remaining cost is the Qwen3.5 hybrid SSM recurrence, which is
+inherently sequential per image token; reducing image-token count (e.g. 2×2
+pixel-shuffle) is the next lever.
+
 ## Usage
 
 Encode an image and dump embeddings:
@@ -82,5 +118,8 @@ Real-file validation: `cmd/mmproj-encode` loads a 623 MB, 377-tensor
 - `spatial_unpad` (LLaVA-1.6) trims padded patch rows/cols and inserts
   `v.image_newline` embeddings between rows.
 - No windowed attention / mRoPE VLMs (Qwen2-VL family) yet.
-- GPU-side image-embedding forward is not implemented; the LM forward runs on
-  whatever path the pipeline is configured for.
+- The vision encoder itself runs on the CPU (now SIMD + multi-threaded); the
+  LM forward runs on the GPU when the model is loaded with `-gpu`.
+- A projector must match the target model's embedding space. A LLaVA-1.5-7B
+  projector outputs LLaMA embeddings; on a Qwen model the image tokens are
+  valid but not semantically meaningful without a Qwen-trained projector.
