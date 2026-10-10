@@ -24,7 +24,8 @@ type GenerateConfig struct {
 	Seed          int64
 	Stream        func(token string) // called for each generated token (nil = no streaming)
 	Grammar       *grammar.Grammar   // optional grammar constraint (nil = unconstrained)
-	ThinkingPhase bool               // suppress EOS during <think> block (set automatically by Chat/GenerateText)
+	ThinkingPhase bool               // suppress EOS during  thinking block (set automatically by Chat/GenerateText)
+	ImageMarker   string             // placeholder marking image-token positions (default "<image>")
 }
 
 // DefaultGenerateConfig returns sensible defaults.
@@ -723,6 +724,175 @@ done:
 		GenerateTimeMs: genMs,
 		TotalTokens:    len(generated),
 		PromptTokens:   len(tokens),
+	}, nil
+}
+
+// GenerateDetailedWithEmbeddings is GenerateDetailed with image (or other
+// precomputed) embedding blocks spliced into the prompt. Each occurrence of
+// the image marker (cfg.ImageMarker, default "<image>") in the prompt is
+// replaced by one block of embedding rows (e.g. from vision.Encoder.Encode).
+// Text segments are prefilled as batched tokens; image rows are fed through
+// the single-token embedding path so attention and SSM state advance exactly
+// as if the rows were tokens.
+func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg GenerateConfig) (*GenerateResult, error) {
+	if len(images) == 0 {
+		return p.GenerateDetailed(prompt, cfg)
+	}
+	marker := cfg.ImageMarker
+	if marker == "" {
+		marker = "<image>"
+	}
+	segments := strings.Split(prompt, marker)
+	if len(segments) != len(images)+1 {
+		return nil, fmt.Errorf("image placeholder count mismatch: prompt has %d markers, %d images provided",
+			len(segments)-1, len(images))
+	}
+
+	// Validate embedding shapes before touching state.
+	dim := p.Model.Config.EmbeddingDim
+	for i, blk := range images {
+		if len(blk) == 0 {
+			return nil, fmt.Errorf("image %d has no embedding rows", i)
+		}
+		for r, row := range blk {
+			if len(row) != dim {
+				return nil, fmt.Errorf("image %d row %d has %d dims, want %d", i, r, len(row), dim)
+			}
+		}
+	}
+
+	// Tokenize segments: the first carries BOS, continuations must not.
+	tokenSegs := make([][]int32, len(segments))
+	totalTokens := 0
+	for i, s := range segments {
+		if i == 0 {
+			tokenSegs[i] = p.Tokenizer.Encode(s)
+		} else {
+			tokenSegs[i] = p.Tokenizer.EncodeNoBOS(s)
+		}
+		totalTokens += len(tokenSegs[i])
+	}
+	nImage := 0
+	for _, blk := range images {
+		nImage += len(blk)
+	}
+	if totalTokens == 0 && nImage == 0 {
+		return nil, fmt.Errorf("tokenizer produced no tokens for prompt")
+	}
+	if totalTokens+nImage >= p.MaxSeqLen {
+		return nil, fmt.Errorf("prompt too long: %d tokens (%d text + %d image, max %d)",
+			totalTokens+nImage, totalTokens, nImage, p.MaxSeqLen)
+	}
+
+	if strings.HasSuffix(prompt, " thinking\n") {
+		cfg.ThinkingPhase = true
+	}
+
+	rng := rand.New(rand.NewSource(cfg.Seed))
+	if cfg.Seed < 0 {
+		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+
+	p.KVCache.Reset()
+	if p.RunState.SSMState != nil {
+		p.RunState.SSMState.Reset()
+	}
+
+	runtime.GC()
+	prev := debug.SetGCPercent(2000)
+
+	// Prefill: interleave text segments and image embedding rows.
+	prefillStart := time.Now()
+	pos := 0
+	for i, seg := range tokenSegs {
+		if len(seg) > 0 {
+			ForwardBatch(p.Model, seg, pos, p.KVCache, p.RunState, p.BatchState)
+			pos += len(seg)
+		}
+		if i < len(images) {
+			for _, row := range images[i] {
+				ForwardEmbedding(p.Model, row, pos, p.KVCache, p.RunState)
+				pos++
+			}
+		}
+	}
+	prefillMs := float64(time.Since(prefillStart).Microseconds()) / 1000.0
+
+	// Decode loop (mirrors GenerateDetailed).
+	genStart := time.Now()
+	var generated []int32
+	var recentTokens []int32
+	var genText strings.Builder
+	inThinkBlock := cfg.ThinkingPhase
+	thinkBudget := cfg.MaxTokens * 4 / 5
+
+	ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+	if inThinkBlock {
+		suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+	}
+	nextToken := ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
+	generated = append(generated, int32(nextToken))
+	recentTokens = append(recentTokens, int32(nextToken))
+	genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
+	if cfg.Stream != nil {
+		cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
+	}
+
+	for step := 1; step < cfg.MaxTokens; step++ {
+		if pos >= p.MaxSeqLen-1 {
+			break
+		}
+		lastTok := int32(nextToken)
+		if lastTok == p.Model.Config.EOS {
+			break
+		}
+		for _, stop := range p.Model.Config.StopTokens {
+			if lastTok == stop {
+				goto done
+			}
+		}
+
+		Forward(p.Model, lastTok, pos, p.KVCache, p.RunState)
+		pos++
+
+		if step%32 == 0 {
+			mmap.TrimWorkingSet()
+		}
+
+		ApplySuppressTokens(p.RunState.Logits, p.Model.Config.SuppressTokens)
+		if inThinkBlock && step < thinkBudget {
+			suppressEOSLogits(p.RunState.Logits, p.Model.Config)
+		}
+		nextToken = ops.SampleToken(p.RunState.Logits, cfg.Sampler, recentTokens, rng)
+		generated = append(generated, int32(nextToken))
+		recentTokens = append(recentTokens, int32(nextToken))
+		genText.WriteString(p.Tokenizer.DecodeToken(int32(nextToken)))
+		if inThinkBlock && strings.Contains(genText.String(), "</think>") {
+			inThinkBlock = false
+		}
+		if cfg.Stream != nil {
+			cfg.Stream(p.Tokenizer.DecodeToken(int32(nextToken)))
+		}
+	}
+
+done:
+	genMs := float64(time.Since(genStart).Microseconds()) / 1000.0
+	debug.SetGCPercent(prev)
+	text := trimStopText(p.Tokenizer.Decode(generated), p.Model.Config)
+
+	var tokPerSec float64
+	if genMs > 0 {
+		tokPerSec = float64(len(generated)) / (genMs / 1000.0)
+	}
+
+	return &GenerateResult{
+		Text:           text,
+		Tokens:         generated,
+		TokensPerSec:   tokPerSec,
+		PrefillTimeMs:  prefillMs,
+		GenerateTimeMs: genMs,
+		TotalTokens:    len(generated),
+		PromptTokens:   totalTokens + nImage,
 	}, nil
 }
 

@@ -227,11 +227,6 @@ func ForwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 func forwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memory.MultiLayerKVCache, rs *RunState, projectLogits bool) []float32 {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
-	headDim := cfg.HeadDim
-	numHeads := cfg.NumHeads
-	numKVHeads := cfg.NumKVHeads
-	kvMul := numHeads / numKVHeads
-	pool := rs.Pool
 
 	CPUDiag.Init()
 	diagOn := CPUDiag.Enabled
@@ -245,6 +240,34 @@ func forwardRange(m *Model, token int32, pos, startLayer, endLayer int, kv *memo
 			CPUDiag.LogSlice(-1, pos, "Embed", rs.X[:dim])
 		}
 	}
+
+	return forwardLayers(m, pos, startLayer, endLayer, kv, rs, projectLogits)
+}
+
+// ForwardEmbedding runs a forward pass where the input at `pos` is a
+// precomputed hidden-state vector (e.g. image tokens from a vision encoder)
+// instead of a token ID. The vector is used verbatim as rs.X — no token
+// embedding lookup and no embed scaling — and the full layer stack plus
+// output head runs. `emb` must have length EmbeddingDim.
+func ForwardEmbedding(m *Model, emb []float32, pos int, kv *memory.MultiLayerKVCache, rs *RunState) []float32 {
+	copy(rs.X, emb)
+	return forwardLayers(m, pos, 0, m.Config.NumLayers, kv, rs, true)
+}
+
+// forwardLayers runs the layer stack for a token whose hidden state is
+// already prepared in rs.X (either from the embedding table or an external
+// embedding vector).
+func forwardLayers(m *Model, pos, startLayer, endLayer int, kv *memory.MultiLayerKVCache, rs *RunState, projectLogits bool) []float32 {
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	numHeads := cfg.NumHeads
+	numKVHeads := cfg.NumKVHeads
+	kvMul := numHeads / numKVHeads
+	pool := rs.Pool
+
+	CPUDiag.Init()
+	diagOn := CPUDiag.Enabled
 
 	for l := startLayer; l < endLayer; l++ {
 		layer := &m.Layers[l]

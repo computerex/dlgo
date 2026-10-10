@@ -250,6 +250,19 @@ func (t *Tokenizer) Encode(text string) []int32 {
 	}
 }
 
+// EncodeNoBOS encodes text without the BOS prefix. Used for prompt segments
+// that continue an already-primed sequence (e.g. text after an image).
+func (t *Tokenizer) EncodeNoBOS(text string) []int32 {
+	switch t.ModelType {
+	case "gpt2":
+		return t.encodeBPE(text, nil)
+	case "llama":
+		return t.encodeSPM(text, nil)
+	default:
+		return t.encodeFallback(text, nil)
+	}
+}
+
 func (t *Tokenizer) encodeBPE(text string, result []int32) []int32 {
 	if len(text) == 0 {
 		return result
