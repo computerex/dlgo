@@ -91,7 +91,15 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 			}
 			pe = e.PosEmbed[pos*e.Config.EmbeddingDim : (pos+1)*e.Config.EmbeddingDim]
 		default:
-			pe = e.interpolatePos(i, gridH, gridW, posGrid, learnedOff)
+			// Qwen's sequence is tile-major, whereas learned positions are a
+			// raster grid. Interpolation must use the original raster position,
+			// not the current sequence slot (which only agrees for the first
+			// 2x2 tile).
+			pos := i
+			if e.activePosIndex != nil {
+				pos = e.activePosIndex[i]
+			}
+			pe = e.interpolatePos(pos, gridH, gridW, posGrid, learnedOff)
 		}
 		if pe != nil {
 			for d := range tok {
