@@ -53,9 +53,10 @@ const (
 type InferenceRequest struct {
 	ID              string
 	Messages        []llm.Message
-	StopSequences   []string // user-provided stop sequences from API
-	ReasoningEffort string   // "low", "medium", "high" (default: "medium")
-	EnableThinking  *bool    // nil = auto (enabled for thinking models), false = disable
+	Images          [][][]float32 // optional image embedding blocks, spliced at "<image>" markers
+	StopSequences   []string      // user-provided stop sequences from API
+	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
+	EnableThinking  *bool         // nil = auto (enabled for thinking models), false = disable
 	Config          llm.GenerateConfig
 	Tokens          []int32 // prompt tokens after formatting
 	Generated       []int32 // output tokens so far
@@ -202,6 +203,11 @@ func (s *Scheduler) processRequest(req *InferenceRequest) {
 
 func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
 	pipe := s.model.CPUPipeline
+
+	if len(req.Images) > 0 {
+		req.Output <- StreamEvent{Type: EventError, Error: "image input requires a GPU model (load with -gpu); CPU image prefill is not supported"}
+		return
+	}
 
 	// Reset KV cache
 	pipe.KVCache.Reset()
@@ -394,7 +400,14 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		req.Output <- StreamEvent{Type: EventToken, Token: token}
 	}
 
-	result, err := pipe.GenerateDetailed(prompt, cfg)
+	var result *llm.GenerateResult
+	var err error
+	if len(req.Images) > 0 {
+		cfg.ImageMarker = "<image>"
+		result, err = pipe.GenerateDetailedWithEmbeddings(prompt, req.Images, cfg)
+	} else {
+		result, err = pipe.GenerateDetailed(prompt, cfg)
+	}
 	if err != nil {
 		req.Output <- StreamEvent{Type: EventError, Error: err.Error()}
 		return

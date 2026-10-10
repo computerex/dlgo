@@ -358,7 +358,7 @@ func (h bpeMergeHeap) Less(i, j int) bool {
 	}
 	return h[i].pos < h[j].pos
 }
-func (h bpeMergeHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h bpeMergeHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
 func (h *bpeMergeHeap) Push(x interface{}) { *h = append(*h, x.(bpeMergeEntry)) }
 func (h *bpeMergeHeap) Pop() interface{} {
 	old := *h

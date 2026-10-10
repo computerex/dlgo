@@ -84,7 +84,7 @@ func TestConvertMessages(t *testing.T) {
 	}
 
 	messages := []Message{
-		{Role: "user", Content: "What's the weather in NYC?"},
+		{Role: "user", Content: MessageContent{Text: "What's the weather in NYC?"}},
 	}
 
 	result := convertMessages(messages, tools)
@@ -119,8 +119,8 @@ func TestConvertMessages_ExistingSystem(t *testing.T) {
 	}
 
 	messages := []Message{
-		{Role: "system", Content: "You are a helpful assistant."},
-		{Role: "user", Content: "What's the weather in NYC?"},
+		{Role: "system", Content: MessageContent{Text: "You are a helpful assistant."}},
+		{Role: "user", Content: MessageContent{Text: "What's the weather in NYC?"}},
 	}
 
 	result := convertMessages(messages, tools)
@@ -146,7 +146,7 @@ func TestConvertMessages_ExistingSystem(t *testing.T) {
 
 func TestConvertMessages_NoTools(t *testing.T) {
 	messages := []Message{
-		{Role: "user", Content: "Hello"},
+		{Role: "user", Content: MessageContent{Text: "Hello"}},
 	}
 
 	result := convertMessages(messages, nil)
@@ -162,7 +162,7 @@ func TestConvertMessages_NoTools(t *testing.T) {
 
 func TestConvertMessages_ToolCalls(t *testing.T) {
 	messages := []Message{
-		{Role: "user", Content: "What's the weather?"},
+		{Role: "user", Content: MessageContent{Text: "What's the weather?"}},
 		{
 			Role: "assistant",
 			ToolCalls: []ToolCall{{
@@ -174,7 +174,7 @@ func TestConvertMessages_ToolCalls(t *testing.T) {
 				},
 			}},
 		},
-		{Role: "tool", ToolCallID: "call_0", Content: "22°C, sunny"},
+		{Role: "tool", ToolCallID: "call_0", Content: MessageContent{Text: "22°C, sunny"}},
 	}
 
 	result := convertMessages(messages, nil)

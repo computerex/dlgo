@@ -1280,11 +1280,6 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, pipe ...*GpuPipeline) error {
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
-	headDim := cfg.HeadDim
-	numHeads := cfg.NumHeads
-	numKVHeads := cfg.NumKVHeads
-	kvDim := numKVHeads * headDim
-
 	xCPU := make([]float32, dim)
 	_ = m.TokenEmbed.DequantizeRow(int(token), xCPU)
 	if cfg.EmbedScale != 0 {
@@ -1292,6 +1287,35 @@ func GpuForward(m *llm.Model, gm *GpuModel, token int32, pos int,
 			xCPU[i] *= cfg.EmbedScale
 		}
 	}
+	return gpuForwardCore(m, gm, token, xCPU, pos, kv, rs, logitsBuf, pipe...)
+}
+
+// GpuForwardEmbedding is like GpuForward but the input hidden state at `pos` is
+// a precomputed embedding vector (e.g. an image token from a vision encoder)
+// rather than a token ID. The vector is used verbatim as rs.X — no token
+// embedding lookup and no embed scaling. `emb` must have length EmbeddingDim.
+func GpuForwardEmbedding(m *llm.Model, gm *GpuModel, emb []float32, pos int,
+	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, pipe ...*GpuPipeline) error {
+	cfg := m.Config
+	if len(emb) != cfg.EmbeddingDim {
+		return fmt.Errorf("gpu embedding: got %d dims, want %d", len(emb), cfg.EmbeddingDim)
+	}
+	xCPU := emb
+	return gpuForwardCore(m, gm, -1, xCPU, pos, kv, rs, logitsBuf, pipe...)
+}
+
+// gpuForwardCore runs the full GPU layer stack for one position whose input
+// hidden state is already prepared in xCPU. token is only used by CPU-fallback
+// attention layers (pass -1 when the input is an external embedding).
+func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos int,
+	kv *GpuKVCache, rs *GpuRunState, logitsBuf []float32, pipe ...*GpuPipeline) error {
+	cfg := m.Config
+	dim := cfg.EmbeddingDim
+	headDim := cfg.HeadDim
+	numHeads := cfg.NumHeads
+	numKVHeads := cfg.NumKVHeads
+	kvDim := numKVHeads * headDim
+
 	seqLen := pos + 1
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 

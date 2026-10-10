@@ -1,6 +1,10 @@
 package server
 
-import "time"
+import (
+	"encoding/json"
+	"strings"
+	"time"
+)
 
 // OpenAI-compatible API types for /v1/chat/completions and /v1/models.
 
@@ -38,12 +42,70 @@ type ToolResult struct {
 }
 
 type Message struct {
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	Name             string     `json:"name,omitempty"`
+	Role             string         `json:"role"`
+	Content          MessageContent `json:"content"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
+	Name             string         `json:"name,omitempty"`
+}
+
+// ContentPart is one element of an OpenAI-style multimodal content array.
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL holds an image reference (data URI or URL).
+type ImageURL struct {
+	URL string `json:"url"`
+}
+
+// MessageContent accepts either a plain string (classic) or an array of
+// content parts (multimodal). It records both the flattened text and any image
+// references so handlers can build image embeddings.
+type MessageContent struct {
+	Text   string
+	Images []string // raw URLs / data URIs, in order
+}
+
+func (c *MessageContent) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "null" {
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		c.Text = s
+		return nil
+	}
+	var parts []ContentPart
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		switch p.Type {
+		case "text", "input_text":
+			sb.WriteString(p.Text)
+		case "image_url", "input_image":
+			if p.ImageURL != nil && p.ImageURL.URL != "" {
+				c.Images = append(c.Images, p.ImageURL.URL)
+				// Place a marker so the prompt builder can locate the image.
+				sb.WriteString("<image>")
+			}
+		}
+	}
+	c.Text = sb.String()
+	return nil
+}
+
+func (c MessageContent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.Text)
 }
 
 type ChatCompletionRequest struct {
@@ -64,10 +126,10 @@ type ChatCompletionRequest struct {
 }
 
 type ChatCompletionChoice struct {
-	Index        int       `json:"index"`
-	Message      *Message  `json:"message,omitempty"`
-	Delta        *Message  `json:"delta,omitempty"`
-	FinishReason *string   `json:"finish_reason"`
+	Index        int      `json:"index"`
+	Message      *Message `json:"message,omitempty"`
+	Delta        *Message `json:"delta,omitempty"`
+	FinishReason *string  `json:"finish_reason"`
 }
 
 type UsageInfo struct {

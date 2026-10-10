@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/computerex/dlgo/server"
+	"github.com/computerex/dlgo/vision"
 )
 
 type stringSlice []string
@@ -32,6 +33,7 @@ func main() {
 	ctx := flag.Int("ctx", 0, "max context length (0 = native model context, auto-reduced by memory budget)")
 	maxVRAM := flag.Int("max-vram", 0, "max VRAM to use in MB (0 = auto, reserves 1.5 GB for system)")
 	frontendDir := flag.String("frontend", "", "path to frontend dist/ directory to serve")
+	mmproj := flag.String("mmproj", "", "path to a vision projector (mmproj GGUF) to enable image input")
 
 	var modelsDirs stringSlice
 	flag.Var(&modelsDirs, "models-dir", "directory to scan for .gguf models (can be specified multiple times)")
@@ -67,6 +69,16 @@ func main() {
 
 	addr := *host + ":" + *port
 	srv := server.NewServer(addr, manager, chatManager)
+
+	if *mmproj != "" {
+		enc, err := vision.LoadMmproj(*mmproj)
+		if err != nil {
+			log.Fatalf("Failed to load mmproj %s: %v", *mmproj, err)
+		}
+		srv.SetVisionEncoder(enc)
+		log.Printf("Vision encoder loaded: proj=%s image=%d patch=%d embd=%d (mmproj=%s)",
+			enc.Config.ProjectorType, enc.Config.ImageSize, enc.Config.PatchSize, enc.Config.EmbeddingDim, *mmproj)
+	}
 
 	if *frontendDir != "" {
 		if info, err := os.Stat(*frontendDir); err == nil && info.IsDir() {

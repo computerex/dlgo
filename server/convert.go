@@ -31,7 +31,7 @@ func convertMessages(apiMsgs []Message, tools []Tool) []llm.Message {
 	for _, m := range apiMsgs {
 		if m.Role == "system" {
 			hasSystem = true
-			combined := m.Content
+			combined := m.Content.Text
 			if combined != "" {
 				combined += "\n\n"
 			}
@@ -69,10 +69,10 @@ func convertAPIMessage(m Message) llm.Message {
 
 	// Tool result message
 	if m.Role == "tool" {
-		return llm.Message{Role: "tool", Content: m.Content}
+		return llm.Message{Role: "tool", Content: m.Content.Text}
 	}
 
-	return llm.Message{Role: m.Role, Content: m.Content}
+	return llm.Message{Role: m.Role, Content: m.Content.Text}
 }
 
 // formatToolDefinitions renders the OpenAI tools array into a prompt-friendly

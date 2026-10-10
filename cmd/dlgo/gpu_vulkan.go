@@ -82,6 +82,22 @@ func (a *gpuPipelineAdapter) GenerateDetailed(prompt string, cfg llm.GenerateCon
 	}, nil
 }
 
+func (a *gpuPipelineAdapter) GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg llm.GenerateConfig) (*llm.GenerateResult, error) {
+	result, err := a.pipe.GenerateDetailedWithEmbeddings(prompt, images, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &llm.GenerateResult{
+		Text:           result.Text,
+		Tokens:         result.Tokens,
+		TokensPerSec:   result.TokensPerSec,
+		PrefillTimeMs:  result.PrefillTimeMs,
+		GenerateTimeMs: result.GenerateTimeMs,
+		TotalTokens:    result.TotalTokens,
+		PromptTokens:   result.PromptTokens,
+	}, nil
+}
+
 func (a *gpuPipelineAdapter) SystemOneWithReadout(state string, q llm.SystemOneQuestion, cfg llm.SystemOneConfig, readout *llm.SystemOneReadout) (*llm.SystemOneResult, error) {
 	return a.pipe.SystemOneWithReadout(state, q, cfg, readout)
 }

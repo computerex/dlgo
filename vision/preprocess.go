@@ -12,8 +12,8 @@ import (
 
 // f32Image is an RGB float image, channels interleaved (HxWx3, row-major).
 type f32Image struct {
-	W, H  int
-	Pix   []float32 // len = W*H*3, pixel (x,y) channel c at ((y*W+x)*3+c)
+	W, H int
+	Pix  []float32 // len = W*H*3, pixel (x,y) channel c at ((y*W+x)*3+c)
 }
 
 // decodeToRGBA converts any stdlib-supported image to NRGBA (alpha filled
@@ -139,13 +139,11 @@ func (e *Encoder) convPatches(feats [][]float32) [][]float32 {
 	ic := e.PatchIC
 	oc := e.Config.EmbeddingDim
 	kh, kw := e.PatchKH, e.PatchKW
-	out := make([][]float32, len(feats))
-	acc := make([]float64, oc)
 	kernel := kh * kw * ic
-	for n, f := range feats {
-		for o := range acc {
-			acc[o] = 0
-		}
+	out := make([][]float32, len(feats))
+	e.parallelFor(len(feats), func(idx int) {
+		f := feats[idx]
+		acc := make([]float64, oc)
 		for y := 0; y < kh; y++ {
 			for x := 0; x < kw; x++ {
 				base := (y*kw + x) * ic
@@ -154,9 +152,8 @@ func (e *Encoder) convPatches(feats [][]float32) [][]float32 {
 					if fv == 0 {
 						continue
 					}
-					wRow := base + c // stride into the (KH,KW,IC) block
+					wRow := base + c
 					for o := 0; o < oc; o++ {
-						// GGML memory order: oc is the slowest dimension.
 						acc[o] += float64(e.Patch4DW[wRow+kernel*o]) * fv
 					}
 				}
@@ -169,8 +166,8 @@ func (e *Encoder) convPatches(feats [][]float32) [][]float32 {
 			}
 			v[o] = float32(acc[o])
 		}
-		out[n] = v
-	}
+		out[idx] = v
+	})
 	return out
 }
 

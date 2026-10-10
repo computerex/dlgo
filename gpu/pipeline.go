@@ -1169,7 +1169,53 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	if len(tokens) >= p.MaxSeqLen {
 		return nil, fmt.Errorf("prompt too long: %d tokens (max %d)", len(tokens), p.MaxSeqLen)
 	}
+	return p.generateSegments(prompt, [][]int32{tokens}, nil, cfg)
+}
 
+// GenerateDetailedWithEmbeddings is like GenerateDetailed but replaces each
+// occurrence of the image marker (cfg.ImageMarker, default "<image>") in the
+// prompt with a block of precomputed embedding rows (e.g. from a vision
+// encoder). Text segments are prefilled with the batched GPU path; image rows
+// go through the single-token embedding forward (GpuForwardEmbedding), so KV
+// and SSM state advance exactly as if the rows were tokens.
+func (p *GpuPipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg llm.GenerateConfig) (*GenerateResult, error) {
+	if len(images) == 0 {
+		return p.GenerateDetailed(prompt, cfg)
+	}
+	marker := cfg.ImageMarker
+	if marker == "" {
+		marker = "<image>"
+	}
+	segments := strings.Split(prompt, marker)
+	if len(segments) != len(images)+1 {
+		return nil, fmt.Errorf("image placeholder count mismatch: prompt has %d markers, %d images provided",
+			len(segments)-1, len(images))
+	}
+	dim := p.CPUModel.Config.EmbeddingDim
+	for i, blk := range images {
+		if len(blk) == 0 {
+			return nil, fmt.Errorf("image %d has no embedding rows", i)
+		}
+		for r, row := range blk {
+			if len(row) != dim {
+				return nil, fmt.Errorf("image %d row %d has %d dims, want %d", i, r, len(row), dim)
+			}
+		}
+	}
+	tokenSegs := make([][]int32, len(segments))
+	for i, s := range segments {
+		if i == 0 {
+			tokenSegs[i] = p.Tokenizer.Encode(s)
+		} else {
+			tokenSegs[i] = p.Tokenizer.EncodeNoBOS(s)
+		}
+	}
+	return p.generateSegments(prompt, tokenSegs, images, cfg)
+}
+
+// generateSegments runs the shared prefill + decode loop. tokenSegs[i] is the
+// text tokenized for segment i; images[i] (if non-nil) is spliced after it.
+func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, images [][][]float32, cfg llm.GenerateConfig) (*GenerateResult, error) {
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	if cfg.Seed < 0 {
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -1177,7 +1223,16 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 
 	p.ResetState()
 
-	npos := len(tokens)
+	npos := 0
+	for i, seg := range tokenSegs {
+		npos += len(seg)
+		if i < len(images) {
+			npos += len(images[i])
+		}
+	}
+	if npos >= p.MaxSeqLen {
+		return nil, fmt.Errorf("prompt too long: %d tokens (max %d)", npos, p.MaxSeqLen)
+	}
 
 	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
 	// Keep prefill chunks small to avoid large VRAM spikes from BatchState
@@ -1194,37 +1249,68 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 	}
 
 	prefillStart := time.Now()
-	if p.IsPartialGPU {
-		for i, tok := range tokens {
-			GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-		}
-	} else if !p.UseFusedForward {
-		for i, tok := range tokens {
-			GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
-		}
-	} else if p.HasMoE {
-		// MoE prefill: per-token fused forward (batch prefill not yet supported for MoE)
-		for i, tok := range tokens {
-			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-		}
-	} else {
-		isHybrid := isHybridSSMModel(p.CPUModel)
-		if isHybrid {
-			// Chunked prefill: process prompt in chunks to bound VRAM usage
-			for startPos := 0; startPos < npos; startPos += prefillChunkSize {
-				end := startPos + prefillChunkSize
-				if end > npos {
-					end = npos
+	pos := 0
+	if len(images) == 0 {
+		// No image splice: use the original fast batched prefill path verbatim.
+		tokens := tokenSegs[0]
+		if p.IsPartialGPU {
+			for i, tok := range tokens {
+				GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			}
+		} else if !p.UseFusedForward {
+			for i, tok := range tokens {
+				GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
+			}
+		} else if p.HasMoE {
+			for i, tok := range tokens {
+				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+			}
+		} else if isHybridSSMModel(p.CPUModel) {
+			for cs := 0; cs < npos; cs += prefillChunkSize {
+				ce := cs + prefillChunkSize
+				if ce > npos {
+					ce = npos
 				}
-				chunkTokens := tokens[startPos:end]
-				isLast := end >= npos
-				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, chunkTokens, p.KVCache, p.RunState,
-					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, startPos, isLast, nil)
+				isLast := ce >= npos
+				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens[cs:ce], p.KVCache, p.RunState,
+					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, cs, isLast, nil)
 				Sync()
 			}
 		} else {
 			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
 				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, nil)
+		}
+		pos = npos
+	} else {
+		// Image splice: per-token text forward interleaved with embedding rows.
+		// (Batched prefill assumes a contiguous span from position 0, so we use
+		// the single-token path across segment boundaries.)
+		feedText := func(seg []int32) {
+			for _, tok := range seg {
+				if p.IsPartialGPU {
+					GpuForwardPartial(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+				} else if p.UseFusedForward && p.HasMoE {
+					GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
+				} else if p.UseFusedForward && isHybridSSMModel(p.CPUModel) {
+					GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, []int32{tok}, p.KVCache, p.RunState,
+						p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, pos, true, nil)
+					Sync()
+				} else {
+					GpuForward(p.CPUModel, p.GpuModel, tok, pos, p.KVCache, p.RunState, p.LogitsBuf, p)
+				}
+				pos++
+			}
+		}
+		for i, seg := range tokenSegs {
+			feedText(seg)
+			if i < len(images) {
+				for _, row := range images[i] {
+					if err := GpuForwardEmbedding(p.CPUModel, p.GpuModel, row, pos, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
+						return nil, err
+					}
+					pos++
+				}
+			}
 		}
 	}
 	Sync()
@@ -1322,7 +1408,6 @@ func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*
 		template = p.CPUModel.Config.ChatTemplate
 	}
 	stopStrings := gpuStopStrings(template)
-	pos := len(tokens)
 
 	// Build token pieces for grammar masking
 	var tokenPieces []string
@@ -1475,7 +1560,7 @@ done:
 		PrefillTimeMs:  prefillMs,
 		GenerateTimeMs: genMs,
 		TotalTokens:    len(generated),
-		PromptTokens:   len(tokens),
+		PromptTokens:   npos,
 	}, nil
 }
 

@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+
+	"github.com/computerex/dlgo/vision"
 )
 
 // Server is the main HTTP server for the dlgo inference engine.
@@ -13,6 +15,12 @@ type Server struct {
 	manager     *ModelManager
 	chatManager *ChatManager
 	addr        string
+	vision      *vision.Encoder // optional image encoder (nil = image input disabled)
+}
+
+// SetVisionEncoder enables image input by registering a loaded mmproj encoder.
+func (s *Server) SetVisionEncoder(enc *vision.Encoder) {
+	s.vision = enc
 }
 
 // NewServer creates a new inference server.

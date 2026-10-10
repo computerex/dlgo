@@ -27,6 +27,9 @@ type LoadedModel struct {
 // The actual implementation is in model_manager_gpu.go (vulkan build).
 type GpuPipelineInterface interface {
 	GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*llm.GenerateResult, error)
+	// GenerateDetailedWithEmbeddings replaces each image marker in the prompt
+	// with a block of precomputed embedding rows (image tokens).
+	GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg llm.GenerateConfig) (*llm.GenerateResult, error)
 	// SystemOneWithReadout evaluates one closed-set question on GPU (GPU
 	// feature extraction + trained readout). Implementations may return an
 	// error when the model cannot run the GPU decision path; callers fall

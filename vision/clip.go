@@ -4,16 +4,29 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"os"
+	"time"
+
+	"github.com/computerex/dlgo/quant"
 )
 
 // Encode runs the full pipeline: preprocess -> patch embed -> ViT ->
 // projector, returning one embedding row per image token in the LLM's
 // embedding space (llmDim = MM2.Rows).
 func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
+	dbgTiming := os.Getenv("DLGO_VISION_TIMING") != ""
+	stage := time.Now()
+	mark := func(name string) {
+		if dbgTiming {
+			fmt.Fprintf(os.Stderr, "[vision] %-12s %s\n", name, time.Since(stage))
+			stage = time.Now()
+		}
+	}
 	gridH, gridW, feats, err := e.PrepareImage(src)
 	if err != nil {
 		return nil, err
 	}
+	mark("preprocess")
 
 	// Patch embedding.
 	var tokens [][]float32
@@ -25,6 +38,7 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 			tokens[i] = e.PatchEmbed.MulVecBias(f)
 		}
 	}
+	mark("patchembed")
 
 	// Class token prepend (always position 0 when present).
 	nPos := len(e.PosEmbed) / e.Config.EmbeddingDim
@@ -79,6 +93,7 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 			return nil, fmt.Errorf("vision: block %d: %w", li, err)
 		}
 	}
+	mark("blocks")
 
 	// Post-LN (CLIP).
 	for _, tok := range x {
@@ -99,11 +114,12 @@ func (e *Encoder) Encode(src image.Image) ([][]float32, error) {
 		rowsOut = insertNewlines(x, gridH, gridW, e.ImageNewline)
 	}
 
-	// Projector.
+	// Projector (parallel over tokens).
 	out := make([][]float32, len(rowsOut))
-	for i, tok := range rowsOut {
-		out[i] = e.project(tok)
-	}
+	e.parallelFor(len(rowsOut), func(i int) {
+		out[i] = e.project(rowsOut[i])
+	})
+	mark("projector")
 	return out, nil
 }
 
@@ -191,82 +207,135 @@ func (e *Encoder) forwardLayer(l *Layer, x [][]float32) error {
 	eps := e.Config.LayerNormEps
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
-	// LN1
-	normed := make([][]float32, n)
-	for i := range x {
-		normed[i] = layerNorm(x[i], l.LN1W, l.LN1B, eps)
-	}
-
-	// Q, K, V projections.
-	q := make([][]float32, n)
-	k := make([][]float32, n)
-	v := make([][]float32, n)
-	for i := range normed {
-		q[i] = l.AttnQ.MulVecBias(normed[i])
-		k[i] = l.AttnK.MulVecBias(normed[i])
-		v[i] = l.AttnV.MulVecBias(normed[i])
-	}
-
-	// Bidirectional attention per head.
-	attnOut := make([][]float32, n)
+	// Flatten tokens to a row-major [n][d] buffer once per layer.
+	xf := make([]float32, n*d)
 	for i := 0; i < n; i++ {
-		acc := make([]float32, d)
+		copy(xf[i*d:(i+1)*d], x[i])
+	}
+	// LN1 (parallel over tokens).
+	nf := make([]float32, n*d)
+	e.parallelFor(n, func(i int) {
+		layerNormInto(nf[i*d:(i+1)*d], xf[i*d:(i+1)*d], l.LN1W, l.LN1B, eps)
+	})
+
+	// Batched Q, K, V.
+	qf := make([]float32, n*d)
+	kf := make([]float32, n*d)
+	vf := make([]float32, n*d)
+	e.gemmBT(l.AttnQ.W, l.AttnQ.B, nf, qf, n, d, d)
+	e.gemmBT(l.AttnK.W, l.AttnK.B, nf, kf, n, d, d)
+	e.gemmBT(l.AttnV.W, l.AttnV.B, nf, vf, n, d, d)
+
+	// Bidirectional attention per query token (parallel).
+	af := make([]float32, n*d)
+	e.parallelFor(n, func(i int) {
+		scores := make([]float32, n)
+		acc := af[i*d : (i+1)*d]
 		for h := 0; h < heads; h++ {
-			// scores
-			scores := make([]float32, n)
+			qh := qf[i*d+h*headDim : i*d+h*headDim+headDim]
 			maxS := float32(-math.MaxFloat32)
 			for j := 0; j < n; j++ {
-				var s float64
+				khj := kf[j*d+h*headDim : j*d+h*headDim+headDim]
+				var sc float32
 				for t := 0; t < headDim; t++ {
-					s += float64(q[i][h*headDim+t]) * float64(k[j][h*headDim+t])
+					sc += qh[t] * khj[t]
 				}
-				sf := float32(s) * scale
-				scores[j] = sf
-				if sf > maxS {
-					maxS = sf
+				sc *= scale
+				scores[j] = sc
+				if sc > maxS {
+					maxS = sc
 				}
 			}
-			// softmax
 			sum := float32(0)
-			for j := range scores {
+			for j := 0; j < n; j++ {
 				scores[j] = float32(math.Exp(float64(scores[j] - maxS)))
 				sum += scores[j]
 			}
-			// weighted V
+			accH := acc[h*headDim : h*headDim+headDim]
 			for j := 0; j < n; j++ {
 				w := scores[j] / sum
 				if w == 0 {
 					continue
 				}
+				vj := vf[j*d+h*headDim : j*d+h*headDim+headDim]
 				for t := 0; t < headDim; t++ {
-					acc[h*headDim+t] += w * v[j][h*headDim+t]
+					accH[t] += w * vj[t]
 				}
 			}
 		}
-		attnOut[i] = acc
-	}
+	})
 
-	// Out projection + residual.
-	for i := 0; i < n; i++ {
-		proj := l.AttnOut.MulVecBias(attnOut[i])
-		for ddx := 0; ddx < d; ddx++ {
-			x[i][ddx] += proj[ddx]
-		}
-	}
+	// Batched attn-out projection.
+	pf := make([]float32, n*d)
+	e.gemmBT(l.AttnOut.W, l.AttnOut.B, af, pf, n, d, d)
 
-	// LN2 + FFN (exact GELU) + residual.
-	for i := 0; i < n; i++ {
-		n2 := layerNorm(x[i], l.LN2W, l.LN2B, eps)
-		h := l.FFNUp.MulVecBias(n2)
-		for j := range h {
-			h[j] = gelu(h[j])
-		}
-		down := l.FFNDown.MulVecBias(h)
+	// Residual + LN2 (parallel over tokens).
+	nf2 := make([]float32, n*d)
+	e.parallelFor(n, func(i int) {
 		for ddx := 0; ddx < d; ddx++ {
-			x[i][ddx] += down[ddx]
+			xf[i*d+ddx] += pf[i*d+ddx]
 		}
-	}
+		layerNormInto(nf2[i*d:(i+1)*d], xf[i*d:(i+1)*d], l.LN2W, l.LN2B, eps)
+	})
+
+	// Batched FFN up (d -> ffn), GELU, down (ffn -> d), residual.
+	ffn := l.FFNUp.Rows
+	hf := make([]float32, n*ffn)
+	e.gemmBT(l.FFNUp.W, l.FFNUp.B, nf2, hf, n, ffn, d)
+	e.parallelFor(n, func(i int) {
+		for j := 0; j < ffn; j++ {
+			hf[i*ffn+j] = gelu(hf[i*ffn+j])
+		}
+	})
+	df := make([]float32, n*d)
+	e.gemmBT(l.FFNDown.W, l.FFNDown.B, hf, df, n, d, ffn)
+	e.parallelFor(n, func(i int) {
+		out := x[i]
+		for ddx := 0; ddx < d; ddx++ {
+			out[ddx] = xf[i*d+ddx] + df[i*d+ddx]
+		}
+	})
 	return nil
+}
+
+// parallelForScratch is parallelFor with a per-worker scratch buffer reused
+// layerNormInto writes LayerNorm(x) * w + b into out (len >= len(x)).
+func layerNormInto(out, x, w, b []float32, eps float32) {
+	out = out[:len(x)]
+	var mean float64
+	for _, v := range x {
+		mean += float64(v)
+	}
+	mean /= float64(len(x))
+	var variance float64
+	for _, v := range x {
+		dd := float64(v) - mean
+		variance += dd * dd
+	}
+	variance /= float64(len(x))
+	inv := float32(1.0 / math.Sqrt(variance+float64(eps)))
+	for i := range x {
+		v := (x[i] - float32(mean)) * inv
+		if w != nil {
+			v *= w[i]
+		}
+		if b != nil {
+			v += b[i]
+		}
+		out[i] = v
+	}
+}
+
+// parallelFor runs fn(0..n) across the encoder's worker pool (falls back to a
+// serial loop when no pool is configured).
+func (e *Encoder) parallelFor(n int, fn func(i int)) {
+	if e.pool != nil && n > 1 {
+		e.pool.ParallelFor(n, fn)
+		return
+	}
+	for i := 0; i < n; i++ {
+		fn(i)
+	}
 }
 
 // project applies the LLaVA MLP projector: input-dim -> GELU -> llm-dim.
@@ -293,15 +362,48 @@ func (l *Linear) MulVecBias(x []float32) []float32 {
 	return out
 }
 
+// MulVecInto computes W*x + b into the caller-provided out (len >= Rows),
+// avoiding a per-call allocation. Used by the parallel encoder hot path.
+func (l *Linear) MulVecInto(out, x []float32) {
+	out = out[:l.Rows]
+	if l.B != nil {
+		copy(out, l.B)
+	} else {
+		for i := range out {
+			out[i] = 0
+		}
+	}
+	matVecAccum(out, l.W, x, l.Rows, l.Cols)
+}
+
 func matVecAccum(out, w, x []float32, rows, cols int) {
 	for r := 0; r < rows; r++ {
 		row := w[r*cols : (r+1)*cols]
-		var s float64
+		var s float32
 		for c := 0; c < cols; c++ {
-			s += float64(row[c]) * float64(x[c])
+			s += row[c] * x[c]
 		}
-		out[r] += float32(s)
+		out[r] += s
 	}
+}
+
+// gemmBT computes out[i][o] = sum_c W[o][c] * X[i][c] (+ bias), i.e. Y = X*W^T.
+// Parallel over tokens; each row dot uses a SIMD kernel when available.
+//
+// W is row-major [rows][cols]; X is [n][cols]; out is [n][rows].
+func (e *Encoder) gemmBT(w, bias []float32, x, out []float32, n, rows, cols int) {
+	e.parallelFor(n, func(i int) {
+		xRow := x[i*cols : (i+1)*cols]
+		o := out[i*rows : (i+1)*rows]
+		for r := 0; r < rows; r++ {
+			wRow := w[r*cols : (r+1)*cols]
+			s := quant.SIMDDotF32(wRow, xRow, cols)
+			if bias != nil {
+				s += bias[r]
+			}
+			o[r] = s
+		}
+	})
 }
 
 func layerNorm(x, w, b []float32, eps float32) []float32 {
@@ -325,7 +427,7 @@ func layerNormInPlace(x, w, b []float32, eps float32) {
 	variance /= float64(len(x))
 	inv := float32(1.0 / math.Sqrt(variance+float64(eps)))
 	for i := range x {
-		v := (x[i]-float32(mean))*inv
+		v := (x[i] - float32(mean)) * inv
 		if w != nil {
 			v *= w[i]
 		}

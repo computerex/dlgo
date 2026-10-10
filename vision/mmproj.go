@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/computerex/dlgo/blas"
 	"github.com/computerex/dlgo/format/gguf"
 	"github.com/computerex/dlgo/mmap"
 	"github.com/computerex/dlgo/quant"
@@ -20,14 +21,14 @@ import (
 
 // Config holds the vision encoder hyperparameters parsed from mmproj metadata.
 type Config struct {
-	ProjectorType string  // "mlp", "mlp_norm"
-	ImageSize     int     // e.g. 336
-	PatchSize     int     // e.g. 14
-	EmbeddingDim  int     // vision hidden size (e.g. 1024)
-	ProjectionDim int     // CLIP projection dim (0 = unused)
-	NumHeads      int     // attention heads
-	NumLayers     int     // transformer blocks
-	FFNDim        int     // feed-forward size
+	ProjectorType string // "mlp", "mlp_norm"
+	ImageSize     int    // e.g. 336
+	PatchSize     int    // e.g. 14
+	EmbeddingDim  int    // vision hidden size (e.g. 1024)
+	ProjectionDim int    // CLIP projection dim (0 = unused)
+	NumHeads      int    // attention heads
+	NumLayers     int    // transformer blocks
+	FFNDim        int    // feed-forward size
 	LayerNormEps  float32
 	ImageMean     [3]float32
 	ImageStd      [3]float32
@@ -57,29 +58,32 @@ type Encoder struct {
 	Config Config
 	mf     *mmap.MappedFile
 
-	PatchEmbed Linear // 2D flattened layout (legacy): rows = [OC], cols = [IC*KH*KW], C-fastest
+	PatchEmbed Linear    // 2D flattened layout (legacy): rows = [OC], cols = [IC*KH*KW], C-fastest
 	Patch4DW   []float32 // non-nil when 4D conv layout: GGUF order [KH, KW, IC, OC]
 	PatchKH    int
 	PatchKW    int
 	PatchIC    int
 	PatchBias  []float32 // optional
 
-	PosEmbed  []float32 // [n_pos, EmbeddingDim]
-	ClassEmb  []float32 // optional
-	PreLNW    []float32 // optional
-	PreLNB    []float32
-	PostLNW   []float32
-	PostLNB   []float32
-	Layers    []Layer
+	PosEmbed []float32 // [n_pos, EmbeddingDim]
+	ClassEmb []float32 // optional
+	PreLNW   []float32 // optional
+	PreLNB   []float32
+	PostLNW  []float32
+	PostLNB  []float32
+	Layers   []Layer
 
-	MM0, MM2 Linear // standard LLaVA projector: mm.0 -> GELU -> mm.2
-	MM1, MM3 Linear // Yi variant: mm.0/mm.1 -> norm -> mm.3
+	MM0, MM2     Linear    // standard LLaVA projector: mm.0 -> GELU -> mm.2
+	MM1, MM3     Linear    // Yi variant: mm.0/mm.1 -> norm -> mm.3
 	ImageNewline []float32 // optional (LLaVA-1.6 spatial unpad)
 	YiNorm       bool      // mm.1 present => Yi-style projector
 
 	// Content extent (in pixels) of the last spatial-unpad encode; used to
 	// trim padded patch rows/cols deterministically.
 	lastContentW, lastContentH int
+
+	// pool parallelizes the vision transformer across CPU cores.
+	pool *blas.Pool
 }
 
 // LoadMmproj loads a llama.cpp mmproj GGUF vision encoder from path.
@@ -96,7 +100,7 @@ func LoadMmproj(path string) (*Encoder, error) {
 		return nil, fmt.Errorf("vision: %s has no vision encoder", path)
 	}
 
-	enc := &Encoder{}
+	enc := &Encoder{pool: blas.DefaultPool()}
 	cfg := &enc.Config
 
 	cfg.ProjectorType = toString(md, "clip.projector_type")

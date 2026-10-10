@@ -49,18 +49,18 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 	}
 
 	md := map[string]interface{}{
-		"general.architecture":                        "clip",
-		"clip.has_vision_encoder":                     true,
-		"clip.projector_type":                         "mlp",
-		"clip.vision.image_size":                      uint32(cfg.image),
-		"clip.vision.patch_size":                      uint32(cfg.patch),
-		"clip.vision.embedding_length":                uint32(cfg.embd),
-		"clip.vision.attention.head_count":            uint32(cfg.heads),
-		"clip.vision.block_count":                     uint32(cfg.layers),
-		"clip.vision.feed_forward_length":             uint32(cfg.ffn),
-		"clip.vision.attention.layer_norm_epsilon":    float32(1e-5),
-		"clip.vision.image_mean":                      []float32{0.5, 0.5, 0.5},
-		"clip.vision.image_std":                       []float32{0.5, 0.5, 0.5},
+		"general.architecture":                     "clip",
+		"clip.has_vision_encoder":                  true,
+		"clip.projector_type":                      "mlp",
+		"clip.vision.image_size":                   uint32(cfg.image),
+		"clip.vision.patch_size":                   uint32(cfg.patch),
+		"clip.vision.embedding_length":             uint32(cfg.embd),
+		"clip.vision.attention.head_count":         uint32(cfg.heads),
+		"clip.vision.block_count":                  uint32(cfg.layers),
+		"clip.vision.feed_forward_length":          uint32(cfg.ffn),
+		"clip.vision.attention.layer_norm_epsilon": float32(1e-5),
+		"clip.vision.image_mean":                   []float32{0.5, 0.5, 0.5},
+		"clip.vision.image_std":                    []float32{0.5, 0.5, 0.5},
 	}
 
 	var tensors []gguf.WriteTensor
@@ -103,7 +103,7 @@ func buildTinyMmproj(t *testing.T, cfg tinyCfg, seed int64) (string, map[string]
 		add(p+"ln2.bias", []int64{int64(cfg.embd)}, randVec(q+"ln2b", cfg.embd))
 		for _, proj := range []string{"attn_q", "attn_k", "attn_v", "attn_out"} {
 			add(p+proj+".weight", []int64{int64(cfg.embd), int64(cfg.embd)}, randMat(q+proj+"w", cfg.embd, cfg.embd))
-		} 		// no biases for this fixture (SigLIP-like)
+		} // no biases for this fixture (SigLIP-like)
 		add(p+"ffn_up.weight", []int64{int64(cfg.embd), int64(cfg.ffn)}, randMat(q+"ffnup", cfg.ffn, cfg.embd))
 		add(p+"ffn_down.weight", []int64{int64(cfg.ffn), int64(cfg.embd)}, randMat(q+"ffndown", cfg.embd, cfg.ffn))
 	}
@@ -204,7 +204,7 @@ func (r ref) Encode(imgPix []float32, W, H int) [][]float32 {
 		for y := 0; y < ps; y++ {
 			for x := 0; x < ps; x++ {
 				for ch := 0; ch < 3; ch++ {
-					wRow := (y*ps + x) * 3 + ch
+					wRow := (y*ps+x)*3 + ch
 					fv := f[ch*ps*ps+y*ps+x]
 					for oc := 0; oc < c.embd; oc++ {
 						v[oc] += pw[wRow+(ps*ps*3)*oc] * fv
