@@ -59,3 +59,10 @@ systemone-train/artifacts/
 *.log
 *.prof
 *.test
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Test generation artifacts
+bench/systemone/gen32k-output.txt
