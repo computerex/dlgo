@@ -205,8 +205,29 @@ func (s *Scheduler) processRequest(req *InferenceRequest) {
 func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
 	pipe := s.model.CPUPipeline
 
+	// Vision prefill uses the same device-agnostic Pipeline implementation as
+	// the CPU text path. Image rows are injected through ForwardEmbedding and
+	// use the Qwen M-RoPE grid positions carried in GenerateConfig.
 	if len(req.Images) > 0 {
-		req.Output <- StreamEvent{Type: EventError, Error: "image input requires a GPU model (load with -gpu); CPU image prefill is not supported"}
+		fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
+		prompt := llm.FormatMessages(pipe.Model.Config, req.Messages, fmtOpts)
+		cfg := req.Config
+		cfg.ImageMarker = "<image>"
+		cfg.Stream = func(token string) {
+			if req.Ctx.Err() == nil {
+				req.Output <- StreamEvent{Type: EventToken, Token: token}
+			}
+		}
+		result, err := pipe.GenerateDetailedWithEmbeddings(prompt, req.Images, cfg)
+		if err != nil {
+			req.Output <- StreamEvent{Type: EventError, Error: err.Error()}
+			return
+		}
+		finishReason := "stop"
+		if result.TotalTokens >= cfg.MaxTokens {
+			finishReason = "length"
+		}
+		req.Output <- StreamEvent{Type: EventDone, FinishReason: finishReason, PromptTokens: result.PromptTokens, GeneratedTokens: result.TotalTokens}
 		return
 	}
 
