@@ -33,9 +33,30 @@ desktop.ini
 # Cursor
 .cursor/
 
-# Harness/benchmark artifacts
+# Harness/benchmark artifacts and local agent state
 .harness_*
 .harness_output/
+.claude/
+.sessions/
+._review_jeff/
+jobs/
+terminal-bench-2/
+
+# Root-level scratch outputs from local model/GPU experiments. Reusable tools
+# belong under bench/scripts/ or cmd/; durable benchmark documentation belongs
+# under docs/ or bench/systemone/.
+/*.png
+/*.jpg
+/*.jpeg
+/*.json
+/*.txt
+/*.log
+/*.prof
+/*.cpu
+/*.py
+/*.ps1
+/*.exe
+/nul
 
 # Ollama Modelfiles (temp)
 Modelfile*
@@ -50,9 +71,10 @@ bench/results/
 frontend/dist/
 frontend/node_modules/
 
-# System One local secrets and generated training artifacts
+# System One local secrets, generated training artifacts, and feature caches
 systemone-train/.env
 systemone-train/data/generated/
+systemone-train/data/seed_*.jsonl
 systemone-train/artifacts/
 
 # Misc

@@ -192,6 +192,28 @@ On the development workstation (Windows 11, RTX 4070 Ti SUPER 16 GB, Qwen3.5 9B 
 
 These are a development snapshot, not a service SLO or a benchmark claim. Jev timing includes network/provider execution; dlgo timing includes local HTTP and GPU inference. Use `Server-Timing` and your own workload/state lengths for p50/p95 measurements.
 
+## Vision / multimodal inference
+
+The repository includes a local multimodal path for an `mmproj` vision projector plus a compatible text GGUF backbone. `dlgo-vision` preprocesses an image, executes the projector, inserts the resulting image-embedding block at `<image>`, and generates directly from the combined sequence.
+
+```bash
+# Build (CPU path)
+go build -ldflags "-linkmode internal" -o dlgo-vision ./cmd/dlgo-vision
+
+# Describe an image. The projector output embedding width must equal the
+# language model embedding width.
+dlgo-vision \
+  -mmproj C:\models\mmproj.gguf \
+  -model C:\models\text-model.gguf \
+  -image C:\images\example.png \
+  -prompt "Describe this image in detail:\n<image>" \
+  -max-tokens 128
+```
+
+`-image` also accepts deterministic synthetic fixtures (`white`, `black`, `gray`, `cb`, `red`, `green`, `blue`) for projector and image-token-placement checks. `cmd/mmproj-encode` is a companion utility for encoding/inspecting projector output. The vision stack lives in `vision/` and supports mmproj loading, CLIP-style preprocessing, patch/grid encoding, and projector output insertion into the language-model prompt.
+
+The current implementation validates projector/text embedding-dimension compatibility at runtime and supports image grids needed by the embedding-generation path. It is an inference implementation, not a claim of compatibility with every vendor chat template or multimodal model family; validate the projector, text backbone, image prompt marker, and visual quality together for each model pairing.
+
 ## CLI Usage
 
 ### `dlgo run` — Interactive Chat
