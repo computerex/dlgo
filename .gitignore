@@ -75,7 +75,15 @@ frontend/node_modules/
 systemone-train/.env
 systemone-train/data/generated/
 systemone-train/data/seed_*.jsonl
-systemone-train/artifacts/
+# Keep the three published unified readouts below source control; other local
+# experiments, reports, temporary heads, and caches remain ignored.
+systemone-train/artifacts/*
+!systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.json
+!systemone-train/artifacts/qwen35-08b-q4-readout-v10-uni.gguf
+!systemone-train/artifacts/qwen38-2b-q4-readout-v2-uni.json
+!systemone-train/artifacts/qwen38-2b-q4-readout-v2-uni.gguf
+!systemone-train/artifacts/qwen35-9b-q3-readout-v2-uni.json
+!systemone-train/artifacts/qwen35-9b-q3-readout-v2-uni.gguf
 
 # Misc
 *.log

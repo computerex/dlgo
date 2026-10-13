@@ -77,13 +77,15 @@ state + question + semantic candidate criteria
 
 ### Included unified Qwen heads
 
-Artifacts are generated locally under `systemone-train/artifacts/` (gitignored because they are model outputs). The evaluated `splits-gp2` results are:
+The three published unified artifacts below are versioned in `systemone-train/artifacts/` so a checkout can run the included heads immediately. Other experimental artifacts, feature caches, and reports remain local/gitignored. The evaluated `splits-gp2` results are:
 
 | Backbone | Quant | Unified artifact | GPU test | CPU test | Notes |
 |---|---|---|---:|---:|---|
 | Qwen3.5 0.8B | Q4_K_M | `qwen35-08b-q4-readout-v10-uni` | 78.64% | 78.93% | Lowest-latency head |
 | Qwen3.8 2B | Q4_K_M | `qwen38-2b-q4-readout-v2-uni` | 84.85% | 84.13% | Balanced head |
 | Qwen3.5 9B | Q3_K_M | `qwen35-9b-q3-readout-v2-uni` | 93.65% | 93.51% | Highest corpus accuracy |
+
+Each published head is available as both a human-inspectable JSON artifact and a compact GGUF export. Pass the JSON path as the API `readout` value; the GGUF export is provided for distribution and inspection tooling. The playground manifest references these versioned JSON artifacts by default.
 
 The corpus metrics are not a broad factual-reasoning claim. `bench/systemone/compare_jev_suite.py` provides a separate, sealed cross-domain Jev comparison harness.
 
