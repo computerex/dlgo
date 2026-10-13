@@ -40,6 +40,37 @@ dlgo-vision \
 
 The current implementation validates projector/text embedding-dimension compatibility at runtime and supports image grids needed by the embedding-generation path. It is an inference implementation, not a claim of compatibility with every vendor chat template or multimodal model family; validate the projector, text backbone, image prompt marker, and visual quality together for each model pairing.
 
+## Diffusion image generation
+
+In addition to language and vision-language inference, dlgo includes a local text-to-image diffusion pipeline. The current implementation targets **Z-Image / Lumina2-style DiT** checkpoints rather than claiming universal compatibility with every Stable Diffusion checkpoint family. It runs the complete pipeline locally:
+
+```text
+prompt -> Qwen text encoder -> quantized DiT denoising -> VAE decode -> PNG
+```
+
+The implementation includes a GGUF DiT loader, scheduler/sampler, 3D RoPE, quantized-weight CPU inference, Vulkan GPU DiT execution, SafeTensors VAE decoding, memory-budget estimation, and PNG output.
+
+```bash
+# CPU inference
+go build -ldflags "-linkmode internal" -o dlgo-image ./cmd/dlgo-image
+
+dlgo-image \
+  --diffusion-model C:\models\z-image-turbo-Q4_K_M.gguf \
+  --vae C:\models\ae.safetensors \
+  --llm C:\models\qwen-text-encoder.gguf \
+  -p "a cinematic photograph of a red fox in snow" \
+  -o output.png -W 1024 -H 1024 --steps 8
+
+# Vulkan-accelerated DiT inference
+dlgo-image --gpu \
+  --diffusion-model C:\models\z-image-turbo-Q4_K_M.gguf \
+  --vae C:\models\ae.safetensors \
+  --llm C:\models\qwen-text-encoder.gguf \
+  -p "a cinematic photograph of a red fox in snow" -o output.png
+```
+
+`dlgo-image` validates dimensions and estimates peak memory before generation. The text encoder is released after prompt embedding so the DiT and VAE have the available memory budget. GPU acceleration applies to the DiT execution path; model compatibility, image quality, determinism, VRAM use, and throughput must be validated for each checkpoint/quantization/resolution combination. The diffusion implementation is in `models/diffusion/`, with CPU/GPU correctness and integration tests alongside it.
+
 ## CLI Usage
 
 ### `dlgo run` — Interactive Chat
