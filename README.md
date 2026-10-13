@@ -18,182 +18,6 @@ dlgo run model.gguf --gpu
 dlgo server --model model.gguf --gpu
 ```
 
-## System One: Fast Typed Decisions
-
-Alongside chat generation, dlgo has a local **System One** API for deterministic closed-set decisions: choice selection, binary verification (`noul`), and ordered scores. It is designed to mirror the typed request/response shape used by TypeSafe Jev while keeping inference local.
-
-> **Scope and calibration:** System One head accuracy is only established for the evaluated distribution. A high binary probability is a preference between the two decision candidates, not a universal guarantee of truth. Evaluate and calibrate each application domain before automating consequential actions.
-
-### API
-
-`POST /v1/systemone` takes a loaded model, an on-disk readout artifact, a state, and one or more questions. The response contains typed answers and `Server-Timing` (`queue`, `decision`) measurements.
-
-```bash
-curl http://127.0.0.1:8080/v1/systemone \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen35-9b",
-    "readout": "C:\\projects\\dlgo\\systemone-train\\artifacts\\qwen35-9b-q3-readout-v2-uni.json",
-    "state": "A standard Pokemon type chart applies. Moltres is a Fire/Flying-type Pokemon.",
-    "questions": {
-      "moltres_water": {
-        "type": "noul",
-        "instructions": "Is Moltres, a Fire/Flying-type, weak to Water-type attacks?",
-        "criteria": {
-          "true": "Water attacks deal super-effective damage to Moltres.",
-          "false": "Water attacks deal neutral, reduced, or no damage to Moltres."
-        }
-      }
-    }
-  }'
-```
-
-For `noul`, use semantic `true`/`false` criteria whenever possible. They are compiled as the candidate meanings while the public response remains the probability of `yes`:
-
-```json
-{"answers":{"moltres_water":{"type":"noul","noul":0.78}}}
-```
-
-This is materially more informative than a bare `yes`/`no` label for factual or policy verification.
-
-### Architecture
-
-The one-pass decision path is:
-
-```text
-state + question + semantic candidate criteria
-        -> deterministic System One prompt compiler
-        -> Qwen GGUF backbone prefill (CPU or Vulkan GPU)
-        -> final normalized hidden state at "Answer code:"
-        -> trained linear readout (one row per answer-code slot)
-        -> normalized typed probabilities
-```
-
-- Prompts resolve candidate codes deterministically (`A`, `B`, …) by sorted value.
-- A shared state prefix is prefilled once for multi-question requests; each question evaluates only its suffix.
-- A readout supports up to five options; wider questions degrade rather than silently producing a misleading head result.
-- A unified (`device: any`) head trains on both CPU and GPU feature snapshots so the same artifact can be served on either engine.
-- `choice`, `noul`, and `score` are engine forms; training examples are closed-choice rows with explicit criteria and answer codes.
-
-### Included unified Qwen heads
-
-The three published unified artifacts below are versioned in `systemone-train/artifacts/` so a checkout can run the included heads immediately. Other experimental artifacts, feature caches, and reports remain local/gitignored. The evaluated `splits-gp2` results are:
-
-| Backbone | Quant | Unified artifact | GPU test | CPU test | Notes |
-|---|---|---|---:|---:|---|
-| Qwen3.5 0.8B | Q4_K_M | `qwen35-08b-q4-readout-v10-uni` | 78.64% | 78.93% | Lowest-latency head |
-| Qwen3.8 2B | Q4_K_M | `qwen38-2b-q4-readout-v2-uni` | 84.85% | 84.13% | Balanced head |
-| Qwen3.5 9B | Q3_K_M | `qwen35-9b-q3-readout-v2-uni` | 93.65% | 93.51% | Highest corpus accuracy |
-
-Each published head is available as both a human-inspectable JSON artifact and a compact GGUF export. Pass the JSON path as the API `readout` value; the GGUF export is provided for distribution and inspection tooling. The playground manifest references these versioned JSON artifacts by default.
-
-The corpus metrics are not a broad factual-reasoning claim. `bench/systemone/compare_jev_suite.py` provides a separate, sealed cross-domain Jev comparison harness.
-
-### Playground
-
-Build the React frontend and launch a GPU playground server:
-
-```powershell
-cd frontend
-npm install
-npm run build
-cd ..
-
-# Fast 0.8B startup
-.\bench\systemone\playground.ps1
-
-# 9B decision model
-.\bench\systemone\playground.ps1 -Size 9b
-```
-
-Open `http://localhost:8080`, choose **Playground**, select a model, edit state/questions, and inspect typed probabilities, latency, request history, and VRAM status. The Pokémon preset demonstrates semantic noul criteria; it is intentionally distinct from readout training examples.
-
-For frontend HMR, run `npm run dev` in `frontend/`; Vite proxies System One requests to the server on port 8080.
-
-### Train a unified head for another backbone
-
-The System One trainer lives at `cmd/systemone-train`. A head must be trained from feature snapshots of the exact quantized backbone, context length, prompt format, and CPU/GPU engine configuration to be served.
-
-1. Create JSONL splits with rows containing:
-   - `id`, `state`, `instructions`, `criteria`, `codes`, and `target`;
-   - at least two criteria per row;
-   - explicit code assignments such as `{ "no": "A", "yes": "B" }` for robust GPU extraction.
-2. Extract/cache features once per device. Re-running skips cache hits and checkpoints periodically.
-3. Union-train from both caches to produce a `device: any` JSON readout and optional GGUF export.
-4. Evaluate CPU and GPU separately, then validate against held-out, mechanism-disjoint examples.
-
-Illustrative commands (paths and model IDs are local choices):
-
-```powershell
-# CPU feature cache fill
-.\systemone-train.exe `
-  -model C:\models\backbone.gguf `
-  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
-  -device cpu -feature-cache features-cpu.json `
-  -output readout-cpu-tmp.json -epochs 1 -ctx 512
-
-# GPU feature cache fill (run with no other GPU model process)
-.\systemone-train-gpu.exe `
-  -model C:\models\backbone.gguf `
-  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
-  -device gpu -feature-cache features-gpu.json `
-  -output readout-gpu-tmp.json -epochs 1 -ctx 512
-
-# Train one any-device artifact from the two complete caches
-.\systemone-train-gpu.exe `
-  -model C:\models\backbone.gguf `
-  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
-  -device cpu -feature-cache features-cpu.json -union-cache features-gpu.json `
-  -output readout-uni.json -gguf-output readout-uni.gguf `
-  -report readout-uni-report.json -epochs 100 -lr 0.02 -ctx 512
-```
-
-The included scripts in `bench/systemone/` are concrete examples for the 9B pipeline:
-
-- `union-train-9b.ps1` / `union-train-9b-v3.ps1` / `union-train-9b-v4.ps1` — union training variants;
-- `extract-9b-*.ps1` — feature-cache extraction;
-- `validate-2b-uni.ps1`, `validate_v3.py` — validation helpers;
-- `gen_aug2.py`, `gen_aug3.py` — experimental corpus augmentation generators;
-- `compare_jev_pokemon.py`, `compare_jev_suite.py` — Jev 1.13 comparison harnesses.
-
-### Data and evaluation
-
-The current generated corpus and artifacts are intentionally ignored by Git:
-
-```text
-systemone-train/data/generated/
-systemone-train/artifacts/
-systemone-train/.env
-```
-
-The base `splits-gp2` data is structured state-to-choice supervision. It historically contained only `choice` rows, so applications using `noul` should supply semantic true/false criteria and must add independent noul validation. Keep evaluation entity/relation pairs out of training; do not promote a head using only random-split accuracy.
-
-To compare a local 9B head to Jev 1.13, place an OpenRouter key only in ignored `systemone-train/.env`:
-
-```text
-OPENROUTER_API_KEY=sk-or-...
-```
-
-Then run:
-
-```powershell
-python .\bench\systemone\compare_jev_pokemon.py
-python .\bench\systemone\compare_jev_suite.py
-```
-
-The suite sends the same state, question, and semantic criteria to Jev (`typesafe/jev-1.13`) and local dlgo. Result JSON is saved beneath the ignored `bench/results/` directory. Never commit API keys or raw secret-bearing requests.
-
-### Latency snapshot
-
-On the development workstation (Windows 11, RTX 4070 Ti SUPER 16 GB, Qwen3.5 9B Q3_K_M GPU resident), the 32-case semantic-noul comparison run measured:
-
-| System | Mean end-to-end wall time | Accuracy on the 32-case suite | Mean Brier |
-|---|---:|---:|---:|
-| Jev 1.13 through OpenRouter | 282.8 ms | 31/32 (96.9%) | 0.0184 |
-| dlgo Qwen3.5 9B v2 unified head, localhost | 345.1 ms | 30/32 (93.8%) | 0.0677 |
-
-These are a development snapshot, not a service SLO or a benchmark claim. Jev timing includes network/provider execution; dlgo timing includes local HTTP and GPU inference. Use `Server-Timing` and your own workload/state lengths for p50/p95 measurements.
-
 ## Vision / multimodal inference
 
 The repository includes a local multimodal path for an `mmproj` vision projector plus a compatible text GGUF backbone. `dlgo-vision` preprocesses an image, executes the projector, inserts the resulting image-embedding block at `<image>`, and generates directly from the combined sequence.
@@ -411,6 +235,183 @@ Same GGUF file, `temperature=0`, `seed=42`, `max_tokens=64`.
 | Qwen3.5 9B | Q3_K_M | 7.5 tok/s | 7.2 tok/s | **+4%** |
 | Qwen3.5 27B | Q3_K_M | 2.5 tok/s | 2.4 tok/s | **+4%** |
 | Qwen3.5 35B MoE | Q3_K_M | 8.1 tok/s | 7.6 tok/s | **+7%** |
+
+## System One: Fast Typed Decisions
+
+Alongside chat generation, dlgo has a local **System One** API for deterministic closed-set decisions: choice selection, binary verification (`noul`), and ordered scores. It is designed to mirror the typed request/response shape used by TypeSafe Jev while keeping inference local.
+
+> **Scope and calibration:** System One head accuracy is only established for the evaluated distribution. A high binary probability is a preference between the two decision candidates, not a universal guarantee of truth. Evaluate and calibrate each application domain before automating consequential actions.
+
+### API
+
+`POST /v1/systemone` takes a loaded model, an on-disk readout artifact, a state, and one or more questions. The response contains typed answers and `Server-Timing` (`queue`, `decision`) measurements.
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen35-9b",
+    "readout": "C:\\projects\\dlgo\\systemone-train\\artifacts\\qwen35-9b-q3-readout-v2-uni.json",
+    "state": "A standard Pokemon type chart applies. Moltres is a Fire/Flying-type Pokemon.",
+    "questions": {
+      "moltres_water": {
+        "type": "noul",
+        "instructions": "Is Moltres, a Fire/Flying-type, weak to Water-type attacks?",
+        "criteria": {
+          "true": "Water attacks deal super-effective damage to Moltres.",
+          "false": "Water attacks deal neutral, reduced, or no damage to Moltres."
+        }
+      }
+    }
+  }'
+```
+
+For `noul`, use semantic `true`/`false` criteria whenever possible. They are compiled as the candidate meanings while the public response remains the probability of `yes`:
+
+```json
+{"answers":{"moltres_water":{"type":"noul","noul":0.78}}}
+```
+
+This is materially more informative than a bare `yes`/`no` label for factual or policy verification.
+
+### Architecture
+
+The one-pass decision path is:
+
+```text
+state + question + semantic candidate criteria
+        -> deterministic System One prompt compiler
+        -> Qwen GGUF backbone prefill (CPU or Vulkan GPU)
+        -> final normalized hidden state at "Answer code:"
+        -> trained linear readout (one row per answer-code slot)
+        -> normalized typed probabilities
+```
+
+- Prompts resolve candidate codes deterministically (`A`, `B`, …) by sorted value.
+- A shared state prefix is prefilled once for multi-question requests; each question evaluates only its suffix.
+- A readout supports up to five options; wider questions degrade rather than silently producing a misleading head result.
+- A unified (`device: any`) head trains on both CPU and GPU feature snapshots so the same artifact can be served on either engine.
+- `choice`, `noul`, and `score` are engine forms; training examples are closed-choice rows with explicit criteria and answer codes.
+
+### Included unified Qwen heads
+
+The three published unified artifacts below are versioned in `systemone-train/artifacts/` so a checkout can run the included heads immediately. Other experimental artifacts, feature caches, and reports remain local/gitignored. The evaluated `splits-gp2` results are:
+
+| Backbone | Quant | Unified artifact | GPU test | CPU test | Notes |
+|---|---|---|---:|---:|---|
+| Qwen3.5 0.8B | Q4_K_M | `qwen35-08b-q4-readout-v10-uni` | 78.64% | 78.93% | Lowest-latency head |
+| Qwen3.8 2B | Q4_K_M | `qwen38-2b-q4-readout-v2-uni` | 84.85% | 84.13% | Balanced head |
+| Qwen3.5 9B | Q3_K_M | `qwen35-9b-q3-readout-v2-uni` | 93.65% | 93.51% | Highest corpus accuracy |
+
+Each published head is available as both a human-inspectable JSON artifact and a compact GGUF export. Pass the JSON path as the API `readout` value; the GGUF export is provided for distribution and inspection tooling. The playground manifest references these versioned JSON artifacts by default.
+
+The corpus metrics are not a broad factual-reasoning claim. `bench/systemone/compare_jev_suite.py` provides a separate, sealed cross-domain Jev comparison harness.
+
+### Playground
+
+Build the React frontend and launch a GPU playground server:
+
+```powershell
+cd frontend
+npm install
+npm run build
+cd ..
+
+# Fast 0.8B startup
+.\bench\systemone\playground.ps1
+
+# 9B decision model
+.\bench\systemone\playground.ps1 -Size 9b
+```
+
+Open `http://localhost:8080`, choose **Playground**, select a model, edit state/questions, and inspect typed probabilities, latency, request history, and VRAM status. The Pokémon preset demonstrates semantic noul criteria; it is intentionally distinct from readout training examples.
+
+For frontend HMR, run `npm run dev` in `frontend/`; Vite proxies System One requests to the server on port 8080.
+
+### Train a unified head for another backbone
+
+The System One trainer lives at `cmd/systemone-train`. A head must be trained from feature snapshots of the exact quantized backbone, context length, prompt format, and CPU/GPU engine configuration to be served.
+
+1. Create JSONL splits with rows containing:
+   - `id`, `state`, `instructions`, `criteria`, `codes`, and `target`;
+   - at least two criteria per row;
+   - explicit code assignments such as `{ "no": "A", "yes": "B" }` for robust GPU extraction.
+2. Extract/cache features once per device. Re-running skips cache hits and checkpoints periodically.
+3. Union-train from both caches to produce a `device: any` JSON readout and optional GGUF export.
+4. Evaluate CPU and GPU separately, then validate against held-out, mechanism-disjoint examples.
+
+Illustrative commands (paths and model IDs are local choices):
+
+```powershell
+# CPU feature cache fill
+.\systemone-train.exe `
+  -model C:\models\backbone.gguf `
+  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
+  -device cpu -feature-cache features-cpu.json `
+  -output readout-cpu-tmp.json -epochs 1 -ctx 512
+
+# GPU feature cache fill (run with no other GPU model process)
+.\systemone-train-gpu.exe `
+  -model C:\models\backbone.gguf `
+  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
+  -device gpu -feature-cache features-gpu.json `
+  -output readout-gpu-tmp.json -epochs 1 -ctx 512
+
+# Train one any-device artifact from the two complete caches
+.\systemone-train-gpu.exe `
+  -model C:\models\backbone.gguf `
+  -train train.jsonl -dev dev.jsonl -calibration calibration.jsonl -test test.jsonl `
+  -device cpu -feature-cache features-cpu.json -union-cache features-gpu.json `
+  -output readout-uni.json -gguf-output readout-uni.gguf `
+  -report readout-uni-report.json -epochs 100 -lr 0.02 -ctx 512
+```
+
+The included scripts in `bench/systemone/` are concrete examples for the 9B pipeline:
+
+- `union-train-9b.ps1` / `union-train-9b-v3.ps1` / `union-train-9b-v4.ps1` — union training variants;
+- `extract-9b-*.ps1` — feature-cache extraction;
+- `validate-2b-uni.ps1`, `validate_v3.py` — validation helpers;
+- `gen_aug2.py`, `gen_aug3.py` — experimental corpus augmentation generators;
+- `compare_jev_pokemon.py`, `compare_jev_suite.py` — Jev 1.13 comparison harnesses.
+
+### Data and evaluation
+
+The current generated corpus and artifacts are intentionally ignored by Git:
+
+```text
+systemone-train/data/generated/
+systemone-train/artifacts/
+systemone-train/.env
+```
+
+The base `splits-gp2` data is structured state-to-choice supervision. It historically contained only `choice` rows, so applications using `noul` should supply semantic true/false criteria and must add independent noul validation. Keep evaluation entity/relation pairs out of training; do not promote a head using only random-split accuracy.
+
+To compare a local 9B head to Jev 1.13, place an OpenRouter key only in ignored `systemone-train/.env`:
+
+```text
+OPENROUTER_API_KEY=sk-or-...
+```
+
+Then run:
+
+```powershell
+python .\bench\systemone\compare_jev_pokemon.py
+python .\bench\systemone\compare_jev_suite.py
+```
+
+The suite sends the same state, question, and semantic criteria to Jev (`typesafe/jev-1.13`) and local dlgo. Result JSON is saved beneath the ignored `bench/results/` directory. Never commit API keys or raw secret-bearing requests.
+
+### Latency snapshot
+
+On the development workstation (Windows 11, RTX 4070 Ti SUPER 16 GB, Qwen3.5 9B Q3_K_M GPU resident), the 32-case semantic-noul comparison run measured:
+
+| System | Mean end-to-end wall time | Accuracy on the 32-case suite | Mean Brier |
+|---|---:|---:|---:|
+| Jev 1.13 through OpenRouter | 282.8 ms | 31/32 (96.9%) | 0.0184 |
+| dlgo Qwen3.5 9B v2 unified head, localhost | 345.1 ms | 30/32 (93.8%) | 0.0677 |
+
+These are a development snapshot, not a service SLO or a benchmark claim. Jev timing includes network/provider execution; dlgo timing includes local HTTP and GPU inference. Use `Server-Timing` and your own workload/state lengths for p50/p95 measurements.
+
 
 ## Project Structure
 
