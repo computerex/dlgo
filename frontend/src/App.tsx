@@ -3,10 +3,12 @@ import { ChatPanel } from './components/ChatPanel';
 import { ChatList } from './components/ChatList';
 import { ModelSelector } from './components/ModelSelector';
 import { SettingsPanel } from './components/SettingsPanel';
+import { SystemOnePlayground } from './systemone/SystemOnePlayground';
 import { loadModel, unloadModel, listModels } from './api';
 import type { ChatSession } from './api';
 
 function App() {
+  const [view, setView] = useState<'chat' | 'systemone'>('chat');
   const [model, setModel] = useState('');
   const [temperature, setTemperature] = useState(0.7);
   const [topP, setTopP] = useState(0.9);
@@ -47,6 +49,10 @@ function App() {
       setModel(chat.model);
     }
   }, []);
+
+  if (view === 'systemone') {
+    return <SystemOnePlayground onBackToChat={() => setView('chat')} />;
+  }
 
   return (
     <div className="h-screen flex">
@@ -108,6 +114,17 @@ function App() {
                 <span className="text-[var(--text-secondary)] text-xs animate-pulse">switching...</span>
               )}
             </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[var(--text-secondary)]">System One</span>
+            <button
+              onClick={() => setView('systemone')}
+              className="text-[11px] px-2.5 py-1 rounded-lg font-medium transition-colors border"
+              style={{ background: 'var(--accent)', color: 'white', borderColor: 'var(--accent)' }}
+              title="Open the System One decision playground"
+            >
+              ⚖ Playground
+            </button>
           </div>
           <button
             onClick={() => setRightSidebarOpen(!rightSidebarOpen)}

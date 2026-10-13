@@ -88,8 +88,8 @@ func TestConvertWireQuestion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(q.Choices) != 2 || q.Choices[0].Value != "yes" || q.Choices[1].Value != "no" {
-		t.Fatalf("noul choices = %+v", q.Choices)
+	if len(q.Choices) != 2 || q.Choices[0].Value != "no" || q.Choices[1].Value != "yes" {
+		t.Fatalf("noul choices = %+v, want code-ascending no,yes", q.Choices)
 	}
 
 	// Score conversion discretizes the range.

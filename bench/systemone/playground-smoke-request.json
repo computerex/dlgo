@@ -1,0 +1,30 @@
+{
+  "model": "qwen35-08b",
+  "readout": "C:\\projects\\dlgo\\systemone-train\\artifacts\\qwen35-08b-q4-readout-v10-uni.json",
+  "state": "You are in a Pokemon battle. The opponent's active Pokemon is Blastoise, a Water-type turtle that uses powerful Water attacks. Your active Pokemon is Charizard, a Fire/Flying-type at half health. Your party is: Charizard (Fire/Flying), Pikachu (Electric), Gengar (Ghost/Poison), and Snorlax (Normal).",
+  "questions": {
+    "switch": {
+      "type": "choice",
+      "instructions": "Which party member should you switch in to gain the best type advantage against the opponent's Water-type Blastoise?",
+      "criteria": {
+        "pikachu": "Electric-type Pokemon; Electric attacks deal super-effective damage to Water Pokemon.",
+        "gengar": "Ghost/Poison-type Pokemon; its attacks have no type advantage against Water.",
+        "snorlax": "Normal-type Pokemon; its attacks have no type advantage against Water."
+      }
+    },
+    "charizard_water_weak": {
+      "type": "noul",
+      "instructions": "Is your active Charizard, a Fire/Flying-type, weak to the opponent's Water attacks?"
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is switching out Charizard right now?",
+      "criteria": [
+        "Low: Charizard can keep fighting safely.",
+        "Moderate: risk exists but manageable.",
+        "High: Charizard is likely to faint soon.",
+        "Critical: Charizard will faint this turn."
+      ]
+    }
+  }
+}

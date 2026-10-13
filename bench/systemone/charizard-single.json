@@ -1,0 +1,11 @@
+{
+  "model": "qwen35-9b",
+  "readout": "C:\\projects\\dlgo\\systemone-train\\artifacts\\qwen35-9b-q3-readout-v2-uni.json",
+  "state": "You are in a Pokemon battle. The opponent's active Pokemon is Blastoise, a Water-type turtle that uses powerful Water attacks. Your active Pokemon is Charizard, a Fire/Flying-type at half health. Your party is: Charizard (Fire/Flying), Pikachu (Electric), Gengar (Ghost/Poison), and Snorlax (Normal).",
+  "questions": {
+    "charizard_water_weak": {
+      "type": "noul",
+      "instructions": "Is your active Charizard, a Fire/Flying-type, weak to the opponent's Water attacks?"
+    }
+  }
+}

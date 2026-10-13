@@ -474,7 +474,12 @@ func parseJevQuestion(id string, wire jevWireQuestion) (parsedQuestion, error) {
 				falseLabel = pq.NoulFalse
 			}
 		}
-		pq.Choices = []llm.Choice{{Value: "yes", Label: trueLabel}, {Value: "no", Label: falseLabel}}
+		// Emit choices in sorted-value order (no before yes) so the compiled
+		// prompt lists answer codes ascending (" A: no", " B: yes"). Training
+		// prompts always list options in code-ascending order; a yes-first
+		// order produces " B: yes" before " A: no", which is off-distribution
+		// for the readout and measurably flips noul answers.
+		pq.Choices = []llm.Choice{{Value: "no", Label: falseLabel}, {Value: "yes", Label: trueLabel}}
 	default:
 		return pq, fmt.Errorf("question %q: unknown type %q (expected choice, noul, or score)", id, pq.Type)
 	}
@@ -875,7 +880,9 @@ func convertWireQuestion(q SystemOneQuestion, index int) (llm.SystemOneQuestion,
 			out.Choices[i] = llm.Choice{Value: key, Label: q.Criteria[key]}
 		}
 	case "noul":
-		out.Choices = []llm.Choice{{Value: "yes", Label: "yes"}, {Value: "no", Label: "no"}}
+		// Keep code/prompt order stable with all trained choice prompts:
+		// "no" receives A and is emitted before "yes" (B).
+		out.Choices = []llm.Choice{{Value: "no", Label: "no"}, {Value: "yes", Label: "yes"}}
 	case "score":
 		if q.Max < q.Min {
 			return out, fmt.Errorf("question %d: max %d < min %d", index, q.Max, q.Min)
