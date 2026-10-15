@@ -1,3 +1,5 @@
+//go:build windows
+
 // gpu-watchdog: launches a child process and kills it if GPU or system becomes unstable.
 //
 // Monitors:

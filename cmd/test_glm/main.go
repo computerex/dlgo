@@ -1,3 +1,5 @@
+//go:build vulkan && cgo
+
 package main
 
 import (

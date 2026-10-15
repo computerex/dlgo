@@ -5,18 +5,25 @@ Fast LLM inference in pure Go. Run GGUF models locally on CPU or GPU — no Pyth
 ## Quick Start
 
 ```bash
-# Install
+# Core chat CLI
 go install github.com/computerex/dlgo/cmd/dlgo@latest
+
+# Optional first-party commands
+go install github.com/computerex/dlgo/cmd/dlgo-server@latest
+go install github.com/computerex/dlgo/cmd/dlgo-vision@latest
+go install github.com/computerex/dlgo/cmd/dlgo-image@latest
+go install github.com/computerex/dlgo/cmd/mmproj-encode@latest
 
 # Chat with a model (like ollama)
 dlgo run model.gguf
 
-# Chat with GPU acceleration
-dlgo run model.gguf --gpu
-
 # Start web server with UI
-dlgo server --model model.gguf --gpu
+dlgo server --model model.gguf
 ```
+
+`go install` puts commands in `$(go env GOPATH)/bin` (or `$(go env GOBIN)` when set); add that directory to your shell `PATH` before invoking them by name. `go install github.com/computerex/dlgo/cmd/...@latest` is also supported for portable CPU builds. GPU/Vulkan acceleration requires a source build with the `vulkan` tag and a cgo toolchain/Vulkan SDK; see [Building from Source](#building-from-source).
+
+`gpu-watchdog` is intentionally Windows-only because it uses Windows Job Objects and PDH GPU performance counters. `test_glm` is a Vulkan diagnostic command, not a portable end-user CLI.
 
 ## Vision / multimodal inference
 
