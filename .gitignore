@@ -71,6 +71,9 @@ bench/results/
 frontend/dist/
 frontend/node_modules/
 
+# Local release staging (uploaded to GitHub Releases, not source control)
+/dist/
+
 # System One local secrets, generated training artifacts, and feature caches
 systemone-train/.env
 systemone-train/data/generated/
