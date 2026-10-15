@@ -20,6 +20,14 @@ func main() {
 		cmdServer(os.Args[2:])
 	case "info":
 		cmdInfo(os.Args[2:])
+	case "models":
+		cmdModels()
+	case "list":
+		cmdList()
+	case "pull":
+		cmdPull(os.Args[2:])
+	case "rm":
+		cmdRM(os.Args[2:])
 	case "systemone":
 		cmdSystemOne(os.Args[2:])
 	case "version", "--version", "-v":
@@ -57,6 +65,10 @@ Usage:
   dlgo run <model.gguf> [flags]    Start interactive chat (like ollama)
   dlgo server [flags]              Start API server with web UI
   dlgo info <model.gguf>           Show model metadata
+  dlgo models                       List supported downloadable model aliases
+  dlgo pull <alias|URL>             Download a GGUF model from Hugging Face or URL
+  dlgo list                         List models downloaded by dlgo
+  dlgo rm <name>                    Remove a downloaded model
   dlgo systemone [flags]           Run one native System One decision
   dlgo version                     Print version
   dlgo help                        Show this help

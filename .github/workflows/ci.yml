@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+      - name: Verify formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+      # bench/scripts contains several intentionally standalone main programs;
+      # GPU-only examples require the Vulkan build tag. Test library packages
+      # that form the supported portable CPU surface instead.
+      - name: Test portable CPU packages
+        run: >-
+          go test ./audio ./blas ./core ./decode ./format/... ./grammar ./layers
+          ./memory ./models/... ./quant ./server ./vision
+      - name: Build all command packages
+        run: go build ./cmd/...
+
+  cross-build:
+    name: cross-build (${{ matrix.goos }}/${{ matrix.goarch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+      - name: Build all portable command packages
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build ./cmd/...

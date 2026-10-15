@@ -25,6 +25,32 @@ dlgo server --model model.gguf
 
 `gpu-watchdog` is intentionally Windows-only because it uses Windows Job Objects and PDH GPU performance counters. `test_glm` is a Vulkan diagnostic command, not a portable end-user CLI.
 
+### Download supported GGUF models
+
+`dlgo` can download a small catalog of compatible [Unsloth GGUF](https://huggingface.co/unsloth) releases from Hugging Face. This is a convenience downloader, not a model registry: you can also use any compatible local GGUF or pass a direct HTTPS GGUF URL.
+
+```bash
+# Show catalog aliases and their exact Hugging Face download URLs
+dlgo models
+
+# Download to the platform cache (~/.cache/dlgo/models on macOS/Linux;
+# the OS user cache on Windows), then use its printed path with dlgo run.
+dlgo pull qwen3.5:0.8b-q4_k_m
+dlgo pull qwen3.5:9b-q3_k_m
+
+# Manage downloads
+dlgo list
+dlgo rm qwen3.5:0.8b-q4_k_m
+
+# Put downloads in a chosen directory instead
+DLGO_MODELS=/path/to/models dlgo pull qwen3.5:0.8b-q4_k_m
+# or: dlgo pull -dir /path/to/models https://host.example/model.gguf
+```
+
+The initial catalog deliberately contains tested Qwen3.5 0.8B and 9B Unsloth variants. `dlgo models` prints the authoritative model repo, filename, and direct URL before a download begins. Hugging Face model weights retain their upstream licenses; review each model card before use or redistribution.
+
+## CLI Usage
+
 ## Vision / multimodal inference
 
 The repository includes a local multimodal path for an `mmproj` vision projector plus a compatible text GGUF backbone. `dlgo-vision` preprocesses an image, executes the projector, inserts the resulting image-embedding block at `<image>`, and generates directly from the combined sequence.
