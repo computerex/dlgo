@@ -1,0 +1,119 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Affine8 MoE variant: one dispatch computes n_used experts (gl_WorkGroupID.y =
+// expert slot). Expert weights start at (base_offset + idx*expert_stride) BLOCKS.
+// Mirrors matvec_q4_k_moe.comp over the canonical Affine8 block (quant/affine8.go).
+
+layout(local_size_x = 128) in;
+
+struct block_affine8 {
+    uint32_t q32[8];
+    float16_t d;
+    float16_t m;
+};
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(scalar, set = 0, binding = 1) readonly buffer A { block_affine8 data_a[]; };
+layout(set = 0, binding = 2) readonly buffer B { vec4 data_b_v4[]; };
+layout(set = 0, binding = 3) readonly buffer Indices { float expert_indices[]; };
+
+layout(push_constant) uniform Params {
+    int rows;
+    int cols;
+    int expert_stride;
+    int base_offset;
+    int shared_input;
+};
+
+#define NUM_ROWS 2
+
+shared float tmpsh[NUM_ROWS][4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint first_row = gl_WorkGroupID.x * uint(NUM_ROWS);
+    uint slot = gl_WorkGroupID.y;
+
+    uint ncols = uint(cols);
+    uint nblk = ncols >> 5;
+
+    int eidx = int(expert_indices[slot]);
+    uint expert_offset = uint(base_offset) + uint(eidx) * uint(expert_stride);
+    uint bv4base = ((shared_input != 0) ? 0u : (slot * ncols)) >> 2;
+
+    uint num_rows = uint(NUM_ROWS);
+    if (first_row + num_rows > uint(rows)) {
+        num_rows = uint(rows) - first_row;
+        if (first_row >= uint(rows)) return;
+    }
+
+    float temp[NUM_ROWS];
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = 0.0;
+
+    for (uint b = tid; b < nblk; b += 128u) {
+        uint bo = bv4base + b * 8u;
+        vec4 x0 = data_b_v4[bo + 0u];
+        vec4 x1 = data_b_v4[bo + 1u];
+        vec4 x2 = data_b_v4[bo + 2u];
+        vec4 x3 = data_b_v4[bo + 3u];
+        vec4 x4 = data_b_v4[bo + 4u];
+        vec4 x5 = data_b_v4[bo + 5u];
+        vec4 x6 = data_b_v4[bo + 6u];
+        vec4 x7 = data_b_v4[bo + 7u];
+        float xsum = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w)
+                   + (x2.x + x2.y + x2.z + x2.w) + (x3.x + x3.y + x3.z + x3.w)
+                   + (x4.x + x4.y + x4.z + x4.w) + (x5.x + x5.y + x5.z + x5.w)
+                   + (x6.x + x6.y + x6.z + x6.w) + (x7.x + x7.y + x7.z + x7.w);
+
+        [[unroll]] for (uint r = 0; r < NUM_ROWS; r++) {
+            if (r >= num_rows) break;
+            block_affine8 blk = data_a[expert_offset + (first_row + r) * nblk + b];
+
+            u8vec4 c0 = unpack8(blk.q32[0]);
+            u8vec4 c1 = unpack8(blk.q32[1]);
+            u8vec4 c2 = unpack8(blk.q32[2]);
+            u8vec4 c3 = unpack8(blk.q32[3]);
+            u8vec4 c4 = unpack8(blk.q32[4]);
+            u8vec4 c5 = unpack8(blk.q32[5]);
+            u8vec4 c6 = unpack8(blk.q32[6]);
+            u8vec4 c7 = unpack8(blk.q32[7]);
+
+            float qsum =
+                x0.x * float(c0.x) + x0.y * float(c0.y) + x0.z * float(c0.z) + x0.w * float(c0.w) +
+                x1.x * float(c1.x) + x1.y * float(c1.y) + x1.z * float(c1.z) + x1.w * float(c1.w) +
+                x2.x * float(c2.x) + x2.y * float(c2.y) + x2.z * float(c2.z) + x2.w * float(c2.w) +
+                x3.x * float(c3.x) + x3.y * float(c3.y) + x3.z * float(c3.z) + x3.w * float(c3.w) +
+                x4.x * float(c4.x) + x4.y * float(c4.y) + x4.z * float(c4.z) + x4.w * float(c4.w) +
+                x5.x * float(c5.x) + x5.y * float(c5.y) + x5.z * float(c5.z) + x5.w * float(c5.w) +
+                x6.x * float(c6.x) + x6.y * float(c6.y) + x6.z * float(c6.z) + x6.w * float(c6.w) +
+                x7.x * float(c7.x) + x7.y * float(c7.y) + x7.z * float(c7.z) + x7.w * float(c7.w);
+
+            temp[r] = fma(float(blk.d), qsum, fma(float(blk.m), xsum, temp[r]));
+        }
+    }
+
+    [[unroll]] for (int r = 0; r < NUM_ROWS; r++) temp[r] = subgroupAdd(temp[r]);
+
+    if (gl_SubgroupInvocationID == 0u) {
+        [[unroll]] for (int r = 0; r < NUM_ROWS; r++) {
+            tmpsh[r][gl_SubgroupID] = temp[r];
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        [[unroll]] for (uint n = 0; n < num_rows; n++) {
+            float sum = 0.0;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; s++) {
+                sum += tmpsh[n][s];
+            }
+            out_data[slot * uint(rows) + first_row + n] = sum;
+        }
+    }
+}

@@ -43,6 +43,12 @@ extern "C" {
 #define QTYPE_IQ1_M   29
 #define QTYPE_BF16    30
 #define QTYPE_TQ1_0   34
+// Canonical unified weight format (see quant/affine8.go). Not a GGML type;
+// markers >39 are free. Weights uploaded in this format route to the single
+// gpu_gemm_affine8 kernel regardless of their original quantization scheme.
+#define QTYPE_AFFINE8 60
+// Byte-lean canonical format for sub-8-bit sources (see quant/affine4.go).
+#define QTYPE_AFFINE4 61
 
 // Shader pipeline IDs
 typedef enum {
@@ -195,6 +201,22 @@ typedef enum {
     PIPE_ATTENTION_TILED_BARRIER,
     PIPE_ATTENTION_TILED_KV4,
     PIPE_GEMM_Q3K_RECOVERED,
+    // Unified GEMM: canonical Affine8 weights × f32 input (see quant/affine8.go).
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_GEMM_AFFINE8_COOPMAT,
+    // Tensor-core (cooperative matrix) bidirectional flash attention. Requires
+    // head_dim == 128. Appended at the end so existing pipeline IDs stay stable.
+    PIPE_ATTENTION_FLASH_COOPMAT,
+    // Unified single-token matvec over canonical Affine8 weights (dense decode).
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_MATVEC_AFFINE8,
+    // Byte-lean canonical Affine4 family (sub-8-bit sources; see quant/affine4.go):
+    // one decode matvec + one prefill GEMM. Appended at the end (ID stability).
+    PIPE_MATVEC_AFFINE4,
+    PIPE_GEMM_AFFINE4_COOPMAT,
+    // Fused MoE matvec over the canonical formats (n_used experts / dispatch).
+    PIPE_MATVEC_AFFINE4_MOE,
+    PIPE_MATVEC_AFFINE8_MOE,
     PIPE_COUNT
 } PipelineID;
 
@@ -271,6 +293,17 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
 // Batch matrix-vector: out[p*rows+r] = dot(W[r,:], x[p*cols...]) for each position p
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos, int qtype);
+
+// Unified GEMM over the canonical Affine8 weight format (every GGUF quant scheme
+// is repacked to Affine8 at load time; see quant/affine8.go). One kernel, one
+// weight type, one optimization surface.
+int gpu_gemm_affine8(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                     int rows, int cols, int npos);
+
+// Unified GEMM over the canonical Affine4 weight format (byte-lean companion of
+// Affine8 for sub-8-bit sources; see quant/affine4.go).
+int gpu_gemm_affine4(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                     int rows, int cols, int npos);
 
 // Element-wise operations
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps);
@@ -399,6 +432,19 @@ int gpu_gemm_q3k_tiled(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 
 // Test-only: force Q3_K GEMM availability (0=off, 1=on). Not used by inference.
 void gpu_set_gemm_q3k(int on);
+
+// Disable cooperative-matrix GEMMs (0=allow, 1=disable). Their kernels narrow
+// activations to FP16, which overflows for diffusion DiT activations; disabling
+// selects the FP32-activation GEMM paths instead.
+void gpu_set_no_coopmat_gemm(int on);
+
+// Precision override for the DiT full-attention kernel:
+//   -1 = follow DLGO_ATTN_F16 env (default: f16 ON), 0 = force f32, 1 = force f16.
+void gpu_set_attention_f16(int v);
+
+// Tensor-core (cooperative matrix) full-attention override:
+//   -1 = follow DLGO_ATTN_COOPMAT env (default OFF), 1 = force ON. head_dim==128 only.
+void gpu_set_attention_coopmat(int v);
 
 // Synchronize: wait for all GPU work to complete
 void gpu_sync(void);

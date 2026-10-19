@@ -8,12 +8,13 @@
 #extension GL_EXT_scalar_block_layout : require
 
 // Q5_K-weight × FP32-input GEMM using cooperative matrix (tensor cores).
-// Tile: BM=64, BN=64, BK=32.  128 threads = 4 subgroups in 2×2 layout.
-// Each subgroup: 2×2 coopmat 16×16 tiles → 32×32 output.
-// BK=32 aligns with one Q5_K scale group.
+// Tile: BM=64, BN=128, BK=32.  128 threads = 4 subgroups in 2×2 layout.
+// Each subgroup: 2×4 coopmat 16×16 tiles → 32×64 output.
+// BK=32 == exactly one Q5_K group, so the group index (and hence the scale/min
+// and the qs nibble / qh bit positions) is uniform over the whole k-tile.
 
 #define BM     64u
-#define BN     64u
+#define BN     128u
 #define BK     32u
 #define SHMEM_STRIDE (BK / 2u + 4u)  // = 20 f16vec2 per row
 #define TM     16u
@@ -22,23 +23,25 @@
 #define SG_M   2u
 #define SG_N   2u
 #define CMS_M  2u
-#define CMS_N  2u
+#define CMS_N  4u
 #define N_K_TILES (BK / TK)  // = 2
 
 layout(local_size_x = 128) in;
 
-// Q5_K block: 256 elements, 176 bytes
+// Q5_K block: 256 elements, 176 bytes. qh/qs are declared as 32-bit words so the
+// dequant can pull four adjacent quant bytes with a single aligned load. The
+// block is 176 bytes (16-byte aligned members), so every word load is aligned.
 struct block_q5_k {
     float16_t d;
     float16_t dmin;
-    uint8_t scales[12];
-    uint8_t qh[32];
-    uint8_t qs[128];
+    uint8_t   scales[12];
+    uint32_t  qh32[8];    // 32 bytes (== uint8_t qh[32])
+    uint32_t  qs32[32];   // 128 bytes (== uint8_t qs[128])
 };
 
 layout(set = 0, binding = 0) buffer Out { float out_data[]; };
 layout(scalar, set = 0, binding = 1) readonly buffer A { block_q5_k data_a[]; };
-layout(set = 0, binding = 2) readonly buffer B { float data_b[]; };
+layout(set = 0, binding = 2) readonly buffer B { vec4 data_b4[]; };
 
 layout(push_constant) uniform Params {
     int rows;
@@ -82,9 +85,12 @@ void main() {
     uint sg_m = sg_id / SG_N;
     uint sg_n = sg_id % SG_N;
 
-    uint n_tiles_n = (uint(npos) + BN - 1u) / BN;
-    uint tile_n = gl_WorkGroupID.x % n_tiles_n;
-    uint tile_m = gl_WorkGroupID.x / n_tiles_n;
+    // Dispatch order: tile_m varies fastest. A scheduling wave then covers all
+    // M-tiles for a single N-tile, so the (small) activation tile for that N is
+    // reused from L2 while the weights stay resident.
+    uint n_tiles_m = (uint(rows) + BM - 1u) / BM;
+    uint tile_m = gl_WorkGroupID.x % n_tiles_m;
+    uint tile_n = gl_WorkGroupID.x / n_tiles_m;
 
     uint wg_m = tile_m * BM;
     uint wg_n = tile_n * BN;
@@ -97,91 +103,65 @@ void main() {
     for (uint i = 0u; i < CMS_M * CMS_N; i++)
         acc[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
 
-    const uint LOAD_COUNT = (BM * (BK / 2u)) / 128u;  // 8
+    const uint LOAD_COUNT_A = (BM * 8u) / 128u;        // 4  (A path: 4 k per thread)
+    const uint LOAD_COUNT_B = (BN * 8u) / 128u;        // 8  (B path: 4 k per thread)
 
     for (uint k_base = 0u; k_base < K; k_base += BK) {
         // === Load A tile: dequantize Q5_K weights into smA ===
-        for (uint e = 0u; e < LOAD_COUNT; e++) {
+        // BK=32 == one Q5_K group, so group/grp/sub/bit are uniform per k-tile.
+        // Each thread produces 4 consecutive k-values from two aligned 32-bit
+        // loads, and the nibble/bit extraction is done with SWAR.
+        uint a_group   = (k_base % 256u) / 32u;  // 0..7
+        uint a_grp     = a_group / 2u;           // 0..3  qs half
+        uint a_sub     = a_group & 1u;           // nibble select
+        uint a_bit     = a_group;                // qh bit index
+        uint a_block_k = k_base / 256u;
+
+        for (uint e = 0u; e < LOAD_COUNT_A; e++) {
             uint idx = e * 128u + tid;
-            uint row = idx / (BK / 2u);     // 0..63 row within BM
-            uint col2 = idx % (BK / 2u);    // 0..15 vec2 index within BK
+            uint row = idx >> 3u;        // 0..63 row within BM
+            uint col4 = idx & 7u;        // 0..7 group of 4 k-values
             uint m_global = wg_m + row;
-            uint k_global = k_base + col2 * 2u;
 
-            f16vec2 val = f16vec2(0.0, 0.0);
-            if (m_global < M && k_global < K) {
-                uint block_k = k_global / 256u;
-                uint local_k = k_global % 256u;
-                uint ib = m_global * num_blocks_per_row + block_k;
-
-                uint group = local_k / 32u;  // 0..7
-
+            f16vec2 v0 = f16vec2(0.0, 0.0);
+            f16vec2 v1 = f16vec2(0.0, 0.0);
+            if (m_global < M) {
+                uint ib = m_global * num_blocks_per_row + a_block_k;
                 float d_val = float(data_a[ib].d);
                 float dmin_val = float(data_a[ib].dmin);
-                float sc = extract_scale(ib, group);
-                float mn = extract_min(ib, group);
-                float d = d_val * sc;
-                float m = -dmin_val * mn;
+                float dd = d_val * extract_scale(ib, a_group);
+                float mm = -dmin_val * extract_min(ib, a_group);
 
-                // Q5_K layout: qs[128] holds low 4 bits, qh[32] holds the 5th bit.
-                // 8 groups of 32 elements. Group g occupies:
-                //   qs: bytes [(g/2)*32 .. (g/2)*32+31], low nibble if g even, high if g odd
-                //   qh: bit (g/2) for even groups, bit (g/2 + 4) for odd groups
-                // Or equivalently per the matvec:
-                //   For element at local_k within 256-block:
-                //   grp = local_k / 64 (0..3), sub = (local_k % 64) / 32 (0..1)
-                //   lane = local_k % 32
-                //   qs_byte_idx = grp * 32 + lane
-                //   nibble: sub==0 → low 4 bits, sub==1 → high 4 bits
-                //   qh byte = qh[lane], bit = (grp*2 + sub) counting from bit 0
+                uint qs32 = data_a[ib].qs32[a_grp * 8u + col4];
+                uint qh32 = data_a[ib].qh32[col4];
+                uint q4v  = (qs32 >> (a_sub * 4u)) & 0x0F0F0F0Fu;
+                uint qhv  = (qh32 >> a_bit) & 0x01010101u;
+                uint qv   = q4v | (qhv << 4u);
 
-                uint grp = local_k / 64u;          // 0..3
-                uint sub = (local_k % 64u) / 32u;  // 0..1
-                uint lane = local_k % 32u;
-
-                uint qs_byte = uint(data_a[ib].qs[grp * 32u + lane]);
-                uint q4 = (qs_byte >> (sub * 4u)) & 0xFu;
-                uint qh_byte = uint(data_a[ib].qh[lane]);
-                uint qh_bit = (qh_byte >> (grp * 2u + sub)) & 1u;
-                float q0 = float(q4 | (qh_bit << 4u));
-
-                // Second element
-                uint k_global2 = k_global + 1u;
-                float q1 = 0.0;
-                if (k_global2 < K) {
-                    uint local_k2 = k_global2 % 256u;
-                    uint grp2 = local_k2 / 64u;
-                    uint sub2 = (local_k2 % 64u) / 32u;
-                    uint lane2 = local_k2 % 32u;
-
-                    uint qs_byte2 = uint(data_a[ib].qs[grp2 * 32u + lane2]);
-                    uint q4_2 = (qs_byte2 >> (sub2 * 4u)) & 0xFu;
-                    uint qh_byte2 = uint(data_a[ib].qh[lane2]);
-                    uint qh_bit2 = (qh_byte2 >> (grp2 * 2u + sub2)) & 1u;
-                    q1 = float(q4_2 | (qh_bit2 << 4u));
-                }
-
-                val.x = float16_t(fma(d, q0, m));
-                val.y = float16_t(fma(d, q1, m));
+                v0 = f16vec2(float16_t(fma(dd, float(qv & 0xFFu), mm)),
+                             float16_t(fma(dd, float((qv >> 8u) & 0xFFu), mm)));
+                v1 = f16vec2(float16_t(fma(dd, float((qv >> 16u) & 0xFFu), mm)),
+                             float16_t(fma(dd, float((qv >> 24u) & 0xFFu), mm)));
             }
-            smA[row * SHMEM_STRIDE + col2] = val;
+            smA[row * SHMEM_STRIDE + col4 * 2u]      = v0;
+            smA[row * SHMEM_STRIDE + col4 * 2u + 1u] = v1;
         }
 
-        // === Load B tile: FP32 input → smB ===
-        for (uint e = 0u; e < LOAD_COUNT; e++) {
+        // === Load B tile: FP32 input → smB (vec4 loads) ===
+        for (uint e = 0u; e < LOAD_COUNT_B; e++) {
             uint idx = e * 128u + tid;
-            uint row = idx / (BK / 2u);
-            uint col2 = idx % (BK / 2u);
+            uint row = idx >> 3u;
+            uint col4 = idx & 7u;
             uint n_global = wg_n + row;
-            uint k_global = k_base + col2 * 2u;
-            f16vec2 val = f16vec2(0.0, 0.0);
-            if (n_global < N && k_global + 1u < K) {
-                val.x = float16_t(data_b[n_global * K + k_global]);
-                val.y = float16_t(data_b[n_global * K + k_global + 1u]);
-            } else if (n_global < N && k_global < K) {
-                val.x = float16_t(data_b[n_global * K + k_global]);
+            f16vec2 v0 = f16vec2(0.0, 0.0);
+            f16vec2 v1 = f16vec2(0.0, 0.0);
+            if (n_global < N) {
+                vec4 x4 = data_b4[(n_global * K + k_base + col4 * 4u) >> 2u];
+                v0 = f16vec2(float16_t(x4.x), float16_t(x4.y));
+                v1 = f16vec2(float16_t(x4.z), float16_t(x4.w));
             }
-            smB[row * SHMEM_STRIDE + col2] = val;
+            smB[row * SHMEM_STRIDE + col4 * 2u]      = v0;
+            smB[row * SHMEM_STRIDE + col4 * 2u + 1u] = v1;
         }
 
         barrier();
@@ -224,7 +204,7 @@ void main() {
 
     barrier();
 
-    for (uint e = 0u; e < 32u; e++) {
+    for (uint e = 0u; e < (BM * BN) / 128u; e++) {
         uint idx = e * 128u + tid;
         uint local_m = idx % BM;
         uint local_n = idx / BM;

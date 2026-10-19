@@ -820,6 +820,15 @@ func GpuForwardPartial(m *llm.Model, gm *GpuModel, token int32, pos int,
 	copy(logitsBuf, pipe.CPURunState.Logits)
 }
 
+// pickA8 returns the Affine8 copy of a prefill weight if one was built (see
+// DLGO_LLM_AFFINE8 + uploadAffine8Copy), else the original per-quant tensor.
+func pickA8(a8, orig *GpuTensor) *GpuTensor {
+	if a8 != nil {
+		return a8
+	}
+	return orig
+}
+
 // BuildBatchLayerConfs creates layer configs that point to batch-sized scratch
 // buffers while sharing the same weight/norm buffers as single-token configs.
 func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *GpuBatchState, kv *GpuKVCache) []*LayerConf {
@@ -849,7 +858,8 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
-			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
+			lc.SetAttn(gl.AttnNorm, pickA8(gl.WqA8, gl.Wq), pickA8(gl.WkA8, gl.Wk),
+				pickA8(gl.WvA8, gl.Wv), pickA8(gl.WoA8, gl.Wo),
 				gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
 			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
 			if gl.AttnSinks != 0 {
@@ -882,8 +892,8 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 				ffnNorm = gl.PostAttnNorm
 				postAttnNorm = 0
 			}
-			lc.SetFFN(ffnNorm, ffnGate, gl.FFNUp, gl.FFNDown,
-				postAttnNorm, gl.PostFFNNorm)
+			lc.SetFFN(ffnNorm, pickA8(gl.GateA8, ffnGate), pickA8(gl.UpA8, gl.FFNUp),
+				pickA8(gl.DownA8, gl.FFNDown), postAttnNorm, gl.PostFFNNorm)
 		}
 
 		ffnType := 0
@@ -1047,10 +1057,14 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		if layer.Spec.Core == llm.CoreSSM && pipe.HasSSM {
 			tStart, tOn := ssmTimeBegin(chunkTimed)
 			Barrier()
-			BatchMatVec(bs.SSMQKV, gl.SSMInProj.Buf, bs.XNorm, gl.SSMInProj.Rows, gl.SSMInProj.Cols, npos, gl.SSMInProj.Type)
-			BatchMatVec(bs.SSMZ, gl.SSMGate.Buf, bs.XNorm, gl.SSMGate.Rows, gl.SSMGate.Cols, npos, gl.SSMGate.Type)
-			BatchMatVec(bs.SSMAlpha, gl.SSMAlpha.Buf, bs.XNorm, gl.SSMAlpha.Rows, gl.SSMAlpha.Cols, npos, gl.SSMAlpha.Type)
-			BatchMatVec(bs.SSMBeta, gl.SSMBeta.Buf, bs.XNorm, gl.SSMBeta.Rows, gl.SSMBeta.Cols, npos, gl.SSMBeta.Type)
+			ssmIn := pickA8(gl.SSMInProjA8, gl.SSMInProj)
+			ssmGate := pickA8(gl.SSMGateA8, gl.SSMGate)
+			ssmAlpha := pickA8(gl.SSMAlphaA8, gl.SSMAlpha)
+			ssmBeta := pickA8(gl.SSMBetaA8, gl.SSMBeta)
+			BatchMatVec(bs.SSMQKV, ssmIn.Buf, bs.XNorm, ssmIn.Rows, ssmIn.Cols, npos, ssmIn.Type)
+			BatchMatVec(bs.SSMZ, ssmGate.Buf, bs.XNorm, ssmGate.Rows, ssmGate.Cols, npos, ssmGate.Type)
+			BatchMatVec(bs.SSMAlpha, ssmAlpha.Buf, bs.XNorm, ssmAlpha.Rows, ssmAlpha.Cols, npos, ssmAlpha.Type)
+			BatchMatVec(bs.SSMBeta, ssmBeta.Buf, bs.XNorm, ssmBeta.Rows, ssmBeta.Cols, npos, ssmBeta.Type)
 			ssmTimeEnd(4, tStart, tOn)
 			Barrier()
 
@@ -1130,7 +1144,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 			}
 
 			outStart, outOn := ssmTimeBegin(chunkTimed)
-			BatchMatVec(bs.AttnProj, gl.SSMOut.Buf, bs.SSMY, gl.SSMOut.Rows, gl.SSMOut.Cols, npos, gl.SSMOut.Type)
+			ssmOut := pickA8(gl.SSMOutA8, gl.SSMOut)
+			BatchMatVec(bs.AttnProj, ssmOut.Buf, bs.SSMY, ssmOut.Rows, ssmOut.Cols, npos, ssmOut.Type)
 			ssmTimeEnd(9, outStart, outOn)
 			ssmTimeEnd(1, tStart, tOn)
 
@@ -1837,6 +1852,9 @@ func gpuForwardFFN(layer *llm.Layer, gl *GpuLayer, rs *GpuRunState, input Buf, d
 }
 
 func supportsGPUQType(qtype uint32) bool {
+	if qtype == QuantTypeAffine8 || qtype == QuantTypeAffine4 {
+		return true // unified canonical formats (see quant/affine*.go)
+	}
 	switch qtype {
 	case 0, 1, 2, 6, 7, 8, 11, 12, 13, 14: // F32, F16, Q4_0, Q5_0, Q5_1, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K
 		return true
@@ -1879,6 +1897,8 @@ func quantBlockSize(qtype uint32) int {
 	case 1, 30: // F16, BF16
 		return 1
 	case 2, 3, 6, 7, 8, 9, 20, 39: // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, IQ4_NL, MXFP4
+		return 32
+	case QuantTypeAffine4, QuantTypeAffine8: // canonical formats: 32 values per block
 		return 32
 	case 10, 11, 12, 13, 14, 15: // Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K
 		return 256

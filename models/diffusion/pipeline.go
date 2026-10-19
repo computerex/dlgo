@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/png"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"time"
@@ -240,6 +241,9 @@ func GenerateImage(
 	latent := EulerSample(modelFn, latentSize, cfg.Steps, cfg.Seed)
 	log.Printf("Sampling done in %v", time.Since(sampleStart))
 	gpu.PerfPrint()
+	if err := validateLatent(latent); err != nil {
+		return err
+	}
 
 	// Free DiT resources and allocate VAE scratch (lazy — avoids peak VRAM overlap)
 	if gpuPrepareVAE != nil {
@@ -267,6 +271,38 @@ func GenerateImage(
 	}
 
 	log.Printf("Total generation time: %v", time.Since(totalStart))
+	return nil
+}
+
+// ditStageDebug enables per-stage and per-step numerical diagnostics.
+// Set DLGO_DIT_STAGE_DEBUG=1 to dump activation ranges inside the first main
+// transformer block and per-step sampler statistics. Used to trace numerical
+// blowups; off by default.
+var ditStageDebug = os.Getenv("DLGO_DIT_STAGE_DEBUG") == "1"
+
+// validateLatent reports numerical corruption before the VAE turns it into a silent black image.
+func validateLatent(latent []float32) error {
+	if len(latent) == 0 {
+		return fmt.Errorf("sampling produced an empty latent")
+	}
+	minV, maxV := latent[0], latent[0]
+	nonFinite := 0
+	for _, v := range latent {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			nonFinite++
+			continue
+		}
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
+	log.Printf("Sampled latent: min=%g max=%g nonfinite=%d/%d", minV, maxV, nonFinite, len(latent))
+	if nonFinite > 0 {
+		return fmt.Errorf("DiT sampling produced %d non-finite latent values; refusing to write a black image", nonFinite)
+	}
 	return nil
 }
 

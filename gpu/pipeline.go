@@ -423,7 +423,9 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 	// path regardless of which memory type they land in.
 
 	var err error
-	gm.TokenEmbed, err = UploadTensor(m.TokenEmbed)
+	// TokenEmbed/Output are projection-class weights: route through the
+	// native-or-Affine8 uploader so an exotic scheme never falls back to CPU.
+	gm.TokenEmbed, err = uploadProjWeight(m.TokenEmbed)
 	if err != nil {
 		return nil, fmt.Errorf("upload token_embed: %w", err)
 	}
@@ -441,7 +443,7 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 		}
 	}
 
-	gm.Output, err = UploadTensor(m.Output)
+	gm.Output, err = uploadProjWeight(m.Output)
 	if err != nil {
 		return nil, fmt.Errorf("upload output: %w", err)
 	}
@@ -477,25 +479,25 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 		}
 
 		if cl.Wq != nil {
-			gl.Wq, err = UploadTensor(cl.Wq)
+			gl.Wq, gl.WqA8, err = uploadWeightPair(cl.Wq)
 			if err != nil {
 				return nil, fmt.Errorf("layer %d wq: %w", l, err)
 			}
 		}
 		if cl.Wk != nil {
-			gl.Wk, err = UploadTensor(cl.Wk)
+			gl.Wk, gl.WkA8, err = uploadWeightPair(cl.Wk)
 			if err != nil {
 				return nil, fmt.Errorf("layer %d wk: %w", l, err)
 			}
 		}
 		if cl.Wv != nil {
-			gl.Wv, err = UploadTensor(cl.Wv)
+			gl.Wv, gl.WvA8, err = uploadWeightPair(cl.Wv)
 			if err != nil {
 				return nil, fmt.Errorf("layer %d wv: %w", l, err)
 			}
 		}
 		if cl.Wo != nil {
-			gl.Wo, err = UploadTensor(cl.Wo)
+			gl.Wo, gl.WoA8, err = uploadWeightPair(cl.Wo)
 			if err != nil {
 				return nil, fmt.Errorf("layer %d wo: %w", l, err)
 			}
@@ -543,18 +545,18 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			if cl.FFNRouterBias != nil {
 				gl.FFNRouterBias, _ = UploadF32Slice(cl.FFNRouterBias)
 			}
-			if moeUploaded && cl.FFNGateUpExps != nil && supportsGPUQType(cl.FFNGateUpExps.Type) {
-				gl.FFNGateUpExps, err = UploadTensor(cl.FFNGateUpExps)
+			if moeUploaded && cl.FFNGateUpExps != nil && (supportsGPUQType(cl.FFNGateUpExps.Type) || llmUnifiedQuant()) {
+				gl.FFNGateUpExps, err = uploadProjWeight(cl.FFNGateUpExps)
 				if err != nil {
 					moeUploaded = false
 				}
-			} else if moeUploaded && cl.FFNGateExps != nil && supportsGPUQType(cl.FFNGateExps.Type) {
-				gl.FFNGateExps, err = UploadTensor(cl.FFNGateExps)
+			} else if moeUploaded && cl.FFNGateExps != nil && (supportsGPUQType(cl.FFNGateExps.Type) || llmUnifiedQuant()) {
+				gl.FFNGateExps, err = uploadProjWeight(cl.FFNGateExps)
 				if err != nil {
 					moeUploaded = false
 				}
 				if moeUploaded && cl.FFNUpExps != nil {
-					gl.FFNUpExps, err = UploadTensor(cl.FFNUpExps)
+					gl.FFNUpExps, err = uploadProjWeight(cl.FFNUpExps)
 					if err != nil {
 						moeUploaded = false
 					}
@@ -563,7 +565,7 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 				moeUploaded = false
 			}
 			if moeUploaded && cl.FFNDownExps != nil {
-				gl.FFNDownExps, err = UploadTensor(cl.FFNDownExps)
+				gl.FFNDownExps, err = uploadProjWeight(cl.FFNDownExps)
 				if err != nil {
 					moeUploaded = false
 				}
@@ -579,27 +581,27 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 				gl.FFNDownExpsBias, _ = UploadF32Slice(cl.FFNDownExpsBias)
 			}
 			if cl.FFNGateShared != nil {
-				gl.FFNGateShared, _ = UploadTensor(cl.FFNGateShared)
+				gl.FFNGateShared, _ = uploadProjWeight(cl.FFNGateShared)
 			}
 			if cl.FFNUpShared != nil {
-				gl.FFNUpShared, _ = UploadTensor(cl.FFNUpShared)
+				gl.FFNUpShared, _ = uploadProjWeight(cl.FFNUpShared)
 			}
 			if cl.FFNDownShared != nil {
-				gl.FFNDownShared, _ = UploadTensor(cl.FFNDownShared)
+				gl.FFNDownShared, _ = uploadProjWeight(cl.FFNDownShared)
 			}
 			if cl.FFNRouterShared != nil {
 				gl.FFNRouterShared, _ = UploadF32Slice(cl.FFNRouterShared)
 			}
 		} else {
-			gl.FFNGate, _ = UploadTensor(cl.FFNGate)
+			gl.FFNGate, gl.GateA8, _ = uploadWeightPair(cl.FFNGate)
 			if cl.FFNUp != nil {
-				gl.FFNUp, err = UploadTensor(cl.FFNUp)
+				gl.FFNUp, gl.UpA8, err = uploadWeightPair(cl.FFNUp)
 				if err != nil {
 					return nil, fmt.Errorf("layer %d ffn_up: %w", l, err)
 				}
 			}
 			if cl.FFNDown != nil {
-				gl.FFNDown, err = UploadTensor(cl.FFNDown)
+				gl.FFNDown, gl.DownA8, err = uploadWeightPair(cl.FFNDown)
 				if err != nil {
 					return nil, fmt.Errorf("layer %d ffn_down: %w", l, err)
 				}
@@ -618,16 +620,16 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 
 		// SSM (Gated Delta Net) weights
 		if cl.SSMInProj != nil {
-			gl.SSMInProj, _ = UploadTensor(cl.SSMInProj)
+			gl.SSMInProj, gl.SSMInProjA8, _ = uploadWeightPair(cl.SSMInProj)
 		}
 		if cl.AttnGate != nil {
-			gl.SSMGate, _ = UploadTensor(cl.AttnGate)
+			gl.SSMGate, gl.SSMGateA8, _ = uploadWeightPair(cl.AttnGate)
 		}
 		if cl.SSMAlpha != nil {
-			gl.SSMAlpha, _ = UploadTensor(cl.SSMAlpha)
+			gl.SSMAlpha, gl.SSMAlphaA8, _ = uploadWeightPair(cl.SSMAlpha)
 		}
 		if cl.SSMBeta != nil {
-			gl.SSMBeta, _ = UploadTensor(cl.SSMBeta)
+			gl.SSMBeta, gl.SSMBetaA8, _ = uploadWeightPair(cl.SSMBeta)
 		}
 		if cl.SSMConv1dW != nil {
 			gl.SSMConv1dW, _ = UploadF32Slice(cl.SSMConv1dW)
@@ -642,7 +644,7 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			gl.SSMNorm, _ = UploadF32Slice(cl.SSMNorm)
 		}
 		if cl.SSMOut != nil {
-			gl.SSMOut, _ = UploadTensor(cl.SSMOut)
+			gl.SSMOut, gl.SSMOutA8, _ = uploadWeightPair(cl.SSMOut)
 		}
 
 	}

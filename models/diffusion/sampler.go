@@ -1,6 +1,7 @@
 package diffusion
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -109,6 +110,9 @@ func EulerSample(
 		// Run model
 		modelOutput := model(x, t)
 		log.Printf("Step %d/%d done in %v (sigma=%.4f)", i+1, steps, time.Since(stepStart), sigma)
+		if ditStageDebug {
+			logSamplerStats(fmt.Sprintf("step %d model output", i+1), modelOutput)
+		}
 
 		// Get denoised prediction
 		denoised := denoiser.Denoise(modelOutput, x, sigma)
@@ -120,11 +124,35 @@ func EulerSample(
 			d := (x[j] - denoised[j]) / sigma
 			x[j] += d * dt
 		}
+		if ditStageDebug {
+			logSamplerStats(fmt.Sprintf("step %d latent", i+1), x)
+		}
 
 		_ = denoised // for GC
 	}
 
 	return x
+}
+
+func logSamplerStats(label string, values []float32) {
+	if len(values) == 0 {
+		return
+	}
+	minV, maxV := values[0], values[0]
+	nonFinite := 0
+	for _, v := range values {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			nonFinite++
+			continue
+		}
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
+	log.Printf("%s: min=%g max=%g nonfinite=%d/%d", label, minV, maxV, nonFinite, len(values))
 }
 
 // GaussianNoise generates standard normal noise.

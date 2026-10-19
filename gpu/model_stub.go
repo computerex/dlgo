@@ -25,6 +25,10 @@ type GpuRunState struct{}
 type GpuKVCache struct{}
 
 func UploadTensor(*core.QuantizedTensor) (*GpuTensor, error) { return nil, errNoGPU }
+func UploadTensorAffine8(*core.QuantizedTensor) (*GpuTensor, error) { return nil, errNoGPU }
+func UploadTensorAffine4(*core.QuantizedTensor) (*GpuTensor, error) { return nil, errNoGPU }
+func Affine8BytesFor(rows, cols int) uint64                  { return uint64(rows) * uint64(cols) / 32 * 36 }
+func Affine4BytesFor(rows, cols int) uint64                  { return uint64(rows) * uint64(cols) / 32 * 20 }
 func UploadF32Slice([]float32) (Buf, error)                  { return 0, errNoGPU }
 func NewGpuRunState(_, _, _, _, _ int) (*GpuRunState, error)  { return nil, errNoGPU }
 func NewGpuKVCache(_, _, _, _ int, _ []bool) (*GpuKVCache, error) { return nil, errNoGPU }

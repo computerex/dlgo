@@ -57,6 +57,9 @@ func QuantizeQ8_1(q, f Buf, n int) error     { return errNoGPU }
 func MatVecOffsetDp4a(o Buf, oo int, w Buf, wo int, q Buf, r, c int, t uint32) error { return errNoGPU }
 func MoEMatVecDp4a(o, w, q, i Buf, r, c int, t uint32, es, bo, si, nu int) error    { return errNoGPU }
 func MoEMatVecIQ(o, w, x, tb, i Buf, r, c int, t uint32, es, bo, si, nu int) error { return errNoGPU }
+func MoEMatVecNative(o, w, x, i Buf, r, c int, t uint32, es, bo, si, nu int) error {
+	return errNoGPU
+}
 func MoEAccumulate(o, e, w, b, i Buf, d, n int, h bool) error                      { return errNoGPU }
 func SwiGLU_OAI_Bias_MoE(o, g, u, gb, ub, i Buf, tn int, a, l float32, ed int) error { return errNoGPU }
 func MoEBiasAdd(d, b, i Buf, ed, nu int) error                                    { return errNoGPU }
@@ -66,6 +69,9 @@ func QuantizeQ8_1At(q Buf, qo int, f Buf, fo, n int) error                      
 func BeginBatch()                            {}
 func EndBatch()                              {}
 func SetGemmQ3K(bool)                        {}
+func SetNoCoopmatGemm(bool)                  {}
+func SetAttentionF16(bool)                   {}
+func SetAttentionCoopmat(bool)               {}
 func Barrier()                               {}
 func AddRMSNorm(no, so, a, b, w Buf, n int, eps float32) error { return errNoGPU }
 
@@ -96,6 +102,15 @@ func UpsampleNearest(out, in Buf, channels, H, W int) error { return errNoGPU }
 func SpatialAttention(out, q, k, v Buf, channels, spatial int, scale float32) error { return errNoGPU }
 func GemmQ4K(out, weights, x Buf, M, K, N int) error         { return errNoGPU }
 func SplitQKV(q, k, v, qkv Buf, qDim, kvDim, seqLen int) error { return errNoGPU }
+
+// QuantTypeAffine8 is the canonical unified weight format (see quant/affine8.go).
+const QuantTypeAffine8 = 60
+
+// QuantTypeAffine4 is the byte-lean canonical weight format (see quant/affine4.go).
+const QuantTypeAffine4 = 61
+
+func GemmAffine8(out, weights, x Buf, rows, cols, npos int) error { return errNoGPU }
+func GemmAffine4(out, weights, x Buf, rows, cols, npos int) error { return errNoGPU }
 
 type MoEFFNConf struct{}
 

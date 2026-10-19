@@ -1,0 +1,257 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Cooperative-matrix (tensor-core) flash attention for the Z-Image DiT.
+//
+// Bidirectional (non-causal) full attention, one HEAD per workgroup, BR query
+// rows per workgroup, 4 subgroups (16 query rows each). QK^T and P·V are done
+// with f16 -> f32 cooperative matrices (tensor cores); the softmax runs on f32
+// scores staged through shared memory.
+//
+// Two-pass structure (to keep O in registers and avoid any online-softmax
+// rescale round-trip, which cannot fit in NVIDIA's 48 KiB shared-memory limit):
+//   Pass 1: S = Q·K^T for every KV block, keep the running per-row max.
+//   Pass 2: recompute S, P = exp(S - m), row-sum, and O += P·V.
+// The extra QK pass costs 1.5x the matmul FLOPs but is robust and needs no O
+// staging; the reference SIMT kernel this replaces ran at ~8.5 TFLOPS.
+//
+// Q/K/V:  [seq_len, num_heads*head_dim] (f32 row-major); head_dim MUST be 128.
+// Output:[seq_len, num_heads*head_dim] (f32 row-major).
+// Dispatch: groups_x = num_heads, groups_y = ceil(seq_len / 64).
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale.
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer         Out { float  out_data[]; };
+layout(set = 0, binding = 1) readonly buffer Q { vec4   q4[]; };
+layout(set = 0, binding = 2) readonly buffer K { vec4   k4[]; };
+layout(set = 0, binding = 3) readonly buffer V { vec4   v4[]; };
+
+layout(push_constant) uniform Params {
+    int   num_heads;
+    int   num_kv_heads;
+    int   head_dim;
+    int   kv_dim;
+    int   seq_len;
+    float scale;
+} pc;
+
+#define BR   64          // query rows per workgroup
+#define BN   32          // KV positions per block
+#define HD   128         // head_dim (fixed)
+#define SDF  68          // f16vec2 stride for a row of HD (=64 + 4 pad)
+#define SPF  18          // f16vec2 stride for a row of BN (=16 + 2 pad)
+#define TM   16
+#define TN   16
+#define TK   16
+#define NKT_QK 8         // HD / 16  (d-tiles for QK^T)
+#define NAN    2         // BN / 16  (key-tiles per block)
+#define NKT_PV 2         // BN / 16  (key-tiles for P·V)
+#define NDT    8         // HD / 16  (d-tiles for P·V)
+
+shared f16vec2 Qs [BR * SDF];   // this WG's queries, pre-scaled, f16
+shared f16vec2 KVs[BN * SDF];   // K then V for the current block
+shared float   Ssh[BN * BR];    // scores, [key][query]
+shared f16vec2 Psh[BR * SPF];   // probabilities, [query][key]
+shared float   Epi[BR * 16];    // epilogue scratch, [query][d-tile]
+shared float   sh_rmax[BR];
+shared float   sh_rsum[BR];
+shared float   sh_rinv[BR];
+
+void main() {
+    uint tid  = gl_LocalInvocationID.x;   // 0..127
+    uint sg   = gl_SubgroupID;            // 0..3
+    uint lane = gl_SubgroupInvocationID;  // 0..31
+    uint head = gl_WorkGroupID.x;
+    uint qblk = gl_WorkGroupID.y;
+
+    int  N     = pc.seq_len;
+    uint qdim  = uint(pc.num_heads) * HD;
+    uint kvdim = uint(pc.kv_dim);
+    uint kv_mul = (pc.num_kv_heads > 0) ? uint(pc.num_heads) / uint(pc.num_kv_heads) : 1u;
+    if (kv_mul == 0u) kv_mul = 1u;
+    uint kv_head = head / kv_mul;
+    int  qr_base = int(qblk) * BR;
+    uint kv_col0 = kv_head * HD;
+    float sc     = pc.scale;
+
+    // ---- Load queries (BR x HD), pre-scaled, into Qs as f16 (vec4 global loads) ----
+    for (uint e = 0u; e < 16u; e++) {          // (BR*HD/4)/128 = 16
+        uint idx = e * 128u + tid;
+        uint r   = idx >> 5u;                  // /32  (32 vec4 = 128 f32 per row)
+        uint c   = idx & 31u;
+        int  qr  = qr_base + int(r);
+        vec4 v = vec4(0.0);
+        if (qr < N) v = q4[((uint(qr) * qdim + head * HD) >> 2u) + c] * sc;
+        Qs[r * SDF + c * 2u]      = f16vec2(float16_t(v.x), float16_t(v.y));
+        Qs[r * SDF + c * 2u + 1u] = f16vec2(float16_t(v.z), float16_t(v.w));
+    }
+
+    if (tid < BR) sh_rmax[tid] = -3.0e38;
+    barrier();
+
+    // =====================================================================
+    // Pass 1 — running per-row max of the scores
+    // =====================================================================
+    for (int blk = 0; blk < N; blk += BN) {
+        for (uint e = 0u; e < 8u; e++) {       // (BN*HD/4)/128 = 8
+            uint idx = e * 128u + tid;
+            uint p   = idx >> 5u;
+            uint c   = idx & 31u;
+            int  pos = blk + int(p);
+            vec4 v = vec4(0.0);
+            if (pos < N) v = k4[((uint(pos) * kvdim + kv_col0) >> 2u) + c];
+            KVs[p * SDF + c * 2u]      = f16vec2(float16_t(v.x), float16_t(v.y));
+            KVs[p * SDF + c * 2u + 1u] = f16vec2(float16_t(v.z), float16_t(v.w));
+        }
+        barrier();
+
+        coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> accS[NAN];
+        for (uint i = 0u; i < NAN; i++)
+            accS[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        for (uint kt = 0u; kt < NKT_QK; kt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+            coopMatLoad(matA, Qs, (sg * TM) * SDF + kt * (TK / 2u), SDF,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            for (uint an = 0u; an < NAN; an++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                coopMatLoad(matB, KVs, (an * TN) * SDF + kt * (TK / 2u), SDF,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                accS[an] = coopMatMulAdd(matA, matB, accS[an]);
+            }
+        }
+        for (uint an = 0u; an < NAN; an++)
+            coopMatStore(accS[an], Ssh, (an * TN) * BR + sg * TM, BR,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        uint row  = sg * TM + (lane >> 1u);
+        uint lh   = lane & 1u;
+        int  blkvalid = min(BN, N - blk);
+        float mx = -3.0e38;
+        for (uint k = 0u; k < 16u; k++) {
+            uint key = lh * 16u + k;
+            if (int(key) < blkvalid) mx = max(mx, Ssh[key * BR + row]);
+        }
+        mx = max(mx, subgroupShuffleXor(mx, 1u));
+        if (lh == 0u) sh_rmax[row] = max(sh_rmax[row], mx);
+        barrier();
+    }
+
+    // =====================================================================
+    // Pass 2 — exp, row-sum and O += P·V
+    // =====================================================================
+    coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> accO[NDT];
+    for (uint i = 0u; i < NDT; i++)
+        accO[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+    if (tid < BR) sh_rsum[tid] = 0.0;
+    barrier();
+
+    for (int blk = 0; blk < N; blk += BN) {
+        // ---- K -> KVs ----
+        for (uint e = 0u; e < 8u; e++) {      // (BN*HD/4)/128 = 8
+            uint idx = e * 128u + tid;
+            uint p   = idx >> 5u;
+            uint c   = idx & 31u;
+            int  pos = blk + int(p);
+            vec4 v = vec4(0.0);
+            if (pos < N) v = k4[((uint(pos) * kvdim + kv_col0) >> 2u) + c];
+            KVs[p * SDF + c * 2u]      = f16vec2(float16_t(v.x), float16_t(v.y));
+            KVs[p * SDF + c * 2u + 1u] = f16vec2(float16_t(v.z), float16_t(v.w));
+        }
+        barrier();
+
+        // ---- QK^T -> Ssh ----
+        coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> accS[NAN];
+        for (uint i = 0u; i < NAN; i++)
+            accS[i] = coopmat<float32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0.0f);
+        for (uint kt = 0u; kt < NKT_QK; kt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+            coopMatLoad(matA, Qs, (sg * TM) * SDF + kt * (TK / 2u), SDF,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            for (uint an = 0u; an < NAN; an++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                coopMatLoad(matB, KVs, (an * TN) * SDF + kt * (TK / 2u), SDF,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                accS[an] = coopMatMulAdd(matA, matB, accS[an]);
+            }
+        }
+        for (uint an = 0u; an < NAN; an++)
+            coopMatStore(accS[an], Ssh, (an * TN) * BR + sg * TM, BR,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+
+        // ---- V -> KVs (issued before the softmax compute to hide latency) ----
+        for (uint e = 0u; e < 8u; e++) {      // (BN*HD/4)/128 = 8
+            uint idx = e * 128u + tid;
+            uint p   = idx >> 5u;
+            uint c   = idx & 31u;
+            int  pos = blk + int(p);
+            vec4 v = vec4(0.0);
+            if (pos < N) v = v4[((uint(pos) * kvdim + kv_col0) >> 2u) + c];
+            KVs[p * SDF + c * 2u]      = f16vec2(float16_t(v.x), float16_t(v.y));
+            KVs[p * SDF + c * 2u + 1u] = f16vec2(float16_t(v.z), float16_t(v.w));
+        }
+
+        // ---- softmax -> Psh (f16) ----
+        uint row  = sg * TM + (lane >> 1u);
+        uint lh   = lane & 1u;
+        float m   = sh_rmax[row];
+        int  blkvalid = min(BN, N - blk);
+        float part = 0.0;
+        for (uint kp = 0u; kp < 8u; kp++) {
+            uint k0 = lh * 16u + kp * 2u;
+            float p0 = (int(k0)      < blkvalid) ? exp(Ssh[k0 * BR + row] - m)        : 0.0;
+            float p1 = (int(k0 + 1u) < blkvalid) ? exp(Ssh[(k0 + 1u) * BR + row] - m) : 0.0;
+            Psh[row * SPF + (k0 >> 1u)] = f16vec2(float16_t(p0), float16_t(p1));
+            part += p0 + p1;
+        }
+        part += subgroupShuffleXor(part, 1u);
+        if (lh == 0u) sh_rsum[row] += part;
+        barrier();
+
+        // ---- O += P·V ----
+        for (uint kt = 0u; kt < NKT_PV; kt++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> matA;
+            coopMatLoad(matA, Psh, (sg * TM) * SPF + kt * (TK / 2u), SPF,
+                        gl_CooperativeMatrixLayoutRowMajor);
+            for (uint nd = 0u; nd < NDT; nd++) {
+                coopmat<float16_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> matB;
+                coopMatLoad(matB, KVs, (kt * TK) * SDF + nd * (TN / 2u), SDF,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                accO[nd] = coopMatMulAdd(matA, matB, accO[nd]);
+            }
+        }
+        barrier();
+    }
+
+    // =====================================================================
+    // Epilogue — normalise by the row sum and write out
+    // =====================================================================
+    if (tid < BR) sh_rinv[tid] = (sh_rsum[tid] > 0.0) ? (1.0 / sh_rsum[tid]) : 0.0;
+    barrier();
+
+    for (uint nd = 0u; nd < NDT; nd++) {
+        coopMatStore(accO[nd], Epi, (sg * TM) * 16u, 16u,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint i = 0u; i < 8u; i++) {
+            uint idx = lane * 8u + i;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            uint qlocal = sg * TM + r;
+            int  qr = qr_base + int(qlocal);
+            if (qr < N) {
+                out_data[uint(qr) * qdim + head * HD + nd * 16u + c] =
+                    Epi[qlocal * 16u + c] * sh_rinv[qlocal];
+            }
+        }
+        barrier();
+    }
+}

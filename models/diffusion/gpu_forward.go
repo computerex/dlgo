@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"sort"
 	"time"
 
@@ -13,6 +14,12 @@ import (
 	"github.com/computerex/dlgo/gpu"
 	"github.com/computerex/dlgo/ops"
 )
+
+// useAffine8 reports whether the DiT repacks its big projection weights into the
+// unified canonical Affine8 format (see docs/dit-gemm-quant-abstraction-plan.md).
+// Default on: every quantization scheme then flows through one GEMM kernel.
+// Set DLGO_DIT_NO_AFFINE8=1 to fall back to the original per-quant GEMM kernels.
+func useAffine8() bool { return os.Getenv("DLGO_DIT_NO_AFFINE8") != "1" }
 
 // GpuDebugProfile accumulates per-operation timing across layers.
 type GpuDebugProfile struct {
@@ -163,8 +170,11 @@ type GpuDiTModel struct {
 	NNoise  int           // number of noise refiner layers
 	NMain   int           // number of main layers
 
-	// Embeddings (kept on CPU for now since they run once per step)
-	// The heavy per-layer MatVecs are on GPU.
+	// Embedding / final-layer weights, repacked to the canonical Affine8 format so
+	// they run on the unified GEMM kernel. These were previously computed on the
+	// CPU at ~8 GFLOPS (~14% of each step). Optional: nil falls back to the CPU.
+	XEmbed   *gpu.GpuTensor // image patch embedding [hidden, patchDim]
+	FinalLin *gpu.GpuTensor // final layer projection [patchDim, hidden]
 }
 
 // GpuDiTRunState holds GPU activation buffers for DiT inference.
@@ -221,11 +231,21 @@ func UploadDiTModel(m *DiTModel) (*GpuDiTModel, error) {
 	}
 
 	for _, l := range allCPULayers {
-		totalBytes += uint64(len(l.AttnQKV.Data))
-		totalBytes += uint64(len(l.AttnOut.Data))
-		totalBytes += uint64(len(l.FFNGate.Data))
-		totalBytes += uint64(len(l.FFNDown.Data))
-		totalBytes += uint64(len(l.FFNUp.Data))
+		if useAffine8() {
+			// The big projections are repacked to Affine8 (≈1.125 bytes/weight)
+			// on upload, so estimate their footprint from the canonical size.
+			totalBytes += gpu.Affine8BytesFor(l.AttnQKV.Rows, l.AttnQKV.Cols)
+			totalBytes += gpu.Affine8BytesFor(l.AttnOut.Rows, l.AttnOut.Cols)
+			totalBytes += gpu.Affine8BytesFor(l.FFNGate.Rows, l.FFNGate.Cols)
+			totalBytes += gpu.Affine8BytesFor(l.FFNDown.Rows, l.FFNDown.Cols)
+			totalBytes += gpu.Affine8BytesFor(l.FFNUp.Rows, l.FFNUp.Cols)
+		} else {
+			totalBytes += uint64(len(l.AttnQKV.Data))
+			totalBytes += uint64(len(l.AttnOut.Data))
+			totalBytes += uint64(len(l.FFNGate.Data))
+			totalBytes += uint64(len(l.FFNDown.Data))
+			totalBytes += uint64(len(l.FFNUp.Data))
+		}
 		if l.AdaLNWeight != nil {
 			totalBytes += uint64(len(l.AdaLNWeight.Data))
 		}
@@ -249,23 +269,31 @@ func UploadDiTModel(m *DiTModel) (*GpuDiTModel, error) {
 		var err error
 		gl := &gm.Layers[i]
 
-		gl.AttnQKV, err = gpu.UploadTensor(l.AttnQKV)
+		// The big projections are repacked into the canonical Affine8 format so a
+		// single unified GEMM kernel serves every quantization scheme; no
+		// per-quant GEMM selection is needed downstream. DLGO_DIT_NO_AFFINE8=1
+		// restores the original per-quant upload path as an escape hatch.
+		uploadW := gpu.UploadTensorAffine8
+		if !useAffine8() {
+			uploadW = gpu.UploadTensor
+		}
+		gl.AttnQKV, err = uploadW(l.AttnQKV)
 		if err != nil {
 			return nil, fmt.Errorf("layer %d AttnQKV: %w", i, err)
 		}
-		gl.AttnOut, err = gpu.UploadTensor(l.AttnOut)
+		gl.AttnOut, err = uploadW(l.AttnOut)
 		if err != nil {
 			return nil, fmt.Errorf("layer %d AttnOut: %w", i, err)
 		}
-		gl.FFNGate, err = gpu.UploadTensor(l.FFNGate)
+		gl.FFNGate, err = uploadW(l.FFNGate)
 		if err != nil {
 			return nil, fmt.Errorf("layer %d FFNGate: %w", i, err)
 		}
-		gl.FFNDown, err = gpu.UploadTensor(l.FFNDown)
+		gl.FFNDown, err = uploadW(l.FFNDown)
 		if err != nil {
 			return nil, fmt.Errorf("layer %d FFNDown: %w", i, err)
 		}
-		gl.FFNUp, err = gpu.UploadTensor(l.FFNUp)
+		gl.FFNUp, err = uploadW(l.FFNUp)
 		if err != nil {
 			return nil, fmt.Errorf("layer %d FFNUp: %w", i, err)
 		}
@@ -309,9 +337,103 @@ func UploadDiTModel(m *DiTModel) (*GpuDiTModel, error) {
 		}
 	}
 
+	// Embedding / final-layer weights → Affine8 on GPU (small, but they were the
+	// two ~2-GFLOP CPU matmuls per step).
+	if m.XEmbedWeight != nil {
+		var uerr error
+		gm.XEmbed, uerr = gpu.UploadTensorAffine8(m.XEmbedWeight)
+		if uerr != nil {
+			return nil, fmt.Errorf("XEmbed: %w", uerr)
+		}
+	}
+	if m.FinalLinWeight != nil {
+		var uerr error
+		gm.FinalLin, uerr = gpu.UploadTensorAffine8(m.FinalLinWeight)
+		if uerr != nil {
+			return nil, fmt.Errorf("FinalLin: %w", uerr)
+		}
+	}
+
 	log.Printf("[diffusion/gpu] Uploaded %d layers to GPU (%.1f MB)",
 		totalLayers, float64(gpu.AllocatedBytes())/(1024*1024))
 	return gm, nil
+}
+
+// gpuLinearGemm computes out = x @ weight^T on the GPU via the unified Affine8
+// kernel, with a one-off upload/download. weight must be an Affine8 GpuTensor.
+// Returns an error (so the caller can fall back to CPU) rather than panicking.
+func gpuLinearGemm(weight *gpu.GpuTensor, out, x []float32, rows, cols, npos int) error {
+	if weight == nil {
+		return fmt.Errorf("no gpu weight")
+	}
+	if npos <= 0 || rows <= 0 || cols <= 0 {
+		return nil
+	}
+	if cols%32 != 0 {
+		return fmt.Errorf("cols %d not a multiple of 32", cols)
+	}
+	xb := gpu.Alloc(uint64(npos) * uint64(cols) * 4)
+	if xb == 0 {
+		return fmt.Errorf("alloc in failed")
+	}
+	defer gpu.Free(xb)
+	ob := gpu.Alloc(uint64(npos) * uint64(rows) * 4)
+	if ob == 0 {
+		return fmt.Errorf("alloc out failed")
+	}
+	defer gpu.Free(ob)
+
+	if err := gpu.UploadF32(xb, x[:npos*cols]); err != nil {
+		return err
+	}
+	if err := gpu.BatchMatVec(ob, weight.Buf, xb, rows, cols, npos, gpu.QuantTypeAffine8); err != nil {
+		return err
+	}
+	if err := gpu.DownloadF32(ob, out[:npos*rows]); err != nil {
+		return err
+	}
+	return nil
+}
+
+// forwardFinalLayerGPU mirrors forwardFinalLayer but runs the final linear
+// projection on the GPU (a ~2 GFLOP matmul that was costing ~250 ms/step on the
+// CPU at ~8 GFLOPS). AdaLN modulation and the per-token LayerNorm stay on CPU
+// (cheap). Falls back to the CPU GEMM on any GPU error.
+func forwardFinalLayerGPU(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState,
+	x []float32, seqLen int, tEmb []float32) []float32 {
+	cfg := m.Config
+	hidden := cfg.HiddenSize
+	patchDim := cfg.PatchSize * cfg.PatchSize * cfg.OutChannels
+
+	// AdaLN modulation: SiLU(tEmb) → Linear → scale + bias
+	copy(rs.SiLUBuf, tEmb)
+	ops.SiLU(rs.SiLUBuf)
+	scale := rs.Mod[:hidden]
+	blas.QMatVecMulParallel(scale, m.FinalAdaLNWeight, rs.SiLUBuf, rs.pool)
+	addBias(scale, m.FinalAdaLNBias)
+
+	// LayerNorm (no affine) then modulate by (1 + scale)
+	normed := make([]float32, seqLen*hidden)
+	for i := 0; i < seqLen; i++ {
+		ops.LayerNorm(normed[i*hidden:(i+1)*hidden],
+			x[i*hidden:(i+1)*hidden], rs.OnesWeight, rs.ZeroBias, 1e-6)
+	}
+	for i := 0; i < seqLen; i++ {
+		for j := 0; j < hidden; j++ {
+			normed[i*hidden+j] *= (1.0 + scale[j])
+		}
+	}
+
+	out := make([]float32, seqLen*patchDim)
+	if gm != nil && gm.FinalLin != nil {
+		if err := gpuLinearGemm(gm.FinalLin, out, normed, patchDim, hidden, seqLen); err != nil {
+			blas.QBatchGEMMParallel(out, m.FinalLinWeight, normed, seqLen, rs.pool)
+		}
+	} else {
+		blas.QBatchGEMMParallel(out, m.FinalLinWeight, normed, seqLen, rs.pool)
+	}
+	addBiasBatch(out, m.FinalLinBias, seqLen, patchDim)
+	return out
 }
 
 // NewGpuDiTRunState allocates GPU activation buffers.
@@ -435,6 +557,7 @@ func NewGpuDiTRunState(cfg ZImageConfig, maxSeqLen int) (*GpuDiTRunState, error)
 func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRunState,
 	x []float32, timestep float32, context []float32, contextLen, H, W int, debug bool) []float32 {
 
+	ditCallCount++
 	cfg := m.Config
 	hidden := cfg.HiddenSize
 	patchSize := cfg.PatchSize
@@ -468,9 +591,16 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 	blas.QBatchGEMMParallel(txt, m.CapEmbedLinWeight, txtNormed, contextLen, rs.pool)
 	addBiasBatch(txt, m.CapEmbedLinBias, contextLen, hidden)
 
-	// 4. Image embedding
+	// 4. Image embedding. ~2 GFLOP; was a CPU matmul at ~8 GFLOPS. Run on the
+	// unified GPU GEMM (fall back to CPU if the weight is unavailable).
 	img := make([]float32, nImgTokens*hidden)
-	blas.QBatchGEMMParallel(img, m.XEmbedWeight, imgPatches, nImgTokens, rs.pool)
+	if gm != nil && gm.XEmbed != nil {
+		if err := gpuLinearGemm(gm.XEmbed, img, imgPatches, hidden, patchDim, nImgTokens); err != nil {
+			blas.QBatchGEMMParallel(img, m.XEmbedWeight, imgPatches, nImgTokens, rs.pool)
+		}
+	} else {
+		blas.QBatchGEMMParallel(img, m.XEmbedWeight, imgPatches, nImgTokens, rs.pool)
+	}
 	addBiasBatch(img, m.XEmbedBias, nImgTokens, hidden)
 
 	// 5. Pad text and image
@@ -552,6 +682,9 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 	// Download text back
 	t0 = time.Now()
 	gpu.DownloadF32(grs.X, txt[:nTxtPadded*hidden])
+	if ditStageDebug {
+		logGPUFloatStats("context refiner", txt)
+	}
 	if dp != nil && dp.Enabled {
 		dp.AddOp("download_txt", time.Since(t0))
 	}
@@ -566,12 +699,15 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 		dp.AddOp("upload_img", time.Since(t0))
 	}
 	for i := 0; i < gm.NNoise; i++ {
-		gpuForwardBlock(gm, grs, &gm.Layers[gm.NCtxRef+i], nImgPadded, hidden, nil, nTxtPadded, rs.TEmb, peStride, fmt.Sprintf("noise_ref[%d]", i), dp)
+		gpuForwardBlock(gm, grs, &gm.Layers[gm.NCtxRef+i], nImgPadded, hidden, pe, nTxtPadded, rs.TEmb, peStride, fmt.Sprintf("noise_ref[%d]", i), dp)
 	}
 
 	// Download image back
 	t0 = time.Now()
 	gpu.DownloadF32(grs.X, img[:nImgPadded*hidden])
+	if ditStageDebug {
+		logGPUFloatStats("noise refiner", img)
+	}
 	if dp != nil && dp.Enabled {
 		dp.AddOp("download_img", time.Since(t0))
 	}
@@ -593,7 +729,11 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 
 	// 10. Main layers
 	for i := 0; i < gm.NMain; i++ {
-		gpuForwardBlock(gm, grs, &gm.Layers[gm.NCtxRef+gm.NNoise+i], totalSeq, hidden, nil, 0, rs.TEmb, peStride, fmt.Sprintf("main[%d]", i), dp)
+		gpuForwardBlock(gm, grs, &gm.Layers[gm.NCtxRef+gm.NNoise+i], totalSeq, hidden, pe, 0, rs.TEmb, peStride, fmt.Sprintf("main[%d]", i), dp)
+		if ditStageDebug {
+			gpu.DownloadF32(grs.X, combined)
+			logGPUFloatStats(fmt.Sprintf("main[%d]", i), combined)
+		}
 	}
 
 	// Download combined result
@@ -603,11 +743,15 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 		dp.AddOp("download_combined", time.Since(t0))
 	}
 
+	if ditStageDebug {
+		logGPUFloatStats("main transformer", combined)
+	}
+
 	// === CPU: Final layer + post-processing ===
 
-	// 11. Final layer
+	// 11. Final layer (GEMM on GPU; AdaLN + LayerNorm on CPU)
 	t0 = time.Now()
-	out := forwardFinalLayer(m, rs, combined, totalSeq, rs.TEmb)
+	out := forwardFinalLayerGPU(m, gm, rs, combined, totalSeq, rs.TEmb)
 	if dp != nil && dp.Enabled {
 		dp.AddOp("cpu_final_layer", time.Since(t0))
 	}
@@ -628,6 +772,52 @@ func GpuDiTForward(m *DiTModel, gm *GpuDiTModel, rs *DiTRunState, grs *GpuDiTRun
 	return result
 }
 
+// ditCallCount counts GpuDiTForward invocations so stage dumps can target a
+// specific denoising call.
+var ditCallCount int
+
+// The coopmat GEMM kernels narrow both operands to FP16 (max 65504), but DiT
+// activations reach ~2e5 (the FFN SwiGLU output), overflowing to inf and then
+// NaN. Scaling activations by an exact power of two keeps them in range without
+// losing precision (the exponent shift is exact), and the GEMM output is scaled
+// back afterwards. 2^-6 keeps activations valid up to ~4.2e6, ~20x the largest
+// magnitude observed for Z-Image.
+const (
+	gemmInScale  float32 = 1.0 / 64.0
+	gemmOutScale float32 = 64.0
+)
+
+func dbgDump(layerName, stage string, buf gpu.Buf, n int) {
+	if !ditStageDebug || ditCallCount != 2 || layerName != "main[0]" {
+		return
+	}
+	tmp := make([]float32, n)
+	gpu.DownloadF32(buf, tmp)
+	logGPUFloatStats(layerName+" "+stage, tmp)
+}
+
+func logGPUFloatStats(stage string, values []float32) {
+	if len(values) == 0 {
+		log.Printf("[diffusion/gpu] %s: empty", stage)
+		return
+	}
+	minV, maxV := values[0], values[0]
+	nonFinite := 0
+	for _, v := range values {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			nonFinite++
+			continue
+		}
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
+	log.Printf("[diffusion/gpu] %s: min=%g max=%g nonfinite=%d/%d", stage, minV, maxV, nonFinite, len(values))
+}
+
 // gpuForwardBlock runs one transformer block on GPU.
 // adaLNInput is CPU float32 slice (small, computed once per step) or nil.
 func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
@@ -646,6 +836,15 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 	hasAdaLN := gl.AdaLNWeight != nil && adaLNInput != nil
 
 	h4 := uint64(hidden * 4) // bytes per hidden-dim slice
+
+	if ditStageDebug && ditCallCount == 1 && layerName == "main[0]" {
+		adalnType := uint32(0xFFFFFFFF)
+		if gl.AdaLNWeight != nil {
+			adalnType = gl.AdaLNWeight.Type
+		}
+		log.Printf("[diffusion/gpu] %s types: qkv=%d attnout=%d ffn_gate=%d ffn_up=%d ffn_down=%d adaln=%d",
+			layerName, gl.AttnQKV.Type, gl.AttnOut.Type, gl.FFNGate.Type, gl.FFNUp.Type, gl.FFNDown.Type, adalnType)
+	}
 
 	debug := dp != nil && dp.Enabled
 	layerStart := time.Now()
@@ -690,11 +889,19 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 	}
 	gpu.Barrier()
 	measure("attn_norm")
+	dbgDump(layerName, "xnorm", grs.XNorm, seqLen*hidden)
 
 	// --- QKV projection ---
+	// gpu.Barrier() only sets a deferred flag consumed by the *next* dispatch, so
+	// each dependent step below needs its own call.
+	gpu.Scale(grs.XNorm, gemmInScale, seqLen*hidden)
+	gpu.Barrier()
 	gpu.BatchMatVec(grs.QKV, gl.AttnQKV.Buf, grs.XNorm, gl.AttnQKV.Rows, gl.AttnQKV.Cols, seqLen, gl.AttnQKV.Type)
 	gpu.Barrier()
+	gpu.Scale(grs.QKV, gemmOutScale, seqLen*(qDim+2*kvDim))
+	gpu.Barrier()
 	measure("attn_qkv_proj")
+	dbgDump(layerName, "qkv", grs.QKV, seqLen*(qDim+2*kvDim))
 
 	// --- Split + QKNorm + RoPE ---
 	gpu.SplitQKV(grs.Q, grs.K, grs.V, grs.QKV, qDim, kvDim, seqLen)
@@ -708,6 +915,8 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 	gpu.RoPE3D(grs.K, grs.PE, seqLen, numKVHeads, headDim, peOffset, peStride)
 	gpu.Barrier()
 	measure("split_qknorm_rope")
+	dbgDump(layerName, "q_after_rope", grs.Q, seqLen*qDim)
+	dbgDump(layerName, "k_after_rope", grs.K, seqLen*kvDim)
 
 	// --- Attention ---
 	attnScale := float32(1.0 / math.Sqrt(float64(headDim)))
@@ -715,9 +924,14 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 		numHeads, numKVHeads, headDim, kvDim, seqLen, attnScale)
 	gpu.Barrier()
 	measure("attention")
+	dbgDump(layerName, "attn_out", grs.AttnOut, seqLen*qDim)
 
 	// --- Attention output projection ---
+	gpu.Scale(grs.AttnOut, gemmInScale, seqLen*qDim)
+	gpu.Barrier()
 	gpu.BatchMatVec(grs.Proj, gl.AttnOut.Buf, grs.AttnOut, gl.AttnOut.Rows, gl.AttnOut.Cols, seqLen, gl.AttnOut.Type)
+	gpu.Barrier()
+	gpu.Scale(grs.Proj, gemmOutScale, seqLen*hidden)
 	gpu.Barrier()
 	measure("attn_out_proj")
 
@@ -735,6 +949,7 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 	}
 	gpu.Barrier()
 	measure("attn_residual")
+	dbgDump(layerName, "x_after_attn", grs.X, seqLen*hidden)
 
 	// --- FFN path ---
 	if hasAdaLN {
@@ -750,22 +965,36 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 	}
 	gpu.Barrier()
 	measure("ffn_norm")
+	dbgDump(layerName, "ffn_xnorm", grs.XNorm, seqLen*hidden)
 
-	// --- FFN gate + up projections ---
+	// --- FFN gate + up projections (shared activation: scale once) ---
+	gpu.Scale(grs.XNorm, gemmInScale, seqLen*hidden)
+	gpu.Barrier()
 	gpu.BatchMatVec(grs.Gate, gl.FFNGate.Buf, grs.XNorm, gl.FFNGate.Rows, gl.FFNGate.Cols, seqLen, gl.FFNGate.Type)
 	gpu.BatchMatVec(grs.Up, gl.FFNUp.Buf, grs.XNorm, gl.FFNUp.Rows, gl.FFNUp.Cols, seqLen, gl.FFNUp.Type)
 	gpu.Barrier()
+	gpu.Scale(grs.Gate, gemmOutScale, seqLen*ffnDim)
+	gpu.Scale(grs.Up, gemmOutScale, seqLen*ffnDim)
+	gpu.Barrier()
 	measure("ffn_gate_up")
+	dbgDump(layerName, "ffn_gate", grs.Gate, seqLen*ffnDim)
+	dbgDump(layerName, "ffn_up", grs.Up, seqLen*ffnDim)
 
 	// --- SwiGLU ---
 	gpu.SwiGLU(grs.Hidden, grs.Gate, grs.Up, seqLen*ffnDim)
 	gpu.Barrier()
 	measure("ffn_swiglu")
+	dbgDump(layerName, "ffn_hidden", grs.Hidden, seqLen*ffnDim)
 
-	// --- FFN down projection ---
+	// --- FFN down projection (input is the SwiGLU output, the largest activation) ---
+	gpu.Scale(grs.Hidden, gemmInScale, seqLen*ffnDim)
+	gpu.Barrier()
 	gpu.BatchMatVec(grs.FFNOut, gl.FFNDown.Buf, grs.Hidden, gl.FFNDown.Rows, gl.FFNDown.Cols, seqLen, gl.FFNDown.Type)
 	gpu.Barrier()
+	gpu.Scale(grs.FFNOut, gemmOutScale, seqLen*hidden)
+	gpu.Barrier()
 	measure("ffn_down_proj")
+	dbgDump(layerName, "ffn_out", grs.FFNOut, seqLen*hidden)
 
 	// --- FFN norm2 + gate residual ---
 	gpu.BatchRMSNorm(grs.FFNOut, grs.FFNOut, gl.FFNNorm2, hidden, seqLen, eps)
@@ -780,6 +1009,7 @@ func gpuForwardBlock(gm *GpuDiTModel, grs *GpuDiTRunState, gl *GpuDiTLayer,
 		gpu.Add(grs.X, grs.X, grs.FFNOut, seqLen*hidden)
 	}
 
+	dbgDump(layerName, "x_after_ffn", grs.X, seqLen*hidden)
 	if !debug {
 		gpu.EndBatch()
 	} else {

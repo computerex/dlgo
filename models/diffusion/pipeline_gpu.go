@@ -5,6 +5,7 @@ package diffusion
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/computerex/dlgo/gpu"
@@ -36,6 +37,11 @@ func setupDiffusionGPU(
 	if err := gpu.Init(); err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("GPU init: %w", err)
 	}
+	// The coopmat GEMM kernels are ~5x faster than the FP32 fallbacks, but they
+	// narrow activations to FP16. GpuDiTForward keeps activations in range by
+	// scaling them by an exact power of two around each GEMM, so coopmat is safe
+	// for the DiT. DLGO_DIT_NOCOOPMAT=1 selects the slower FP32-activation path.
+	gpu.SetNoCoopmatGemm(os.Getenv("DLGO_DIT_NOCOOPMAT") == "1")
 	log.Printf("[diffusion/gpu] GPU: %s (%.0f MB VRAM)", gpu.DeviceName(),
 		float64(gpu.VRAMBytes())/(1024*1024))
 

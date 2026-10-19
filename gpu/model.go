@@ -54,6 +54,205 @@ func UploadTensor(qt *core.QuantizedTensor) (*GpuTensor, error) {
 	return &GpuTensor{Buf: buf, Type: qt.Type, Rows: qt.Rows, Cols: qt.Cols}, nil
 }
 
+// uploadBytes allocates and uploads a raw byte slice as a GpuTensor.
+func uploadBytes(data []byte, typ uint32, rows, cols int) (*GpuTensor, error) {
+	buf := Alloc(uint64(len(data)))
+	if buf == 0 {
+		return nil, fmt.Errorf("gpu: alloc failed for tensor %dx%d (%d bytes)", rows, cols, len(data))
+	}
+	if err := Upload(buf, data); err != nil {
+		Free(buf)
+		return nil, err
+	}
+	return &GpuTensor{Buf: buf, Type: typ, Rows: rows, Cols: cols}, nil
+}
+
+// Affine8BytesFor returns the canonical Affine8 byte size for a rows×cols weight.
+func Affine8BytesFor(rows, cols int) uint64 {
+	return uint64(rows) * uint64(cols) / quant.Affine8GroupSize * quant.Affine8BlockBytes
+}
+
+// UploadTensorAffine8 repacks a QuantizedTensor into the canonical Affine8 format
+// (see quant/affine8.go) and uploads it. After this, the weight tensor — whatever
+// its on-disk quantization scheme — is served by the single unified GEMM kernel
+// (gpu_gemm_affine8); no per-quant code is needed in the hot path.
+func UploadTensorAffine8(qt *core.QuantizedTensor) (*GpuTensor, error) {
+	if qt == nil {
+		return nil, nil
+	}
+	if qt.FP32Data != nil {
+		return uploadBytes(quant.QuantizeAffine8(qt.FP32Data), QuantTypeAffine8, qt.Rows, qt.Cols)
+	}
+	enc, err := quant.RepackAffine8(qt.Data, qt.Type, qt.Rows*qt.Cols)
+	if err != nil {
+		return nil, fmt.Errorf("affine8 repack %dx%d: %w", qt.Rows, qt.Cols, err)
+	}
+	return uploadBytes(enc, QuantTypeAffine8, qt.Rows, qt.Cols)
+}
+
+// Affine4BytesFor returns the canonical Affine4 byte size for a rows×cols weight.
+func Affine4BytesFor(rows, cols int) uint64 {
+	return uint64(rows) * uint64(cols) / quant.Affine4GroupSize * quant.Affine4BlockBytes
+}
+
+// UploadTensorAffine4 repacks a QuantizedTensor into the byte-lean canonical
+// Affine4 format (see quant/affine4.go) and uploads it. Used for sub-8-bit
+// sources where Affine8's extra bytes would cost decode bandwidth.
+func UploadTensorAffine4(qt *core.QuantizedTensor) (*GpuTensor, error) {
+	if qt == nil {
+		return nil, nil
+	}
+	if qt.FP32Data != nil {
+		return uploadBytes(quant.QuantizeAffine4(qt.FP32Data), QuantTypeAffine4, qt.Rows, qt.Cols)
+	}
+	enc, err := quant.RepackAffine4(qt.Data, qt.Type, qt.Rows*qt.Cols)
+	if err != nil {
+		return nil, fmt.Errorf("affine4 repack %dx%d: %w", qt.Rows, qt.Cols, err)
+	}
+	return uploadBytes(enc, QuantTypeAffine4, qt.Rows, qt.Cols)
+}
+
+// gpuNativeQuant reports whether the GPU has a native per-quant kernel for the
+// scheme (a matvec_*/coopmat kernel selected in gpu_matvec / gpu_batch_matvec).
+// Any scheme NOT listed here would otherwise fall through to the CPU
+// QMatVecMulParallel fallback; uploadProjWeight repacks those to Affine8 at load
+// so they stay on the GPU. (quant.Dequantize — hence RepackAffine8 — covers
+// every GGML type, so this fallback is always available.)
+func gpuNativeQuant(qtype uint32) bool {
+	switch qtype {
+	case 0, 1, 2, 6, 7, 8, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23, 29, 30, 34, 39:
+		return true
+	}
+	return false
+}
+
+// llmAffine8Quant reports whether a scheme should ALSO get an Affine8 copy for
+// the batched prefill path on top of its native weights. True for schemes with
+// NO cooperative-matrix GEMM: in batched prefill they otherwise fall back to a
+// per-token matvec that re-reads the whole weight matrix once per prompt token
+// (the SystemOne 9B Q3_K FFN bottleneck). Q4_K/Q5_K/Q6_K/BF16 already have
+// byte-optimal coopmat GEMMs and are left untouched (decode bytes matter).
+func llmAffine8Quant(qtype uint32) bool {
+	switch qtype {
+	case 12, 13, 14, 30: // Q4_K, Q5_K, Q6_K, BF16
+		return false
+	}
+	return true
+}
+
+// llmUseBatchAffine8 reports whether to build Affine8 copies of the prefill
+// projection/FFN weights. Opt-in via DLGO_LLM_AFFINE8=1.
+//
+// These copies are consumed ONLY by the batched prefill path
+// (BuildBatchLayerConfs → gpu_forward_layer_batch → the one unified coopmat
+// GEMM). Single-token decode keeps the original per-quant weights, so decode
+// speed is unchanged; the cost is the extra Affine8 VRAM (one copy of the
+// affected tensors).
+func llmUseBatchAffine8() bool {
+	return os.Getenv("DLGO_LLM_AFFINE8") == "1"
+}
+
+// uploadProjWeight uploads a projection/FFN weight tensor in its ORIGINAL
+// quantization when the GPU has a native kernel for it; otherwise it repacks to
+// the canonical Affine8 format so the scheme still runs on the GPU instead of
+// falling back to the CPU (no unsupported quants).
+func uploadProjWeight(qt *core.QuantizedTensor) (*GpuTensor, error) {
+	if qt == nil {
+		return nil, nil
+	}
+	// Canonical formats use 32-element blocks; each weight row must be a whole
+	// number of blocks for the row-major matvec/GEMM indexing to be correct.
+	shapeOK := qt.Cols%quant.Affine8GroupSize == 0
+	// Unified canonical path (DLGO_UNIFIED_QUANT=1): EVERY projected weight is
+	// repacked to Affine4 (sub-8-bit sources, byte-lean decode) or Affine8
+	// (≥5.5-bit sources). The whole model then runs on exactly two matvec kernels
+	// (matvec_affine4/8) + two GEMMs (gemm_affine4/8_coopmat) — no per-quant code.
+	if llmUnifiedQuant() && qt.FP32Data == nil && shapeOK {
+		if gt, err := uploadCanonical(qt); err == nil {
+			return gt, nil
+		}
+	}
+	// Forced Affine8 (DLGO_DECODE_AFFINE8=1): A/B knob pinning everything to
+	// Affine8 regardless of source bit width.
+	if llmDecodeAffine8() && qt.FP32Data == nil && shapeOK {
+		if gt, err := UploadTensorAffine8(qt); err == nil {
+			return gt, nil
+		}
+	}
+	// Otherwise: native per-quant kernel when one exists, else Affine8 fallback
+	// (so there are no unsupported quants).
+	if qt.FP32Data == nil && !gpuNativeQuant(qt.Type) && shapeOK {
+		if gt, err := UploadTensorAffine8(qt); err == nil {
+			return gt, nil
+		}
+	}
+	return UploadTensor(qt)
+}
+
+// canonicalQuant4 reports whether a GGML type should be stored as the byte-lean
+// Affine4 (≤ ~5 bits/weight) rather than Affine8. Keeping sub-5-bit sources on
+// Affine4 holds decode weight bytes close to the native schemes while still
+// collapsing every source onto one format family.
+func canonicalQuant4(qtype uint32) bool {
+	switch qtype {
+	case 6, 7, 8, 9, 13, 14, 15, 30, 0, 1: // Q5_0,Q5_1,Q8_0,Q8_1,Q5_K,Q6_K,Q8_K,BF16,F32,F16
+		return false
+	}
+	return true // Q2_K,Q3_K,Q4_0,Q4_1,Q4_K,IQ*,TQ*,MXFP4
+}
+
+// uploadCanonical repacks a weight tensor to its canonical format (Affine4 or
+// Affine8, chosen by source bit-width).
+func uploadCanonical(qt *core.QuantizedTensor) (*GpuTensor, error) {
+	if canonicalQuant4(qt.Type) {
+		return UploadTensorAffine4(qt)
+	}
+	return UploadTensorAffine8(qt)
+}
+
+// llmUnifiedQuant reports whether to repack every projected weight to a canonical
+// Affine format (Affine4 for ≤5-bit sources, else Affine8) for BOTH decode and
+// prefill. This is the DEFAULT dense-path configuration: the whole model runs on
+// the two unified matvec kernels + two unified GEMMs, so no per-quant kernel is
+// on the hot path. Set DLGO_UNIFIED_QUANT=0 to fall back to the legacy per-quant
+// kernels (used to A/B and to exercise the per-quant code paths in tests).
+func llmUnifiedQuant() bool { return os.Getenv("DLGO_UNIFIED_QUANT") != "0" }
+
+// llmDecodeAffine8 reports whether to force all projected weights onto the
+// canonical Affine8 format for BOTH decode and prefill (opt-in via
+// DLGO_DECODE_AFFINE8=1) — the A/B knob for the Affine8-only configuration.
+func llmDecodeAffine8() bool { return os.Getenv("DLGO_DECODE_AFFINE8") == "1" }
+
+// uploadAffine8Copy repacks+uploads an Affine8 copy of qt for the batched
+// prefill path, or returns nil when it is not warranted (flag off, native
+// coopmat scheme, FP32, or unsupported shape).
+func uploadAffine8Copy(qt *core.QuantizedTensor) *GpuTensor {
+	if qt == nil || !llmUseBatchAffine8() || qt.FP32Data != nil || !llmAffine8Quant(qt.Type) {
+		return nil
+	}
+	if (qt.Rows*qt.Cols)%quant.Affine8GroupSize != 0 {
+		return nil
+	}
+	gt, err := UploadTensorAffine8(qt)
+	if err != nil {
+		return nil
+	}
+	return gt
+}
+
+// uploadWeightPair returns (base, affine8copy) for a projection/FFN weight:
+// base is the native tensor (or Affine8 when the scheme has no native kernel);
+// the copy is the optional Affine8 prefill variant, built only when the flag is
+// on and the scheme has no coopmat GEMM. When base is already Affine8 the copy
+// is nil — prefill then uses base via pickA8.
+func uploadWeightPair(qt *core.QuantizedTensor) (*GpuTensor, *GpuTensor, error) {
+	base, err := uploadProjWeight(qt)
+	if err != nil || base == nil || base.Type == QuantTypeAffine8 || base.Type == QuantTypeAffine4 {
+		return base, nil, err
+	}
+	return base, uploadAffine8Copy(qt), nil
+}
+
 // UploadF32Slice uploads a float32 slice to a new GPU buffer.
 func UploadF32Slice(data []float32) (Buf, error) {
 	if len(data) == 0 {
@@ -99,6 +298,13 @@ type GpuLayer struct {
 	FFNDownBias  Buf
 	PostFFNNorm  Buf
 
+	// Affine8 copies of the projection/FFN weights used ONLY by the batched
+	// prefill path (BuildBatchLayerConfs → the one unified coopmat GEMM). nil
+	// unless DLGO_LLM_AFFINE8=1 and the source quant has no coopmat GEMM.
+	// Single-token decode keeps using the per-quant fields above.
+	WqA8, WkA8, WvA8, WoA8 *GpuTensor
+	GateA8, UpA8, DownA8   *GpuTensor
+
 	// MoE expert weights (packed, GPU-supported)
 	FFNRouter     *GpuTensor // [expertCount × dim] router/gating network
 	FFNRouterBias Buf        // [expertCount] optional bias
@@ -136,6 +342,12 @@ type GpuLayer struct {
 	SSMOut     *GpuTensor // [dim × valueDim]
 	SSMState   Buf        // [numHeads × headKDim × headVDim] float32 (persistent)
 	SSMConvBuf Buf        // [convK × channels] float32 (persistent)
+
+	// Affine8 copies of the SSM projection weights, used ONLY by batched prefill
+	// (same rationale as the Wq/WoA8/etc. fields). nil unless DLGO_LLM_AFFINE8=1
+	// and the source quant has no coopmat GEMM (e.g. Qwen3.5's attn_gate=Q3_K).
+	// Single-token decode keeps the per-quant fields above.
+	SSMInProjA8, SSMGateA8, SSMAlphaA8, SSMBetaA8, SSMOutA8 *GpuTensor
 }
 
 // GpuModel holds all model weights on the GPU.
@@ -461,6 +673,13 @@ func (gm *GpuModel) FreeAll() {
 		freeTensor(gl.FFNGate)
 		freeTensor(gl.FFNUp)
 		freeTensor(gl.FFNDown)
+		freeTensor(gl.WqA8)
+		freeTensor(gl.WkA8)
+		freeTensor(gl.WvA8)
+		freeTensor(gl.WoA8)
+		freeTensor(gl.GateA8)
+		freeTensor(gl.UpA8)
+		freeTensor(gl.DownA8)
 		freeBuf(gl.FFNUpBias)
 		freeBuf(gl.FFNDownBias)
 		freeBuf(gl.PostFFNNorm)
@@ -493,6 +712,11 @@ func (gm *GpuModel) FreeAll() {
 		freeBuf(gl.SSMDtBias)
 		freeBuf(gl.SSMNorm)
 		freeTensor(gl.SSMOut)
+		freeTensor(gl.SSMInProjA8)
+		freeTensor(gl.SSMGateA8)
+		freeTensor(gl.SSMAlphaA8)
+		freeTensor(gl.SSMBetaA8)
+		freeTensor(gl.SSMOutA8)
 		freeBuf(gl.SSMState)
 		freeBuf(gl.SSMConvBuf)
 	}

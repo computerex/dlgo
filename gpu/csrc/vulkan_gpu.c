@@ -794,6 +794,12 @@ int gpu_init(void) {
     fprintf(stderr, "[dlgo/gpu] Initialized Vulkan on %s (%.0f MB VRAM)\n",
         g.dev_props.deviceName,
         (double)gpu_vram_bytes() / (1024.0 * 1024.0));
+    fprintf(stderr, "[dlgo/gpu] maxComputeSharedMemorySize=%u maxComputeWorkGroupInvocations=%u maxComputeWorkGroupSize=(%u,%u,%u)\n",
+        g.dev_props.limits.maxComputeSharedMemorySize,
+        g.dev_props.limits.maxComputeWorkGroupInvocations,
+        g.dev_props.limits.maxComputeWorkGroupSize[0],
+        g.dev_props.limits.maxComputeWorkGroupSize[1],
+        g.dev_props.limits.maxComputeWorkGroupSize[2]);
 
     return GPU_OK;
 }
@@ -1412,10 +1418,38 @@ int gpu_set_iq_tables(GpuBuf iq1s_buf, GpuBuf iq2xxs_buf, GpuBuf iq2s_buf, GpuBu
 // ---------------------------------------------------------------------------
 // Operations (implemented after shaders are compiled)
 // ---------------------------------------------------------------------------
+// dispatch_affine_matvec: the canonical Affine4/Affine8 single-token matvec. It
+// takes a (rows, cols, w_off) push constant, so the SAME kernel serves a plain
+// matvec (w_off=0, dense decode) and an expert-slice matvec (w_off = the weight
+// offset in 32-weight blocks), which is what the MoE offset path needs.
+static int dispatch_affine_matvec(PipelineID pipe, GpuBuf out_buf, GpuBuf weights_buf,
+                                  GpuBuf x_buf, int rows, int cols,
+                                  int rows_per_wg, int w_off_blocks) {
+    struct { int rows; int cols; int w_off; } pc = {rows, cols, w_off_blocks};
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                int rows, int cols, int qtype) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    // Canonical formats use the 3-int push-constant matvec (w_off=0).
+    if (qtype == QTYPE_AFFINE8)
+        return dispatch_affine_matvec(PIPE_MATVEC_AFFINE8, out_buf, weights_buf, x_buf, rows, cols, 2, 0);
+    if (qtype == QTYPE_AFFINE4)
+        return dispatch_affine_matvec(PIPE_MATVEC_AFFINE4, out_buf, weights_buf, x_buf, rows, cols, 2, 0);
 
     PipelineID pipe;
     GpuBuf table_buf = 0;
@@ -1495,6 +1529,15 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
                       GpuBuf x_buf, int rows, int cols, int qtype) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    // Canonical formats: an expert lives at weights_offset_bytes within the packed
+    // tensor; convert it to a 32-weight-block offset for the unified matvec.
+    if (qtype == QTYPE_AFFINE8)
+        return dispatch_affine_matvec(PIPE_MATVEC_AFFINE8, out_buf, weights_buf, x_buf,
+                                      rows, cols, 2, weights_offset_bytes / 36);
+    if (qtype == QTYPE_AFFINE4)
+        return dispatch_affine_matvec(PIPE_MATVEC_AFFINE4, out_buf, weights_buf, x_buf,
+                                      rows, cols, 2, weights_offset_bytes / 20);
 
     PipelineID pipe;
     GpuBuf table_buf = 0;
@@ -1974,6 +2017,8 @@ int gpu_moe_matvec_native(GpuBuf out_buf, GpuBuf weights_buf,
         case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS_MOE;  rows_per_wg = 2; break;
         case 20:             pipe = PIPE_MATVEC_IQ4_NL_MOE;  rows_per_wg = 2; break;
         case 39:             pipe = PIPE_MATVEC_MXFP4_MOE;   rows_per_wg = 1; break;
+        case QTYPE_AFFINE4:  pipe = PIPE_MATVEC_AFFINE4_MOE; rows_per_wg = 2; break;
+        case QTYPE_AFFINE8:  pipe = PIPE_MATVEC_AFFINE8_MOE; rows_per_wg = 2; break;
         default: return GPU_ERR_DISPATCH;
     }
 
@@ -2634,19 +2679,59 @@ static int gemm_q3k_available(void);
 static int gemm_q3k_recovered_selected(void);
 static int gpu_gemm_q3k_recovered(GpuBuf out, GpuBuf weights, GpuBuf x, int rows, int cols, int npos);
 
+/* When set, gpu_batch_matvec avoids the cooperative-matrix GEMMs. Those kernels
+ * narrow activations to FP16, but diffusion DiT activations (notably the SwiGLU
+ * output, which reaches ~2e5 for Z-Image) exceed the FP16 range and overflow to
+ * inf, then NaN. The FP32-activation GEMM paths match stable-diffusion.cpp. */
+static int g_no_coopmat_gemm = 0;
+
+void gpu_set_no_coopmat_gemm(int on) {
+    g_no_coopmat_gemm = on ? 1 : 0;
+}
+
+/* Precision override for the DiT full-attention kernel.
+ * -1 = follow DLGO_ATTN_F16 env (default: f16 ON), 0 = force f32, 1 = force f16.
+ * The f16 variant is ~1.45x faster (measured in isolation) because the kernel is
+ * shared-memory throughput bound and f16 halves the shared traffic. */
+static int g_attn_f16 = -1;
+
+void gpu_set_attention_f16(int v) {
+    g_attn_f16 = v;
+}
+
+/* Tensor-core (cooperative matrix) full-attention override.
+ * -1 = follow DLGO_ATTN_COOPMAT env (default: OFF until verified), 1 = force ON.
+ * Only valid for head_dim == 128. */
+static int g_attn_coopmat = -1;
+
+void gpu_set_attention_coopmat(int v) {
+    g_attn_coopmat = v;
+}
+
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos, int qtype) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
     if (npos <= 0) return GPU_OK;
-    if (npos == 1) return gpu_matvec(out_buf, weights_buf, x_buf, rows, cols, qtype);
+    /* Single-token: the unified per-format matvec (matvec_affine*) is far
+     * cheaper than the BN=128 GEMM, which wastes 127/128 columns at npos=1. */
+    if (npos == 1)
+        return gpu_matvec(out_buf, weights_buf, x_buf, rows, cols, qtype);
+
+    /* Unified canonical-Affine8 path: every quantization scheme is repacked to
+     * Affine8 at load time, so all batched GEMMs share this single kernel. */
+    if (qtype == QTYPE_AFFINE8)
+        return gpu_gemm_affine8(out_buf, weights_buf, x_buf, rows, cols, npos);
+    /* Byte-lean canonical-Affine4 batched GEMM (sub-8-bit sources). */
+    if (qtype == QTYPE_AFFINE4)
+        return gpu_gemm_affine4(out_buf, weights_buf, x_buf, rows, cols, npos);
 
     /* Use BF16 coopmat GEMM when available and batched */
-    if (qtype == QTYPE_BF16 && npos > 1 && g.has_coopmat) {
+    if (qtype == QTYPE_BF16 && npos > 1 && g.has_coopmat && !g_no_coopmat_gemm) {
         return gpu_gemm_bf16(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
     /* Use Q4_K coopmat GEMM when available and batched */
-    if (qtype == QTYPE_Q4_K && npos > 1 && g.has_coopmat) {
+    if (qtype == QTYPE_Q4_K && npos > 1 && g.has_coopmat && !g_no_coopmat_gemm) {
         return gpu_gemm_q4k(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
     /* Fallback: dequant + scalar tiled GEMM for Q4_K without coopmat */
@@ -2654,11 +2739,11 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         return gpu_gemm_q4k_tiled(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
     /* Use Q5_K coopmat GEMM when available and batched */
-    if (qtype == QTYPE_Q5_K && npos > 1 && g.has_coopmat) {
+    if (qtype == QTYPE_Q5_K && npos > 1 && g.has_coopmat && !g_no_coopmat_gemm) {
         return gpu_gemm_q5k(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
     /* Use Q6_K coopmat GEMM when available, otherwise f32 tiled */
-    if (qtype == QTYPE_Q6_K && npos > 1 && g.has_coopmat) {
+    if (qtype == QTYPE_Q6_K && npos > 1 && g.has_coopmat && !g_no_coopmat_gemm) {
         return gpu_gemm_q6k(out_buf, weights_buf, x_buf, rows, cols, npos);
     }
     if (qtype == QTYPE_Q6_K && npos > 1) {
@@ -2860,7 +2945,12 @@ int gpu_attention_full_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_
     struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; } pc =
         {num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale};
     DispatchParams dp = {0};
-    dp.pipe = PIPE_ATTENTION_FULL_F16;
+    // FP32 full attention.
+    // NOTE: measured (2026-10) that this kernel is NOT memory-bound: shrinking
+    // the K/V working set to L2 (wrap) and even broadcasting every load to one
+    // address both left the time unchanged. It is bound by issue/shared-memory
+    // traffic/barrier latency at 1 workgroup/SM occupancy.
+    dp.pipe = PIPE_ATTENTION_FULL_F32;
     dp.bufs[0] = out_buf;
     dp.bufs[1] = q_buf;
     dp.bufs[2] = k_buf;
@@ -2868,9 +2958,40 @@ int gpu_attention_full_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_
     dp.num_bufs = 4;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
-    dp.groups_x = num_heads;
-    dp.groups_y = (seq_len + 7) / 8;
+    // x = query block (fastest-varying dimension), y = head.
+    dp.groups_x = (seq_len + 7) / 8;
+    dp.groups_y = num_heads;
     dp.groups_z = 1;
+    // FP16 attention variant (default ON). This shader puts the head on x and
+    // the query block on y (opposite of the f32 variant), so the dispatch
+    // dimensions must be swapped. Set DLGO_ATTN_F16=0 (or gpu_set_attention_f16(0))
+    // to force the f32 kernel for parity checks.
+    {
+        // Tensor-core (coopmat) flash attention. Default ON for head_dim==128
+        // (verified 2.3x faster than the SIMT f16 kernel, parity relAbs ~4e-4).
+        // DLGO_ATTN_COOPMAT=0 disables it (falls back to the SIMT f16 kernel).
+        int use_coopmat = g_attn_coopmat;
+        if (use_coopmat < 0) {
+            const char* e = getenv("DLGO_ATTN_COOPMAT");
+            use_coopmat = !(e && e[0] == '0');  // default ON
+        }
+        if (use_coopmat && head_dim == 128 && g.has_coopmat) {
+            dp.pipe = PIPE_ATTENTION_FLASH_COOPMAT;
+            dp.groups_x = num_heads;
+            dp.groups_y = (seq_len + 63) / 64;  // BR = 64 query rows per WG
+            return dispatch_compute(&dp);
+        }
+        int use_f16 = g_attn_f16;
+        if (use_f16 < 0) {
+            const char* e = getenv("DLGO_ATTN_F16");
+            use_f16 = !(e && e[0] == '0');
+        }
+        if (use_f16) {
+            dp.pipe = PIPE_ATTENTION_FULL_F16;
+            dp.groups_x = num_heads;
+            dp.groups_y = (seq_len + 15) / 16;  // BR = 16 query rows per WG
+        }
+    }
     return dispatch_compute(&dp);
 }
 
@@ -3388,7 +3509,8 @@ int gpu_gemm_q5k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.num_bufs = 3;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 63) / 64);
+    /* BM=64, BN=128 */
+    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
     dp.groups_y = 1;
     dp.groups_z = 1;
     return dispatch_compute(&dp);
@@ -3408,7 +3530,53 @@ int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.num_bufs = 3;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 63) / 64);
+    /* BM=64, BN=128 */
+    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+/* Unified GEMM over the canonical Affine8 weight format. Every weight tensor is
+ * repacked to Affine8 at load time (see quant/affine8.go), so this single kernel
+ * serves all quantization schemes. BM=64, BN=128. */
+int gpu_gemm_affine8(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                     int rows, int cols, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GEMM_AFFINE8_COOPMAT;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// Batched GEMM over canonical Affine4 weights (byte-lean companion of
+// gpu_gemm_affine8). Same tiling (BM=64, BN=128, BK=32).
+int gpu_gemm_affine4(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                     int rows, int cols, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GEMM_AFFINE4_COOPMAT;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
     dp.groups_y = 1;
     dp.groups_z = 1;
     return dispatch_compute(&dp);

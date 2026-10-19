@@ -193,6 +193,10 @@ func BytesForN(ggmlType uint32, n int) int {
 		return (n / 256) * 66
 	case 39: // MXFP4: 32 values per block, 17 bytes
 		return (n / 32) * 17
+	case 60: // canonical Affine8 (see affine8.go): 32 values / 36 bytes
+		return (n / Affine8GroupSize) * Affine8BlockBytes
+	case 61: // canonical Affine4 (see affine4.go): 32 values / 20 bytes
+		return (n / Affine4GroupSize) * Affine4BlockBytes
 	default:
 		return 0
 	}

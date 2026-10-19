@@ -10,9 +10,14 @@
 // Q/K/V layout: [seq_len, num_heads * head_dim] (f32, row-major)
 // Output:       [seq_len, num_heads * head_dim] (f32, row-major)
 //
-// Dispatch: groups_x = num_heads,
-//           groups_y = ceil(seq_len / BR),
+// Dispatch: groups_x = ceil(seq_len / BR),
+//           groups_y = num_heads,
 //           groups_z = 1
+// NOTE: x is the fastest-varying dispatch dimension, so ordering the query
+// blocks on x keeps every workgroup in a wave working on the same head. That
+// head's K/V (a few MB) then stays resident in L2 across all its query blocks
+// instead of thrashing across all heads' K/V. With BR=8 and a 4k sequence this
+// kernel is bandwidth-bound on K/V re-reads, so this ordering matters a lot.
 // Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale (24 bytes)
 // Buffers: 0=out (vec4), 1=Q (vec4), 2=K (vec4), 3=V (vec4)
 
@@ -51,8 +56,9 @@ shared vec4 Qf[BR * HD4P];
 shared vec4 kvsh[BC * HD4P];
 
 void main() {
-    uint head = gl_WorkGroupID.x;
-    uint wg_row = gl_WorkGroupID.y;
+    // x = query block (fastest-varying), y = head: keeps one head's K/V hot in L2.
+    uint wg_row = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
     if (head >= uint(num_heads)) return;
 
     uint tid = gl_LocalInvocationID.x;
@@ -94,8 +100,11 @@ void main() {
         int tile_len = min(int(BC), N - tile_start);
 
         // --- K load into kvsh (cooperative, coalesced) ---
-        // BC * HD4 = 1024 entries, 256 threads -> 4 iterations
-        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+        // BC * HD4 = 1024 entries, 256 threads -> 4 iterations. Unrolled so the
+        // four independent global loads issue back-to-back and their latencies
+        // overlap, instead of serialising through the dependent shared store.
+        [[unroll]] for (uint e = 0u; e < (uint(BC) * uint(HD4)) / uint(WG_SIZE); e++) {
+            uint i = e * uint(WG_SIZE) + tid;
             uint kp = i / uint(HD4);
             uint d  = i % uint(HD4);
             int kpos = tile_start + int(kp);
@@ -141,7 +150,8 @@ void main() {
 
         // --- V load into kvsh (reuse shared mem after K reads done) ---
         barrier(); // ensure all K reads complete before overwriting kvsh
-        for (uint i = tid; i < uint(BC) * uint(HD4); i += WG_SIZE) {
+        [[unroll]] for (uint e = 0u; e < (uint(BC) * uint(HD4)) / uint(WG_SIZE); e++) {
+            uint i = e * uint(WG_SIZE) + tid;
             uint vp = i / uint(HD4);
             uint d  = i % uint(HD4);
             int vpos = tile_start + int(vp);

@@ -104,6 +104,26 @@ dlgo-image --gpu \
 
 `dlgo-image` validates dimensions and estimates peak memory before generation. The text encoder is released after prompt embedding so the DiT and VAE have the available memory budget. GPU acceleration applies to the DiT execution path; model compatibility, image quality, determinism, VRAM use, and throughput must be validated for each checkpoint/quantization/resolution combination. The diffusion implementation is in `models/diffusion/`, with CPU/GPU correctness and integration tests alongside it.
 
+### VAE weights
+
+Z-Image ships the FLUX `AutoencoderKL` (16 latent channels, `scaling_factor` 0.3611, `shift_factor` 0.1159), and dlgo reads the **ldm/ComfyUI-style** tensor layout (`decoder.up.<i>.block.<j>`, `decoder.mid.attn_1`, `decoder.norm_out`). The upstream `Tongyi-MAI/Z-Image-Turbo` VAE is stored in diffusers layout (`decoder.up_blocks.<i>.resnets.<j>`, `decoder.conv_norm_out`), and the FLUX `ae.safetensors` release is licence-gated. `tools/convert_zimage_vae.py` renames the diffusers keys into the layout dlgo loads, writing a decoder-only safetensors:
+
+```bash
+python tools/convert_zimage_vae.py   # -> C:\models\z-image-vae-decoder.safetensors
+```
+
+The script asserts the decoder channel flow before writing (the up-block index is inverted between the two layouts), so a mismatch fails loudly rather than producing a black image.
+
+### GPU numerics
+
+The Vulkan cooperative-matrix GEMM kernels narrow both operands to FP16. Z-Image DiT activations exceed FP16 range (the FFN SwiGLU output reaches ~2e5, versus FP16 max 65504), which overflows to `inf` and then `NaN` — surfacing as an all-black PNG.
+
+Dropping to the FP32-activation fallbacks is correct but slow (measured ~4.8x slower per step: the Q5_K/Q6_K fallbacks have no tiled GEMM and degrade to scalar matvec). Instead `GpuDiTForward` scales each GEMM's activation by an exact power of two (2^-6) and undoes it on the output. Power-of-two scaling is exact in floating point, so this costs no precision, and it extends the safe activation range to ~4.2e6. `DLGO_DIT_NOCOOPMAT=1` selects the slower FP32-activation path for comparison.
+
+Because the activations are rescaled in place, the dispatches around each GEMM must be barrier-separated: `gpu.Barrier()` only sets a flag that is consumed by the *next* dispatch, so a missing call between the scale and its GEMM is a data race that silently makes generation nondeterministic. Two runs with identical arguments must produce byte-identical output.
+
+`GenerateImage` also validates the sampled latent and reports non-finite values instead of writing a silent black image.
+
 ## CLI Usage
 
 ### `dlgo run` — Interactive Chat

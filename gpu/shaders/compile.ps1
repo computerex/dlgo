@@ -133,7 +133,9 @@ $shaders = @(
     @{name="ssm_recurrence_batch_t32"; file="ssm_recurrence_batch_t32.comp"},
     @{name="attention_tiled_barrier"; file="attention_tiled_barrier.comp"},
     @{name="attention_tiled_kv4"; file="attention_tiled_kv4.comp"},
-    @{name="gemm_q3k_coopmat_recovered"; file="gemm_q3k_coopmat_recovered.comp"; target="vulkan1.3"}
+    @{name="gemm_q3k_coopmat_recovered"; file="gemm_q3k_coopmat_recovered.comp"; target="vulkan1.3"},
+    @{name="gemm_affine8_coopmat"; file="gemm_affine8_coopmat.comp"; target="vulkan1.3"},
+    @{name="attention_flash_f16_coopmat"; file="attention_flash_f16_coopmat.comp"; target="vulkan1.3"}
 )
 
 $header = @"
@@ -325,6 +327,8 @@ static const ShaderInfo shader_registry[] = {
     {"attention_tiled_barrier", spv_attention_tiled_barrier, spv_attention_tiled_barrier_size, 4, 28}, // PIPE_ATTENTION_TILED_BARRIER
     {"attention_tiled_kv4", spv_attention_tiled_kv4, spv_attention_tiled_kv4_size, 4, 28}, // PIPE_ATTENTION_TILED_KV4
     {"gemm_q3k_coopmat_recovered", spv_gemm_q3k_coopmat_recovered, spv_gemm_q3k_coopmat_recovered_size, 3, 12}, // PIPE_GEMM_Q3K_RECOVERED
+    {"gemm_affine8_coopmat", spv_gemm_affine8_coopmat, spv_gemm_affine8_coopmat_size, 3, 12}, // PIPE_GEMM_AFFINE8_COOPMAT
+    {"attention_flash_f16_coopmat", spv_attention_flash_f16_coopmat, spv_attention_flash_f16_coopmat_size, 4, 24}, // PIPE_ATTENTION_FLASH_COOPMAT
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

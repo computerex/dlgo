@@ -540,6 +540,24 @@ func MoEMatVecIQ(out, weights, x, table, indices Buf,
 	return nil
 }
 
+// MoEMatVecNative dispatches batched float-input MoE matvec for all active
+// experts (the native path used for canonical Affine4/Affine8 experts too).
+// Expert indices stay on GPU; expert_stride/base_offset are in 32-weight blocks.
+func MoEMatVecNative(out, weights, x, indices Buf,
+	rows, cols int, qtype uint32,
+	expertStride, baseOffset, sharedInput, nUsed int) error {
+	rc := C.gpu_moe_matvec_native(
+		C.GpuBuf(out), C.GpuBuf(weights),
+		C.GpuBuf(x), C.GpuBuf(indices),
+		C.int(rows), C.int(cols), C.int(qtype),
+		C.int(expertStride), C.int(baseOffset),
+		C.int(sharedInput), C.int(nUsed))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_matvec_native failed (%d)", rc)
+	}
+	return nil
+}
+
 // SwiGLUAt dispatches SwiGLU with byte offsets into the buffers.
 func SwiGLUAt(out, gate, up Buf, outOff, gateOff, upOff, n int) error {
 	rc := C.gpu_swiglu_at(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up),
@@ -954,6 +972,68 @@ func SetGemmQ3K(on bool) {
 		v = 1
 	}
 	C.gpu_set_gemm_q3k(v)
+}
+
+// SetNoCoopmatGemm disables cooperative-matrix GEMMs, forcing the
+// FP32-activation GEMM paths. The diffusion DiT needs this: its activations
+// (e.g. the SwiGLU output) exceed the FP16 range the coopmat kernels narrow to,
+// which overflows to inf and then NaN. LLM inference leaves it enabled.
+func SetNoCoopmatGemm(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_no_coopmat_gemm(v)
+}
+
+// SetAttentionF16 selects the DiT full-attention precision: true = FP16 kernel
+// (default, ~1.45x faster), false = FP32 kernel. Test/parity hook.
+func SetAttentionF16(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_f16(v)
+}
+
+// SetAttentionCoopmat selects the tensor-core (cooperative matrix) full-attention
+// kernel (head_dim == 128 only; falls back otherwise). Test/parity hook.
+func SetAttentionCoopmat(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_coopmat(v)
+}
+
+// QuantTypeAffine8 is the canonical unified weight format (see quant/affine8.go).
+// It is not a GGML type; weights uploaded in this format are routed to the single
+// gpu_gemm_affine8 / matvec_affine8 kernels, regardless of the quantization
+// scheme they were converted from.
+const QuantTypeAffine8 = 60
+
+// QuantTypeAffine4 is the byte-lean canonical weight format for sub-8-bit
+// sources (see quant/affine4.go). Not a GGML type.
+const QuantTypeAffine4 = 61
+
+// GemmAffine8 runs the unified batched GEMM over canonical Affine8 weights.
+func GemmAffine8(out, weights, x Buf, rows, cols, npos int) error {
+	rc := C.gpu_gemm_affine8(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.int(rows), C.int(cols), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gemm_affine8 failed (%d)", rc)
+	}
+	return nil
+}
+
+// GemmAffine4 runs the unified batched GEMM over canonical Affine4 weights.
+func GemmAffine4(out, weights, x Buf, rows, cols, npos int) error {
+	rc := C.gpu_gemm_affine4(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.int(rows), C.int(cols), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gemm_affine4 failed (%d)", rc)
+	}
+	return nil
 }
 
 // gemmQ3KRecovered is a test-only entry point; inference never selects this candidate.
