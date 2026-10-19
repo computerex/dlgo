@@ -87,9 +87,10 @@ func (p *Pipeline) SystemOneHidden(state string, q SystemOneQuestion, cfg System
 	if err := cfg.Err(); err != nil {
 		return nil, nil, 0, err
 	}
-	if p == nil || p.Model == nil || p.Tokenizer == nil || p.KVCache == nil || p.RunState == nil {
+	if p == nil || p.Model == nil || p.Tokenizer == nil {
 		return nil, nil, 0, fmt.Errorf("System One pipeline is not initialized")
 	}
+	p.ensureCPUState()
 	if len(q.Choices) < 2 {
 		return nil, nil, 0, fmt.Errorf("System One requires at least two choices")
 	}
@@ -132,9 +133,10 @@ func (p *Pipeline) SystemOne(state string, q SystemOneQuestion, cfg SystemOneCon
 	if err := cfg.Err(); err != nil {
 		return nil, err
 	}
-	if p == nil || p.Model == nil || p.Tokenizer == nil || p.KVCache == nil || p.RunState == nil {
+	if p == nil || p.Model == nil || p.Tokenizer == nil {
 		return nil, fmt.Errorf("System One pipeline is not initialized")
 	}
+	p.ensureCPUState()
 	if len(q.Choices) < 2 {
 		return nil, fmt.Errorf("System One requires at least two choices")
 	}
@@ -321,9 +323,10 @@ func (p *Pipeline) SystemOneMulti(state string, questions []SystemOneQuestion, c
 	if err := cfg.Err(); err != nil {
 		return nil, err
 	}
-	if p == nil || p.Model == nil || p.Tokenizer == nil || p.KVCache == nil || p.RunState == nil {
+	if p == nil || p.Model == nil || p.Tokenizer == nil {
 		return nil, fmt.Errorf("System One pipeline is not initialized")
 	}
+	p.ensureCPUState()
 	if len(questions) == 0 {
 		return nil, fmt.Errorf("SystemOneMulti requires at least one question")
 	}

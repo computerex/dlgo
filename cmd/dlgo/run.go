@@ -240,8 +240,12 @@ func handleCommand(input string, pipe *llm.Pipeline, messages []llm.Message, cfg
 			messages = messages[:1]
 			messages[0] = sys
 		}
-		pipe.KVCache.Reset()
-		if pipe.RunState.SSMState != nil {
+		// CPU buffers may be nil when a GPU pipeline owns inference (see
+		// gpu.NewGpuPipeline, which releases the CPU scratch to save host RAM).
+		if pipe.KVCache != nil {
+			pipe.KVCache.Reset()
+		}
+		if pipe.RunState != nil && pipe.RunState.SSMState != nil {
 			pipe.RunState.SSMState.Reset()
 		}
 		fmt.Println("  Conversation cleared.")

@@ -76,6 +76,28 @@ func (p *Pipeline) RebuildBuffers() {
 	p.BatchState = NewBatchState(cfg, batchCap, p.MaxSeqLen)
 }
 
+// ensureCPUState lazily (re)creates the CPU-side buffers when they are absent.
+// NewPipeline allocates them eagerly, but something (an explicit FreeForGPU, or
+// GPU pipeline construction, which releases the CPU scratch to avoid doubling
+// peak host memory) may have released them. Every CPU inference entry point
+// calls this first, so a freed pipeline transparently re-allocates instead of
+// nil-dereferencing.
+func (p *Pipeline) ensureCPUState() {
+	if p.KVCache == nil || p.RunState == nil || p.BatchState == nil {
+		p.RebuildBuffers()
+	}
+}
+
+// Runner is the backend-agnostic generation surface implemented by both the CPU
+// pipeline (*Pipeline) and the GPU pipeline (gpu.GpuPipeline). Hold a Runner and
+// you never need to branch on backend. For the simplest possible loader see
+// gpu.NewRunner, which picks the best available backend and never blows up host
+// memory on large contexts.
+type Runner interface {
+	GenerateDetailed(prompt string, cfg GenerateConfig) (*GenerateResult, error)
+	GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg GenerateConfig) (*GenerateResult, error)
+}
+
 const (
 	minContextLen = 64 // smallest context we'll auto-shrink to
 )
@@ -458,6 +480,7 @@ func grammarSample(logits []float32, cfg GenerateConfig, recentTokens []int32, r
 
 // Generate produces text from a prompt using the loaded model.
 func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error) {
+	p.ensureCPUState()
 	if len(prompt) == 0 {
 		return nil, fmt.Errorf("empty prompt")
 	}
@@ -569,6 +592,7 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 // generates tokens, and decodes the result. Returns the generated text and
 // token/second throughput.
 func (p *Pipeline) GenerateText(prompt string, cfg GenerateConfig) (string, float64, error) {
+	p.ensureCPUState()
 	tokens := p.Tokenizer.Encode(prompt)
 	if len(tokens) == 0 {
 		return "", 0, fmt.Errorf("tokenizer produced no tokens for prompt")
@@ -618,6 +642,7 @@ type GenerateResult struct {
 
 // GenerateDetailed is like GenerateText but returns detailed timing information.
 func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*GenerateResult, error) {
+	p.ensureCPUState()
 	tokens := p.Tokenizer.Encode(prompt)
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("tokenizer produced no tokens for prompt")
@@ -738,6 +763,7 @@ done:
 // the single-token embedding path so attention and SSM state advance exactly
 // as if the rows were tokens.
 func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]float32, cfg GenerateConfig) (*GenerateResult, error) {
+	p.ensureCPUState()
 	if len(images) == 0 {
 		return p.GenerateDetailed(prompt, cfg)
 	}
@@ -1004,6 +1030,7 @@ func extractHarmonyFinal(text string) string {
 // GenerateTextWithStopStrings is like GenerateText but also handles text-level
 // stop string detection for multi-token stop sequences.
 func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig) (string, float64, error) {
+	p.ensureCPUState()
 	tokens := p.Tokenizer.Encode(prompt)
 	if len(tokens) == 0 {
 		return "", 0, fmt.Errorf("tokenizer produced no tokens")

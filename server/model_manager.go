@@ -157,28 +157,13 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 		}
 
 		if useGPU {
-			// Free CPU-side buffers BEFORE GPU pipeline creation.
-			// The GPU pipeline allocates its own KV cache, run state, and batch
-			// state in VRAM. Keeping CPU buffers alive during GPU allocation
-			// doubles peak memory, which can crash the system with large contexts
-			// (e.g., 256K native context = ~8.5 GB CPU + GPU VRAM).
-			// We save the needed info and rebuild CPU buffers only if GPU fails.
-			savedMaxSeqLen := pipe.MaxSeqLen
-			pipe.FreeForGPU()
-			runtime.GC()
-			debug.FreeOSMemory()
-			mmap.TrimWorkingSet()
-
+			// gpu.NewGpuPipeline releases the CPU-side KV/run/batch scratch before
+			// uploading weights (avoiding a double peak in host memory at large
+			// contexts) and rebuilds it if GPU creation fails, so no manual
+			// memory juggling is needed here.
 			gpuPipe, err := mm.gpuNewPipeline(pipe)
 			if err != nil {
 				log.Printf("GPU pipeline creation failed, falling back to CPU: %v", err)
-				// Rebuild CPU buffers for CPU-only inference.
-				// Note: pipe.MaxSeqLen may have been reduced by the GPU pipeline
-				// estimator; use the (possibly reduced) value.
-				if pipe.MaxSeqLen <= 0 {
-					pipe.MaxSeqLen = savedMaxSeqLen
-				}
-				pipe.RebuildBuffers()
 			} else {
 				loaded.GpuPipeline = gpuPipe
 			}

@@ -8,6 +8,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -707,6 +709,18 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 	ffnDim := cfg.FFNDim
 
+	// Release the CPU-side KV cache / run state / batch state BEFORE uploading
+	// weights. The GPU pipeline owns its own KV in VRAM; holding the full-context
+	// CPU scratch during the (multi-second) weight upload roughly doubles peak
+	// host memory and can exhaust the Windows commit limit at large contexts
+	// (fatal: out of memory, errno 1455). The GPU path recomputes RoPE tables
+	// from config when RunState is nil, and the CPU buffers are rebuilt below if
+	// GPU creation ultimately fails and the caller falls back to CPU.
+	cpuPipeline.FreeForGPU()
+	runtime.GC()
+	debug.FreeOSMemory()
+	mmap.TrimWorkingSet()
+
 	// Retry loop: if GPU allocation fails, reduce layers and retry.
 	// Limited to 3 retries to avoid VRAM fragmentation from repeated
 	// partial allocations. Each retry does a full Sync + buffer table
@@ -724,6 +738,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if numGPULayers <= 0 {
+			cpuPipeline.RebuildBuffers()
 			return nil, fmt.Errorf("insufficient VRAM (%.0f MB) for even 1 layer — use CPU mode", totalVRAM)
 		}
 		isPartial = numGPULayers < cfg.NumLayers
@@ -911,6 +926,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 		layerConfs = nil
 
 		if attempt >= maxRetries {
+			cpuPipeline.RebuildBuffers()
 			return nil, fmt.Errorf("VRAM alloc failed after %d retries with %d layers: %v — use CPU mode",
 				maxRetries, numGPULayers, allocErr)
 		}
@@ -1133,6 +1149,36 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	return pipe, nil
 }
 
+// NewRunner is the one-call, memory-safe way to get an inference backend.
+//
+// It loads the model, initializes Vulkan, and builds the GPU pipeline. Weight
+// upload releases the CPU-side scratch first (so a large context can never
+// double peak host memory / exhaust the Windows commit limit), and if GPU
+// creation fails the CPU buffers are rebuilt so the returned Runner is always
+// usable. A missing/unusable GPU degrades to CPU rather than erroring.
+//
+//	runner, backend, err := gpu.NewRunner("model.gguf", 32768)
+//	if err != nil { log.Fatal(err) }
+//	res, err := runner.GenerateDetailed(prompt, cfg)
+//
+// backend is "GPU (Vulkan)" or "CPU". err is non-nil only for hard failures
+// (e.g. the model file could not be loaded).
+func NewRunner(modelPath string, ctx int) (llm.Runner, string, error) {
+	pipe, err := llm.NewPipeline(modelPath, ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := Init(); err != nil {
+		return pipe, "CPU", nil
+	}
+	gp, err := NewGpuPipeline(pipe)
+	if err != nil {
+		// NewGpuPipeline rebuilt the CPU buffers on failure.
+		return pipe, "CPU", nil
+	}
+	return gp, "GPU (" + DeviceName() + ")", nil
+}
+
 // ResetState zeros all caches and SSM state for a fresh inference.
 func (p *GpuPipeline) ResetState() {
 	p.KVCache.Reset()
@@ -1186,16 +1232,10 @@ func (p *GpuPipeline) FreeAll() {
 	ResetBufferTable()
 }
 
-// GenerateResult holds detailed output from a GPU generation run.
-type GenerateResult struct {
-	Text           string
-	Tokens         []int32
-	TokensPerSec   float64
-	PrefillTimeMs  float64
-	GenerateTimeMs float64
-	TotalTokens    int
-	PromptTokens   int
-}
+// GenerateResult is the shared generation result. It is an alias (not a new
+// type) of llm.GenerateResult so the GPU and CPU pipelines are interchangeable
+// behind llm.Runner and no caller needs to copy fields between two structs.
+type GenerateResult = llm.GenerateResult
 
 // GenerateDetailed runs generation on GPU with detailed timing.
 func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*GenerateResult, error) {
