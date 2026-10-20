@@ -1,0 +1,252 @@
+// GQA-folded split-KV decode attention for the LLM decode path (npos == 1).
+//
+// Supersedes attention_decode_split.comp for grouped-query models. That kernel
+// gives one workgroup per (q-head, split), so the kv_mul q-heads that share a KV
+// head each stage the *same* K/V tile into their own shared memory: the KV cache
+// is read kv_mul times per position (4x for Qwen3.5-9B's 16/4 layout).
+//
+// Here one workgroup owns a whole KV head — all kv_mul q-heads — and one split
+// of the window, so every K/V element is staged once and reused kv_mul times.
+// Grid becomes (num_kv_heads, num_splits).
+//
+// The decode-split kernel also computed its QK dot redundantly: every one of the
+// 8 subgroups ran the full head_dim dot for the same position, an 8x waste of
+// both FMAs and shared-memory reads. That is fixed here by giving each q-head
+// its own subgroup:
+//
+//   subgroup sg  (0 .. kv_mul-1) = q-head  sg
+//   lane                          = KV position within the 32-position tile
+//   thread                        = one 8-dim slice of one q-head's output row
+//
+// Phases per tile: all 256 threads cooperatively stage K/V, subgroups 0..kv_mul-1
+// compute the QK dots for their head and run the online softmax, the weights go
+// to shared, and finally kv_mul*hd8 threads each accumulate the 8 output dims
+// they own. The PV accumulators are therefore 8 floats per thread rather than
+// kv_mul*head_dim/8, which keeps register pressure flat as heads are folded.
+//
+// Per (q-head, split) it emits the same unnormalized partial as
+// attention_decode_split.comp — (running_max, running_sum, acc[head_dim]) — so
+// attention_decode_merge.comp consumes it unchanged.
+//
+// Requires head_dim in {64,128,192,256}, num_heads == kv_mul * num_kv_heads with
+// kv_mul <= 8, and kv_mul*hd8 <= 256. Otherwise the caller keeps the
+// non-folded kernel.
+//
+// Measured on Qwen3.5-9B (16/4 heads, head_dim 256), gen32k_9b -tokens 16384
+// -ctx 20480 -progress 2048, comparing DLGO_ATTN_DECODE_GQA 1 vs 0 on one binary:
+// decode 76.03 vs 70.95 tok/s overall, and the per-2048-token throughput at
+// 16k context 74.0 vs 64.4 tok/s. The context-linear decode cost effectively
+// disappears: T/token went from 12.95 + 1.57e-4*N ms to 13.45 + 3.5e-6*N ms
+// (slope ~45x smaller, intercept +0.5 ms). Below ~3k positions the fold is 1-2%
+// slower, because it halves the workgroup count (kv_heads x splits instead of
+// heads x splits) at a context too short to amortise it.
+//
+// Dispatch: groups_x = num_kv_heads, groups_y = num_splits, groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale,
+//                 softcap, num_splits (32 bytes)
+// Buffers: 0=partial(f32), 1=Q(f32 vec4), 2=KCache(packed half2 uvec4),
+//          3=VCache(packed half2 uvec4)
+
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Partial { float partial[]; };
+layout(set = 0, binding = 1) readonly buffer Q { vec4 q_v4[]; };
+layout(set = 0, binding = 2) readonly buffer K { uvec4 k_v4[]; };
+layout(set = 0, binding = 3) readonly buffer V { uvec4 v_v4[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;      // multiple of 64, <= 256
+    int kv_dim;        // float elements per KV position
+    int seq_len;       // window length (positions in [0, seq_len))
+    float scale;
+    float softcap;
+    int num_splits;
+};
+
+#define BC        32          // KV positions per tile == lanes per subgroup
+#define HDDMAX    256         // max head_dim
+#define HDD4MAX   64          // max head_dim/4 (vec4 per head)
+#define HD8MAX    32          // max head_dim/8 (uvec4 per head)
+#define HD8PMAX   33          // HD8MAX + 1 bank-conflict padding
+#define HPWMAX    8           // max q-heads folded into one workgroup
+
+shared uvec4 ksh[BC * HD8PMAX];          // 16.9 KB (hd 256)
+shared uvec4 vsh[BC * HD8PMAX];          // 16.9 KB
+shared vec4  qsh[HPWMAX * HDD4MAX];      // 8.0 KB, pre-scaled queries
+shared float wsh[HPWMAX * BC];           // 1.0 KB, per-tile softmax weights
+shared float corrsh[HPWMAX];             // per-tile online-softmax correction
+
+void main() {
+    uint kv_head = gl_WorkGroupID.x;
+    uint split   = gl_WorkGroupID.y;
+    uint tid     = gl_LocalInvocationID.x;
+    uint sg      = tid >> 5u;     // subgroup: which folded q-head computes QK
+    uint lane    = tid & 31u;     // lane: which KV position in the tile
+
+    uint hd     = uint(head_dim);
+    uint hd4    = hd / 4u;                       // vec4 per head (f32)
+    uint hd8    = hd / 8u;                       // uvec4 per head (packed half2)
+    uint kv_mul = uint(num_heads) / uint(num_kv_heads);
+    if (kv_head >= uint(num_kv_heads) || kv_mul == 0u || kv_mul > uint(HPWMAX)) return;
+
+    uint S       = uint(num_splits);
+    uint stride  = 2u + hd;                      // partial: m, l, acc[hd]
+    uint hq_base = kv_head * kv_mul;
+
+    int N     = seq_len;
+    int chunk = (N + int(S) - 1) / int(S);
+    int s0    = int(split) * chunk;
+    int s1    = min(N, s0 + chunk);
+    if (s0 >= s1) {
+        // Empty split: leave an inert partial (exp(m - M) == 0, so both the
+        // numerator and denominator contributions vanish) rather than stale
+        // data from the previous dispatch.
+        for (uint ho = 0u; ho < kv_mul; ho++) {
+            uint head = hq_base + ho;
+            uint base = (head * S + split) * stride;
+            for (uint i = tid; i < stride; i += 256u) partial[base + i] = 0.0;
+            if (tid == 0u) partial[base] = -1.0e30;
+        }
+        return;
+    }
+
+    uint kvd8    = uint(kv_dim) / 8u;            // uvec4 per KV position
+    uint kv_off8 = kv_head * hd8;                // uvec4 offset to this head
+
+    // ---- stage the kv_mul queries sharing this KV head, pre-scaled ----
+    for (uint idx = tid; idx < kv_mul * hd4; idx += 256u) {
+        uint ho = idx / hd4;
+        uint d  = idx - ho * hd4;
+        qsh[ho * uint(HDD4MAX) + d] = q_v4[(hq_base + ho) * hd4 + d] * scale;
+    }
+
+    // QK role: this thread's subgroup owns q-head sg (only kv_mul subgroups run).
+    bool qk_on = (sg < kv_mul);
+    uint qk_ho = sg;
+    float runMax = -1.0e30;
+    float runSum = 0.0;
+
+    // PV role: this thread owns one 8-dim slice of one q-head's output row.
+    uint pv_ho = tid / hd8;
+    uint pv_u  = tid - pv_ho * hd8;
+    bool pv_on = (pv_ho < kv_mul);
+    vec4 accA = vec4(0.0);
+    vec4 accB = vec4(0.0);
+
+    uint tileEntries = uint(BC) * hd8;
+
+    for (int ts = s0; ts < s1; ts += int(BC)) {
+        // ---- cooperative coalesced K + V tile load (all 256 threads) ----
+        [[unroll]] for (uint e = 0u; e < (uint(BC) * uint(HD8MAX)) / 256u; e++) {
+            uint i = e * 256u + tid;
+            if (i < tileEntries) {
+                uint kp  = i / hd8;
+                uint d8  = i - kp * hd8;
+                int  pos = ts + int(kp);
+                bool ok  = (pos < s1);
+                // Clamp the address even when masked off: GLSL does not
+                // guarantee ?: short-circuits, so an OOB index could fault on
+                // the tail tile.
+                int  cpos = min(pos, s1 - 1);
+                uint src  = uint(cpos) * kvd8 + kv_off8 + d8;
+                ksh[kp * uint(HD8PMAX) + d8] = ok ? k_v4[src] : uvec4(0u);
+                vsh[kp * uint(HD8PMAX) + d8] = ok ? v_v4[src] : uvec4(0u);
+            }
+        }
+        barrier();
+
+        // ---- QK + online softmax, one folded q-head per subgroup ----
+        if (qk_on) {
+            int  myPos = ts + int(lane);
+            bool live  = (myPos < s1);
+
+            // Full head_dim dot, four independent accumulators for ILP: with
+            // only kv_mul of the 8 subgroups active there is a single warp per
+            // scheduler, so a two-deep chain would stall on FMA latency.
+            vec4 dv0 = vec4(0.0), dv1 = vec4(0.0);
+            if (live) {
+                [[unroll]] for (uint i = 0u; i < uint(HD8MAX); i++) {
+                    if (i < hd8) {
+                        uvec4 kv = ksh[lane * uint(HD8PMAX) + i];
+                        vec2 a = unpackHalf2x16(kv.x);
+                        vec2 b = unpackHalf2x16(kv.y);
+                        vec2 c = unpackHalf2x16(kv.z);
+                        vec2 d = unpackHalf2x16(kv.w);
+                        vec4 q0 = qsh[qk_ho * uint(HDD4MAX) + i * 2u + 0u];
+                        vec4 q1 = qsh[qk_ho * uint(HDD4MAX) + i * 2u + 1u];
+                        dv0 += q0 * vec4(a.x, a.y, b.x, b.y);
+                        dv1 += q1 * vec4(c.x, c.y, d.x, d.y);
+                    }
+                }
+            }
+            float s = live ? (dv0.x + dv0.y + dv0.z + dv0.w
+                            + dv1.x + dv1.y + dv1.z + dv1.w) : -1.0e30;
+            if (softcap > 0.0 && live) s = softcap * tanh(s / softcap);
+
+            // Online softmax across the 32 positions this subgroup covers.
+            float tileMax = s;
+            [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+                tileMax = max(tileMax, subgroupShuffleXor(tileMax, off));
+
+            float newMax = max(runMax, tileMax);
+            float corr   = exp(runMax - newMax);
+            runMax = newMax;
+            runSum *= corr;
+
+            float w = live ? exp(s - newMax) : 0.0;
+            float wsum = w;
+            [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+                wsum += subgroupShuffleXor(wsum, off);
+            runSum += wsum;
+
+            wsh[qk_ho * uint(BC) + lane] = w;
+            if (lane == 0u) corrsh[qk_ho] = corr;
+        }
+        barrier();
+
+        // ---- weighted V accumulate: this thread's 8 dims of its q-head ----
+        if (pv_on) {
+            float corr = corrsh[pv_ho];
+            accA *= corr;
+            accB *= corr;
+            uint wb = pv_ho * uint(BC);
+            [[unroll]] for (uint p = 0u; p < uint(BC); p++) {
+                float w = wsh[wb + p];
+                uvec4 t = vsh[p * uint(HD8PMAX) + pv_u];
+                vec2 a0 = unpackHalf2x16(t.x);
+                vec2 a1 = unpackHalf2x16(t.y);
+                vec2 a2 = unpackHalf2x16(t.z);
+                vec2 a3 = unpackHalf2x16(t.w);
+                accA += w * vec4(a0.x, a0.y, a1.x, a1.y);
+                accB += w * vec4(a2.x, a2.y, a3.x, a3.y);
+            }
+        }
+
+        barrier(); // all LDS reads done before the next tile overwrites ksh/vsh
+    }
+
+    // ---- emit the unnormalized partial for each folded q-head ----
+    if (pv_on) {
+        uint head = hq_base + pv_ho;
+        uint base = (head * S + split) * stride + 2u + pv_u * 8u;
+        partial[base + 0u] = accA.x;
+        partial[base + 1u] = accA.y;
+        partial[base + 2u] = accA.z;
+        partial[base + 3u] = accA.w;
+        partial[base + 4u] = accB.x;
+        partial[base + 5u] = accB.y;
+        partial[base + 6u] = accB.z;
+        partial[base + 7u] = accB.w;
+    }
+    if (qk_on && lane == 0u) {
+        uint base = ((hq_base + qk_ho) * S + split) * stride;
+        partial[base + 0u] = runMax;
+        partial[base + 1u] = runSum;
+    }
+}

@@ -1,0 +1,60 @@
+// Combine the split-KV partials produced by attention_decode_split.comp.
+//
+// For each head, the num_splits workgroups each produced an unnormalized
+// partial softmax (m = running max, l = running sum, acc[head_dim] = weighted V
+// sum, all relative to that split's own max). This kernel folds them into one
+// normalized output:
+//
+//   M   = max_s m_s
+//   den = sum_s l_s * exp(m_s - M)
+//   out[d] = (sum_s acc_s[d] * exp(m_s - M)) / den
+//
+// It is tiny (num_heads workgroups, one per head) and entirely L2-resident.
+//
+// Dispatch: groups_x = num_heads, groups_y = 1, groups_z = 1
+// Push constants: num_heads, head_dim, num_splits (12 bytes)
+// Buffers: 0 = out (f32 head_dim per head), 1 = partial (f32)
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Out { float outd[]; };
+layout(set = 0, binding = 1) readonly buffer Partial { float partial[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int head_dim;    // multiple of 64, <= 256
+    int num_splits;
+};
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    if (head >= uint(num_heads)) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd  = uint(head_dim);
+    uint S   = uint(num_splits);
+    uint stride = 2u + hd;             // m, l, acc[hd]
+    uint base = head * S * stride;
+
+    // Global max across splits (S <= 8, so a serial scan is cheapest).
+    float M = -1.0e30;
+    for (uint s = 0u; s < S; s++) {
+        M = max(M, partial[base + s * stride]);
+    }
+
+    float den = 0.0;
+    for (uint s = 0u; s < S; s++) {
+        den += partial[base + s * stride + 1u]
+             * exp(partial[base + s * stride] - M);
+    }
+    float inv = (den > 0.0) ? (1.0 / den) : 0.0;
+
+    for (uint d = tid; d < hd; d += 256u) {
+        float num = 0.0;
+        for (uint s = 0u; s < S; s++) {
+            num += partial[base + s * stride + 2u + d]
+                 * exp(partial[base + s * stride] - M);
+        }
+        outd[head * hd + d] = num * inv;
+    }
+}

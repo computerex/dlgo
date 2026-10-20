@@ -117,14 +117,27 @@ func main() {
 		pipe.Model.Config.EOS = -1
 	}
 
-	// Progress hook (stream callback is cheap; we just count).
-	lastProgress := time.Now()
+	// Windowed decode-speed reporting. Stream fires once per generated token, so
+	// we time each block of `progress` tokens to show how decode speed varies
+	// with context length (it should fall as attention cost grows).
+	promptTok := len(pipe.Tokenizer.Encode(prompt))
+	winCount := 0
+	var winStart time.Time
 	genCfg.Stream = func(tok string) {
-		if *progress > 0 {
-			if time.Since(lastProgress) > 3*time.Second {
-				lastProgress = time.Now()
-			}
+		if *progress <= 0 {
+			return
 		}
+		if winCount == 0 {
+			winStart = time.Now()
+		}
+		winCount++
+		if winCount%*progress != 0 {
+			return
+		}
+		el := time.Since(winStart).Seconds()
+		fmt.Fprintf(os.Stderr, "  [decode] ctx~%6d  %6.1f tok/s (over last %d tokens)\n",
+			promptTok+winCount, float64(*progress)/el, *progress)
+		winStart = time.Now()
 	}
 
 	fmt.Println(strings.Repeat("=", 72))

@@ -80,6 +80,10 @@ func DequantizeInto(dst []float32, data []byte, ggmlType uint32, n int) {
 		dequantizeTQ2_0Into(dst, data, n)
 	case 39: // MXFP4
 		dequantizeMXFP4Into(dst, data, n)
+	case 60: // canonical Affine8 (see affine8.go)
+		copy(dst, DequantizeAffine8(data, n))
+	case 61: // canonical Affine4 (see affine4.go)
+		copy(dst, DequantizeAffine4(data, n))
 	default:
 		if _, warned := dequantFallbackOnce.LoadOrStore(ggmlType, true); !warned {
 			fmt.Fprintf(os.Stderr, "[dlgo] WARNING: quant type %d has no zero-alloc DequantizeInto — "+

@@ -111,6 +111,7 @@ const QuantTypeAffine4 = 61
 
 func GemmAffine8(out, weights, x Buf, rows, cols, npos int) error { return errNoGPU }
 func GemmAffine4(out, weights, x Buf, rows, cols, npos int) error { return errNoGPU }
+func ConvertQuantToAffine(out, src Buf, n, qtype, outBits int) error { return errNoGPU }
 
 type MoEFFNConf struct{}
 

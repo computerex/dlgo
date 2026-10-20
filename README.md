@@ -124,6 +124,107 @@ Because the activations are rescaled in place, the dispatches around each GEMM m
 
 `GenerateImage` also validates the sampled latent and reports non-finite values instead of writing a silent black image.
 
+### Retro sprites (8-bit / 16-bit)
+
+`cmd/dlgo-sprite` runs the same pipeline and then post-processes the render into a
+console-era sprite. The pipeline output is a smooth RGB image, which is the
+opposite of a sprite; `models/diffusion/sprite.go` enforces the hardware limits
+that actually define the look:
+
+| era | grid | palette | flag |
+| --- | --- | --- | --- |
+| 16-bit (SNES) | 16..64 px | 15 colours + transparent | `-size 32 -colors 15` (default) |
+| 8-bit (NES) | 8..16 px | 3 colours + transparent | `-nes-size 16 -nes-colors 3` |
+
+```bash
+go build -tags "cgo vulkan" -ldflags "-linkmode internal" -o dlgo-sprite ./cmd/dlgo-sprite
+
+dlgo-sprite --gpu \
+  --diffusion-model C:\models\z-image-turbo-Q4_K_M.gguf \
+  --vae C:\models\ae.safetensors \
+  --llm C:\models\qwen-text-encoder.gguf \
+  -p "pixel art sprite of a knight in plate armor, full body, centered, plain solid white background" \
+  -name knight -W 512 -H 512 -size 32 -colors 15 -nes-size 16 -nes-colors 3 -ascii
+```
+
+Per prompt it writes `<name>.png` (native size, one image pixel per sprite pixel),
+`<name>@8x.png` (nearest-neighbour preview), `<outdir>/sheet.png` (contact sheet on
+a checkerboard) and, with `-nes-size`, a second 8-bit variant under `<outdir>/nes`
+from the *same* render — the two eras are separate quantisations of one denoise
+pass, not a resample of each other. `-compose <dir>` rebuilds only the contact
+sheet, with no model load and no GPU.
+
+To render a whole set in one go, pass several prompts with `-prompts "a;b;c"`.
+With `-gpu` every prompt is rendered inside a single process from **one** model
+load (`diffusion.GenerateImageBatch`), so the DiT weight upload — which dominates
+startup — is paid once instead of per sprite. Each render is byte-identical to the
+single-prompt path (same seed and noise), so batching only changes wall-clock
+time, not the result. Output names are slugified (filler words like "pixel art
+sprite of" are dropped, so "…a blue slime" → `blue-slime`). This keeps the DiT
+resident for VAE decoding, so it is intended for small resolutions (≤512×512); at
+1024×1024 leave `-prompts` off and call one prompt per process, which frees the
+DiT before the VAE to stay within VRAM.
+
+Measured on a 4070 Ti SUPER at 512×512 / 8 steps: a single sprite went from ~65 s
+to ~21 s, and six sprites from ~390 s (six processes) to ~60 s (one batch). Most
+of that came from parallelising the Affine8 repack that runs at load time — the
+DiT is 6 G weights converted from Q4_K_M to Affine8 on the CPU before upload, and
+that conversion is now spread across cores (byte-identical output), cutting it
+from ~41 s to ~12 s.
+
+That repack is the last per-run cost, and it is also the last reason the runtime
+needs the per-quant GEMM kernels at all. `cmd/dlgo-convert` removes both: it
+rewrites a model's weight tensors once, up front, into dlgo's canonical formats —
+**Affine4** for the ≤5-bit bulk (Q4_K etc., 0.625 B/weight) and **Affine8** for the
+≥5.5-bit tensors (Q5_K/Q6_K). A converted model contains no Q4_K/Q6_K/… at all,
+so the runtime only ever runs the unified Affine4/Affine8 kernels and the per-quant
+GEMM/matvec kernels become dead code (deletable).
+
+```bash
+dlgo-convert -i z-image-turbo-Q4_K_M.gguf -o z-image-turbo-canon.gguf
+dlgo-sprite --gpu --diffusion-model z-image-turbo-canon.gguf --vae ... --llm ... -p "..."
+```
+
+Loading a converted model is a pure upload — the ~8 s CPU repack is gone.
+Measured 512²/8-step: load ~10.8 s (repack path) → ~4 s warm (converted), and the
+per-step cost drops to ~0.54 s (Affine4 streams fewer bytes than Affine8 or Q4_K).
+The one cost is disk: the canonical file is ~5.9 GB vs 4.8 GB source. The
+fastest load doesn't need a bigger file at all, because the conversion now also
+runs **on the GPU at load time** (`gpu/shaders/convert_to_affine.comp`): the
+small source tensor is uploaded, the shader decodes the Q4_K/Q5_K/Q6_K block and
+requantizes it into Affine4/Affine8 in VRAM, and the scratch buffer is freed.
+That is one load-time kernel, not a per-quant kernel zoo — after it, every weight
+is canonical, exactly the precondition for deleting the per-quant GEMM/matvec
+kernels. It is wired into `gpu.UploadTensorAffine8`/`UploadTensorAffine4` (used by
+both the DiT and the LLM unified path), decodes Q4_K/Q5_K/Q6_K, and falls back to
+the CPU repack for any other source or when `DLGO_NO_GPU_CONVERT=1`. Measured
+512²/8-step on the Q4_K_M DiT: DiT weight load ~10.8 s (CPU repack) → **~5.8 s**
+(VRAM convert), sprite unchanged. `gpu/convert_affine_test.go` checks the GPU
+encoding is as faithful to the source as the CPU repack for all three types
+(`relL2(GPU,src)` ≈ `relL2(CPU,src)`).
+
+The transform is, in order: integer box downsample to the sprite grid (so every
+output pixel is an unweighted block mean and no pixel is a blend), background key
+(a flood fill from the border, so a white highlight *inside* the subject survives
+while the surrounding field is keyed to transparent), crop to the subject and
+re-centre on the grid, then variance-weighted median cut and a snap to the nearest
+palette entry. Box selection is weighted by `population x range^2` rather than
+plain range because a sprite has one dominant flat colour: unweighted median cut
+keeps splitting that flat region and starves the trim, eyes and edge highlights.
+Dithering is deliberately absent — it reads as noise at these resolutions.
+
+`-ascii` prints the quantised grid as characters, which is the only practical way
+to check a 32x32 sprite over a terminal or in a headless run:
+
+```text
+  .............**.................
+  ............=*==................
+  ...........*+*=:#...............
+  .........##%:*=.%#%.............
+  ........*=*-==:::::%............
+  .......%-*%+-*=:==-:............
+```
+
 ## CLI Usage
 
 ### `dlgo run` — Interactive Chat

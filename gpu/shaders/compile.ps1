@@ -1,3 +1,15 @@
+param([string[]]$Only = @())
+
+# -Only accepts either repeated flags or a single comma-separated list:
+#   compile.ps1 -Only attention_decode_split,attention_decode_merge
+$onlyNames = @()
+foreach ($o in $Only) {
+    foreach ($part in ($o -split ',')) {
+        $t = $part.Trim()
+        if ($t) { $onlyNames += $t }
+    }
+}
+
 $shaders = @(
     @{name="matvec_f32"; file="matvec_f32.comp"},
     @{name="matvec_q4_0"; file="matvec_q4_0.comp"},
@@ -135,7 +147,16 @@ $shaders = @(
     @{name="attention_tiled_kv4"; file="attention_tiled_kv4.comp"},
     @{name="gemm_q3k_coopmat_recovered"; file="gemm_q3k_coopmat_recovered.comp"; target="vulkan1.3"},
     @{name="gemm_affine8_coopmat"; file="gemm_affine8_coopmat.comp"; target="vulkan1.3"},
-    @{name="attention_flash_f16_coopmat"; file="attention_flash_f16_coopmat.comp"; target="vulkan1.3"}
+    @{name="attention_flash_f16_coopmat"; file="attention_flash_f16_coopmat.comp"; target="vulkan1.3"},
+    @{name="matvec_affine8"; file="matvec_affine8.comp"},
+    @{name="matvec_affine4"; file="matvec_affine4.comp"},
+    @{name="gemm_affine4_coopmat"; file="gemm_affine4_coopmat.comp"; target="vulkan1.3"},
+    @{name="matvec_affine4_moe"; file="matvec_affine4_moe.comp"},
+    @{name="matvec_affine8_moe"; file="matvec_affine8_moe.comp"},
+    @{name="attention_decode_split"; file="attention_decode_split.comp"},
+    @{name="attention_decode_gqa"; file="attention_decode_gqa.comp"},
+    @{name="attention_decode_merge"; file="attention_decode_merge.comp"},
+    @{name="convert_to_affine"; file="convert_to_affine.comp"}
 )
 
 $header = @"
@@ -151,11 +172,18 @@ $header = @"
 foreach ($s in $shaders) {
     $spvFile = Join-Path $PSScriptRoot "$($s.name).spv"
     $env = if ($s.target) { $s.target } else { "vulkan1.2" }
-    Write-Host "Compiling $($s.file) -> $spvFile ($env)"
-    & glslc --target-env=$env -O (Join-Path $PSScriptRoot $s.file) -o $spvFile
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to compile $($s.file)"
-        exit 1
+    # -Only <names> skips glslc for unchanged shaders but still regenerates the
+    # header from their existing .spv, so a single-shader edit costs seconds
+    # instead of recompiling all of them.
+    $recompile = ($onlyNames.Count -eq 0) -or ($onlyNames -contains $s.name)
+    if (-not (Test-Path $spvFile)) { $recompile = $true }
+    if ($recompile) {
+        Write-Host "Compiling $($s.file) -> $spvFile ($env)"
+        & glslc --target-env=$env -O (Join-Path $PSScriptRoot $s.file) -o $spvFile
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to compile $($s.file)"
+            exit 1
+        }
     }
 
     $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $spvFile))
@@ -329,6 +357,15 @@ static const ShaderInfo shader_registry[] = {
     {"gemm_q3k_coopmat_recovered", spv_gemm_q3k_coopmat_recovered, spv_gemm_q3k_coopmat_recovered_size, 3, 12}, // PIPE_GEMM_Q3K_RECOVERED
     {"gemm_affine8_coopmat", spv_gemm_affine8_coopmat, spv_gemm_affine8_coopmat_size, 3, 12}, // PIPE_GEMM_AFFINE8_COOPMAT
     {"attention_flash_f16_coopmat", spv_attention_flash_f16_coopmat, spv_attention_flash_f16_coopmat_size, 4, 24}, // PIPE_ATTENTION_FLASH_COOPMAT
+    {"matvec_affine8", spv_matvec_affine8, spv_matvec_affine8_size, 3, 12}, // PIPE_MATVEC_AFFINE8
+    {"matvec_affine4", spv_matvec_affine4, spv_matvec_affine4_size, 3, 12}, // PIPE_MATVEC_AFFINE4
+    {"gemm_affine4_coopmat", spv_gemm_affine4_coopmat, spv_gemm_affine4_coopmat_size, 3, 12}, // PIPE_GEMM_AFFINE4_COOPMAT
+    {"matvec_affine4_moe", spv_matvec_affine4_moe, spv_matvec_affine4_moe_size, 4, 20}, // PIPE_MATVEC_AFFINE4_MOE
+    {"matvec_affine8_moe", spv_matvec_affine8_moe, spv_matvec_affine8_moe_size, 4, 20}, // PIPE_MATVEC_AFFINE8_MOE
+    {"attention_decode_split", spv_attention_decode_split, spv_attention_decode_split_size, 4, 32}, // PIPE_ATTENTION_DECODE_SPLIT
+    {"attention_decode_gqa", spv_attention_decode_gqa, spv_attention_decode_gqa_size, 4, 32}, // PIPE_ATTENTION_DECODE_GQA
+    {"attention_decode_merge", spv_attention_decode_merge, spv_attention_decode_merge_size, 2, 12}, // PIPE_ATTENTION_DECODE_MERGE
+    {"convert_to_affine", spv_convert_to_affine, spv_convert_to_affine_size, 2, 12}, // PIPE_CONVERT_TO_AFFINE
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

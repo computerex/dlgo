@@ -217,6 +217,20 @@ typedef enum {
     // Fused MoE matvec over the canonical formats (n_used experts / dispatch).
     PIPE_MATVEC_AFFINE4_MOE,
     PIPE_MATVEC_AFFINE8_MOE,
+    // Split-KV decode attention (npos == 1, head_dim == 128): one dispatch
+    // produces per-split partials, the second merges them. Appended at the end
+    // so existing pipeline IDs stay stable.
+    PIPE_ATTENTION_DECODE_SPLIT,
+    // GQA-folded split-KV decode attention: one workgroup per (KV head, split)
+    // covering every q-head that shares that KV head, so the KV cache is read
+    // once per position instead of once per q-head.
+    PIPE_ATTENTION_DECODE_GQA,
+    PIPE_ATTENTION_DECODE_MERGE,
+    // Load-time in-VRAM weight converter: decodes a GGML K-quant (Q4_K/Q5_K/Q6_K)
+    // block tensor and requantizes it into the canonical Affine4/Affine8 format on
+    // the device (gpu/shaders/convert_to_affine.comp). Appended at the end so
+    // existing pipeline IDs stay stable.
+    PIPE_CONVERT_TO_AFFINE,
     PIPE_COUNT
 } PipelineID;
 
@@ -365,6 +379,38 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
                             int num_heads, int num_kv_heads, int head_dim,
                             int kv_dim, int start_seq_len, float scale, float softcap, int npos);
 
+// Split-KV decode attention (npos == 1). Splits the KV range across num_splits
+// workgroups per head to fill the GPU, stages K/V tiles in shared memory and
+// writes per-split partials into `partial_buf`, which must hold at least
+// num_heads * num_splits * (2 + head_dim) floats. The second dispatch merges
+// those partials into `out_buf`.
+int gpu_attention_decode(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                         GpuBuf partial_buf, int num_heads, int num_kv_heads, int head_dim,
+                         int kv_dim, int seq_len, float scale, float softcap, int start_pos);
+
+// GQA-folded variant of the above: one workgroup per (KV head, split) that
+// covers all num_heads/num_kv_heads q-heads sharing that KV head, so the KV
+// cache is staged and read once per position instead of once per q-head.
+// Requires 2 <= kv_mul <= 8 and kv_mul * (head_dim/8) <= 256; otherwise it
+// returns GPU_ERR_DISPATCH and the caller keeps gpu_attention_decode.
+int gpu_attention_decode_gqa(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                             GpuBuf partial_buf, int num_heads, int num_kv_heads, int head_dim,
+                             int kv_dim, int seq_len, float scale, float softcap, int start_pos);
+
+// Maximum num_splits gpu_attention_decode[_gqa] will pick (bounds the partial buffer).
+#define GPU_ATTENTION_DECODE_MAX_SPLITS 16
+
+// Select the split-KV decode kernel for gpu_attention_f16 (default on for
+// supported head_dim). Exposed so tests can compare against the tiled kernel.
+void gpu_set_attention_decode(int on);
+
+// Select the GQA-folded split-KV decode kernel (default on when kv_mul > 1).
+void gpu_set_attention_decode_gqa(int on);
+
+// Which kernel the most recent single-token decode attention dispatch used:
+// 0 = tiled, 1 = split (per q-head), 2 = GQA-folded split. Diagnostics/tests.
+int gpu_attention_decode_used(void);
+
 // Tiled attention with FP32 KV cache (online softmax, no seq_len limit)
 int gpu_attention_tiled_f32(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                             int num_heads, int num_kv_heads, int head_dim, int kv_dim,
@@ -417,6 +463,10 @@ int gpu_gemm_q4_k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 int gpu_split_qkv(GpuBuf q_buf, GpuBuf k_buf, GpuBuf v_buf, GpuBuf qkv_buf,
                    int qDim, int kvDim, int seqLen);
 int gpu_dequant_q4k_f16(GpuBuf out_f16, GpuBuf weights_q4k, int rows, int cols);
+// Convert n elements of a GGML K-quant tensor (src, already uploaded) into the
+// canonical Affine format in out. out_bits = 8 -> Affine8, 4 -> Affine4.
+// qtype is the GGML id: 12=Q4_K, 13=Q5_K, 14=Q6_K. One load-time dispatch.
+int gpu_convert_quant(GpuBuf out, GpuBuf src, int n, int qtype, int out_bits);
 int gpu_gemm_f16(GpuBuf out_buf, GpuBuf weight_f16, GpuBuf x_buf,
                  int M, int N, int K, int out_stride);
 int gpu_gemm_bf16(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,

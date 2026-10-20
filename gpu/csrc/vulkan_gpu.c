@@ -504,8 +504,17 @@ static BufferAlloc* get_buf(GpuBuf id) {
 // ---------------------------------------------------------------------------
 // Public API: init / shutdown
 // ---------------------------------------------------------------------------
+
+/* Defined with the decode-attention scratch further down. The cached partial
+ * buffer is a file-static handle, so it must be dropped whenever the device is
+ * (re)created: otherwise a second gpu_init() in the same process would dispatch
+ * against a buffer that belonged to the previous device. */
+static void attn_decode_reset_scratch(void);
+
 int gpu_init(void) {
     if (g.initialized) return GPU_OK;
+
+    attn_decode_reset_scratch();
 
     int rc = load_vulkan();
     if (rc != GPU_OK) return rc;
@@ -832,6 +841,7 @@ void gpu_shutdown(void) {
     if (vk_lib) CLOSE_LIB(vk_lib);
 
     memset(&g, 0, sizeof(g));
+    attn_decode_reset_scratch();
 }
 
 const char* gpu_device_name(void) {
@@ -1337,8 +1347,19 @@ static int dispatch_compute(DispatchParams* p) {
 #include "shaders_spirv.h"
 
 int gpu_load_pipelines(void) {
-    int total = sizeof(shader_registry) / sizeof(shader_registry[0]);
-    if (total > PIPE_COUNT) total = PIPE_COUNT;
+    int registry_rows = (int)(sizeof(shader_registry) / sizeof(shader_registry[0]));
+    /* The registry table in gpu/shaders/compile.ps1 must have exactly one row
+     * per PipelineID, index-aligned. If it is short, the tail pipelines are
+     * never created and simply dispatch as GPU_ERR_SHADER — a failure mode that
+     * is very hard to trace once the header has been regenerated. Fail loudly. */
+    if (registry_rows != (int)PIPE_COUNT) {
+        fprintf(stderr, "[dlgo/gpu] FATAL: shader_registry has %d rows but PIPE_COUNT is %d; "
+                        "fix gpu/shaders/compile.ps1 and regenerate shaders_spirv.h\n",
+                registry_rows, (int)PIPE_COUNT);
+        fflush(stderr);
+        return GPU_ERR_SHADER;
+    }
+    int total = registry_rows;
 
     for (int i = 0; i < total; i++) {
         const ShaderInfo* si = &shader_registry[i];
@@ -3222,6 +3243,31 @@ int gpu_dequant_q4k_f16(GpuBuf out_f16, GpuBuf weights_q4k, int rows, int cols) 
     return dispatch_compute(&dp);
 }
 
+/* Load-time in-VRAM weight converter: decode a GGML K-quant tensor and
+ * requantize it into the canonical Affine4/Affine8 format on the device. One
+ * workgroup per 32-element Affine group. Replaces the CPU repack
+ * (quant.RepackAffine4/8) so loading is upload + one dispatch. */
+int gpu_convert_quant(GpuBuf out, GpuBuf src, int n, int qtype, int out_bits) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+
+    int num_groups = n / 32;
+    if (num_groups <= 0) return GPU_OK;
+
+    struct { int qtype; int out_bits; int num_groups; } pc = {qtype, out_bits, num_groups};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_CONVERT_TO_AFFINE;
+    dp.bufs[0] = src;
+    dp.bufs[1] = out;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_groups;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_gemm_f16(GpuBuf out_buf, GpuBuf weight_f16, GpuBuf x_buf,
                  int M, int N, int K, int out_stride) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
@@ -3843,6 +3889,114 @@ int gpu_batch_kv_store_f16(GpuBuf k_cache_buf, GpuBuf v_cache_buf,
     return dispatch_compute(&dp);
 }
 
+/* ---- Split-KV decode attention (see attention_decode_split.comp) ---- */
+
+/* Split-KV decode is the default when the shape allows it.
+ * DLGO_ATTN_DECODE=0 restores the single-workgroup-per-head tiled kernel. */
+static int g_attn_decode = -1;
+static int g_attn_decode_logged = 0;
+static int attn_decode_selected(void) {
+    if (g_attn_decode < 0) {
+        const char* e = getenv("DLGO_ATTN_DECODE");
+        g_attn_decode = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_attn_decode;
+}
+void gpu_set_attention_decode(int on) { g_attn_decode = on ? 1 : 0; }
+
+/* GQA-folded split-KV decode: one workgroup per (KV head, split), covering every
+ * q-head that shares the KV head. Default on whenever the head grouping allows
+ * it; DLGO_ATTN_DECODE_GQA=0 forces the per-q-head kernel so the two can be
+ * A/B'd on the same binary. */
+static int g_attn_decode_gqa = -1;
+static int attn_decode_gqa_selected(void) {
+    if (g_attn_decode_gqa < 0) {
+        const char* e = getenv("DLGO_ATTN_DECODE_GQA");
+        g_attn_decode_gqa = (e && e[0] == '0') ? 0 : 1;
+    }
+    return g_attn_decode_gqa;
+}
+void gpu_set_attention_decode_gqa(int on) { g_attn_decode_gqa = on ? 1 : 0; }
+
+/* Which kernel the most recent single-token decode attention dispatch actually
+ * used: 0 = tiled, 1 = split (per q-head), 2 = GQA-folded split. Lets tests
+ * assert the intended path was taken instead of comparing a kernel with itself. */
+static int g_attn_decode_used = 0;
+int gpu_attention_decode_used(void) { return g_attn_decode_used; }
+
+/* The split-KV kernel divides head_dim across 8 subgroups in uvec4 (8 half)
+ * granularity, so head_dim must be a multiple of 64 and at most 256. */
+static int attn_decode_shape_ok(int head_dim) {
+    return head_dim >= 64 && head_dim <= 256 && (head_dim % 64) == 0;
+}
+
+/* The GQA-folded kernel keeps one PV thread per 8 output dims of each folded
+ * q-head, so kv_mul * head_dim/8 must fit in a 256-thread workgroup. It also
+ * needs the head grouping to be exact. */
+static int attn_decode_gqa_shape_ok(int num_heads, int num_kv_heads, int head_dim) {
+    if (!attn_decode_shape_ok(head_dim)) return 0;
+    if (num_heads <= 0 || num_kv_heads <= 0) return 0;
+    if ((num_heads % num_kv_heads) != 0) return 0;
+    int kv_mul = num_heads / num_kv_heads;
+    if (kv_mul < 2 || kv_mul > 8) return 0;
+    if (kv_mul * (head_dim / 8) > 256) return 0;
+    return 1;
+}
+
+/* Number of KV splits that fills the GPU: aim for ~64 workgroups (one per SM on
+ * a 66-SM part), and only split when each slice is long enough to pay for the
+ * extra merge dispatch.
+ *
+ * The measured crossover against the tiled kernel is ~1500 positions for the
+ * per-q-head kernel: below that the extra merge dispatch costs more than the
+ * parallelism buys, so require 2048 and at least 512 positions per split. */
+static int attn_decode_splits_impl(int groups_per_split, int window_len, int min_chunk) {
+    if (window_len < 2048 || groups_per_split <= 0) return 1;
+    int ns = 64 / groups_per_split;
+    if (ns < 1) ns = 1;
+    if (ns > GPU_ATTENTION_DECODE_MAX_SPLITS) ns = GPU_ATTENTION_DECODE_MAX_SPLITS;
+    int maxByLen = window_len / min_chunk;
+    if (ns > maxByLen) ns = maxByLen;
+    if (ns < 1) ns = 1;
+    return ns;
+}
+static int attn_decode_splits(int num_heads, int window_len) {
+    return attn_decode_splits_impl(num_heads, window_len, 512);
+}
+/* Each folded workgroup covers kv_mul q-heads, so it can take a shorter slice
+ * than a per-q-head workgroup before the merge dispatch dominates. */
+static int attn_decode_gqa_splits(int num_kv_heads, int window_len) {
+    return attn_decode_splits_impl(num_kv_heads, window_len, 256);
+}
+
+/* Scratch buffer holding the per-split partials. Owned by the GPU context and
+ * grown on demand; a few hundred KB at most. Allocating a buffer is host-side
+ * only (vkCreateBuffer + bind), so this is safe while a batch is recording. */
+static GpuBuf g_attn_partial = 0;
+static uint64_t g_attn_partial_bytes = 0;
+
+static GpuBuf attn_decode_partial_buf(uint64_t need) {
+    if (g_attn_partial && g_attn_partial_bytes >= need) return g_attn_partial;
+    if (g_attn_partial) {
+        gpu_free(g_attn_partial);
+        g_attn_partial = 0;
+        g_attn_partial_bytes = 0;
+    }
+    GpuBuf b = gpu_alloc(need, 0);
+    if (!b) return 0;
+    g_attn_partial = b;
+    g_attn_partial_bytes = need;
+    return b;
+}
+
+/* Drop the cached handle without touching it: only valid when the device is
+ * being created or has already been torn down. See the declaration above
+ * gpu_init. */
+static void attn_decode_reset_scratch(void) {
+    g_attn_partial = 0;
+    g_attn_partial_bytes = 0;
+}
+
 int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
                       int num_heads, int num_kv_heads, int head_dim, int kv_dim,
                       int seq_len, float scale, float softcap, int start_pos) {
@@ -3852,6 +4006,51 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
     int window_len = seq_len - start_pos;
     // FP16 KV: each position = kv_dim/2 uint32s = kv_dim*2 bytes
     uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
+
+    /* gpu_attention_f16 is only ever used for single-token decode, so hand off
+     * to a split-KV kernel when the shape allows it. Those kernels spread the
+     * KV range over enough workgroups to fill the GPU and stage K/V tiles in
+     * shared memory; see attention_decode_gqa.comp (grouped-query models, one
+     * workgroup per KV head) and attention_decode_split.comp (one per q-head).
+     *
+     * Only taken when it can actually split (the splits helper returns >1).
+     * Short-context decode stays on the tiled kernel, where it is already fast
+     * and the extra merge dispatch would only add overhead.
+     *
+     * Measured on Qwen3.5-9B (16/4, head_dim 256), gen32k_9b -tokens 16384
+     * -ctx 20480 -progress 2048, same binary with DLGO_ATTN_DECODE_GQA 0/1:
+     *   per-q-head 75.3 -> 64.4 tok/s (2k -> 16k context), 70.95 tok/s overall
+     *   folded     74.3 -> 74.0 tok/s,                        76.03 tok/s overall
+     * i.e. ~45x flatter with respect to context, and 1-2% slower only in the
+     * first 2k window where the fold halves the workgroup count. */
+    g_attn_decode_used = 0;
+    if (window_len > 0 && attn_decode_selected()) {
+        int folded = 0;
+        int ns = 0;
+        if (attn_decode_gqa_selected() &&
+            attn_decode_gqa_shape_ok(num_heads, num_kv_heads, head_dim)) {
+            ns = attn_decode_gqa_splits(num_kv_heads, window_len);
+            folded = 1;
+        } else if (attn_decode_shape_ok(head_dim)) {
+            ns = attn_decode_splits(num_heads, window_len);
+        }
+        if (ns > 1) {
+            uint64_t need = (uint64_t)num_heads * (uint64_t)ns
+                          * (uint64_t)(2 + head_dim) * sizeof(float);
+            GpuBuf pb = attn_decode_partial_buf(need);
+            if (pb) {
+                if (folded) {
+                    return gpu_attention_decode_gqa(out_buf, q_buf, k_cache_buf, v_cache_buf,
+                                                    pb, num_heads, num_kv_heads, head_dim,
+                                                    kv_dim, seq_len, scale, softcap, start_pos);
+                }
+                return gpu_attention_decode(out_buf, q_buf, k_cache_buf, v_cache_buf, pb,
+                                            num_heads, num_kv_heads, head_dim, kv_dim,
+                                            seq_len, scale, softcap, start_pos);
+            }
+            /* Allocation failed: fall through to the tiled kernel. */
+        }
+    }
 
     struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
         {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
@@ -3870,6 +4069,123 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
     dp.groups_y = 1;
     dp.groups_z = 1;
     return dispatch_compute(&dp);
+}
+
+/* Second half of the split-KV pair: fold the per-split partials into `out_buf`. */
+static int attn_decode_merge(GpuBuf out_buf, GpuBuf partial_buf, int num_heads,
+                             int head_dim, int ns) {
+    struct { int num_heads; int head_dim; int num_splits; } mp = {num_heads, head_dim, ns};
+    DispatchParams dm = {0};
+    dm.pipe = PIPE_ATTENTION_DECODE_MERGE;
+    dm.bufs[0] = out_buf;
+    dm.bufs[1] = partial_buf;
+    dm.num_bufs = 2;
+    dm.push_data = &mp;
+    dm.push_size = sizeof(mp);
+    dm.groups_x = num_heads;
+    dm.groups_y = 1;
+    dm.groups_z = 1;
+    return dispatch_compute(&dm);
+}
+
+int gpu_attention_decode(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                         GpuBuf partial_buf, int num_heads, int num_kv_heads, int head_dim,
+                         int kv_dim, int seq_len, float scale, float softcap, int start_pos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (!attn_decode_shape_ok(head_dim)) return GPU_ERR_DISPATCH;
+    g_attn_decode_used = 1;
+
+    int window_len = seq_len - start_pos;
+    if (window_len <= 0) return GPU_OK;
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
+
+    /* Fill the GPU: aim for ~64 workgroups (the 4070 Ti SUPER has 66 SMs), and
+     * only split when each slice is long enough to be worth the merge cost. */
+    int ns = attn_decode_splits(num_heads, window_len);
+
+    if (!g_attn_decode_logged) {
+        g_attn_decode_logged = 1;
+        fprintf(stderr, "[dlgo/gpu] decode attention: split-KV kernel (head_dim=%d kv_dim=%d splits=%d window=%d)\n",
+                head_dim, kv_dim, ns, window_len);
+        fflush(stderr);
+    }
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len;
+             float scale; float softcap; int num_splits; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap, ns};
+
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_DECODE_SPLIT;
+    dp.bufs[0] = partial_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = ns;
+    dp.groups_z = 1;
+    int rc = dispatch_compute(&dp);
+    if (rc != GPU_OK) return rc;
+
+    /* The merge reads what the split dispatch just wrote. */
+    gpu_barrier();
+    return attn_decode_merge(out_buf, partial_buf, num_heads, head_dim, ns);
+}
+
+int gpu_attention_decode_gqa(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
+                             GpuBuf partial_buf, int num_heads, int num_kv_heads, int head_dim,
+                             int kv_dim, int seq_len, float scale, float softcap, int start_pos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (!attn_decode_gqa_shape_ok(num_heads, num_kv_heads, head_dim)) return GPU_ERR_DISPATCH;
+    g_attn_decode_used = 2;
+
+    int window_len = seq_len - start_pos;
+    if (window_len <= 0) return GPU_OK;
+    uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
+
+    /* One workgroup per (KV head, split). The folds means num_kv_heads workgroups
+     * per split rather than num_heads, so the split count scales up by kv_mul to
+     * keep the same ~64 workgroups of parallelism. */
+    int ns = attn_decode_gqa_splits(num_kv_heads, window_len);
+
+    if (!g_attn_decode_logged) {
+        g_attn_decode_logged = 1;
+        fprintf(stderr, "[dlgo/gpu] decode attention: GQA-folded split-KV kernel "
+                        "(heads=%d kv_heads=%d head_dim=%d kv_dim=%d splits=%d window=%d)\n",
+                num_heads, num_kv_heads, head_dim, kv_dim, ns, window_len);
+        fflush(stderr);
+    }
+
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len;
+             float scale; float softcap; int num_splits; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap, ns};
+
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ATTENTION_DECODE_GQA;
+    dp.bufs[0] = partial_buf;
+    dp.bufs[1] = q_buf;
+    dp.bufs[2] = k_cache_buf;
+    dp.bufs[3] = v_cache_buf;
+    dp.buf_offsets[2] = kv_byte_offset;
+    dp.buf_offsets[3] = kv_byte_offset;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_kv_heads;
+    dp.groups_y = ns;
+    dp.groups_z = 1;
+    int rc = dispatch_compute(&dp);
+    if (rc != GPU_OK) return rc;
+
+    /* The merge reads what the split dispatch just wrote. */
+    gpu_barrier();
+    return attn_decode_merge(out_buf, partial_buf, num_heads, head_dim, ns);
 }
 
 int gpu_attention_f16_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v_cache_buf,
@@ -3902,8 +4218,7 @@ int gpu_attention_f16_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, Gp
 }
 
 /* Experimental barrier-reduced attention: default and single-token paths unchanged. */
-static int g_attention_barrier = -1;
-void gpu_set_attention_barrier(int on) { g_attention_barrier = on ? 1 : 0; }
+static int g_attention_barrier = -1;void gpu_set_attention_barrier(int on) { g_attention_barrier = on ? 1 : 0; }
 static int attention_barrier_selected(void) {
     if (g_attention_barrier < 0) {
         const char* e = getenv("DLGO_ATTN_BARRIER");

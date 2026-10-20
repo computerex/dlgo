@@ -72,6 +72,66 @@ func Affine8BytesFor(rows, cols int) uint64 {
 	return uint64(rows) * uint64(cols) / quant.Affine8GroupSize * quant.Affine8BlockBytes
 }
 
+// gpuConvertType reports whether the in-VRAM converter has a decode kernel for a
+// GGML source type (Q4_K/Q5_K/Q6_K — see gpu/shaders/convert_to_affine.comp).
+// Other schemes fall back to the CPU repack.
+func gpuConvertType(qtype uint32) bool {
+	switch qtype {
+	case 12, 13, 14: // Q4_K, Q5_K, Q6_K
+		return true
+	}
+	return false
+}
+
+// convertOnGPU repacks a block-quantized tensor (no FP32) into the canonical
+// format on the GPU instead of the CPU: upload the source bytes to a scratch
+// buffer, dispatch the convert shader into a fresh canonical buffer, free the
+// scratch. outBits 8 → Affine8, 4 → Affine4. The scratch is a real allocation
+// because model weights are uploaded before the run-state pool is created.
+//
+// ok is false (and err nil) when the GPU path is unavailable, so callers fall
+// back to the CPU repack. Any dispatch/allocation failure also returns ok=false
+// with the error attached — callers should treat non-ok as "use the CPU path".
+func convertOnGPU(qt *core.QuantizedTensor, outBits int) (gt *GpuTensor, ok bool, err error) {
+	if qt == nil || qt.FP32Data != nil || !gpuConvertType(qt.Type) {
+		return nil, false, nil
+	}
+	if !IsInitialized() || os.Getenv("DLGO_NO_GPU_CONVERT") == "1" {
+		return nil, false, nil
+	}
+	n := qt.Rows * qt.Cols
+	// K-quant blocks are 256 elements and Affine groups are 32; both must divide
+	// the tensor cleanly (K-quant tensors always satisfy this by construction).
+	if n%256 != 0 || n%quant.Affine8GroupSize != 0 {
+		return nil, false, nil
+	}
+
+	src, err := uploadBytes(qt.Data, qt.Type, qt.Rows, qt.Cols)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var outSize uint64
+	var otype uint32
+	if outBits == 8 {
+		outSize, otype = Affine8BytesFor(qt.Rows, qt.Cols), QuantTypeAffine8
+	} else {
+		outSize, otype = Affine4BytesFor(qt.Rows, qt.Cols), QuantTypeAffine4
+	}
+	outBuf, aerr := AllocE(outSize)
+	if aerr != nil {
+		Free(src.Buf)
+		return nil, false, aerr
+	}
+	if cerr := ConvertQuantToAffine(outBuf, src.Buf, n, int(qt.Type), outBits); cerr != nil {
+		Free(src.Buf)
+		Free(outBuf)
+		return nil, false, cerr
+	}
+	Free(src.Buf)
+	return &GpuTensor{Buf: outBuf, Type: otype, Rows: qt.Rows, Cols: qt.Cols}, true, nil
+}
+
 // UploadTensorAffine8 repacks a QuantizedTensor into the canonical Affine8 format
 // (see quant/affine8.go) and uploads it. After this, the weight tensor — whatever
 // its on-disk quantization scheme — is served by the single unified GEMM kernel
@@ -80,8 +140,21 @@ func UploadTensorAffine8(qt *core.QuantizedTensor) (*GpuTensor, error) {
 	if qt == nil {
 		return nil, nil
 	}
+	// Already canonical Affine8/Affine4 (e.g. a model preconverted with
+	// dlgo-convert): upload the bytes verbatim instead of dequantising+
+	// requantising them again. This makes loading a converted model a pure upload
+	// and lets the per-quant GEMM/matvec kernels be deleted (the model contains no
+	// other weight format).
+	if (qt.Type == QuantTypeAffine8 || qt.Type == QuantTypeAffine4) && qt.FP32Data == nil {
+		return UploadTensor(qt)
+	}
 	if qt.FP32Data != nil {
 		return uploadBytes(quant.QuantizeAffine8(qt.FP32Data), QuantTypeAffine8, qt.Rows, qt.Cols)
+	}
+	// Repack on the GPU when the source is a K-quant the converter decodes; this
+	// skips the multisecond CPU repack. Falls back to the CPU path otherwise.
+	if gt, ok, _ := convertOnGPU(qt, 8); ok {
+		return gt, nil
 	}
 	enc, err := quant.RepackAffine8(qt.Data, qt.Type, qt.Rows*qt.Cols)
 	if err != nil {
@@ -104,6 +177,10 @@ func UploadTensorAffine4(qt *core.QuantizedTensor) (*GpuTensor, error) {
 	}
 	if qt.FP32Data != nil {
 		return uploadBytes(quant.QuantizeAffine4(qt.FP32Data), QuantTypeAffine4, qt.Rows, qt.Cols)
+	}
+	// Repack on the GPU when the source is a K-quant the converter decodes.
+	if gt, ok, _ := convertOnGPU(qt, 4); ok {
+		return gt, nil
 	}
 	enc, err := quant.RepackAffine4(qt.Data, qt.Type, qt.Rows*qt.Cols)
 	if err != nil {

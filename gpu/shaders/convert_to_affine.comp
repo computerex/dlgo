@@ -1,0 +1,182 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_scalar_block_layout : require
+
+// Convert a GGML K-quant block tensor into the canonical Affine4 / Affine8
+// weight format ON the GPU (see quant/affine4.go, quant/affine8.go).
+//
+// This replaces the per-quant decode-then-requant that used to run on the CPU at
+// load time (quant.RepackAffine4 / quant.RepackAffine8). Doing it in VRAM means
+// the load is: upload the small source bytes (Q4_K etc.) + one dispatch, instead
+// of a multisecond CPU repack followed by a larger Affine upload. It is the ONE
+// load-time kernel that lets every per-quant GEMM/matvec kernel be deleted: after
+// conversion the model only ever contains Affine4/Affine8.
+//
+// Mapping is purely linear over the flattened row-major tensor:
+//   * source is a concatenation of 256-element quant blocks;
+//   * output is a concatenation of 32-element Affine groups (8 per quant block);
+//   * group g  ->  block g/8, sub-block g%8.
+//
+// One workgroup = one 32-weight Affine group (32 lanes, one element each):
+//   decode element -> reduce min/max over the 32 lanes in shared memory ->
+//   requantize w = d*q + m -> pack codes + (d,m) into the output block.
+//
+// Supported qtype (GGML ids): 12 = Q4_K, 13 = Q5_K, 14 = Q6_K.
+// out_bits: 8 -> Affine8 (36 B / 32 w), 4 -> Affine4 (20 B / 32 w).
+
+layout(local_size_x = 32) in;
+
+layout(scalar, set = 0, binding = 0) readonly  buffer Src { uint8_t src[]; };
+layout(scalar, set = 0, binding = 1) writeonly buffer Dst { uint    dst32[]; };
+
+layout(push_constant) uniform Params {
+    int qtype;       // 12=Q4_K, 13=Q5_K, 14=Q6_K
+    int out_bits;    // 8 = Affine8, 4 = Affine4
+    int num_groups;  // number of 32-element groups (n / 32)
+} pc;
+
+shared float s_min[32];
+shared float s_max[32];
+shared uint  s_q[32];
+
+// Read a float16 (two little-endian bytes) at byte offset `off`.
+float f16_at(uint off) {
+    uint lo = uint(src[off]);
+    uint hi = uint(src[off + 1u]);
+    return unpackHalf2x16(lo | (hi << 8)).x;
+}
+
+// Reconstruct the Q4_K/Q5_K sub-block scale & min for scale index si (0..7).
+// The 12-byte 6-bit scale/min packing is identical for Q4_K and Q5_K; only the
+// block byte stride differs (passed as `base`).
+void k_scale(uint base, uint si, out float sc, out float mn) {
+    uint sb = base + 4u;  // 12 scale bytes start 4 bytes into the block
+    uint lo, hi;
+    if (si < 4u) {
+        lo = uint(src[sb + si]) & 0x3Fu;
+        hi = uint(src[sb + 4u + si]) & 0x3Fu;
+    } else {
+        uint i = si - 4u;
+        lo = (uint(src[sb + 8u + i]) & 0x0Fu) | (((uint(src[sb + i])     >> 6) & 0x03u) << 4);
+        hi = ((uint(src[sb + 8u + i]) >> 4) & 0x0Fu) | (((uint(src[sb + 4u + i]) >> 6) & 0x03u) << 4);
+    }
+    float d    = f16_at(base);
+    float dmin = f16_at(base + 2u);
+    sc = d * float(lo);
+    mn = dmin * float(hi);
+}
+
+// Q4_K: 144 B/block; d(2) dmin(2) scales(12) qs(128). Element `t` (0..31) of
+// sub-block `sub` (0..7): sub 2*grp+half selects low/high nibble of qs[grp*32+t].
+float dec_q4k(uint b, uint sub, uint t) {
+    uint grp  = sub >> 1;
+    uint hb   = sub & 1u;   // nibble half: 0 = low, 1 = high
+    float sc, mn;
+    k_scale(b * 144u, 2u * grp + hb, sc, mn);
+    uint qb = uint(src[b * 144u + 16u + grp * 32u + t]);
+    uint q  = (hb == 0u) ? (qb & 0x0Fu) : (qb >> 4);
+    return sc * float(q) - mn;
+}
+
+// Q5_K: 176 B/block; d(2) dmin(2) scales(12) qh(32) qs(128). Same nibble layout
+// as Q4_K plus a 5th bit from qh[t] at bit (2*grp+half) = sub.
+float dec_q5k(uint b, uint sub, uint t) {
+    uint grp  = sub >> 1;
+    uint hb   = sub & 1u;   // nibble half: 0 = low, 1 = high
+    float sc, mn;
+    k_scale(b * 176u, 2u * grp + hb, sc, mn);
+    uint ql = uint(src[b * 176u + 48u + grp * 32u + t]);
+    uint qh = uint(src[b * 176u + 16u + t]);
+    uint q  = (hb == 0u) ? (ql & 0x0Fu) : (ql >> 4);
+    q |= ((qh >> sub) & 1u) << 4;
+    return sc * float(q) - mn;
+}
+
+// Q6_K: 210 B/block; ql(128) qh(64) scales(16 int8) d(2, at 208). Mirrors
+// quant.DequantizeQ6_K: output element p = sub*32+t -> n128=p/128,
+// quad=(p>>5)&3 (which of q1..q4), run position l=t, scale sub-group l/16.
+float dec_q6k(uint b, uint sub, uint t) {
+    uint o    = b * 210u;
+    float d   = f16_at(o + 208u);
+    uint p    = sub * 32u + t;          // 0..255
+    uint n128 = p >> 7;                 // 0 or 1
+    uint quad = (p >> 5) & 3u;          // 0..3 selects q1..q4
+    uint l    = t;                      // position within the 32-run
+    uint qlOff = o + n128 * 64u;
+    uint qhOff = o + 128u + n128 * 32u;
+    uint scBase = o + 192u;
+
+    uint ql0  = uint(src[qlOff + l]);        // low nibbles for q1/q3
+    uint ql32 = uint(src[qlOff + l + 32u]);  // low nibbles for q2/q4
+    uint qh   = uint(src[qhOff + l]);
+
+    int qraw;
+    if (quad == 0u)      qraw = int((ql0  & 0x0Fu) | (((qh >> 0) & 3u) << 4)) - 32;
+    else if (quad == 1u) qraw = int((ql32 & 0x0Fu) | (((qh >> 2) & 3u) << 4)) - 32;
+    else if (quad == 2u) qraw = int((ql0  >> 4)    | (((qh >> 4) & 3u) << 4)) - 32;
+    else                 qraw = int((ql32 >> 4)    | (((qh >> 6) & 3u) << 4)) - 32;
+
+    uint is = 8u * n128 + (l >> 4);     // l/16
+    uint scIdx;
+    if (quad == 0u)      scIdx = is;
+    else if (quad == 1u) scIdx = is + 2u;
+    else if (quad == 2u) scIdx = is + 4u;
+    else                 scIdx = is + 6u;
+
+    int s = int(src[scBase + scIdx]);
+    if (s >= 128) s -= 256;             // int8 sign-extend
+    return d * float(s) * float(qraw);
+}
+
+void main() {
+    uint g = gl_WorkGroupID.x;          // Affine group index (uniform per WG)
+    if (g >= uint(pc.num_groups)) return;
+    uint t   = gl_LocalInvocationID.x;  // 0..31
+    uint sub = g & 7u;                  // sub-block within the 256-element block
+    uint b   = g >> 3;                  // 256-element block index
+
+    float val;
+    if (pc.qtype == 12)      val = dec_q4k(b, sub, t);
+    else if (pc.qtype == 13) val = dec_q5k(b, sub, t);
+    else                     val = dec_q6k(b, sub, t);
+
+    // Reduce the group's actual min/max (matches quant.QuantizeAffine*).
+    s_min[t] = val;
+    s_max[t] = val;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (t < s) {
+            s_min[t] = min(s_min[t], s_min[t + s]);
+            s_max[t] = max(s_max[t], s_max[t + s]);
+        }
+        barrier();
+    }
+    float mn = s_min[0];
+    float mx = s_max[0];
+
+    uint  maxq = (pc.out_bits == 8) ? 255u : 15u;
+    float d    = (mx - mn) / float(maxq);
+    float inv  = (d > 0.0) ? (1.0 / d) : 0.0;
+    float qf   = (inv != 0.0) ? floor((val - mn) * inv + 0.5) : 0.0;
+    uint  q    = uint(clamp(qf, 0.0, float(maxq)));
+
+    s_q[t] = q;
+    barrier();
+
+    if (pc.out_bits == 8) {
+        // Affine8: 8 uint32 code words (4 codes each) + 1 packed (d,m) word.
+        if (t < 8u) {
+            uint j = t * 4u;
+            dst32[g * 9u + t] = s_q[j] | (s_q[j + 1u] << 8) | (s_q[j + 2u] << 16) | (s_q[j + 3u] << 24);
+        }
+        if (t == 0u) dst32[g * 9u + 8u] = packHalf2x16(vec2(d, mn));
+    } else {
+        // Affine4: 4 uint32 code words (8 nibbles each) + 1 packed (d,m) word.
+        if (t < 4u) {
+            uint j = t * 8u;
+            dst32[g * 5u + t] = s_q[j] | (s_q[j + 1u] << 4) | (s_q[j + 2u] << 8)  | (s_q[j + 3u] << 12)
+                              | (s_q[j + 4u] << 16) | (s_q[j + 5u] << 20) | (s_q[j + 6u] << 24) | (s_q[j + 7u] << 28);
+        }
+        if (t == 0u) dst32[g * 5u + 4u] = packHalf2x16(vec2(d, mn));
+    }
+}

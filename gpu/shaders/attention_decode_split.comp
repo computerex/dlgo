@@ -1,0 +1,220 @@
+// Split-KV decode attention for the LLM decode path (npos == 1).
+//
+// Replaces PIPE_ATTENTION_TILED for single-token decode. That kernel is one
+// workgroup per (head, position) — 16 workgroups for a 16-head model on a 66-SM
+// GPU — and its PV phase is a serial dependent global-load FMA chain over the
+// tile with only head_dim of 256 threads active. Both make decode attention
+// latency-bound at a few percent of memory bandwidth, which is the slope of the
+// decode-vs-context curve.
+//
+// This kernel fixes all three:
+//
+//  1. Split-KV across workgroups. Grid is (num_heads, num_splits), so a 16-head
+//     model with num_splits=4 fills 64 of 66 SMs instead of 16.
+//  2. K and V tiles are staged in shared memory with cooperative coalesced
+//     uvec4 loads (all 256 threads issue independent loads). The compute phases
+//     then read LDS, so no FMA chain ever waits on DRAM.
+//  3. The 8 subgroups split the *output dims* rather than the query rows (there
+//     is only one query row in decode), so every one of the 256 threads carries
+//     a live accumulator. Online softmax uses subgroupShuffleXor, which needs no
+//     barriers. Only 2 barriers per tile.
+//
+// Supports head_dim in {64, 128, 192, 256} (i.e. any multiple of 64 up to 256),
+// which covers the Qwen3.5 0.8B/2B/9B shapes. Per (head, split) it emits an
+// unnormalized partial (running_max, running_sum, acc[head_dim]) which
+// attention_decode_merge.comp combines. Summation order differs from
+// attention_tiled (splits are combined afterwards), so output matches to fp32
+// rounding rather than bit-exactly.
+//
+// Dispatch: groups_x = num_heads, groups_y = num_splits, groups_z = 1
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale,
+//                 softcap, num_splits (32 bytes)
+// Buffers: 0=partial(f32), 1=Q(f32 vec4), 2=KCache(packed half2 uvec4),
+//          3=VCache(packed half2 uvec4)
+
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Partial { float partial[]; };
+layout(set = 0, binding = 1) readonly buffer Q { vec4 q_v4[]; };
+layout(set = 0, binding = 2) readonly buffer K { uvec4 k_v4[]; };
+layout(set = 0, binding = 3) readonly buffer V { uvec4 v_v4[]; };
+
+layout(push_constant) uniform Params {
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;      // multiple of 64, <= 256
+    int kv_dim;        // float elements per KV position
+    int seq_len;       // window length (positions in [0, seq_len))
+    float scale;
+    float softcap;
+    int num_splits;
+};
+
+#define BC        32    // KV positions per tile == lanes per subgroup
+#define NSUB      8     // subgroups per workgroup
+#define HD8MAX    32    // max head_dim/8  (= 32 uvec4 for head_dim 256)
+#define HD8PMAX   33    // HD8MAX + 1 bank-conflict padding
+#define DPU4MAX   4     // max uvec4 per subgroup (= HD8MAX / NSUB)
+#define HDDMAX    256   // max head_dim
+
+shared uvec4 ksh[BC * HD8PMAX];   // 16.9 KB
+shared uvec4 vsh[BC * HD8PMAX];   // 16.9 KB
+shared float Qf[HDDMAX];          // 1.0 KB, pre-scaled query
+
+void main() {
+    uint head  = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    if (head >= uint(num_heads)) return;
+
+    uint tid  = gl_LocalInvocationID.x;
+    uint sg   = tid >> 5u;    // 0..NSUB-1 : owns output dims [sg*dps, +dps)
+    uint lane = tid & 31u;    // 0..31     : owns KV position `lane` in the tile
+
+    uint hd      = uint(head_dim);
+    uint hd4     = hd / 4u;        // vec4  per head (f32)
+    uint hd8     = hd / 8u;        // uvec4 per head (packed half2)
+    uint dps     = hd / uint(NSUB);        // output dims per subgroup
+    uint dpu4    = hd8 / uint(NSUB);       // uvec4 per subgroup
+    uint accBase = sg * dpu4;              // uvec4 offset into a KV position
+
+    uint kv_mul  = uint(num_heads) / uint(num_kv_heads);
+    uint kv_head = head / kv_mul;
+    uint kvd8    = uint(kv_dim) / 8u;      // uvec4 per KV position
+    uint kv_off8 = kv_head * hd8;          // uvec4 offset to this head
+
+    int N     = seq_len;
+    int S     = num_splits;
+    int chunk = (N + S - 1) / S;
+    int s0    = int(split) * chunk;
+    int s1    = min(N, s0 + chunk);
+
+    // Stage the query once; every subgroup dots against the full head_dim.
+    for (uint d = tid; d < hd4; d += 256u) {
+        vec4 q = q_v4[head * hd4 + d] * scale;
+        uint b = d * 4u;
+        Qf[b + 0u] = q.x;
+        Qf[b + 1u] = q.y;
+        Qf[b + 2u] = q.z;
+        Qf[b + 3u] = q.w;
+    }
+    barrier();
+
+    vec4 o[2u * DPU4MAX];
+    [[unroll]] for (uint j = 0u; j < 2u * DPU4MAX; j++) o[j] = vec4(0.0);
+
+    float runMax = -1.0e30;
+    float runSum = 0.0;
+
+    uint tileEntries = uint(BC) * hd8;
+    uint stride      = 2u + hd;   // partial stride: m, l, acc[hd]
+
+    for (int ts = s0; ts < s1; ts += BC) {
+        // ---- cooperative coalesced K + V tile load ----
+        [[unroll]] for (uint e = 0u; e < (uint(BC) * uint(HD8MAX)) / 256u; e++) {
+            uint i = e * 256u + tid;
+            if (i < tileEntries) {
+                uint kp  = i / hd8;
+                uint d8  = i % hd8;
+                int  pos = ts + int(kp);
+                bool ok  = (pos < s1);
+                // Clamp the address even when masked off: GLSL does not
+                // guarantee ?: short-circuits, so an OOB index could fault on
+                // the tail tile.
+                int  cpos = min(pos, s1 - 1);
+                uint src  = uint(cpos) * kvd8 + kv_off8 + d8;
+                ksh[kp * uint(HD8PMAX) + d8] = ok ? k_v4[src] : uvec4(0u);
+                vsh[kp * uint(HD8PMAX) + d8] = ok ? v_v4[src] : uvec4(0u);
+            }
+        }
+        barrier();
+
+        // ---- QK dot for this lane's KV position (full head_dim) ----
+        int  myPos = ts + int(lane);
+        bool live  = (myPos < s1);
+        float dv0 = 0.0, dv1 = 0.0;
+        if (live) {
+            [[unroll]] for (uint i = 0u; i < uint(HD8MAX); i++) {
+                if (i < hd8) {
+                    uvec4 kv = ksh[lane * uint(HD8PMAX) + i];
+                    vec2 a = unpackHalf2x16(kv.x);
+                    vec2 b = unpackHalf2x16(kv.y);
+                    vec2 c = unpackHalf2x16(kv.z);
+                    vec2 d = unpackHalf2x16(kv.w);
+                    uint qb = i * 8u;
+                    dv0 = fma(Qf[qb + 0u], a.x, dv0);
+                    dv0 = fma(Qf[qb + 1u], a.y, dv0);
+                    dv0 = fma(Qf[qb + 2u], b.x, dv0);
+                    dv0 = fma(Qf[qb + 3u], b.y, dv0);
+                    dv1 = fma(Qf[qb + 4u], c.x, dv1);
+                    dv1 = fma(Qf[qb + 5u], c.y, dv1);
+                    dv1 = fma(Qf[qb + 6u], d.x, dv1);
+                    dv1 = fma(Qf[qb + 7u], d.y, dv1);
+                }
+            }
+        }
+        float s = live ? (dv0 + dv1) : -1.0e30;
+        if (softcap > 0.0 && live) s = softcap * tanh(s / softcap);
+
+        // ---- online softmax: subgroup-wide reductions, no barriers ----
+        float tileMax = s;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            tileMax = max(tileMax, subgroupShuffleXor(tileMax, off));
+
+        float newMax = max(runMax, tileMax);
+        float corr   = exp(runMax - newMax);
+        runMax = newMax;
+        runSum *= corr;
+        [[unroll]] for (uint j = 0u; j < 2u * DPU4MAX; j++) o[j] *= corr;
+
+        float w = live ? exp(s - newMax) : 0.0;
+        float wsum = w;
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            wsum += subgroupShuffleXor(wsum, off);
+        runSum += wsum;
+
+        // ---- weighted V accumulate: this subgroup's dps dims only ----
+        [[unroll]] for (uint j = 0u; j < uint(DPU4MAX); j++) {
+            if (j < dpu4) {
+                uvec4 p = vsh[lane * uint(HD8PMAX) + accBase + j];
+                vec2 a0 = unpackHalf2x16(p.x), a1 = unpackHalf2x16(p.y);
+                vec2 a2 = unpackHalf2x16(p.z), a3 = unpackHalf2x16(p.w);
+                o[2u * j + 0u] += w * vec4(a0.x, a0.y, a1.x, a1.y);
+                o[2u * j + 1u] += w * vec4(a2.x, a2.y, a3.x, a3.y);
+            }
+        }
+
+        barrier(); // all LDS reads done before the next tile overwrites ksh/vsh
+    }
+
+    // ---- reduce each accumulator across the 32 lanes of the subgroup ----
+    [[unroll]] for (uint j = 0u; j < 2u * DPU4MAX; j++) {
+        [[unroll]] for (uint off = 16u; off >= 1u; off >>= 1u)
+            o[j] += subgroupShuffleXor(o[j], off);
+    }
+
+    uint base = (head * uint(S) + split) * stride;
+    if (lane == 0u) {
+        uint oo = base + 2u + sg * dps;
+        [[unroll]] for (uint j = 0u; j < uint(DPU4MAX); j++) {
+            if (j < dpu4) {
+                uint b = oo + j * 8u;
+                partial[b + 0u] = o[2u * j + 0u].x;
+                partial[b + 1u] = o[2u * j + 0u].y;
+                partial[b + 2u] = o[2u * j + 0u].z;
+                partial[b + 3u] = o[2u * j + 0u].w;
+                partial[b + 4u] = o[2u * j + 1u].x;
+                partial[b + 5u] = o[2u * j + 1u].y;
+                partial[b + 6u] = o[2u * j + 1u].z;
+                partial[b + 7u] = o[2u * j + 1u].w;
+            }
+        }
+    }
+    if (tid == 0u) {
+        partial[base + 0u] = runMax;
+        partial[base + 1u] = runSum;
+    }
+}

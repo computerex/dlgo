@@ -1036,6 +1036,20 @@ func GemmAffine4(out, weights, x Buf, rows, cols, npos int) error {
 	return nil
 }
 
+// ConvertQuantToAffine converts n elements of a GGML K-quant tensor already
+// resident in GPU buffer `src` into the canonical Affine format in `out`,
+// entirely on the device (see gpu/shaders/convert_to_affine.comp). outBits=8
+// produces Affine8 (36 B / 32 weights), outBits=4 produces Affine4 (20 B / 32).
+// qtype is the GGML id (12=Q4_K, 13=Q5_K, 14=Q6_K). This is the load-time
+// replacement for the CPU repack (quant.RepackAffine4/8).
+func ConvertQuantToAffine(out, src Buf, n, qtype, outBits int) error {
+	rc := C.gpu_convert_quant(C.GpuBuf(out), C.GpuBuf(src), C.int(n), C.int(qtype), C.int(outBits))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: convert_quant failed (%d)", rc)
+	}
+	return nil
+}
+
 // gemmQ3KRecovered is a test-only entry point; inference never selects this candidate.
 func gemmQ3KRecovered(out, weights, x Buf, rows, cols, npos int) error {
 	rc := C.gpu_gemm_q3k_recovered(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x), C.int(rows), C.int(cols), C.int(npos))
@@ -1062,6 +1076,46 @@ func SetAttentionKV4(on bool) {
 	}
 	C.gpu_set_attention_kv4(v)
 }
+
+// SetAttentionDecode selects the split-KV single-token decode attention kernel
+// (on by default; DLGO_ATTN_DECODE=0 disables it). Tests use this to compare it
+// against the tiled kernel it replaces.
+//
+// NOTE: the dispatch selection itself lives in csrc/vulkan_gpu.c, which cgo only
+// sees through the preamble's #include. Go's build cache tracks Go sources, not
+// that C file, so a C-only edit does not trigger a rebuild — also touch or edit a
+// Go source in this package after changing it.
+func SetAttentionDecode(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_decode(v)
+}
+
+// SetAttentionDecodeGQA selects the GQA-folded split-KV single-token decode
+// attention kernel (on by default when kv_mul > 1; DLGO_ATTN_DECODE_GQA=0
+// disables it, which falls back to the per-q-head split kernel). It folds the
+// num_heads/num_kv_heads q-heads that share a KV head into one workgroup, so the
+// KV cache is read once per position instead of once per q-head.
+//
+// Same cgo rebuild caveat as SetAttentionDecode.
+//
+// The partials scratch buffer both split kernels use is a backend-side cache;
+// it is dropped in gpu_init/gpu_shutdown so a second Init() in one process (as
+// the tests do) cannot dispatch against a handle from the destroyed device.
+func SetAttentionDecodeGQA(on bool) {
+	v := C.int(0)
+	if on {
+		v = 1
+	}
+	C.gpu_set_attention_decode_gqa(v)
+}
+
+// AttentionDecodeUsed reports which single-token decode attention kernel the most
+// recent dispatch used: 0 = tiled (attention_tiled.comp), 1 = split per q-head
+// (attention_decode_split.comp), 2 = GQA-folded split (attention_decode_gqa.comp).
+func AttentionDecodeUsed() int { return int(C.gpu_attention_decode_used()) }
 
 // SetSSMRecT32 forces the 32-lane SSM recurrence variant selection,
 // bypassing the DLGO_SSM_REC_T32 env cache. Test-only hook.

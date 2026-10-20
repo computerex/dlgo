@@ -99,3 +99,7 @@ __pycache__/
 
 # Test generation artifacts
 bench/systemone/gen32k-output.txt
+
+# Generated sprite output from cmd/dlgo-sprite. Regenerate with the tool; the
+# prompts live in the run command / docs, not in the repository.
+sprites/

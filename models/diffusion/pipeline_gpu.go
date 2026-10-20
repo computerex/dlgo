@@ -12,10 +12,23 @@ import (
 )
 
 // setupDiffusionGPU initializes GPU resources for diffusion if cfg.UseGPU is true.
-// Returns (cleanup func, model callback, prepareVAE func, vae decode func, error).
-// VAE scratch buffers are allocated lazily via prepareVAE, which also frees DiT
-// resources first. This allows 1024x1024 generation on 16 GB cards.
-// If GPU is not requested, returns (nil, nil, nil, nil, nil) and the caller uses CPU.
+// Returns (cleanup func, model callback, setContext func, prepareVAE func,
+// vae decode func, error).
+// VAE scratch buffers are allocated lazily via prepareVAE, which (unless
+// keepDiTForVAE is set) also frees DiT resources first. This allows 1024x1024
+// generation on 16 GB cards.
+// If GPU is not requested, returns all-nil and the caller uses CPU.
+//
+// setContext lets a caller reuse the loaded GPU model for a different prompt
+// (batch rendering) without re-uploading weights: it rebinds the text context
+// that modelFn feeds to the DiT.
+//
+// keepDiTForVAE, when true, leaves the DiT weights resident when prepareVAE
+// allocates the VAE scratch buffers, so a single process can denoise several
+// prompts and then decode them. This trades VRAM headroom for the ability to
+// amortise the (expensive) DiT upload across many images; it is only safe when
+// DiT + VAE + run-state fit in VRAM together (small resolutions). When false the
+// single-image behaviour is unchanged: the DiT is freed before the VAE runs.
 func setupDiffusionGPU(
 	dit *DiTModel,
 	rs *DiTRunState,
@@ -25,17 +38,18 @@ func setupDiffusionGPU(
 	contextLen int,
 	latentH, latentW int,
 	maxSeqLen int,
-) (cleanup func(), modelFn func([]float32, float32) []float32,
+	keepDiTForVAE bool,
+) (cleanup func(), modelFn func([]float32, float32) []float32, setContext func([]float32, int),
 	prepareVAE func() error,
 	vaeFn func([]float32, int, int) []float32, err error) {
 	if !cfg.UseGPU {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil
 	}
 
 	log.Println("[diffusion/gpu] Initializing GPU...")
 	gpuStart := time.Now()
 	if err := gpu.Init(); err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("GPU init: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("GPU init: %w", err)
 	}
 	// The coopmat GEMM kernels are ~5x faster than the FP32 fallbacks, but they
 	// narrow activations to FP16. GpuDiTForward keeps activations in range by
@@ -50,14 +64,14 @@ func setupDiffusionGPU(
 	gm, err := UploadDiTModel(dit)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, nil, fmt.Errorf("upload DiT: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("upload DiT: %w", err)
 	}
 
 	// Allocate DiT GPU run state
 	grs, err := NewGpuDiTRunState(dit.Config, maxSeqLen)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, nil, fmt.Errorf("GPU run state: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("GPU run state: %w", err)
 	}
 
 	// Upload VAE weights to GPU (small, ~189 MB — keep resident)
@@ -65,7 +79,7 @@ func setupDiffusionGPU(
 	gvm, err := UploadVAEModel(vae)
 	if err != nil {
 		gpu.Shutdown()
-		return nil, nil, nil, nil, fmt.Errorf("upload VAE: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("upload VAE: %w", err)
 	}
 
 	log.Printf("[diffusion/gpu] GPU setup complete in %v (VRAM used: %.1f MB)",
@@ -159,7 +173,9 @@ func setupDiffusionGPU(
 	}
 
 	prepareVAE = func() error {
-		freeDiTResources()
+		if !keepDiTForVAE {
+			freeDiTResources()
+		}
 		log.Println("[diffusion/gpu] Allocating VAE scratch buffers...")
 		var allocErr error
 		gvrs, allocErr = NewGpuVAERunState(vae.Config, latentH, latentW)
@@ -191,13 +207,23 @@ func setupDiffusionGPU(
 		log.Println("[diffusion/gpu] GPU resources freed")
 	}
 
+	// The text context fed to the DiT. Batch rendering rebinds it via setContext
+	// so the same uploaded weights serve every prompt.
+	curContext := context
+	curContextLen := contextLen
+
 	modelFn = func(x []float32, timestep float32) []float32 {
-		return GpuDiTForward(dit, gm, rs, grs, x, timestep, context, contextLen, latentH, latentW, cfg.Debug)
+		return GpuDiTForward(dit, gm, rs, grs, x, timestep, curContext, curContextLen, latentH, latentW, cfg.Debug)
+	}
+
+	setContext = func(c []float32, l int) {
+		curContext = c
+		curContextLen = l
 	}
 
 	vaeFn = func(latent []float32, h, w int) []float32 {
 		return GpuVAEDecode(vae, gvm, gvrs, latent, h, w)
 	}
 
-	return cleanup, modelFn, prepareVAE, vaeFn, nil
+	return cleanup, modelFn, setContext, prepareVAE, vaeFn, nil
 }

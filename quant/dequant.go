@@ -110,6 +110,10 @@ func Dequantize(data []byte, ggmlType uint32, n int) ([]float32, error) {
 		return DequantizeTQ2_0(data, n), nil
 	case 39: // MXFP4
 		return DequantizeMXFP4(data, n), nil
+	case 60: // canonical Affine8 (see affine8.go)
+		return DequantizeAffine8(data, n), nil
+	case 61: // canonical Affine4 (see affine4.go)
+		return DequantizeAffine4(data, n), nil
 	default:
 		return nil, fmt.Errorf("unsupported quantization type: %d", ggmlType)
 	}

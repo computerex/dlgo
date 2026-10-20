@@ -130,7 +130,7 @@ func CheckDiffusionMemoryBudget(ditCfg ZImageConfig, width, height, contextLen i
 	return nil
 }
 
-// GenerateImage runs the full Z-Image pipeline:
+// GenerateImage runs the full Z-Image pipeline and writes the result as a PNG:
 // text encoder → DiT denoising → VAE decode → PNG
 func GenerateImage(
 	ditPath string,
@@ -140,19 +140,47 @@ func GenerateImage(
 	cfg ImageGenConfig,
 	outputPath string,
 ) error {
+	start := time.Now()
+	pixels, err := GenerateImagePixels(ditPath, vaePath, llmPath, prompt, cfg)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Saving to %s...", outputPath)
+	if err := savePNG(pixels, cfg.Width, cfg.Height, outputPath); err != nil {
+		return fmt.Errorf("save PNG: %w", err)
+	}
+	log.Printf("Total generation time: %v", time.Since(start))
+	return nil
+}
+
+// GenerateImagePixels runs the full Z-Image pipeline (text encoder → DiT
+// denoising → VAE decode) and returns the decoded image as float32 RGB in
+// [0,1], laid out [3][Height][Width].
+//
+// Exposed separately from GenerateImage so post-processing that needs raw pixels
+// (sprite quantisation, image diffing, statistics) does not have to round-trip
+// through a PNG.
+func GenerateImagePixels(
+	ditPath string,
+	vaePath string,
+	llmPath string,
+	prompt string,
+	cfg ImageGenConfig,
+) ([]float32, error) {
 	totalStart := time.Now()
 
-	// 0. Memory budget check (estimate with max context length)
+	// 0. Memory budget check (estimate with max context length)	// 0. Memory budget check (estimate with max context length)
 	ditCfg := DefaultZImageConfig()
 	if err := CheckDiffusionMemoryBudget(ditCfg, cfg.Width, cfg.Height, 512); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 1. Load text encoder, encode, then free it before loading DiT
 	log.Println("Loading text encoder...")
 	te, err := NewTextEncoder(llmPath, 512)
 	if err != nil {
-		return fmt.Errorf("load text encoder: %w", err)
+		return nil, fmt.Errorf("load text encoder: %w", err)
 	}
 	log.Printf("Text encoder loaded in %v", time.Since(totalStart))
 
@@ -174,7 +202,7 @@ func GenerateImage(
 	loadStart := time.Now()
 	dit, err := LoadDiTModel(ditPath)
 	if err != nil {
-		return fmt.Errorf("load DiT: %w", err)
+		return nil, fmt.Errorf("load DiT: %w", err)
 	}
 	log.Printf("DiT loaded in %v", time.Since(loadStart))
 
@@ -183,7 +211,7 @@ func GenerateImage(
 	loadStart = time.Now()
 	vae, err := LoadVAEDecoder(vaePath)
 	if err != nil {
-		return fmt.Errorf("load VAE: %w", err)
+		return nil, fmt.Errorf("load VAE: %w", err)
 	}
 	log.Printf("VAE loaded in %v", time.Since(loadStart))
 
@@ -215,9 +243,9 @@ func GenerateImage(
 	// 7. GPU setup (if requested)
 	var modelFn func(x []float32, timestep float32) []float32
 	var gpuVaeFn func([]float32, int, int) []float32
-	gpuCleanup, gpuModelFn, gpuPrepareVAE, gpuVaeDecodeFn, gpuErr := setupDiffusionGPU(dit, rs, vae, cfg, context, contextLen, latentH, latentW, maxSeqLen)
+	gpuCleanup, gpuModelFn, _, gpuPrepareVAE, gpuVaeDecodeFn, gpuErr := setupDiffusionGPU(dit, rs, vae, cfg, context, contextLen, latentH, latentW, maxSeqLen, false)
 	if gpuErr != nil {
-		return fmt.Errorf("GPU setup: %w", gpuErr)
+		return nil, fmt.Errorf("GPU setup: %w", gpuErr)
 	}
 	if gpuCleanup != nil {
 		defer gpuCleanup()
@@ -233,7 +261,6 @@ func GenerateImage(
 	gpuVaeFn = gpuVaeDecodeFn
 
 	// 8. Run Euler sampler
-	// 8. Run Euler sampler
 	log.Printf("Sampling: %d steps, seed=%d, cfg_scale=%.1f", cfg.Steps, cfg.Seed, cfg.CFGScale)
 	sampleStart := time.Now()
 	gpu.PerfReset()
@@ -242,13 +269,13 @@ func GenerateImage(
 	log.Printf("Sampling done in %v", time.Since(sampleStart))
 	gpu.PerfPrint()
 	if err := validateLatent(latent); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Free DiT resources and allocate VAE scratch (lazy — avoids peak VRAM overlap)
 	if gpuPrepareVAE != nil {
 		if err := gpuPrepareVAE(); err != nil {
-			return fmt.Errorf("prepare VAE: %w", err)
+			return nil, fmt.Errorf("prepare VAE: %w", err)
 		}
 	}
 
@@ -263,15 +290,8 @@ func GenerateImage(
 	}
 	log.Printf("VAE decode done in %v", time.Since(decStart))
 
-	// 10. Save as PNG
-	log.Printf("Saving to %s...", outputPath)
-	err = savePNG(pixels, cfg.Width, cfg.Height, outputPath)
-	if err != nil {
-		return fmt.Errorf("save PNG: %w", err)
-	}
-
-	log.Printf("Total generation time: %v", time.Since(totalStart))
-	return nil
+	log.Printf("Pipeline done in %v", time.Since(totalStart))
+	return pixels, nil
 }
 
 // ditStageDebug enables per-stage and per-step numerical diagnostics.

@@ -292,7 +292,7 @@ func TestGpuForwardBlockNoAdaLN(t *testing.T) {
 	gpu.UploadF32(gpuRS.X, input)
 
 	// Run GPU forward block
-	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, peOffset, nil, peStride)
+	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, peOffset, nil, peStride, "test", nil)
 	gpu.Sync()
 
 	// Download result
@@ -479,7 +479,7 @@ func TestGpuForwardBlockWithAdaLN(t *testing.T) {
 	gpuRS.PE = peBuf
 
 	gpu.UploadF32(gpuRS.X, input)
-	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, peOffset, adaLNInput, peStride)
+	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, peOffset, adaLNInput, peStride, "test", nil)
 	gpu.Sync()
 
 	gpuOut := make([]float32, seqLen*hidden)
@@ -653,7 +653,7 @@ func TestGpuForwardRealModel(t *testing.T) {
 	gpu.UploadF32(gpuRS.X, input)
 
 	t.Log("Running GPU forward block...")
-	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, 0, adaLNInput, peStride)
+	gpuForwardBlock(gpuModel, gpuRS, gpuLayer, seqLen, hidden, pe, 0, adaLNInput, peStride, "test", nil)
 	gpu.Sync()
 
 	gpuOut := make([]float32, seqLen*hidden)
