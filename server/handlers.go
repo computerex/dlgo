@@ -109,12 +109,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		seed = *req.Seed
 	}
 
-	// Agentic tool-calling defaults to non-thinking mode: it is faster and, in
-	// practice, produces more reliable tool arguments. Callers can opt back into
-	// reasoning with enable_thinking:true.
+	// Agentic tool-calling defaults to non-thinking mode (faster, and in practice
+	// more reliable tool arguments) ONLY when the caller gave no reasoning signal.
+	// We always honour an explicit enable_thinking, and a positive reasoning_effort
+	// keeps thinking enabled so the model reasons first and then emits a tool call.
 	if len(req.Tools) > 0 && req.EnableThinking == nil {
-		off := false
-		req.EnableThinking = &off
+		switch strings.ToLower(strings.TrimSpace(req.ReasoningEffort)) {
+		case "", "none", "off", "disabled":
+			off := false
+			req.EnableThinking = &off
+		}
 	}
 
 	ctx, cancel := context.WithCancel(r.Context())

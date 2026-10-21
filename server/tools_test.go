@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/computerex/dlgo/models/llm"
 )
 
 func TestFormatToolDefinitions(t *testing.T) {
@@ -507,4 +509,34 @@ func min2(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestLegacyToolConventionUnchanged locks in that architectures without a native
+// tool protocol (every arch except qwen35/qwen35moe) keep the original
+// OpenAI-style behavior: prose tool definitions that ask for bare JSON, and the
+// bare-JSON parser/stripper.
+func TestLegacyToolConventionUnchanged(t *testing.T) {
+	tools := []Tool{{
+		Type:     "function",
+		Function: Function{Name: "get_weather", Description: "Get weather"},
+	}}
+
+	defs := formatToolDefinitions(tools, llm.ToolCallFormatNone)
+	if !containsString(defs, "respond with JSON") {
+		t.Errorf("legacy tool definitions must ask the model to respond with JSON; got: %s", defs)
+	}
+	if containsString(defs, "<tools>") || containsString(defs, "<IMPORTANT>") {
+		t.Errorf("legacy tool definitions must not use the native <tools> block; got: %s", defs)
+	}
+
+	// Bare-JSON tool call (the legacy convention) still parses.
+	calls := parseToolCalls(`{"name": "get_weather", "arguments": {"city": "NYC"}}`)
+	if len(calls) != 1 || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("legacy bare-JSON parse failed: %+v", calls)
+	}
+
+	// And it still strips from content.
+	if got := stripToolCalls(`ok {"name": "get_weather", "arguments": {"city": "NYC"}}`); got != "ok" {
+		t.Errorf("legacy strip = %q, want ok", got)
+	}
 }
