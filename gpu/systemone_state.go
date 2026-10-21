@@ -26,6 +26,7 @@ type GpuStateSnapshot struct {
 // fresh device buffers. Call it immediately after prefilling the shared
 // prefix, before any suffix pass mutates the live state.
 func (p *GpuPipeline) SnapshotState(npos int) (*GpuStateSnapshot, error) {
+	p.invalidateChatPrefix()
 	if npos <= 0 || npos > p.KVCache.MaxSeq {
 		return nil, fmt.Errorf("gpu: cannot snapshot state at %d positions (max %d)", npos, p.KVCache.MaxSeq)
 	}
@@ -122,10 +123,77 @@ func (p *GpuPipeline) SnapshotState(npos int) (*GpuStateSnapshot, error) {
 	return snap, nil
 }
 
+// snapshotRecurrentState copies only the GPU SSM recurrent state and conv
+// history into fresh device buffers, recording kvLen = npos. KV rows are NOT
+// copied; the caller must keep KV[0, npos) resident. Used by cross-request chat
+// prefix reuse, where the resident KV is reused as-is and only the recurrent
+// state needs to be rewound to the prefix boundary.
+func (p *GpuPipeline) snapshotRecurrentState(npos int) (*GpuStateSnapshot, error) {
+	if npos <= 0 || npos > p.KVCache.MaxSeq {
+		return nil, fmt.Errorf("gpu: cannot snapshot recurrent state at %d positions (max %d)", npos, p.KVCache.MaxSeq)
+	}
+	if !p.HasSSM {
+		return nil, fmt.Errorf("gpu: recurrent snapshot requires SSM state")
+	}
+	Sync()
+	snap := &GpuStateSnapshot{kvLen: npos}
+	cfg := p.CPUModel.Config
+	numHeads := cfg.SSMTimeStepRank
+	numKVGroups := cfg.SSMGroupCount
+	if numKVGroups <= 0 {
+		numKVGroups = numHeads
+	}
+	headVDim := cfg.SSMInnerSize / numHeads
+	headKDim := cfg.SSMStateSize
+	keyDim := numKVGroups * headKDim
+	qkvDim := keyDim*2 + numHeads*headVDim
+	convK := cfg.SSMConvKernel
+	snap.ssmStateBytes = uint64(numHeads*headKDim*headVDim) * 4
+	snap.ssmConvBytes = uint64(convK*qkvDim) * 4
+	snap.ssmState = make([]Buf, cfg.NumLayers)
+	snap.ssmConv = make([]Buf, cfg.NumLayers)
+
+	BeginBatch()
+	for l := 0; l < cfg.NumLayers; l++ {
+		gl := &p.GpuModel.Layers[l]
+		if gl.SSMState == 0 || gl.SSMConvBuf == 0 {
+			continue
+		}
+		s := Alloc(snap.ssmStateBytes)
+		c := Alloc(snap.ssmConvBytes)
+		if s == 0 || c == 0 {
+			EndBatch()
+			freeBuf(s)
+			freeBuf(c)
+			snap.Free()
+			return nil, fmt.Errorf("gpu: recurrent snapshot alloc failed at layer %d", l)
+		}
+		if err := CopyRegion(s, 0, gl.SSMState, 0, snap.ssmStateBytes); err != nil {
+			EndBatch()
+			freeBuf(s)
+			freeBuf(c)
+			snap.Free()
+			return nil, fmt.Errorf("gpu: recurrent state snapshot copy layer %d: %w", l, err)
+		}
+		if err := CopyRegion(c, 0, gl.SSMConvBuf, 0, snap.ssmConvBytes); err != nil {
+			EndBatch()
+			freeBuf(s)
+			freeBuf(c)
+			snap.Free()
+			return nil, fmt.Errorf("gpu: recurrent conv snapshot copy layer %d: %w", l, err)
+		}
+		snap.ssmState[l], snap.ssmConv[l] = s, c
+	}
+	EndBatch()
+	Sync()
+	return snap, nil
+}
+
 // RestoreState copies all captured KV, SSM, and conv state back into the live
 // pipeline and resets KVCache.Len to the shared prefix boundary. Use it when
 // switching cached prefixes or after any operation that can overwrite prefix KV.
 func (p *GpuPipeline) RestoreState(s *GpuStateSnapshot) error {
+	p.invalidateChatPrefix()
 	return p.restoreState(s, true)
 }
 
@@ -139,6 +207,7 @@ func (p *GpuPipeline) RestoreState(s *GpuStateSnapshot) error {
 // ResetState, or switching prefixes invalidates this guarantee. Pipeline use
 // (including restore and subsequent inference) must be externally serialized.
 func (p *GpuPipeline) RestoreRecurrentState(s *GpuStateSnapshot) error {
+	p.invalidateChatPrefix()
 	return p.restoreState(s, false)
 }
 

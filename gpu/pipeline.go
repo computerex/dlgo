@@ -88,7 +88,22 @@ type GpuPipeline struct {
 	// make concurrent pipeline inference or eviction safe.
 	prefixCacheMu sync.Mutex
 	prefixCache   []prefixCacheEntry
+
+	// Cross-request chat prefix reuse (agentic use). The previous generation's
+	// prompt is remembered; when the next request's tokens extend it, only the
+	// new suffix is prefilled. We keep the KV for [0, chatPrefixTokens) resident
+	// (generation only appends beyond it) and snapshot just the GPU SSM/conv
+	// recurrent state at the prefix boundary (cheap, ~tens of MB) so it can be
+	// rewound. Only valid when SSM runs on the GPU (not cpuSSMDelta/cpuSSMFull)
+	// and the hybrid batched prefill path is used. See chatPrefixEligible.
+	chatPrefixTokens []int32
+	chatPrefixSnap   *GpuStateSnapshot
+	chatPrefixValid  bool
 }
+
+// prefixReuseEnabled toggles cross-request KV prefix reuse for chat. Default on;
+// set DLGO_PREFIX_REUSE=0 to disable.
+var prefixReuseEnabled = os.Getenv("DLGO_PREFIX_REUSE") != "0"
 
 // prefixCacheMaxEntries caps cached prefixes. Each entry holds a KV+SSM
 // snapshot for the cached prefix length (order ~100-200 MB for a 10K-token
@@ -1179,8 +1194,119 @@ func NewRunner(modelPath string, ctx int) (llm.Runner, string, error) {
 	return gp, "GPU (" + DeviceName() + ")", nil
 }
 
+// invalidateChatPrefix drops any cached cross-request chat prefix snapshot and
+// forgets the remembered prompt tokens.
+func (p *GpuPipeline) invalidateChatPrefix() {
+	if p.chatPrefixSnap != nil {
+		p.chatPrefixSnap.Free()
+		p.chatPrefixSnap = nil
+	}
+	p.chatPrefixTokens = nil
+	p.chatPrefixValid = false
+}
+
+// chatPrefixEligible reports whether cross-request prefix reuse can be used
+// safely for this pipeline: SSM must run on the GPU (not the CPU delta/full
+// fallbacks), no layer may offload attention to the CPU, and prefill must take
+// the hybrid batched path (which accepts an arbitrary start position).
+func (p *GpuPipeline) chatPrefixEligible() bool {
+	if !prefixReuseEnabled || !p.HasSSM {
+		return false
+	}
+	if cpuSSMDelta || cpuSSMFull || p.IsPartialGPU || p.HasMoE || p.hasCPUAttn {
+		return false
+	}
+	if !p.UseFusedForward || !isHybridSSMModel(p.CPUModel) {
+		return false
+	}
+	return true
+}
+
+// tryChatPrefixReuse restores the GPU SSM state to the boundary of the
+// previously cached prompt when the new prompt tokens extend it. On success it
+// returns the length of the reusable prefix and leaves the resident KV for
+// [0, reuseLen) intact so the caller can prefill only tokens[reuseLen:].
+func (p *GpuPipeline) tryChatPrefixReuse(tokenSegs [][]int32, images [][][]float32) (int, bool) {
+	if !p.chatPrefixEligible() || len(images) != 0 || len(tokenSegs) != 1 {
+		return 0, false
+	}
+	if !p.chatPrefixValid || p.chatPrefixSnap == nil {
+		return 0, false
+	}
+	tokens := tokenSegs[0]
+	reuseLen := len(p.chatPrefixTokens)
+	// Require the new prompt to strictly extend the cached prefix so there is
+	// always fresh suffix to prefill (and so a repeat of the exact same prompt
+	// does a clean full prefill instead of a zero-token continuation).
+	if reuseLen == 0 || reuseLen >= len(tokens) || reuseLen >= p.MaxSeqLen {
+		return 0, false
+	}
+	for i := 0; i < reuseLen; i++ {
+		if tokens[i] != p.chatPrefixTokens[i] {
+			return 0, false
+		}
+	}
+	// Restore only the GPU SSM/conv recurrent state and rewind KVCache.Len to the
+	// boundary. The KV rows for [0, reuseLen) are still resident from the prior
+	// prefill (generation only appended beyond reuseLen), so they need no copy.
+	if err := p.restoreState(p.chatPrefixSnap, false); err != nil {
+		return 0, false
+	}
+	return reuseLen, true
+}
+
+// storeChatPrefix captures the GPU SSM/conv recurrent state at the prompt
+// boundary (npos) so the next request can resume from it. The KV rows remain in
+// the live cache; only the recurrent state is copied.
+func (p *GpuPipeline) storeChatPrefix(tokens []int32, npos int) {
+	if !p.chatPrefixEligible() {
+		return
+	}
+	snap, err := p.snapshotRecurrentState(npos)
+	if err != nil || snap == nil {
+		p.invalidateChatPrefix()
+		return
+	}
+	if p.chatPrefixSnap != nil {
+		p.chatPrefixSnap.Free()
+	}
+	p.chatPrefixSnap = snap
+	p.chatPrefixTokens = append([]int32(nil), tokens...)
+	p.chatPrefixValid = true
+}
+
+// generationPrimerTokenLen returns the number of trailing tokens that make up
+// the chat template's generation primer appended after the assistant marker
+// (e.g. the empty thinking block). On the next turn the assistant's real
+// content occupies this position, so the reusable prefix must stop just before
+// these tokens. Returns 0 if no known primer is present.
+func (p *GpuPipeline) generationPrimerTokenLen(prompt string, tokens []int32) int {
+	for _, suf := range []string{"<think></think>\n", "<think>\n"} {
+		if !strings.HasSuffix(prompt, suf) {
+			continue
+		}
+		st := p.Tokenizer.EncodeNoBOS(suf)
+		if len(st) == 0 || len(st) >= len(tokens) {
+			return 0
+		}
+		off := len(tokens) - len(st)
+		match := true
+		for i := range st {
+			if tokens[off+i] != st[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return len(st)
+		}
+	}
+	return 0
+}
+
 // ResetState zeros all caches and SSM state for a fresh inference.
 func (p *GpuPipeline) ResetState() {
+	p.invalidateChatPrefix()
 	p.KVCache.Reset()
 	if p.CPUKVCache != nil {
 		p.CPUKVCache.Reset()
@@ -1219,6 +1345,7 @@ func (p *GpuPipeline) FreeAll() {
 	}
 	StopMemoryMonitor()
 	Sync()
+	p.invalidateChatPrefix()
 	p.freePrefixCache()
 	p.GpuModel.FreeAll()
 	p.RunState.FreeAll()
@@ -1366,8 +1493,6 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
-	p.ResetState()
-
 	npos := 0
 	for i, seg := range tokenSegs {
 		npos += len(seg)
@@ -1377,6 +1502,16 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	}
 	if npos >= p.MaxSeqLen {
 		return nil, fmt.Errorf("prompt too long: %d tokens (max %d)", npos, p.MaxSeqLen)
+	}
+
+	// Cross-request prefix reuse (agentic chat): when this prompt extends the
+	// previously cached one, rewind the GPU SSM state to the cached boundary and
+	// prefill only the new suffix. Falls back to a clean full prefill otherwise.
+	prefillFrom := 0
+	if reuseLen, ok := p.tryChatPrefixReuse(tokenSegs, images); ok {
+		prefillFrom = reuseLen
+	} else {
+		p.ResetState()
 	}
 
 	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
@@ -1412,16 +1547,35 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 			}
 		} else if isHybridSSMModel(p.CPUModel) {
-			for cs := 0; cs < npos; cs += prefillChunkSize {
-				ce := cs + prefillChunkSize
-				if ce > npos {
-					ce = npos
+			// Split the prompt at the pre-primer boundary so we can snapshot the
+			// recurrent state there: the chat template's generation primer (the
+			// closing think block) differs on the next turn -- the assistant's
+			// real content follows instead -- so it must not be part of the
+			// reusable prefix.
+			cacheMode := p.chatPrefixEligible() && len(tokenSegs) == 1
+			cacheableLen := npos
+			if cacheMode {
+				if pl := p.generationPrimerTokenLen(prompt, tokens); pl > 0 && npos-pl > prefillFrom {
+					cacheableLen = npos - pl
 				}
-				isLast := ce >= npos
-				GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens[cs:ce], p.KVCache, p.RunState,
-					p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, cs, isLast, nil)
-				Sync()
 			}
+			runChunks := func(from, to int) {
+				for cs := from; cs < to; cs += prefillChunkSize {
+					ce := cs + prefillChunkSize
+					if ce > to {
+						ce = to
+					}
+					isLast := ce >= npos
+					GpuForwardPrefillBatchHybrid(p.CPUModel, p.GpuModel, tokens[cs:ce], p.KVCache, p.RunState,
+						p.BatchState, p.LogitsBuf, p.BatchLayerConfs, p, cs, isLast, nil)
+					Sync()
+				}
+			}
+			runChunks(prefillFrom, cacheableLen)
+			if cacheMode {
+				p.storeChatPrefix(tokens[:cacheableLen], cacheableLen)
+			}
+			runChunks(cacheableLen, npos)
 		} else {
 			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
 				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, nil)
