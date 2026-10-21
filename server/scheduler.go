@@ -58,6 +58,10 @@ type InferenceRequest struct {
 	StopSequences   []string      // user-provided stop sequences from API
 	ReasoningEffort string        // "low", "medium", "high" (default: "medium")
 	EnableThinking  *bool         // nil = auto (enabled for thinking models), false = disable
+	// ToolParamTypes maps tool name -> parameter name -> declared JSON type,
+	// built from the request's tool schemas. Used to keep argument values
+	// schema-conformant (e.g. a "string" parameter never becomes a raw number).
+	ToolParamTypes map[string]map[string]string
 	Config          llm.GenerateConfig
 	Tokens          []int32 // prompt tokens after formatting
 	Generated       []int32 // output tokens so far

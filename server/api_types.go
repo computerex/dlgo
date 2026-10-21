@@ -118,11 +118,19 @@ type ChatCompletionRequest struct {
 	Temperature       *float64    `json:"temperature,omitempty"`
 	TopP              *float64    `json:"top_p,omitempty"`
 	TopK              *int        `json:"top_k,omitempty"`
+	MinP              *float64    `json:"min_p,omitempty"`
 	MaxTokens         int         `json:"max_tokens,omitempty"`
 	Stream            bool        `json:"stream,omitempty"`
 	Stop              []string    `json:"stop,omitempty"`
 	Seed              *int64      `json:"seed,omitempty"`
 	RepetitionPenalty *float64    `json:"repetition_penalty,omitempty"`
+	FrequencyPenalty  *float64    `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float64    `json:"presence_penalty,omitempty"`
+	// NoRepeatNgramSize bans any token that would complete an n-gram already
+	// present in the generated text. Opt-in only: it truncates/mangles text
+	// that legitimately repeats an earlier span (tool-call arguments that
+	// restate a value from the model's reasoning, enumerated lists, quotes).
+	NoRepeatNgramSize *int        `json:"no_repeat_ngram_size,omitempty"`
 	ReasoningEffort   string      `json:"reasoning_effort,omitempty"`
 	EnableThinking    *bool       `json:"enable_thinking,omitempty"`
 	Tools             []Tool      `json:"tools,omitempty"`

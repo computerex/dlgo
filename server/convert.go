@@ -191,18 +191,59 @@ var toolCallRe = regexp.MustCompile(`\{"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\
 //   - a bare { "name": ..., "arguments": ... } object (legacy fallback)
 //
 // Returns nil if no tool calls are found.
-func parseToolCalls(text string) []ToolCall {
-	if tcs := parseNativeToolCalls(text); len(tcs) > 0 {
+//
+// types is the optional tool-name -> parameter -> declared-type lookup built
+// from the request's tool schemas (see buildToolParamTypes). It keeps decoded
+// arguments schema-conformant; pass nil to fall back to heuristic decoding.
+func parseToolCalls(text string, types map[string]map[string]string) []ToolCall {
+	if tcs := parseNativeToolCalls(text, types); len(tcs) > 0 {
 		return finalizeToolCalls(tcs)
 	}
 	return parseLegacyToolCalls(text)
+}
+
+// buildToolParamTypes extracts the declared JSON type of every tool parameter
+// from OpenAI-style tool schemas, so argument decoding can honour the schema
+// (a "string" parameter stays a JSON string even when its value looks numeric).
+func buildToolParamTypes(tools []Tool) map[string]map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]string, len(tools))
+	for _, tool := range tools {
+		params, ok := tool.Function.Parameters.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		props, ok := params["properties"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		byParam := make(map[string]string, len(props))
+		for name, raw := range props {
+			spec, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if ts, ok := spec["type"].(string); ok && ts != "" {
+				byParam[name] = ts
+			}
+		}
+		if len(byParam) > 0 {
+			out[tool.Function.Name] = byParam
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // parseNativeToolCalls extracts calls from <tool_call>...</tool_call> blocks.
 // The body may be the native <function=...> XML or a JSON object. Unterminated
 // blocks (from a truncated generation) are salvaged: the remaining text is
 // parsed as a best-effort body so the call still surfaces to the client.
-func parseNativeToolCalls(text string) []ToolCall {
+func parseNativeToolCalls(text string, types map[string]map[string]string) []ToolCall {
 	var out []ToolCall
 	search := 0
 	for {
@@ -220,7 +261,7 @@ func parseNativeToolCalls(text string) []ToolCall {
 			// Truncated block: take everything to the end of the text.
 			body = text[bodyStart:]
 		}
-		if tc, ok := parseToolCallBody(body); ok {
+		if tc, ok := parseToolCallBody(body, types); ok {
 			out = append(out, tc)
 		}
 		if !terminated {
@@ -232,10 +273,10 @@ func parseNativeToolCalls(text string) []ToolCall {
 }
 
 // parseToolCallBody parses the inner content of one <tool_call> block.
-func parseToolCallBody(body string) (ToolCall, bool) {
+func parseToolCallBody(body string, types map[string]map[string]string) (ToolCall, bool) {
 	trimmed := strings.TrimSpace(body)
 	if strings.Contains(trimmed, "<function=") {
-		if name, args, ok := parseXMLFunction(trimmed); ok {
+		if name, args, ok := parseXMLFunction(trimmed, types); ok {
 			return ToolCall{Type: "function", Function: FunctionCall{Name: name, Arguments: args}}, true
 		}
 	}
@@ -265,7 +306,7 @@ func parseToolCallBody(body string) (ToolCall, bool) {
 // parseXMLFunction parses a native <function=NAME> ... </function> block and
 // returns the function name plus an arguments JSON string built from the
 // <parameter=KEY>VALUE</parameter> pairs.
-func parseXMLFunction(body string) (name string, args string, ok bool) {
+func parseXMLFunction(body string, types map[string]map[string]string) (name string, args string, ok bool) {
 	fidx := strings.Index(body, "<function=")
 	if fidx < 0 {
 		return "", "", false
@@ -284,6 +325,10 @@ func parseXMLFunction(body string) (name string, args string, ok bool) {
 	if end := strings.Index(inner, "</function>"); end >= 0 {
 		inner = inner[:end]
 	}
+
+	// Declared parameter types for this tool (nil when the client sent no
+	// schema, in which case decoding stays heuristic).
+	declared := types[name]
 
 	argsMap := map[string]interface{}{}
 	search := 0
@@ -317,7 +362,7 @@ func parseXMLFunction(body string) (name string, args string, ok bool) {
 		raw = strings.TrimPrefix(raw, "\n")
 		raw = strings.TrimSuffix(raw, "\n")
 		if key != "" {
-			argsMap[key] = decodeArgValue(raw)
+			argsMap[key] = decodeArgValue(raw, declared[key])
 		}
 		if closeRel < 0 {
 			break
@@ -331,12 +376,24 @@ func parseXMLFunction(body string) (name string, args string, ok bool) {
 	return name, string(encoded), true
 }
 
-// decodeArgValue interprets a raw parameter value: if it is valid JSON (object,
-// array, number, bool, null) it is used as-is; otherwise it is treated as a
-// plain string. This lets structured arguments survive the string-based
-// transport while keeping free-form text (e.g. source code) as a string.
-func decodeArgValue(raw string) interface{} {
+// decodeArgValue interprets a raw parameter value. When the tool schema
+// declares the parameter type, the value is coerced to it — notably a
+// "string" parameter always stays a string, even when the model emitted a bare
+// number (so {"result": 233} does not violate a "type": "string" schema).
+// Without a declared type it falls back to the heuristic: valid JSON (object,
+// array, number, bool, null) is used as-is, anything else is a plain string.
+func decodeArgValue(raw string, wantType string) interface{} {
 	t := strings.TrimSpace(raw)
+	if wantType == "string" {
+		// A JSON-quoted string is unwrapped; everything else is literal text.
+		if len(t) >= 2 && t[0] == '"' && t[len(t)-1] == '"' {
+			var s string
+			if json.Unmarshal([]byte(t), &s) == nil {
+				return s
+			}
+		}
+		return raw
+	}
 	if t == "" {
 		return ""
 	}

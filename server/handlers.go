@@ -95,8 +95,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.TopK != nil {
 		sampler.TopK = *req.TopK
 	}
+	if req.MinP != nil {
+		sampler.MinP = float32(*req.MinP)
+	}
 	if req.RepetitionPenalty != nil {
 		sampler.RepetitionPenalty = float32(*req.RepetitionPenalty)
+	}
+	if req.FrequencyPenalty != nil {
+		sampler.FrequencyPenalty = float32(*req.FrequencyPenalty)
+	}
+	if req.PresencePenalty != nil {
+		sampler.PresencePenalty = float32(*req.PresencePenalty)
+	}
+	if req.NoRepeatNgramSize != nil {
+		sampler.NoRepeatNgramSize = *req.NoRepeatNgramSize
 	}
 
 	maxTokens := 8192
@@ -139,6 +151,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Seed:       seed,
 			ImageGrids: imageGrids,
 		},
+		ToolParamTypes: buildToolParamTypes(req.Tools),
 		Output: make(chan StreamEvent, 64),
 		Ctx:    ctx,
 		Cancel: cancel,
@@ -256,9 +269,9 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			// Tool calls can land in the content stream or, if the model emitted
 			// them inside its reasoning, in the reasoning content. Extract from
 			// content first; only fall back to reasoning when content has none.
-			tcs := parseToolCalls(collected)
+			tcs := parseToolCalls(collected, infReq.ToolParamTypes)
 			if len(tcs) == 0 && reasoningContent != "" {
-				if rtcs := parseToolCalls(reasoningContent); len(rtcs) > 0 {
+				if rtcs := parseToolCalls(reasoningContent, infReq.ToolParamTypes); len(rtcs) > 0 {
 					tcs = rtcs
 				}
 			}
@@ -370,9 +383,9 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	// Tool calls can land in the content stream, or — if the model emitted them
 	// inside its reasoning — in the reasoning content. Extract from content first;
 	// only fall back to reasoning when content has none (avoids duplicates).
-	tcs := parseToolCalls(fullText)
+	tcs := parseToolCalls(fullText, infReq.ToolParamTypes)
 	if len(tcs) == 0 && reasoningContent != "" {
-		if rtcs := parseToolCalls(reasoningContent); len(rtcs) > 0 {
+		if rtcs := parseToolCalls(reasoningContent, infReq.ToolParamTypes); len(rtcs) > 0 {
 			tcs = rtcs
 		}
 	}

@@ -99,4 +99,67 @@ func TestDefaultSamplerConfig(t *testing.T) {
 	if cfg.TopP != 0.9 {
 		t.Errorf("default topP = %f, want 0.9", cfg.TopP)
 	}
+	// Anti-repetition penalties must stay off by default: n-gram blocking
+	// truncates text that legitimately repeats an earlier span (see the
+	// tool-call argument case in DefaultSamplerConfig).
+	if cfg.NoRepeatNgramSize != 0 {
+		t.Errorf("default NoRepeatNgramSize = %d, want 0 (off)", cfg.NoRepeatNgramSize)
+	}
+	if cfg.RepetitionPenalty != 1.0 {
+		t.Errorf("default RepetitionPenalty = %f, want 1.0 (off)", cfg.RepetitionPenalty)
+	}
+}
+
+// TestDefaultSamplerAllowsRepeatingEarlierNgram is a regression test for the
+// bug where a tool-call argument that restated a value already produced in the
+// reasoning block was truncated: with the shipped defaults, the token that
+// completes an already-seen n-gram must NOT be banned.
+func TestDefaultSamplerAllowsRepeatingEarlierNgram(t *testing.T) {
+	cfg := DefaultSamplerConfig()
+	cfg.Temperature = 0 // greedy, deterministic
+
+	// Pretend the model already emitted "F(13) = 233" while thinking, and is
+	// now about to restate it inside a tool-call argument.
+	recent := []int32{9, 8, 7, 6, 5, 4, 3, 2, 1}
+	continuation := int32(1234) // stands in for the repeated value token
+
+	// Make the repeated value the greedy choice, but put a decoy close behind
+	// so a banned token would still be replaced by something else.
+	logits := make([]float32, 4096)
+	for i := range logits {
+		logits[i] = -10
+	}
+	logits[continuation] = 20
+	logits[999] = 19
+
+	for i := 0; i < 8; i++ {
+		got := SampleToken(logits, cfg, recent, nil)
+		if int32(got) != continuation {
+			t.Fatalf("sample %d = %d, want %d (repeated n-gram must not be blocked)", i, got, continuation)
+		}
+		logits = make([]float32, 4096)
+		for j := range logits {
+			logits[j] = -10
+		}
+		logits[continuation] = 20
+		logits[999] = 19
+	}
+
+	// And confirm the hazard is real when the knob is explicitly turned on:
+	// the token completing the seen 8-gram becomes unavailable.
+	on := cfg
+	on.NoRepeatNgramSize = 8
+	// Build a history whose last 7 tokens repeat early, followed by the value.
+	hist := make([]int32, 0, 16)
+	hist = append(hist, 1, 2, 3, 4, 5, 6, 7, 8)
+	hist = append(hist, 1, 2, 3, 4, 5, 6, 7)
+	blocked := make([]float32, 32)
+	for i := range blocked {
+		blocked[i] = -10
+	}
+	blocked[8] = 20
+	blocked[9] = 19
+	if got := SampleToken(blocked, on, hist, nil); got == 8 {
+		t.Fatalf("with NoRepeatNgramSize=8 the repeated token 8 should have been blocked")
+	}
 }

@@ -20,14 +20,27 @@ type SamplerConfig struct {
 
 func DefaultSamplerConfig() SamplerConfig {
 	return SamplerConfig{
-		Temperature:       0.7,
-		TopK:              40,
-		TopP:              0.9,
-		MinP:              0,
-		RepetitionPenalty: 1.1,
+		Temperature: 0.7,
+		TopK:        40,
+		TopP:        0.9,
+		MinP:        0,
+		// Anti-repetition penalties are OFF by default, matching llama.cpp and
+		// the OpenAI sampling surface. They are not neutral transforms and must
+		// be opt-in:
+		//
+		//   * NoRepeatNgramSize bans the token that would complete an n-gram
+		//     already present in the generated text. Any legitimate repeat is
+		//     therefore impossible: a tool-call argument that restates a value
+		//     the model already emitted while reasoning gets truncated exactly
+		//     at the repeat (e.g. reasoning says "F(13) = 233", then the
+		//     argument is cut to "F(13) = "), and enumerated lists / quoted
+		//     snippets get mangled into filler tokens.
+		//   * RepetitionPenalty > 1 punishes every already-seen token, which
+		//     distorts long thinking traces where the same tokens must recur.
+		RepetitionPenalty: 1.0,
 		FrequencyPenalty:  0.0,
 		PresencePenalty:   0.0,
-		NoRepeatNgramSize: 8,
+		NoRepeatNgramSize: 0,
 	}
 }
 

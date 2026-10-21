@@ -7,6 +7,64 @@ import (
 	"github.com/computerex/dlgo/models/llm"
 )
 
+// TestParseToolCallsSchemaTypedArguments verifies that a parameter declared as
+// "type": "string" is emitted as a JSON string even when the model wrote a bare
+// number, while untyped parameters keep the heuristic decoding.
+func TestParseToolCallsSchemaTypedArguments(t *testing.T) {
+	types := map[string]map[string]string{
+		"attempt_completion": {"result": "string"},
+	}
+	input := "<tool_call>\n<function=attempt_completion>\n<parameter=result>\n233\n</parameter>\n</function>\n</tool_call>"
+
+	calls := parseToolCalls(input, types)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v (%s)", err, calls[0].Function.Arguments)
+	}
+	if s, ok := args["result"].(string); !ok || s != "233" {
+		t.Fatalf("result = %#v, want string %q", args["result"], "233")
+	}
+
+	// Without a schema, heuristic decoding keeps the bare number.
+	args = nil
+	calls = parseToolCalls(input, nil)
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v", err)
+	}
+	if _, ok := args["result"].(float64); !ok {
+		t.Fatalf("untyped result = %#v, want number", args["result"])
+	}
+}
+
+// TestBuildToolParamTypes checks schema extraction used for typed decoding.
+func TestBuildToolParamTypes(t *testing.T) {
+	tools := []Tool{{
+		Type: "function",
+		Function: Function{
+			Name: "write_file",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path":     map[string]interface{}{"type": "string"},
+					"contents": map[string]interface{}{"type": "string"},
+					"mode":     map[string]interface{}{"type": "integer"},
+				},
+			},
+		},
+	}}
+	got := buildToolParamTypes(tools)
+	params := got["write_file"]
+	if params["path"] != "string" || params["contents"] != "string" || params["mode"] != "integer" {
+		t.Fatalf("param types = %v, want path/contents=string mode=integer", params)
+	}
+	if buildToolParamTypes(nil) != nil {
+		t.Fatalf("nil tools should produce a nil lookup")
+	}
+}
+
 func TestFormatToolDefinitions(t *testing.T) {
 	tools := []Tool{
 		{
@@ -240,7 +298,7 @@ func TestParseToolCalls(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			calls := parseToolCalls(tt.input)
+			calls := parseToolCalls(tt.input, nil)
 			gotOk := len(calls) > 0
 			if gotOk != tt.wantOk {
 				t.Errorf("parseToolCalls() found = %v, want %v", gotOk, tt.wantOk)
@@ -302,7 +360,7 @@ func BenchmarkParseToolCalls(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		parseToolCalls(input)
+		parseToolCalls(input, nil)
 	}
 }
 
@@ -398,7 +456,7 @@ func TestFormatToolDefinitionsQwen35(t *testing.T) {
 func TestParseNativeToolCallsXML(t *testing.T) {
 	input := "Sure, let me check.\n" +
 		"<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>"
-	calls := parseToolCalls(input)
+	calls := parseToolCalls(input, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(calls))
 	}
@@ -419,7 +477,7 @@ func TestParseNativeToolCallsXML(t *testing.T) {
 
 func TestParseNativeToolCallsMultilineValue(t *testing.T) {
 	input := "<tool_call>\n<function=write_file>\n<parameter=content>\ndef fibonacci():\n    return 1\n</parameter>\n<parameter=path>\n/tmp/fib.py\n</parameter>\n</function>\n</tool_call>"
-	calls := parseToolCalls(input)
+	calls := parseToolCalls(input, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(calls))
 	}
@@ -437,7 +495,7 @@ func TestParseNativeToolCallsMultilineValue(t *testing.T) {
 
 func TestParseNativeToolCallsMultiple(t *testing.T) {
 	input := "<tool_call>\n<function=a>\n</function>\n</tool_call>\n<tool_call>\n<function=b>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
-	calls := parseToolCalls(input)
+	calls := parseToolCalls(input, nil)
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 tool calls, got %d", len(calls))
 	}
@@ -453,7 +511,7 @@ func TestParseNativeToolCallsJSONBody(t *testing.T) {
 	input := `<tool_call>
 {"name": "get_weather", "arguments": {"city": "Paris"}}
 </tool_call>`
-	calls := parseToolCalls(input)
+	calls := parseToolCalls(input, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 tool call, got %d", len(calls))
 	}
@@ -517,7 +575,7 @@ func min2(a, b int) int {
 // still surfaces a call instead of silently doing nothing.
 func TestParseNativeToolCallsTruncated(t *testing.T) {
 	input := "\n\n<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/x.py\n</parameter>\n<parameter=content>\ndef f():\n    return 1"
-	calls := parseToolCalls(input)
+	calls := parseToolCalls(input, nil)
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 salvaged tool call, got %d", len(calls))
 	}
@@ -564,7 +622,7 @@ func TestLegacyToolConventionUnchanged(t *testing.T) {
 	}
 
 	// Bare-JSON tool call (the legacy convention) still parses.
-	calls := parseToolCalls(`{"name": "get_weather", "arguments": {"city": "NYC"}}`)
+	calls := parseToolCalls(`{"name": "get_weather", "arguments": {"city": "NYC"}}`, nil)
 	if len(calls) != 1 || calls[0].Function.Name != "get_weather" {
 		t.Fatalf("legacy bare-JSON parse failed: %+v", calls)
 	}
