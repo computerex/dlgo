@@ -1797,6 +1797,14 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 		thinkBudget = maxThinkBudget
 	}
 	gpuStep := 0
+	// Guard against an empty assistant turn: aggressive quantizations sometimes
+	// close </think> and immediately emit EOS, producing a response with no
+	// content and no tool call. Clients cannot act on that and can sit waiting
+	// forever. Track when thinking closed and whether any real output followed.
+	thinkClosed := false
+	thinkCloseStep := 0
+	answerStarted := false
+	const postThinkGuardSteps = 64
 
 	// Grammar-aware sampling helper (applies EOG suppression + grammar)
 	gpuGrammarSample := func(logits []float32) int {
@@ -1805,7 +1813,14 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 				logits[id] = float32(math.Inf(-1))
 			}
 		}
-		if gpuInThinkBlock && gpuStep < thinkBudget {
+		suppressStop := gpuInThinkBlock && gpuStep < thinkBudget
+		// After thinking closes, do not allow a stop token until at least one
+		// non-whitespace output token exists. Without this, a degenerate sample
+		// ends the turn with empty content and no tool call.
+		if thinkClosed && !answerStarted && gpuStep-thinkCloseStep < postThinkGuardSteps {
+			suppressStop = true
+		}
+		if suppressStop {
 			eos := p.CPUModel.Config.EOS
 			if int(eos) < len(logits) {
 				logits[eos] = float32(math.Inf(-1))
@@ -1891,9 +1906,14 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 
 		tokenText = p.Tokenizer.DecodeToken(int32(nextToken))
 		genText.WriteString(tokenText)
+		if thinkClosed && strings.TrimSpace(tokenText) != "" {
+			answerStarted = true
+		}
 
-		if gpuInThinkBlock && strings.Contains(genText.String(), "</think>") {
+		if gpuInThinkBlock && strings.Contains(genText.String(), "</"+"think>") {
 			gpuInThinkBlock = false
+			thinkClosed = true
+			thinkCloseStep = gpuStep
 		}
 
 		if gpuCheckTextStop(genText.String(), stopStrings) {
