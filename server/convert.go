@@ -199,7 +199,9 @@ func parseToolCalls(text string) []ToolCall {
 }
 
 // parseNativeToolCalls extracts calls from <tool_call>...</tool_call> blocks.
-// The body may be the native <function=...> XML or a JSON object.
+// The body may be the native <function=...> XML or a JSON object. Unterminated
+// blocks (from a truncated generation) are salvaged: the remaining text is
+// parsed as a best-effort body so the call still surfaces to the client.
 func parseNativeToolCalls(text string) []ToolCall {
 	var out []ToolCall
 	search := 0
@@ -210,16 +212,21 @@ func parseNativeToolCalls(text string) []ToolCall {
 		}
 		bodyStart := search + open + len("<tool_call>")
 		closeRel := strings.Index(text[bodyStart:], "</tool_call>")
-		if closeRel < 0 {
-			// Unterminated block (truncated generation): stop.
-			break
+		var body string
+		terminated := closeRel >= 0
+		if terminated {
+			body = text[bodyStart : bodyStart+closeRel]
+		} else {
+			// Truncated block: take everything to the end of the text.
+			body = text[bodyStart:]
 		}
-		body := text[bodyStart : bodyStart+closeRel]
-		search = bodyStart + closeRel + len("</tool_call>")
-
 		if tc, ok := parseToolCallBody(body); ok {
 			out = append(out, tc)
 		}
+		if !terminated {
+			break
+		}
+		search = bodyStart + closeRel + len("</tool_call>")
 	}
 	return out
 }
@@ -293,16 +300,28 @@ func parseXMLFunction(body string) (name string, args string, ok bool) {
 		key := strings.TrimSpace(inner[p : p+gtv])
 		valStart := p + gtv + 1
 		closeRel := strings.Index(inner[valStart:], "</parameter>")
+		var raw string
 		if closeRel < 0 {
-			break
+			// Truncated parameter (no closing tag): salvage the remainder. Strip a
+			// trailing partial </function> or </tool_call> fragment if present.
+			raw = inner[valStart:]
+			raw = strings.TrimSuffix(raw, "</function>")
+			raw = strings.TrimSuffix(raw, "</tool_call>")
+			search = len(inner)
+		} else {
+			raw = inner[valStart : valStart+closeRel]
+			search = valStart + closeRel + len("</parameter>")
 		}
-		raw := inner[valStart : valStart+closeRel]
-		search = valStart + closeRel + len("</parameter>")
 
 		// The template wraps each value in a leading and trailing newline.
 		raw = strings.TrimPrefix(raw, "\n")
 		raw = strings.TrimSuffix(raw, "\n")
-		argsMap[key] = decodeArgValue(raw)
+		if key != "" {
+			argsMap[key] = decodeArgValue(raw)
+		}
+		if closeRel < 0 {
+			break
+		}
 	}
 
 	encoded, err := json.Marshal(argsMap)

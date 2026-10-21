@@ -253,8 +253,19 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			flushSafe(true)
 			collected := fullText.String()
 
-			// Try to detect tool calls in the final output
+			// Tool calls can land in the content stream or, if the model emitted
+			// them inside its reasoning, in the reasoning content. Extract from
+			// content first; only fall back to reasoning when content has none.
 			tcs := parseToolCalls(collected)
+			if len(tcs) == 0 && reasoningContent != "" {
+				if rtcs := parseToolCalls(reasoningContent); len(rtcs) > 0 {
+					tcs = rtcs
+				}
+			}
+			// Never leak tool-call syntax into the visible reasoning block.
+			if reasoningContent != "" && strings.Contains(reasoningContent, "<tool_call>") {
+				reasoningContent = stripToolCalls(reasoningContent)
+			}
 			if len(tcs) > 0 {
 				// Send a final chunk carrying the tool_calls with finish_reason
 				// "tool_calls".
@@ -352,20 +363,24 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	}
 
 	// If thinking didn't complete (no </think> found) and content is empty,
-	// use the reasoning content as the response content. This handles cases
-	// where aggressive quantization (IQ3_XXS etc.) makes the model verbose
-	// in thinking and unable to close </think> within the token budget.
-	if fullText == "" && reasoningContent != "" {
-		fullText = reasoningContent
-		if completionTokens == 0 {
-			completionTokens = len(strings.Fields(reasoningContent)) // approximate fallback
+	// the scheduler may have left everything as reasoning. We handle that fallback
+	// AFTER tool-call extraction below, so a tool call hidden in the reasoning is
+	// still surfaced as a call instead of being dumped into content.
+
+	// Tool calls can land in the content stream, or — if the model emitted them
+	// inside its reasoning — in the reasoning content. Extract from content first;
+	// only fall back to reasoning when content has none (avoids duplicates).
+	tcs := parseToolCalls(fullText)
+	if len(tcs) == 0 && reasoningContent != "" {
+		if rtcs := parseToolCalls(reasoningContent); len(rtcs) > 0 {
+			tcs = rtcs
 		}
 	}
+	// Never leak tool-call syntax into the visible reasoning block.
+	if reasoningContent != "" && strings.Contains(reasoningContent, "<tool_call>") {
+		reasoningContent = stripToolCalls(reasoningContent)
+	}
 
-	// Try to parse tool calls from the generated text.
-	// When found, strip the JSON from the content and keep any remaining
-	// natural language (the model often generates both).
-	tcs := parseToolCalls(fullText)
 	if len(tcs) > 0 {
 		// Strip tool call blocks from the text to recover any natural language
 		// the model emitted alongside the call.
@@ -397,6 +412,16 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 		return
+	}
+
+	// No tool call. If thinking didn't complete and content is empty, fall back
+	// to the reasoning content as the response content (aggressive quantizations
+	// sometimes can't close the think block within the budget).
+	if fullText == "" && reasoningContent != "" {
+		fullText = reasoningContent
+		if completionTokens == 0 {
+			completionTokens = len(strings.Fields(reasoningContent))
+		}
 	}
 
 	resp := ChatCompletionResponse{

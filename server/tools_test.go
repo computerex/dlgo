@@ -511,6 +511,40 @@ func min2(a, b int) int {
 	return b
 }
 
+// TestParseNativeToolCallsTruncated verifies that an unterminated (truncated)
+// <tool_call> block is still salvaged into a best-effort tool call, so a model
+// that stops mid-call (e.g. when thinking + large content exceed max_tokens)
+// still surfaces a call instead of silently doing nothing.
+func TestParseNativeToolCallsTruncated(t *testing.T) {
+	input := "\n\n<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/x.py\n</parameter>\n<parameter=content>\ndef f():\n    return 1"
+	calls := parseToolCalls(input)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 salvaged tool call, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "write_file" {
+		t.Fatalf("name = %q, want write_file", calls[0].Function.Name)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v (%q)", err, calls[0].Function.Arguments)
+	}
+	if args["path"] != "/tmp/x.py" {
+		t.Errorf("path = %q, want /tmp/x.py", args["path"])
+	}
+	if args["content"] != "def f():\n    return 1" {
+		t.Errorf("content = %q", args["content"])
+	}
+}
+
+// TestStripToolCallsTruncated verifies an unterminated <tool_call> is removed
+// from content (to end of text).
+func TestStripToolCallsTruncated(t *testing.T) {
+	input := "Here.\n<tool_call>\n<function=f>\n<parameter=x>\n1"
+	if got := stripToolCalls(input); got != "Here." {
+		t.Errorf("stripToolCalls(truncated) = %q, want %q", got, "Here.")
+	}
+}
+
 // TestLegacyToolConventionUnchanged locks in that architectures without a native
 // tool protocol (every arch except qwen35/qwen35moe) keep the original
 // OpenAI-style behavior: prose tool definitions that ask for bare JSON, and the
