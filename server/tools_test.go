@@ -26,7 +26,7 @@ func TestFormatToolDefinitions(t *testing.T) {
 		},
 	}
 
-	result := formatToolDefinitions(tools)
+	result := formatToolDefinitions(tools, "")
 
 	if result == "" {
 		t.Fatal("formatToolDefinitions returned empty string")
@@ -61,7 +61,7 @@ func TestFormatToolDefinitions_Multiple(t *testing.T) {
 		},
 	}
 
-	result := formatToolDefinitions(tools)
+	result := formatToolDefinitions(tools, "")
 
 	if !containsString(result, "get_weather") {
 		t.Error("result should contain 'get_weather'")
@@ -87,7 +87,7 @@ func TestConvertMessages(t *testing.T) {
 		{Role: "user", Content: MessageContent{Text: "What's the weather in NYC?"}},
 	}
 
-	result := convertMessages(messages, tools)
+	result := convertMessages(messages, tools, "")
 
 	// Should have a system message prepended
 	if len(result) != 2 {
@@ -123,7 +123,7 @@ func TestConvertMessages_ExistingSystem(t *testing.T) {
 		{Role: "user", Content: MessageContent{Text: "What's the weather in NYC?"}},
 	}
 
-	result := convertMessages(messages, tools)
+	result := convertMessages(messages, tools, "")
 
 	// Should still have 2 messages (system message should be updated, not duplicated)
 	if len(result) != 2 {
@@ -149,7 +149,7 @@ func TestConvertMessages_NoTools(t *testing.T) {
 		{Role: "user", Content: MessageContent{Text: "Hello"}},
 	}
 
-	result := convertMessages(messages, nil)
+	result := convertMessages(messages, nil, "")
 
 	if len(result) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(result))
@@ -177,7 +177,7 @@ func TestConvertMessages_ToolCalls(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_0", Content: MessageContent{Text: "22°C, sunny"}},
 	}
 
-	result := convertMessages(messages, nil)
+	result := convertMessages(messages, nil, "")
 
 	if len(result) != 3 {
 		t.Fatalf("expected 3 messages, got %d", len(result))
@@ -269,7 +269,7 @@ func TestFormatToolDefinitions_EmptyParams(t *testing.T) {
 		},
 	}
 
-	result := formatToolDefinitions(tools)
+	result := formatToolDefinitions(tools, "")
 
 	if !containsString(result, "no_params_tool") {
 		t.Error("result should contain tool name")
@@ -327,7 +327,7 @@ func BenchmarkFormatToolDefinitions(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		formatToolDefinitions(tools)
+		formatToolDefinitions(tools, "")
 	}
 }
 
@@ -365,4 +365,146 @@ func TestToolCallJSONRoundTrip(t *testing.T) {
 	if decoded[0].Function.Name != original[0].Function.Name {
 		t.Errorf("Name mismatch: %s != %s", decoded[0].Function.Name, original[0].Function.Name)
 	}
+}
+
+func TestFormatToolDefinitionsQwen35(t *testing.T) {
+	tools := []Tool{{
+		Type: "function",
+		Function: Function{
+			Name:        "get_weather",
+			Description: "Get weather",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"city": map[string]interface{}{"type": "string"},
+				},
+			},
+		},
+	}}
+	out := formatToolDefinitions(tools, "qwen35")
+	for _, want := range []string{"# Tools", "<tools>", "</tools>", `"name":"get_weather"`, "<function=example_function_name>", "<IMPORTANT>", "<tool_call>"} {
+		if !containsString(out, want) {
+			t.Errorf("qwen35 tool definitions missing %q\n%s", want, out)
+		}
+	}
+	// It must not emit the legacy prose "respond with JSON" instruction.
+	if containsString(out, "respond with JSON") {
+		t.Error("qwen35 tool definitions should not use legacy prose instruction")
+	}
+}
+
+func TestParseNativeToolCallsXML(t *testing.T) {
+	input := "Sure, let me check.\n" +
+		"<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>"
+	calls := parseToolCalls(input)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "get_weather" {
+		t.Errorf("name = %q, want get_weather", calls[0].Function.Name)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v (%q)", err, calls[0].Function.Arguments)
+	}
+	if args["city"] != "Tokyo" {
+		t.Errorf("city = %q, want Tokyo", args["city"])
+	}
+	if args["unit"] != "celsius" {
+		t.Errorf("unit = %q, want celsius", args["unit"])
+	}
+}
+
+func TestParseNativeToolCallsMultilineValue(t *testing.T) {
+	input := "<tool_call>\n<function=write_file>\n<parameter=content>\ndef fibonacci():\n    return 1\n</parameter>\n<parameter=path>\n/tmp/fib.py\n</parameter>\n</function>\n</tool_call>"
+	calls := parseToolCalls(input)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments not valid JSON: %v", err)
+	}
+	if args["path"] != "/tmp/fib.py" {
+		t.Errorf("path = %q", args["path"])
+	}
+	if args["content"] != "def fibonacci():\n    return 1" {
+		t.Errorf("content = %q", args["content"])
+	}
+}
+
+func TestParseNativeToolCallsMultiple(t *testing.T) {
+	input := "<tool_call>\n<function=a>\n</function>\n</tool_call>\n<tool_call>\n<function=b>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+	calls := parseToolCalls(input)
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "a" || calls[1].Function.Name != "b" {
+		t.Errorf("names = %q, %q; want a, b", calls[0].Function.Name, calls[1].Function.Name)
+	}
+	if calls[1].Function.Arguments != `{"x":1}` {
+		t.Errorf("b args = %q, want {\"x\":1}", calls[1].Function.Arguments)
+	}
+}
+
+func TestParseNativeToolCallsJSONBody(t *testing.T) {
+	input := `<tool_call>
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+</tool_call>`
+	calls := parseToolCalls(input)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "get_weather" {
+		t.Errorf("name = %q", calls[0].Function.Name)
+	}
+}
+
+func TestStripToolCalls(t *testing.T) {
+	input := "Here you go.\n<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+	if got := stripToolCalls(input); got != "Here you go." {
+		t.Errorf("stripToolCalls = %q, want %q", got, "Here you go.")
+	}
+}
+
+func TestConvertMessagesQwen35ToolsFirst(t *testing.T) {
+	tools := []Tool{{Type: "function", Function: Function{Name: "f", Description: "d"}}}
+	msgs := []Message{
+		{Role: "system", Content: MessageContent{Text: "You are helpful."}},
+		{Role: "user", Content: MessageContent{Text: "hi"}},
+	}
+	out := convertMessages(msgs, tools, "qwen35")
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(out))
+	}
+	sys := out[0].Content
+	if !containsString(sys, "<tools>") || !containsString(sys, "You are helpful.") {
+		t.Fatalf("system missing expected content: %q", sys)
+	}
+	// Tool block must precede the user system content (matches the template).
+	if !containsStringPrefixBefore(sys, "# Tools", "You are helpful.") {
+		t.Errorf("tool block should precede user system content; got %q", sys[:min2(len(sys), 80)])
+	}
+}
+
+func containsStringPrefixBefore(s, first, second string) bool {
+	i := indexOfStr(s, first)
+	j := indexOfStr(s, second)
+	return i >= 0 && j >= 0 && i < j
+}
+
+func indexOfStr(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+func min2(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

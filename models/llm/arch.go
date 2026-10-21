@@ -1,8 +1,10 @@
 package llm
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -14,7 +16,34 @@ type ArchDescriptor struct {
 	EmbedScaleMode   string // "none" or "sqrt_dim"
 	ChatTemplate     string // "chatml", "llama2", "llama3", "gemma", "phi"
 	SupportsThinking bool   // true = model uses <think> blocks (Qwen3/3.5)
+	ToolCallFormat   string // native tool-call protocol, see ToolCallFormat* constants
 }
+
+// Native tool-call protocols.
+//
+// ToolCallFormatQwen35 selects the Qwen3.5 / Qwen3.6 native protocol that the
+// model's embedded chat template defines:
+//
+//   - Function signatures are rendered into the system turn inside a
+//     <tools>...</tools> XML block, one compact JSON object per line.
+//   - The model emits calls as:
+//          <tool_call>
+//          <function=NAME>
+//          <parameter=KEY>
+//          VALUE
+//          </parameter>
+//          </function>
+//          </tool_call>
+//   - Tool results are returned in a <tool_response>...</tool_response> block
+//     inside a *user* turn.
+//
+// The empty value selects the legacy behavior (prose tool description +
+// bare-JSON scraping) used for architectures that have no native protocol
+// wired up yet.
+const (
+	ToolCallFormatNone   = ""
+	ToolCallFormatQwen35 = "qwen35"
+)
 
 // archRegistry maps architecture names to their descriptors.
 var archRegistry = map[string]ArchDescriptor{
@@ -28,8 +57,8 @@ var archRegistry = map[string]ArchDescriptor{
 	"phi2":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"phi3":      {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "phi"},
 	"mistral":   {RopeNeox: false, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "llama2"},
-	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
-	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
+	"qwen35":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true, ToolCallFormat: ToolCallFormatQwen35},
+	"qwen35moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true, ToolCallFormat: ToolCallFormatQwen35},
 	"deepseek2": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "harmony"},
 	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
@@ -165,7 +194,7 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 	var prompt string
 	switch template {
 	case "chatml":
-		prompt = formatChatMLMessages(messages)
+		prompt = formatChatMLDispatch(messages, arch)
 	case "chatml_sep":
 		prompt = formatChatMLSepMessages(messages)
 	case "llama3":
@@ -183,7 +212,7 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 	case "plain":
 		prompt = formatPlainMessages(messages)
 	default:
-		prompt = formatChatMLMessages(messages)
+		prompt = formatChatMLDispatch(messages, arch)
 	}
 
 	if thinking {
@@ -267,6 +296,209 @@ func formatChatMLMessages(messages []Message) string {
 	}
 	b.WriteString("<|im_start|>assistant\n")
 	return b.String()
+}
+
+// formatChatMLDispatch selects the chatml renderer variant for the given
+// architecture. Qwen3.5/3.6 use a native tool protocol (see
+// formatChatMLQwen35Messages); everything else uses the classic renderer.
+func formatChatMLDispatch(messages []Message, arch ArchDescriptor) string {
+	if arch.ToolCallFormat == ToolCallFormatQwen35 {
+		return formatChatMLQwen35Messages(messages)
+	}
+	return formatChatMLMessages(messages)
+}
+
+// formatChatMLQwen35Messages renders messages using the Qwen3.5/3.6 native
+// ChatML template, matching the model's embedded Jinja template exactly so the
+// model uses its trained tool-call protocol.
+//
+// Key differences from the classic renderer:
+//   - Assistant tool calls are rendered as:
+//         <tool_call>
+//         <function=NAME>
+//         <parameter=KEY>
+//         VALUE
+//         </parameter>
+//         </function>
+//         </tool_call>
+//   - Tool results are emitted inside a *user* turn wrapped in
+//     <tool_response>...</tool_response> (consecutive tool results are grouped
+//     into a single user turn, matching the Jinja template).
+func formatChatMLQwen35Messages(messages []Message) string {
+	// lastQueryIndex mirrors the Jinja template's ns.last_query_index: the index
+	// of the last user message that is a genuine query (not a <tool_response>
+	// block). Assistant messages after it are rendered with an (empty) <think>
+	// block, matching the reference template.
+	lastQueryIndex := -1
+	for idx := len(messages) - 1; idx >= 0; idx-- {
+		if messages[idx].Role != "user" {
+			continue
+		}
+		c := strings.TrimSpace(messages[idx].Content)
+		if strings.HasPrefix(c, "<tool_response>") && strings.HasSuffix(c, "</tool_response>") {
+			continue
+		}
+		lastQueryIndex = idx
+		break
+	}
+
+	var b strings.Builder
+	for i := 0; i < len(messages); i++ {
+		m := messages[i]
+
+		// Group consecutive tool result messages into one user turn.
+		if m.Role == "tool" {
+			b.WriteString("<|im_start|>user")
+			for i < len(messages) && messages[i].Role == "tool" {
+				b.WriteString("\n<tool_response>\n")
+				b.WriteString(messages[i].Content)
+				b.WriteString("\n</tool_response>")
+				i++
+			}
+			b.WriteString("<|im_end|>\n")
+			i-- // outer loop will i++
+			continue
+		}
+
+		b.WriteString("<|im_start|>")
+		b.WriteString(m.Role)
+		b.WriteString("\n")
+
+		if m.Role == "assistant" {
+			if i > lastQueryIndex {
+				// No separate reasoning_content is carried on history turns, so
+				// render the empty thinking block the template expects.
+				b.WriteString("<think>\n\n</think>\n\n")
+			}
+			b.WriteString(m.Content)
+			for j, tc := range m.ToolCalls {
+				if j == 0 {
+					if m.Content != "" {
+						b.WriteString("\n\n")
+					}
+				} else {
+					b.WriteString("\n")
+				}
+				b.WriteString("<tool_call>\n<function=")
+				b.WriteString(tc.Name)
+				b.WriteString(">\n")
+				for _, kv := range orderedArgs(tc.Arguments) {
+					b.WriteString("<parameter=")
+					b.WriteString(kv.key)
+					b.WriteString(">\n")
+					b.WriteString(kv.value)
+					b.WriteString("\n</parameter>\n")
+				}
+				b.WriteString("</function>\n</tool_call>")
+			}
+		} else {
+			b.WriteString(m.Content)
+		}
+
+		b.WriteString("<|im_end|>\n")
+	}
+	b.WriteString("<|im_start|>assistant\n")
+	return b.String()
+}
+
+type argKV struct{ key, value string }
+
+// orderedArgs parses an OpenAI-style arguments JSON object into an ordered list
+// of key/value pairs whose values are rendered the way the Jinja template does
+// (objects/arrays as compact JSON, scalars as their string form).
+func orderedArgs(argsJSON string) []argKV {
+	trimmed := strings.TrimSpace(argsJSON)
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	// The arguments field is a JSON object encoded as a string. Some clients
+	// pass a JSON string containing JSON; unwrap one level if needed.
+	if strings.HasPrefix(trimmed, "\"") {
+		var s string
+		if json.Unmarshal([]byte(trimmed), &s) == nil {
+			trimmed = strings.TrimSpace(s)
+		}
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var obj map[string]interface{}
+	if err := dec.Decode(&obj); err != nil {
+		return nil
+	}
+	// Preserve input order for stability where possible.
+	var keys []string
+	keys = append(keys, orderedKeys(trimmed)...)
+	seen := map[string]bool{}
+	out := make([]argKV, 0, len(obj))
+	add := func(k string) {
+		if seen[k] {
+			return
+		}
+		if v, ok := obj[k]; ok {
+			seen[k] = true
+			out = append(out, argKV{key: k, value: renderArgValue(v)})
+		}
+	}
+	for _, k := range keys {
+		add(k)
+	}
+	for k := range obj {
+		add(k)
+	}
+	return out
+}
+
+// orderedKeys returns object keys in the order they appear in rawJSON.
+func orderedKeys(rawJSON string) []string {
+	dec := json.NewDecoder(strings.NewReader(rawJSON))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil
+	}
+	var keys []string
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return keys
+		}
+		key, _ := kt.(string)
+		keys = append(keys, key)
+		// Skip the value.
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return keys
+		}
+	}
+	return keys
+}
+
+// renderArgValue renders a decoded JSON value the way the Qwen Jinja template
+// does: mappings and sequences become compact JSON, everything else its string
+// form.
+func renderArgValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case bool:
+		return strconv.FormatBool(x)
+	case nil:
+		return "null"
+	case map[string]interface{}, []interface{}:
+		if b, err := json.Marshal(x); err == nil {
+			return string(b)
+		}
+		return ""
+	default:
+		if b, err := json.Marshal(x); err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%v", x)
+	}
 }
 
 // formatLlama3Messages formats messages using LLaMA 3 template.

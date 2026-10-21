@@ -42,8 +42,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Determine the model's native tool-call protocol so tool definitions and
+	// parsing match what the model was trained on.
+	toolFormat := llm.GetArchDescriptor(model.CPUPipeline.Model.Config.Architecture).ToolCallFormat
+
 	// Convert messages, injecting tool definitions and formatting tool results
-	msgs := convertMessages(req.Messages, req.Tools)
+	msgs := convertMessages(req.Messages, req.Tools, toolFormat)
 
 	// Collect image references (multimodal content arrays) in message order.
 	var imageRefs []string
@@ -105,6 +109,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		seed = *req.Seed
 	}
 
+	// Agentic tool-calling defaults to non-thinking mode: it is faster and, in
+	// practice, produces more reliable tool arguments. Callers can opt back into
+	// reasoning with enable_thinking:true.
+	if len(req.Tools) > 0 && req.EnableThinking == nil {
+		off := false
+		req.EnableThinking = &off
+	}
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -128,9 +140,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Cancel: cancel,
 	}
 
-	// When tools are provided, apply grammar-constrained decoding for
-	// non-thinking models to prevent malformed JSON at generation time.
-	if len(req.Tools) > 0 {
+	// When tools are provided, apply grammar-constrained decoding only for the
+	// legacy (bare-JSON) protocol on non-thinking models. Native protocols
+	// (e.g. Qwen3.5) emit structured <tool_call> markers rather than bare JSON,
+	// so a JSON grammar would wrongly forbid the model's trained output.
+	if len(req.Tools) > 0 && toolFormat == llm.ToolCallFormatNone {
 		supportsThinking := llm.GetArchDescriptor(model.CPUPipeline.Model.Config.Architecture).SupportsThinking
 		if !supportsThinking {
 			g, err := ToolCallGrammar(false)
@@ -170,36 +184,76 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 	var fullText strings.Builder
 	var reasoningContent string
 
+	// Content-streaming guard for native tool calls: hold back text that could
+	// be, or is, a <tool_call> block so the raw markers are not emitted as
+	// assistant content. The parsed tool_calls arrive in the final chunk. Any
+	// natural-language prefix before the call is still streamed.
+	const tcMarker = "<tool_call>"
+	var emitBuf strings.Builder
+	suppressed := false
+
+	writeContent := func(txt string) {
+		if txt == "" {
+			return
+		}
+		chunk := ChatCompletionChunk{
+			ID:      infReq.ID,
+			Object:  "chat.completion.chunk",
+			Created: nowUnix(),
+			Model:   modelID,
+			Choices: []ChatCompletionChoice{{
+				Index: 0,
+				Delta: &Message{Role: "assistant", Content: MessageContent{Text: txt}},
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	flushSafe := func(final bool) {
+		if suppressed {
+			emitBuf.Reset()
+			return
+		}
+		s := emitBuf.String()
+		if final {
+			writeContent(s)
+			emitBuf.Reset()
+			return
+		}
+		if idx := strings.Index(s, tcMarker); idx >= 0 {
+			writeContent(s[:idx])
+			suppressed = true
+			emitBuf.Reset()
+			return
+		}
+		keep := longestSuffixPrefixLen(s, tcMarker)
+		if len(s) > keep {
+			writeContent(s[:len(s)-keep])
+		}
+		emitBuf.Reset()
+		emitBuf.WriteString(s[len(s)-keep:])
+	}
+
 	for ev := range infReq.Output {
 		switch ev.Type {
 		case EventToken:
 			fullText.WriteString(ev.Token)
-			chunk := ChatCompletionChunk{
-				ID:      infReq.ID,
-				Object:  "chat.completion.chunk",
-				Created: nowUnix(),
-				Model:   modelID,
-				Choices: []ChatCompletionChoice{{
-					Index: 0,
-					Delta: &Message{Role: "assistant", Content: MessageContent{Text: ev.Token}},
-				}},
+			if !suppressed {
+				emitBuf.WriteString(ev.Token)
+				flushSafe(false)
 			}
-			data, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
 
 		case EventDone:
 			reasoningContent = ev.ReasoningContent
+			flushSafe(true)
 			collected := fullText.String()
 
 			// Try to detect tool calls in the final output
 			tcs := parseToolCalls(collected)
 			if len(tcs) > 0 {
-				// For streaming, we send a final chunk with the tool_calls
-				// and finish_reason "tool_calls". The previously streamed
-				// content tokens are still valid (they may contain the
-				// function call JSON, which the client should ignore when
-				// tool_calls is present).
+				// Send a final chunk carrying the tool_calls with finish_reason
+				// "tool_calls".
 				chunk := ChatCompletionChunk{
 					ID:      infReq.ID,
 					Object:  "chat.completion.chunk",
@@ -240,6 +294,22 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			return
 		}
 	}
+}
+
+// longestSuffixPrefixLen returns the length of the longest suffix of s that is a
+// proper prefix of marker (i.e. could be the beginning of a marker split across
+// stream chunks).
+func longestSuffixPrefixLen(s, marker string) int {
+	max := len(marker) - 1
+	if max > len(s) {
+		max = len(s)
+	}
+	for k := max; k > 0; k-- {
+		if strings.HasSuffix(s, marker[:k]) {
+			return k
+		}
+	}
+	return 0
 }
 
 func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *InferenceRequest, modelID string) {
@@ -293,12 +363,9 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, infReq *Inferenc
 	// natural language (the model often generates both).
 	tcs := parseToolCalls(fullText)
 	if len(tcs) > 0 {
-		// Strip tool call JSON from the text to recover natural language
-		cleaned := toolCallRe.ReplaceAllString(fullText, "")
-		cleaned = strings.TrimSpace(cleaned)
-		// The remaining text after stripping tool calls is the content
-		cleaned = strings.TrimPrefix(cleaned, "<|tool_call|>")
-		cleaned = strings.TrimSpace(cleaned)
+		// Strip tool call blocks from the text to recover any natural language
+		// the model emitted alongside the call.
+		cleaned := stripToolCalls(fullText)
 		finishReason = "tool_calls"
 
 		resp := ChatCompletionResponse{
