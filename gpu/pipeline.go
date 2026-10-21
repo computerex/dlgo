@@ -1555,9 +1555,20 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			cacheMode := p.chatPrefixEligible() && len(tokenSegs) == 1
 			cacheableLen := npos
 			if cacheMode {
-				if pl := p.generationPrimerTokenLen(prompt, tokens); pl > 0 && npos-pl > prefillFrom {
+				if pl := p.generationPrimerTokenLen(prompt, tokens); pl > 0 {
 					cacheableLen = npos - pl
 				}
+			}
+			// The cached prefix must always stop at the same pre-primer boundary.
+			// Do not derive it from prefillFrom: on a reusing turn prefillFrom is
+			// already npos-pl, and any guard that compares the two collapses
+			// cacheableLen back to npos, which stores the generation primer as
+			// part of the reusable prefix. The next turn then has the assistant's
+			// real content at that position instead of the primer, the prefix
+			// comparison fails, and the whole prompt is re-prefilled -- i.e. every
+			// other agentic turn loses all reuse.
+			if cacheableLen < prefillFrom {
+				cacheableLen = prefillFrom
 			}
 			runChunks := func(from, to int) {
 				for cs := from; cs < to; cs += prefillChunkSize {
