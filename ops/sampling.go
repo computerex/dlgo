@@ -24,20 +24,18 @@ func DefaultSamplerConfig() SamplerConfig {
 		TopK:        40,
 		TopP:        0.9,
 		MinP:        0,
-		// Anti-repetition penalties are OFF by default, matching llama.cpp and
-		// the OpenAI sampling surface. They are not neutral transforms and must
-		// be opt-in:
+		// Anti-repetition: n-gram blocking must stay OFF. ApplyNgramBlocking sets
+		// the logit of any token completing an already-seen n-gram to -inf, so a
+		// legitimate repeat becomes impossible: a tool-call argument that restates
+		// a value the model already emitted while reasoning gets truncated exactly
+		// at the repeat (reasoning says "F(13) = 233", argument arrives as
+		// "F(13) = "), and enumerated lists / quoted snippets get mangled.
 		//
-		//   * NoRepeatNgramSize bans the token that would complete an n-gram
-		//     already present in the generated text. Any legitimate repeat is
-		//     therefore impossible: a tool-call argument that restates a value
-		//     the model already emitted while reasoning gets truncated exactly
-		//     at the repeat (e.g. reasoning says "F(13) = 233", then the
-		//     argument is cut to "F(13) = "), and enumerated lists / quoted
-		//     snippets get mangled into filler tokens.
-		//   * RepetitionPenalty > 1 punishes every already-seen token, which
-		//     distorts long thinking traces where the same tokens must recur.
-		RepetitionPenalty: 1.0,
+		// A mild RepetitionPenalty is kept because it is a completely different
+		// mechanism: it only divides the logit of already-seen tokens, so a token
+		// that is genuinely the best continuation still wins. It breaks
+		// degenerate loops without ever making text impossible to emit.
+		RepetitionPenalty: 1.1,
 		FrequencyPenalty:  0.0,
 		PresencePenalty:   0.0,
 		NoRepeatNgramSize: 0,

@@ -105,8 +105,10 @@ func TestDefaultSamplerConfig(t *testing.T) {
 	if cfg.NoRepeatNgramSize != 0 {
 		t.Errorf("default NoRepeatNgramSize = %d, want 0 (off)", cfg.NoRepeatNgramSize)
 	}
-	if cfg.RepetitionPenalty != 1.0 {
-		t.Errorf("default RepetitionPenalty = %f, want 1.0 (off)", cfg.RepetitionPenalty)
+	// A mild repetition penalty (logit scaling) is fine and stops runaway loops;
+	// it never makes a token impossible, unlike n-gram blocking.
+	if cfg.RepetitionPenalty != 1.1 {
+		t.Errorf("default RepetitionPenalty = %f, want 1.1", cfg.RepetitionPenalty)
 	}
 }
 

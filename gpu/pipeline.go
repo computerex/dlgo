@@ -101,6 +101,13 @@ type GpuPipeline struct {
 	chatPrefixValid  bool
 }
 
+// maxThinkBudget bounds how many generated tokens may have EOS suppressed
+// while the model is inside its thinking block. It intentionally does not
+// scale with max_tokens: a client requesting a 128k budget must not also grant
+// ~100k tokens of forced non-termination, which turns a rambling thinking
+// block into an unstoppable one.
+const maxThinkBudget = 4096
+
 // prefixReuseEnabled toggles cross-request KV prefix reuse for chat. Default on;
 // set DLGO_PREFIX_REUSE=0 to disable.
 var prefixReuseEnabled = os.Getenv("DLGO_PREFIX_REUSE") != "0"
@@ -1780,7 +1787,15 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	// During the thinking phase, suppress EOS/stop tokens to prevent premature
 	// end-of-generation from quantization noise (especially IQ3_XXS/IQ2_XXS).
 	gpuInThinkBlock := strings.HasSuffix(prompt, "<think>\n")
+	// EOS suppression during thinking is only a nudge against quantization
+	// noise, so it must be bounded independently of the requested max_tokens.
+	// Scaling it off MaxTokens is harmful: a client asking for a large budget
+	// (e.g. 128k) also suppresses EOS for ~100k tokens, so a model that rambles
+	// inside its thinking block is structurally forbidden from stopping.
 	thinkBudget := cfg.MaxTokens * 4 / 5
+	if thinkBudget > maxThinkBudget {
+		thinkBudget = maxThinkBudget
+	}
 	gpuStep := 0
 
 	// Grammar-aware sampling helper (applies EOG suppression + grammar)

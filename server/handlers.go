@@ -208,6 +208,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 	const tcMarker = "<tool_call>"
 	var emitBuf strings.Builder
 	suppressed := false
+	reasoningStreamed := false
 
 	writeContent := func(txt string) {
 		if txt == "" {
@@ -221,6 +222,24 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			Choices: []ChatCompletionChoice{{
 				Index: 0,
 				Delta: &Message{Role: "assistant", Content: MessageContent{Text: txt}},
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+	writeReasoning := func(txt string) {
+		if txt == "" {
+			return
+		}
+		chunk := ChatCompletionChunk{
+			ID:      infReq.ID,
+			Object:  "chat.completion.chunk",
+			Created: nowUnix(),
+			Model:   modelID,
+			Choices: []ChatCompletionChoice{{
+				Index: 0,
+				Delta: &Message{Role: "assistant", ReasoningContent: txt},
 			}},
 		}
 		data, _ := json.Marshal(chunk)
@@ -261,8 +280,15 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 				flushSafe(false)
 			}
 
+		case EventReasoningToken:
+			// Reasoning deltas go straight through so the client is not blind
+			// while the model is still thinking.
+			reasoningStreamed = true
+			writeReasoning(ev.Token)
+
 		case EventDone:
 			reasoningContent = ev.ReasoningContent
+			reasoningStreamed = reasoningStreamed || ev.ReasoningStreamed
 			flushSafe(true)
 			collected := fullText.String()
 
@@ -282,24 +308,14 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 			if len(tcs) > 0 {
 				// Send a final chunk carrying the tool_calls with finish_reason
 				// "tool_calls".
-				chunk := ChatCompletionChunk{
-					ID:      infReq.ID,
-					Object:  "chat.completion.chunk",
-					Created: nowUnix(),
-					Model:   modelID,
-					Choices: []ChatCompletionChoice{{
-						Index: 0,
-						Delta: &Message{
-							Role:             "assistant",
-							ReasoningContent: reasoningContent,
-							ToolCalls:        tcs,
-						},
-						FinishReason: strPtr("tool_calls"),
-					}},
+				finalDelta := &Message{
+					Role:             "assistant",
+					ReasoningContent: reasoningContent,
+					ToolCalls:        tcs,
 				}
-				data, _ := json.Marshal(chunk)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-			} else {
+				if reasoningStreamed {
+					finalDelta.ReasoningContent = ""
+				}
 				chunk := ChatCompletionChunk{
 					ID:      infReq.ID,
 					Object:  "chat.completion.chunk",
@@ -307,7 +323,25 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, r *http.Request, in
 					Model:   modelID,
 					Choices: []ChatCompletionChoice{{
 						Index:        0,
-						Delta:        &Message{ReasoningContent: reasoningContent},
+						Delta:        finalDelta,
+						FinishReason: strPtr("tool_calls"),
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+			} else {
+				finalDelta := &Message{ReasoningContent: reasoningContent}
+				if reasoningStreamed {
+					finalDelta.ReasoningContent = ""
+				}
+				chunk := ChatCompletionChunk{
+					ID:      infReq.ID,
+					Object:  "chat.completion.chunk",
+					Created: nowUnix(),
+					Model:   modelID,
+					Choices: []ChatCompletionChoice{{
+						Index:        0,
+						Delta:        finalDelta,
 						FinishReason: strPtr(ev.FinishReason),
 					}},
 				}

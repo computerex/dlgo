@@ -21,15 +21,29 @@ const (
 	EventToken EventType = iota
 	EventDone
 	EventError
+	// EventReasoningToken carries a chunk of the thinking block so an
+	// OpenAI-compatible client receives reasoning as it is generated instead of
+	// being blind until the block closes.
+	EventReasoningToken
 )
+
+// maxThinkBudget bounds how many generated tokens may have EOS suppressed while
+// the model is inside its thinking block (mirrors gpu.maxThinkBudget). It must
+// not scale with max_tokens, or a large requested budget would forbid the model
+// from terminating.
+const maxThinkBudget = 4096
 
 // StreamEvent is a single event sent from the scheduler to the HTTP handler.
 type StreamEvent struct {
 	Type             EventType
 	Token            string
-	ReasoningContent string // thinking block content (set on EventDone)
-	FinishReason     string
-	PromptTokens     int
+	ReasoningContent string // full thinking block content (set on EventDone)
+	// ReasoningStreamed reports that the thinking block was already delivered
+	// via EventReasoningToken events, so the handler must not emit
+	// ReasoningContent a second time (it is still used for tool-call extraction).
+	ReasoningStreamed bool
+	FinishReason      string
+	PromptTokens      int
 	// GeneratedTokens is the total number of tokens the model generated,
 	// including thinking tokens that were buffered and never emitted as
 	// EventToken. Set on EventDone; usage accounting must use this rather
@@ -259,9 +273,14 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	thinkingEnabled := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
 	inThinkBlock := thinkingEnabled
 	var thinkingContent string
-	// Thinking budget: suppress EOS for at most 80% of max_tokens during thinking.
-	// After that, let the model naturally close </think> and produce content.
+	// Thinking budget: suppress EOS for at most 80% of max_tokens during thinking,
+	// capped so a large max_tokens cannot forbid termination for tens of
+	// thousands of tokens. After that, let the model close </think> and produce
+	// content.
 	thinkBudget := req.Config.MaxTokens * 4 / 5
+	if thinkBudget > maxThinkBudget {
+		thinkBudget = maxThinkBudget
+	}
 
 	// Grammar setup for constrained decoding
 	var tokenPieces []string
@@ -390,6 +409,8 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
 	pipe := s.model.GpuPipeline
+	reqStart := time.Now()
+	firstTokenAt := time.Duration(-1)
 
 	// Use GenerateDetailed with streaming callback
 	fmtOpts := llm.FormatOptions{ReasoningEffort: req.ReasoningEffort, EnableThinking: req.EnableThinking}
@@ -406,20 +427,46 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	var thinkingContent string
 
 	cfg := req.Config
+	thinkClose := "</" + "think>"
+	var reasoningAll strings.Builder
+	reasoningStreamed := false
+	emitReasoning := func(s string) {
+		if s == "" {
+			return
+		}
+		if firstTokenAt < 0 {
+			firstTokenAt = time.Since(reqStart)
+		}
+		reasoningAll.WriteString(s)
+		reasoningStreamed = true
+		req.Output <- StreamEvent{Type: EventReasoningToken, Token: s}
+	}
 	cfg.Stream = func(token string) {
 		if req.Ctx.Err() != nil {
 			return
 		}
 		if inThinkBlock {
 			thinkBuf.WriteString(token)
-			if idx := strings.Index(thinkBuf.String(), "</think>"); idx >= 0 {
+			buf := thinkBuf.String()
+			if idx := strings.Index(buf, thinkClose); idx >= 0 {
 				inThinkBlock = false
-				thinkingContent = strings.TrimSpace(thinkBuf.String()[:idx])
-				after := thinkBuf.String()[idx+len("</think>"):]
-				after = strings.TrimLeft(after, "\n")
+				emitReasoning(buf[:idx])
+				thinkingContent = strings.TrimSpace(buf[:idx])
+				after := strings.TrimLeft(buf[idx+len(thinkClose):], "\n")
+				thinkBuf.Reset()
 				if after != "" {
 					req.Output <- StreamEvent{Type: EventToken, Token: after}
 				}
+				return
+			}
+			// Stream reasoning as it arrives so the client sees progress during
+			// thinking. Hold back a small tail so a close tag split across two
+			// stream chunks is still detected.
+			keep := len(thinkClose) - 1
+			if len(buf) > keep {
+				emitReasoning(buf[:len(buf)-keep])
+				thinkBuf.Reset()
+				thinkBuf.WriteString(buf[len(buf)-keep:])
 			}
 			return
 		}
@@ -441,19 +488,29 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 	// If still buffering (no </think> found), treat as truncated reasoning.
 	if inThinkBlock {
-		thinkingContent = strings.TrimSpace(thinkBuf.String())
+		thinkingContent = strings.TrimSpace(thinkBuf.String() + reasoningAll.String())
 	}
 
 	finishReason := "stop"
 	if result.TotalTokens >= cfg.MaxTokens {
 		finishReason = "length"
 	}
+	// Per-request diagnostic: separates prefill from decode so a slow request can
+	// be attributed without guessing.
+	ttft := firstTokenAt
+	if ttft < 0 {
+		ttft = time.Since(reqStart)
+	}
+	log.Printf("[req] prompt=%d gen=%d prefill=%.0fms decode=%.1f tok/s ttft=%dms streamed_reasoning=%v finish=%s",
+		result.PromptTokens, result.TotalTokens, result.PrefillTimeMs, result.TokensPerSec,
+		ttft.Milliseconds(), reasoningStreamed, finishReason)
 	req.Output <- StreamEvent{
-		Type:             EventDone,
-		FinishReason:     finishReason,
-		PromptTokens:     result.PromptTokens,
-		ReasoningContent: thinkingContent,
-		GeneratedTokens:  result.TotalTokens,
+		Type:              EventDone,
+		FinishReason:      finishReason,
+		PromptTokens:      result.PromptTokens,
+		ReasoningContent:  thinkingContent,
+		ReasoningStreamed: reasoningStreamed,
+		GeneratedTokens:   result.TotalTokens,
 	}
 }
 
