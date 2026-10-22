@@ -33,6 +33,14 @@ func (p *GpuPipeline) SnapshotState(npos int) (*GpuStateSnapshot, error) {
 	if p.KVCache.BytesPerElem == 0 {
 		p.KVCache.BytesPerElem = 2
 	}
+	// The snapshot covers KV + SSM state only. LFM2/LFM2MoE also carries a
+	// per-layer short-convolution rolling history, so restoring one of these
+	// snapshots would silently resume with a stale conv window. Refuse instead:
+	// no path needs it for these models (cross-request prefix reuse is already
+	// gated off when HasMoE, and short-conv models are MoE models).
+	if p.CPUModel != nil && p.CPUModel.Config.HasShortConv() {
+		return nil, fmt.Errorf("gpu: state snapshot is not supported for short-convolution models")
+	}
 	Sync()
 	snap := &GpuStateSnapshot{kvLen: npos}
 	layers := len(p.KVCache.KeyBufs)
@@ -134,6 +142,9 @@ func (p *GpuPipeline) snapshotRecurrentState(npos int) (*GpuStateSnapshot, error
 	}
 	if !p.HasSSM {
 		return nil, fmt.Errorf("gpu: recurrent snapshot requires SSM state")
+	}
+	if p.CPUModel.Config.HasShortConv() {
+		return nil, fmt.Errorf("gpu: recurrent snapshot is not supported for short-convolution models")
 	}
 	Sync()
 	snap := &GpuStateSnapshot{kvLen: npos}

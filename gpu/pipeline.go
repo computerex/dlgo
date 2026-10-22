@@ -430,11 +430,6 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 // all layers are uploaded. Otherwise, only the first numGPULayers layers are
 // uploaded. Layers beyond that limit have OnGPU=false and empty GPU tensors.
 func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
-	// Short-convolution layers (LFM2/LFM2MoE) have no GPU kernel yet.
-	if m.Config.HasShortConv() {
-		return nil, fmt.Errorf("gpu: %s layers using short convolution are not supported yet",
-			m.Config.Architecture)
-	}
 	maxLayers := len(m.Layers)
 	if len(numGPULayers) > 0 && numGPULayers[0] >= 0 {
 		maxLayers = numGPULayers[0]
@@ -574,6 +569,9 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			if cl.FFNRouterBias != nil {
 				gl.FFNRouterBias, _ = UploadF32Slice(cl.FFNRouterBias)
 			}
+			if cl.FFNExpertSelBias != nil {
+				gl.FFNExpertSelBias, _ = UploadF32Slice(cl.FFNExpertSelBias)
+			}
 			if moeUploaded && cl.FFNGateUpExps != nil && (supportsGPUQType(cl.FFNGateUpExps.Type) || llmUnifiedQuant()) {
 				gl.FFNGateUpExps, err = uploadProjWeight(cl.FFNGateUpExps)
 				if err != nil {
@@ -676,6 +674,42 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			gl.SSMOut, gl.SSMOutA8, _ = uploadWeightPair(cl.SSMOut)
 		}
 
+		// LFM2/LFM2MoE causal short convolution: in_proj (dim -> 3*dim),
+		// out_proj (dim -> dim), the depthwise taps, and the rolling b*x
+		// history that the conv shader advances in place.
+		if cl.ShortConvInProj != nil {
+			gl.ShortConvInProj, _, err = uploadWeightPair(cl.ShortConvInProj)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d shortconv in_proj: %w", l, err)
+			}
+		}
+		if cl.ShortConvOutProj != nil {
+			gl.ShortConvOutProj, _, err = uploadWeightPair(cl.ShortConvOutProj)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d shortconv out_proj: %w", l, err)
+			}
+		}
+		if len(cl.ShortConvConv) > 0 {
+			gl.ShortConvConv, err = UploadF32Slice(cl.ShortConvConv)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d shortconv conv: %w", l, err)
+			}
+		}
+		if cl.Spec.Core == llm.CoreShortConv {
+			lcache := m.Config.ShortConvLCache
+			if lcache < 1 {
+				lcache = 3
+			}
+			stateLen := (lcache - 1) * m.Config.EmbeddingDim
+			if stateLen > 0 {
+				gl.ShortConvState = Alloc(uint64(stateLen * 4))
+				if gl.ShortConvState == 0 {
+					return nil, fmt.Errorf("layer %d shortconv state alloc (%d floats)", l, stateLen)
+				}
+				ZeroFill(gl.ShortConvState, uint64(stateLen*4))
+			}
+		}
+
 	}
 
 	gm.NumGPULayers = maxLayers
@@ -697,18 +731,14 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	m := cpuPipeline.Model
 	cfg := m.Config
 
-	// LFM2/LFM2MoE hybrid short-convolution layers have no GPU kernel yet: the
-	// core needs a depthwise convolution over the token axis with its own
-	// rolling state, plus a per-layer KV width. Refuse cleanly so the caller
-	// falls back to CPU instead of dereferencing attention weights that
-	// short-conv layers do not carry.
+	// LFM2/LFM2MoE hybrid short-convolution layers run on the non-fused forward
+	// path below: the fused per-layer C dispatcher has no short-conv core, and
+	// the short-conv step is a sequential scan over the token axis that does not
+	// compose with the fused norm/attention/residual pipeline. Everything else
+	// (projections, MoE experts, attention) still runs on the GPU.
 	if cfg.HasShortConv() {
-		// Honour the contract callers rely on: NewGpuPipeline leaves a usable
-		// CPU pipeline behind when it fails. The caller may have built the
-		// pipeline with llm.WithoutCPUState, so rebuild the scratch here.
-		cpuPipeline.RebuildBuffers()
-		return nil, fmt.Errorf("gpu: %s layers using short convolution are not supported yet; "+
-			"falling back to the CPU pipeline", cfg.Architecture)
+		fmt.Printf("[dlgo/gpu] %s: %d short-convolution layers run on the non-fused GPU path\n",
+			cfg.Architecture, cfg.NumLayers-cfg.AttentionLayerCount())
 	}
 
 	totalVRAM := float64(VRAMBytes()) / (1024 * 1024)
@@ -980,6 +1010,14 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				}
 			}
 
+			// Short-convolution scratch (LFM2/LFM2MoE). Per-layer conv state is
+			// allocated with the weights in UploadModel.
+			if cfg.HasShortConv() && cfg.AttentionLayerCount() < cfg.NumLayers {
+				if err := rs.AllocShortConvScratch(dim); err != nil {
+					return err
+				}
+			}
+
 			return nil
 		}()
 
@@ -1107,7 +1145,9 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// Use fused forward when ALL layers are on GPU (including MoE models).
 	// For MoE: C side handles attention + residual + norm, returns early (ffn_type=3);
 	// Go side then handles MoE FFN dispatch.
-	if !isPartial {
+	// Short-convolution models must use the non-fused path: the fused dispatcher
+	// has no short-conv core.
+	if !isPartial && !cfg.HasShortConv() {
 		pipe.UseFusedForward = supportsFusedForwardGPU(m)
 	}
 	if os.Getenv("DLGO_NO_FUSED") == "1" {
@@ -1402,6 +1442,28 @@ func (p *GpuPipeline) ResetState() {
 		}
 		if p.CPURunState != nil && p.CPURunState.SSMState != nil {
 			p.CPURunState.SSMState.Reset()
+		}
+	}
+
+	// Zero the LFM2/LFM2MoE short-convolution rolling history so a new request
+	// never inherits the previous one's conv state (the CPU path's equivalent
+	// bug produced cross-request contamination that looked like a modelling
+	// error).
+	mcfg := p.CPUModel.Config
+	if mcfg.HasShortConv() {
+		for l := 0; l < mcfg.NumLayers; l++ {
+			gl := &p.GpuModel.Layers[l]
+			if gl.ShortConvState == 0 {
+				continue
+			}
+			lcache := mcfg.ShortConvLCache
+			if lcache < 1 {
+				lcache = 3
+			}
+			n := (lcache - 1) * mcfg.EmbeddingDim
+			if n > 0 {
+				ZeroFill(gl.ShortConvState, uint64(n*4))
+			}
 		}
 	}
 }

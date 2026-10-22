@@ -231,6 +231,10 @@ typedef enum {
     // the device (gpu/shaders/convert_to_affine.comp). Appended at the end so
     // existing pipeline IDs stay stable.
     PIPE_CONVERT_TO_AFFINE,
+    // LFM2/LFM2MoE causal depthwise short convolution over the token axis
+    // (gpu/shaders/shortconv.comp). Appended at the end so existing pipeline
+    // IDs stay stable.
+    PIPE_SHORT_CONV,
     PIPE_COUNT
 } PipelineID;
 
@@ -346,8 +350,8 @@ int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
                         int n, float alpha, float limit,
                         int gate_bias_offset, int up_bias_offset);
 int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
-                 int n_experts, int k, int gating_func,
-                 int weights_norm, float weights_scale);
+                 GpuBuf sel_bias_buf, int n_experts, int k, int gating_func,
+                 int weights_norm, float weights_scale, int has_sel_bias);
 int gpu_gelu(GpuBuf buf, int n);
 int gpu_add(GpuBuf out_buf, GpuBuf a_buf, GpuBuf b_buf, int n);
 int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
@@ -602,6 +606,13 @@ int gpu_copy_region(GpuBuf dst, uint64_t dst_offset, GpuBuf src, uint64_t src_of
 
 // SSM (Gated Delta Net) operations
 int gpu_ssm_conv1d_silu(GpuBuf qkv, GpuBuf conv_state, GpuBuf conv_w, int channels, int conv_k);
+
+// LFM2/LFM2MoE causal depthwise short convolution (kernel conv_k, taps
+// oldest-first) with a rolling (conv_k-1)-row state over the token axis.
+// bcx holds npos rows of [3*dim] in_proj output, y receives npos rows of
+// [dim] c-gated conv output. state is updated in place.
+int gpu_shortconv(GpuBuf bcx_buf, GpuBuf y_buf, GpuBuf state_buf, GpuBuf conv_w_buf,
+                  int dim, int conv_k, int npos);
 int gpu_ssm_preprocess(GpuBuf alpha, GpuBuf beta, GpuBuf ssma, GpuBuf dt_bias,
                        GpuBuf qkv, int num_heads, int head_k_dim, int key_dim,
                        float rms_eps, int has_dt_bias);
@@ -642,6 +653,9 @@ struct GpuMoEConf_s {
     GpuBuf router_w;
     int router_rows, router_cols, router_type;
     GpuBuf router_bias;      // 0 if none
+    // Selection-only expert bias (LFM2MoE / gpt-oss): added AFTER the gating
+    // activation and used only to choose which experts run. 0 if none.
+    GpuBuf sel_bias;
 
     // Expert weights
     GpuBuf gate_w, up_w, down_w;

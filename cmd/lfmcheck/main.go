@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/computerex/dlgo/gpu"
 	"github.com/computerex/dlgo/models/llm"
 	"github.com/computerex/dlgo/ops"
 )
@@ -56,6 +57,8 @@ func main() {
 	first := flag.Bool("first", false, "print the top logits for the first generated token")
 	bos := flag.Bool("bos", false, "force BOS to be prepended when tokenizing")
 	dumpOnly := flag.Bool("dump", false, "only dump the architecture, no generation")
+	useGPU := flag.Bool("gpu", false, "run the generation on the GPU pipeline instead of the CPU one")
+	parity := flag.Bool("parity", false, "run the prompt through the CPU and GPU per-token forwards and compare logits each step")
 	flag.Parse()
 
 	t0 := time.Now()
@@ -138,6 +141,11 @@ func main() {
 		return
 	}
 
+	if *parity {
+		runParity(p, *prompt, *chat)
+		return
+	}
+
 	gcfg := llm.DefaultGenerateConfig()
 	gcfg.MaxTokens = *tokens
 	gcfg.Sampler = ops.SamplerConfig{Temperature: 0, TopK: 1, TopP: 1, RepetitionPenalty: 1.0}
@@ -208,13 +216,36 @@ func main() {
 		fmt.Printf("argmax -> id=%d %q  isEOS=%v\n", got, p.Tokenizer.DecodeToken(int32(got)), int32(got) == cfg.EOS)
 		return
 	}
-	out, tps, err := p.GenerateText(text, gcfg)
-	elapsed := time.Since(t1).Seconds()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "generate failed: %v\n", err)
-		os.Exit(1)
+	var out string
+	var tps float64
+	if *useGPU {
+		var gp *gpu.GpuPipeline
+		gp, err = gpu.NewGpuPipeline(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gpu pipeline failed: %v\n", err)
+			os.Exit(1)
+		}
+		defer gp.FreeAll()
+		var res *gpu.GenerateResult
+		res, err = gp.GenerateDetailed(text, gcfg)
+		if err == nil {
+			out, tps = res.Text, res.TokensPerSec
+		}
+		elapsed := time.Since(t1).Seconds()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gpu generate failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\n== generation: %.2fs, %.2f tok/s (gpu=true)\n", elapsed, tps)
+	} else {
+		out, tps, err = p.GenerateText(text, gcfg)
+		elapsed := time.Since(t1).Seconds()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "generate failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\n== generation: %.2fs, %.2f tok/s (gpu=false)\n", elapsed, tps)
 	}
-	fmt.Printf("\n== generation: %.2fs, %.2f tok/s\n", elapsed, tps)
 	fmt.Printf("----8<----\n%s\n----8<----\n", out)
 
 	// Sanity: flag obviously broken output (empty, or control-character soup).

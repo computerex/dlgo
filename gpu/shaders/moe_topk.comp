@@ -6,7 +6,14 @@
 //   gating_func=2: sigmoid per logit, then top-K
 //   gating_func=3: top-K on raw logits, then softmax on selected
 //
-// Input:  logits[n_experts] (router output, may include bias)
+// has_sel_bias (LFM2MoE / gpt-oss style): the per-expert bias in binding 3 is
+// added AFTER the gating function and is used for SELECTION ONLY. The emitted
+// weight is the unbiased gate value, so the routed output is unchanged by the
+// bias except through which experts were picked. This is why the bias cannot
+// simply be folded into the router bias (that would move it before the
+// activation).
+//
+// Input:  logits[n_experts] (router output, may include router bias)
 // Output: out_indices[k] (int as float), out_weights[k]
 //
 // Runs as a single workgroup (1 invocation) since n_experts is small (32-512).
@@ -16,6 +23,7 @@ layout(local_size_x = 1) in;
 layout(set = 0, binding = 0) buffer Logits { float logits[]; };
 layout(set = 0, binding = 1) buffer OutIndices { float out_indices[]; };
 layout(set = 0, binding = 2) buffer OutWeights { float out_weights[]; };
+layout(set = 0, binding = 3) buffer SelBias { float sel_bias[]; };
 
 layout(push_constant) uniform Params {
     int n_experts;
@@ -23,6 +31,7 @@ layout(push_constant) uniform Params {
     int gating_func;
     int weights_norm;
     float weights_scale;
+    int has_sel_bias;
 };
 
 void main() {
@@ -31,10 +40,11 @@ void main() {
     int ne = min(n_experts, 512);
 
     if (gating_func == 2) {
-        // Sigmoid
+        // Sigmoid, plus the (optional) post-activation selection bias.
         for (int i = 0; i < ne; i++) {
             float x = logits[i];
-            vals[i] = 1.0 / (1.0 + exp(-x));
+            float p = 1.0 / (1.0 + exp(-x));
+            vals[i] = (has_sel_bias != 0) ? p + sel_bias[i] : p;
         }
     } else if (gating_func == 3) {
         // SOFTMAX_WEIGHT: top-K on raw logits first, softmax on selected after
@@ -72,6 +82,10 @@ void main() {
             }
         }
         out_indices[t] = float(bestIdx);
+        // Undo the selection-only bias so the routed weight is the true gate.
+        if (has_sel_bias != 0 && gating_func == 2 && bestIdx >= 0) {
+            bestVal -= sel_bias[bestIdx];
+        }
         out_weights[t] = bestVal;
         if (bestIdx >= 0) used[bestIdx] = true;
     }

@@ -385,6 +385,9 @@ type GpuLayer struct {
 	// MoE expert weights (packed, GPU-supported)
 	FFNRouter     *GpuTensor // [expertCount × dim] router/gating network
 	FFNRouterBias Buf        // [expertCount] optional bias
+	// Selection-only expert bias applied AFTER the gating activation
+	// (LFM2MoE / gpt-oss exp_probs_b). 0 if none.
+	FFNExpertSelBias Buf
 	FFNGateExps   *GpuTensor // [expertCount*expertFFNDim × dim] packed gate
 	FFNUpExps     *GpuTensor // [expertCount*expertFFNDim × dim] packed up
 	FFNGateUpExps *GpuTensor // [expertCount*2*expertFFNDim × dim] fused gate+up
@@ -425,6 +428,15 @@ type GpuLayer struct {
 	// and the source quant has no coopmat GEMM (e.g. Qwen3.5's attn_gate=Q3_K).
 	// Single-token decode keeps the per-quant fields above.
 	SSMInProjA8, SSMGateA8, SSMAlphaA8, SSMBetaA8, SSMOutA8 *GpuTensor
+
+	// LFM2/LFM2MoE causal short convolution. InProj maps dim -> 3*dim (the b, c
+	// and x chunks concatenated), OutProj maps dim -> dim. Conv is the GGUF
+	// depthwise kernel [dim, convK] and State the (convK-1)-row rolling history
+	// of b*x, both float32 and persistent across tokens.
+	ShortConvInProj  *GpuTensor
+	ShortConvOutProj *GpuTensor
+	ShortConvConv    Buf
+	ShortConvState   Buf
 }
 
 // GpuModel holds all model weights on the GPU.
@@ -466,6 +478,10 @@ type GpuRunState struct {
 	// GatedQ attention scratch buffers
 	QFull Buf // [2*qDim] fused Q+gate output
 	QGate Buf // [qDim] attention gate values
+
+	// LFM2/LFM2MoE short convolution scratch buffers
+	ShortConvBCX Buf // [3*dim] in-projection output (b, c, x)
+	ShortConvY   Buf // [dim] c-gated conv output
 
 	// MoE scratch buffers (allocated on first use)
 	MoELogits  Buf // [expertCount] router logits
@@ -550,6 +566,19 @@ func (rs *GpuRunState) AllocGatedQScratch(qDim int) error {
 	rs.QGate = a.alloc(uint64(qDim * 4))
 	if a.err != nil {
 		return fmt.Errorf("gpu: AllocGatedQScratch: %w", a.err)
+	}
+	return nil
+}
+
+// AllocShortConvScratch allocates the scratch buffers used by LFM2/LFM2MoE
+// causal short-convolution layers: the [3*dim] in-projection result and the
+// [dim] gated convolution output.
+func (rs *GpuRunState) AllocShortConvScratch(dim int) error {
+	a := allocChecker{}
+	rs.ShortConvBCX = a.alloc(uint64(3 * dim * 4))
+	rs.ShortConvY = a.alloc(uint64(dim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocShortConvScratch: %w", a.err)
 	}
 	return nil
 }
@@ -765,6 +794,7 @@ func (gm *GpuModel) FreeAll() {
 		// MoE expert weights (packed, multi-GB for large MoE models)
 		freeTensor(gl.FFNRouter)
 		freeBuf(gl.FFNRouterBias)
+		freeBuf(gl.FFNExpertSelBias)
 		freeTensor(gl.FFNGateExps)
 		freeTensor(gl.FFNUpExps)
 		freeTensor(gl.FFNGateUpExps)
@@ -796,6 +826,12 @@ func (gm *GpuModel) FreeAll() {
 		freeTensor(gl.SSMOutA8)
 		freeBuf(gl.SSMState)
 		freeBuf(gl.SSMConvBuf)
+
+		// LFM2/LFM2MoE short convolution
+		freeTensor(gl.ShortConvInProj)
+		freeTensor(gl.ShortConvOutProj)
+		freeBuf(gl.ShortConvConv)
+		freeBuf(gl.ShortConvState)
 	}
 }
 
@@ -830,6 +866,10 @@ func (rs *GpuRunState) FreeAll() {
 	// GatedQ scratch buffers
 	freeBuf(rs.QFull)
 	freeBuf(rs.QGate)
+
+	// LFM2/LFM2MoE short convolution scratch buffers
+	freeBuf(rs.ShortConvBCX)
+	freeBuf(rs.ShortConvY)
 
 	// MoE scratch buffers
 	freeBuf(rs.MoELogits)

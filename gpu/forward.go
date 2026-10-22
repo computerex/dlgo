@@ -277,6 +277,7 @@ func buildMoEConf(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.Model
 			0, rs.MoEGateScratch, rs.MoEUpScratch, 0, rs.MoEOutScratch)
 	}
 	mc.SetRouter(gl.FFNRouter.Buf, gl.FFNRouter.Rows, gl.FFNRouter.Cols, int(gl.FFNRouter.Type), gl.FFNRouterBias)
+	mc.SetSelBias(gl.FFNExpertSelBias)
 	mc.SetExperts(gateGpu.Buf, int(gateGpu.Type), gateStride, gateBaseOff,
 		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
 		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
@@ -326,6 +327,13 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 			rs.FFNNorm, rs.FFNIn, rs.Gate, rs.Up, rs.Hidden, rs.FFNOut)
 
 		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ || layer.Spec.Core == llm.CoreMLA {
+			lc.SetCoreType(1)
+			lc.SetAttnNormOnly(gl.AttnNorm)
+		} else if layer.Spec.Core == llm.CoreShortConv {
+			// Short-conv layers carry no attention/FFN-gate weights of their own
+			// beyond the conv projections, which the fused C dispatcher does not
+			// implement. They run on the non-fused Go path, so this conf is only
+			// a placeholder that must not dereference nil tensors.
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
@@ -854,7 +862,8 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 		lc.SetScratch(bs.X, bs.XNorm, bs.Q, bs.K, bs.V, bs.AttnOut, bs.AttnProj,
 			bs.FFNNorm, bs.FFNIn, bs.Gate, bs.Up, bs.Hidden, bs.FFNOut)
 
-		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ || layer.Spec.Core == llm.CoreMLA {
+		if layer.Spec.Core == llm.CoreSSM || layer.Spec.GatedQ || layer.Spec.Core == llm.CoreMLA ||
+			layer.Spec.Core == llm.CoreShortConv {
 			lc.SetCoreType(1)
 			lc.SetAttnNormOnly(gl.AttnNorm)
 		} else {
@@ -1499,6 +1508,35 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "GatedQ AttnProj", rs.AttnProj, dim)
 			}
+		} else if spec.Core == llm.CoreShortConv && p != nil &&
+			gl.ShortConvInProj != nil && gl.ShortConvOutProj != nil {
+			// LFM2/LFM2MoE causal short convolution:
+			//   bcx = in_proj @ xnorm                [3*dim] = b | c | x
+			//   y   = causal depthwise conv over b*x  (rolling 2-row state)
+			//   out = out_proj @ (c * y)
+			scK := cfg.ShortConvLCache
+			if scK < 1 {
+				scK = 3
+			}
+			Barrier()
+			if err := gpuMatVec(rs.ShortConvBCX, gl.ShortConvInProj, layer.ShortConvInProj, rs.XNorm, rs); err != nil {
+				return fmt.Errorf("layer %d shortconv in_proj: %w", l, err)
+			}
+			Barrier()
+			if err := ShortConv(rs.ShortConvBCX, rs.ShortConvY, gl.ShortConvState, gl.ShortConvConv,
+				dim, scK, 1); err != nil {
+				return fmt.Errorf("layer %d shortconv conv: %w", l, err)
+			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "ShortConv Y", rs.ShortConvY, dim)
+			}
+			Barrier()
+			if err := gpuMatVec(rs.AttnProj, gl.ShortConvOutProj, layer.ShortConvOutProj, rs.ShortConvY, rs); err != nil {
+				return fmt.Errorf("layer %d shortconv out_proj: %w", l, err)
+			}
+			if diagL {
+				GpuDiag.LogBuf("GPU", l, pos, "ShortConv AttnProj", rs.AttnProj, dim)
+			}
 		} else if spec.Core == llm.CoreMLA && p != nil && p.HasMLA {
 			Sync()
 			cpuRS := p.CPURunState
@@ -2009,7 +2047,7 @@ func GpuForwardMoEFFN(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg llm.M
 	}
 	Barrier()
 	MoETopK(rs.MoELogits, rs.MoETopKIdx, rs.MoETopKW,
-		cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc, false, 0)
+		gl.FFNExpertSelBias, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc, false, 0)
 
 	Sync()
 	idxBuf := make([]float32, nUsed)
@@ -2171,6 +2209,7 @@ func gpuForwardMoEFFNFused(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg 
 		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
 		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
 	mc.SetBiases(gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias)
+	mc.SetSelBias(gl.FFNExpertSelBias)
 	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
 		isOAI, 1.702, 7.0)
@@ -2210,6 +2249,7 @@ func gpuForwardMoEFFNNative(gl *GpuLayer, layer *llm.Layer, rs *GpuRunState, cfg
 		upGpu.Buf, int(upGpu.Type), upStride, upBaseOff,
 		gl.FFNDownExps.Buf, int(gl.FFNDownExps.Type), downStride)
 	mc.SetBiases(gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias)
+	mc.SetSelBias(gl.FFNExpertSelBias)
 	mc.SetConfig(dim, expDim, cfg.ExpertCount, nUsed, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale),
 		isOAI, 1.702, 7.0)

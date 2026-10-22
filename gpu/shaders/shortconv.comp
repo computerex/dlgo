@@ -1,0 +1,74 @@
+#version 450
+
+// LFM2 / LFM2MoE causal depthwise short convolution (llama.cpp
+// llm_build_lfm_base::build_lfm_shortconv, causal path).
+//
+// Per token the block computes, from the pre-attention-normed hidden state h:
+//
+//   bcx = in_proj @ h                      -> this shader's input, [npos][3*dim]
+//   b, c, x = bcx[0:dim], bcx[dim:2dim], bcx[2dim:3dim]
+//   bx  = b * x
+//   y   = C0*bx[t-2] + C1*bx[t-1] + C2*bx[t]     // taps OLDEST-FIRST
+//   out = c * y                            -> this shader's output, [npos][dim]
+//
+// conv_w is GGUF blk.N.shortconv.conv.weight laid out [kernel, dim] with the
+// kernel axis innermost, i.e. flat index channel*conv_k + tap. Tap 0 is the
+// oldest element, matching ggml_ssm_conv (y[t,ch] = sum_k C[k,ch]*seq[t+k,ch])
+// and HF's left-padded depthwise Conv1d.
+//
+// state holds (conv_k - 1) previous bx rows, oldest first, and is updated in
+// place. Everything for a given channel lives in one invocation, so no
+// cross-thread ordering is needed: the shader is safe to dispatch inline in a
+// batched command buffer between the in_proj and out_proj matvecs.
+//
+// One invocation per channel; the token loop inside the invocation is what
+// makes this a sequential scan. The work is negligible (dim*conv_k MACs per
+// token per layer) next to the surrounding projections.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer InBCX { float bcx[]; };   // [npos*3*dim]
+layout(set = 0, binding = 1) writeonly buffer OutY { float y[]; };     // [npos*dim]
+layout(set = 0, binding = 2) buffer State { float state[]; };          // [(conv_k-1)*dim]
+layout(set = 0, binding = 3) readonly buffer Weights { float conv_w[]; }; // [dim*conv_k]
+
+layout(push_constant) uniform Params {
+    int dim;
+    int conv_k;
+    int npos;
+};
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= uint(dim)) return;
+
+    int dk = conv_k - 1;          // history rows kept
+    for (int p = 0; p < npos; p++) {
+        int base = p * 3 * dim;
+        float b = bcx[base + c];
+        float g = bcx[base + dim + c];
+        float x = bcx[base + 2 * dim + c];
+        float bx = b * x;
+
+        // state holds the previous dk rows of b*x, oldest first, so it is read
+        // BEFORE the window is advanced: tap t multiplies bx[t - dk] and the
+        // last tap multiplies the current bx. (Shifting first would misalign
+        // every tap by one row and silently produce a different filter.)
+        int wbase = int(c) * conv_k;
+        float acc = 0.0;
+        for (int t = 0; t < dk; t++) {
+            acc += state[t * dim + c] * conv_w[wbase + t];
+        }
+        acc += bx * conv_w[wbase + dk];
+
+        // Advance the rolling window: drop the oldest row, append bx.
+        for (int t = 0; t + 1 < dk; t++) {
+            state[t * dim + c] = state[(t + 1) * dim + c];
+        }
+        if (dk > 0) {
+            state[(dk - 1) * dim + c] = bx;
+        }
+
+        y[p * dim + c] = g * acc;
+    }
+}

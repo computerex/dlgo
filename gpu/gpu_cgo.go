@@ -339,14 +339,20 @@ func SwiGLU_OAI_Bias(out, gate, up, gateBias, upBias Buf, n int, alpha, limit fl
 // MoETopK performs router gating + top-K selection entirely on GPU.
 // weightsNorm: if true, normalize selected weights by their sum.
 // weightsScale: if non-zero and != 1.0, multiply weights by this factor.
-func MoETopK(logits, outIndices, outWeights Buf, nExperts, k, gatingFunc int, weightsNorm bool, weightsScale float32) error {
+// selBias: optional per-expert bias added AFTER the gating activation and used
+// only for expert selection (LFM2MoE / gpt-oss style). Pass 0 for none.
+func MoETopK(logits, outIndices, outWeights, selBias Buf, nExperts, k, gatingFunc int, weightsNorm bool, weightsScale float32) error {
 	wn := 0
 	if weightsNorm {
 		wn = 1
 	}
+	hb := 0
+	if selBias != 0 {
+		hb = 1
+	}
 	rc := C.gpu_moe_topk(C.GpuBuf(logits), C.GpuBuf(outIndices), C.GpuBuf(outWeights),
-		C.int(nExperts), C.int(k), C.int(gatingFunc),
-		C.int(wn), C.float(weightsScale))
+		C.GpuBuf(selBias), C.int(nExperts), C.int(k), C.int(gatingFunc),
+		C.int(wn), C.float(weightsScale), C.int(hb))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: moe_topk failed (%d)", rc)
 	}
@@ -678,6 +684,12 @@ func (mc *MoEFFNConf) SetRouter(w Buf, rows, cols, rtype int, bias Buf) {
 	mc.c.router_cols = C.int(cols)
 	mc.c.router_type = C.int(rtype)
 	mc.c.router_bias = C.GpuBuf(bias)
+}
+
+// SetSelBias installs the post-activation, selection-only expert bias
+// (LFM2MoE / gpt-oss). Pass 0 to clear it.
+func (mc *MoEFFNConf) SetSelBias(b Buf) {
+	mc.c.sel_bias = C.GpuBuf(b)
 }
 
 func (mc *MoEFFNConf) SetExperts(gateW Buf, gateType, gateStride, gateBase int,
@@ -1220,6 +1232,22 @@ func SSMConv1dSiLU(qkv, convState, convW Buf, channels, convK int) error {
 		C.int(channels), C.int(convK))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: ssm_conv1d_silu failed (%d)", rc)
+	}
+	return nil
+}
+
+// ShortConv performs the LFM2/LFM2MoE causal depthwise short convolution.
+//
+// bcx holds npos rows of the [3*dim] in-projection output (b, c, x chunks in
+// that order); y receives npos rows of the c-gated convolution result; state
+// holds (convK-1) rolling rows of b*x, oldest first, and is updated in place.
+// convW is the GGUF shortconv.conv.weight laid out [dim, convK] with the tap
+// axis innermost and tap 0 the oldest.
+func ShortConv(bcx, y, state, convW Buf, dim, convK, npos int) error {
+	rc := C.gpu_shortconv(C.GpuBuf(bcx), C.GpuBuf(y), C.GpuBuf(state), C.GpuBuf(convW),
+		C.int(dim), C.int(convK), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: shortconv failed (%d)", rc)
 	}
 	return nil
 }

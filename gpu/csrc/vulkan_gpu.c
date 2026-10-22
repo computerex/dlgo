@@ -1888,8 +1888,8 @@ int gpu_forward_moe_ffn(const GpuMoEConf* mc) {
     // 3. TopK (+ optional Q8_1 quantize — only if gate/up types benefit from dp4a)
     gpu_barrier();
     rc = gpu_moe_topk(mc->moe_logits, mc->moe_topk_idx, mc->moe_topk_w,
-                      mc->n_experts, n_used, mc->gating_func,
-                      mc->weights_norm, mc->weights_scale);
+                      mc->sel_bias, mc->n_experts, n_used, mc->gating_func,
+                      mc->weights_norm, mc->weights_scale, mc->sel_bias != 0);
     if (rc != GPU_OK) return rc;
     int gate_dp4a = dp4a_safe_type(mc->gate_type, dim);
     int up_dp4a   = dp4a_safe_type(mc->up_type, dim);
@@ -2131,8 +2131,8 @@ int gpu_forward_moe_ffn_native(const GpuMoEConf* mc) {
     // 3. TopK (handles weights_norm and weights_scale internally)
     gpu_barrier();
     rc = gpu_moe_topk(mc->moe_logits, mc->moe_topk_idx, mc->moe_topk_w,
-                      mc->n_experts, n_used, mc->gating_func,
-                      mc->weights_norm, mc->weights_scale);
+                      mc->sel_bias, mc->n_experts, n_used, mc->gating_func,
+                      mc->weights_norm, mc->weights_scale, mc->sel_bias != 0);
     if (rc != GPU_OK) return rc;
 
     // 4. Gate + Up MoE projections using native matvec (float input = ffn_norm)
@@ -2494,20 +2494,26 @@ int gpu_swiglu_oai_bias(GpuBuf out_buf, GpuBuf gate_buf, GpuBuf up_buf,
 }
 
 int gpu_moe_topk(GpuBuf logits_buf, GpuBuf out_indices_buf, GpuBuf out_weights_buf,
-                 int n_experts, int k, int gating_func,
-                 int weights_norm, float weights_scale) {
+                 GpuBuf sel_bias_buf, int n_experts, int k, int gating_func,
+                 int weights_norm, float weights_scale, int has_sel_bias) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int n_experts; int k; int gating_func; int weights_norm; float weights_scale; } pc = {
-        n_experts, k, gating_func, weights_norm, weights_scale
+    struct {
+        int n_experts; int k; int gating_func;
+        int weights_norm; float weights_scale; int has_sel_bias;
+    } pc = {
+        n_experts, k, gating_func, weights_norm, weights_scale, has_sel_bias
     };
     DispatchParams dp = {0};
     dp.pipe = PIPE_MOE_TOPK;
     dp.bufs[0] = logits_buf;
     dp.bufs[1] = out_indices_buf;
     dp.bufs[2] = out_weights_buf;
-    dp.num_bufs = 3;
+    /* Shader only dereferences this when has_sel_bias != 0, but the binding
+     * must always resolve to a real buffer. */
+    dp.bufs[3] = sel_bias_buf ? sel_bias_buf : out_weights_buf;
+    dp.num_bufs = 4;
     dp.push_data = &pc;
     dp.push_size = sizeof(pc);
     dp.groups_x = 1;
@@ -4404,6 +4410,27 @@ int gpu_paged_attention(GpuBuf out_buf, GpuBuf q_buf,
 // ---------------------------------------------------------------------------
 // SSM (Gated Delta Net) operations
 // ---------------------------------------------------------------------------
+
+int gpu_shortconv(GpuBuf bcx_buf, GpuBuf y_buf, GpuBuf state_buf, GpuBuf conv_w_buf,
+                  int dim, int conv_k, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (dim <= 0 || conv_k <= 0 || npos <= 0) return GPU_ERR_DISPATCH;
+
+    struct { int dim; int conv_k; int npos; } pc = {dim, conv_k, npos};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SHORT_CONV;
+    dp.bufs[0] = bcx_buf;
+    dp.bufs[1] = y_buf;
+    /* A kernel of 1 has no history; the shader never indexes state in that
+     * case, but the binding still has to be a real buffer. */
+    dp.bufs[2] = state_buf ? state_buf : bcx_buf;
+    dp.bufs[3] = conv_w_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc; dp.push_size = sizeof(pc);
+    dp.groups_x = (dim + 255) / 256; dp.groups_y = 1; dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
 
 int gpu_ssm_conv1d_silu(GpuBuf qkv, GpuBuf conv_state, GpuBuf conv_w,
                         int channels, int conv_k) {
