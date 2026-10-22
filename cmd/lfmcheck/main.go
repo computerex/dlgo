@@ -52,6 +52,9 @@ func main() {
 	tokens := flag.Int("tokens", 32, "tokens to generate")
 	prompt := flag.String("prompt", "The capital of France is", "prompt text")
 	chat := flag.Bool("chat", false, "wrap the prompt in the model's chat template")
+	enc := flag.Bool("enc", false, "print the tokenization of the prompt and exit")
+	first := flag.Bool("first", false, "print the top logits for the first generated token")
+	bos := flag.Bool("bos", false, "force BOS to be prepended when tokenizing")
 	dumpOnly := flag.Bool("dump", false, "only dump the architecture, no generation")
 	flag.Parse()
 
@@ -144,6 +147,66 @@ func main() {
 	if *chat {
 		text = llm.FormatChat(cfg, "", text)
 		fmt.Printf("\n== chat prompt:\n%s\n", text)
+	}
+	if *enc {
+		ids := p.Tokenizer.Encode(text)
+		fmt.Printf("\n== tokenization: %d tokens\n", len(ids))
+		for i, id := range ids {
+			fmt.Printf("  %3d %7d %q\n", i, id, p.Tokenizer.DecodeToken(id))
+		}
+		if !*first {
+			return
+		}
+	}
+
+	if *bos {
+		p.Tokenizer.AddBOS = true
+		p.Model.Config.AddBOS = true
+		fmt.Printf("forced AddBOS=true (bos id=%d)\n", cfg.BOS)
+	}
+
+	if *first {
+		// Mirror the server's CPU path exactly: prefill the chat prompt, apply
+		// the EOG suppression list, then greedy-pick the first token.
+		ids := p.Tokenizer.Encode(text)
+		p.ResetSequenceState()
+		llm.ForwardBatch(p.Model, ids, 0, p.KVCache, p.RunState, p.BatchState)
+		logits := p.RunState.Logits
+		fmt.Printf("\n== prefill done, prompt=%d tokens\n", len(ids))
+		llm.ApplySuppressTokens(logits, cfg.SuppressTokens)
+		fmt.Printf("suppressTokens=%v eos=%d stopTokens=%v\n", cfg.SuppressTokens, cfg.EOS, cfg.StopTokens)
+
+		type pair struct {
+			id int
+			l  float32
+		}
+		best := make([]pair, 0, 8)
+		for i, v := range logits {
+			if len(best) < 8 {
+				best = append(best, pair{i, v})
+			} else {
+				worst := 0
+				for j := 1; j < len(best); j++ {
+					if best[j].l < best[worst].l {
+						worst = j
+					}
+				}
+				if v > best[worst].l {
+					best[worst] = pair{i, v}
+				}
+			}
+		}
+		for i := 1; i < len(best); i++ {
+			for j := i; j > 0 && best[j].l > best[j-1].l; j-- {
+				best[j], best[j-1] = best[j-1], best[j]
+			}
+		}
+		for _, b := range best {
+			fmt.Printf("  logit %9.4f  id=%7d  %q\n", b.l, b.id, p.Tokenizer.DecodeToken(int32(b.id)))
+		}
+		got := ops.SampleToken(logits, ops.SamplerConfig{Temperature: 0}, nil, nil)
+		fmt.Printf("argmax -> id=%d %q  isEOS=%v\n", got, p.Tokenizer.DecodeToken(int32(got)), int32(got) == cfg.EOS)
+		return
 	}
 	out, tps, err := p.GenerateText(text, gcfg)
 	elapsed := time.Since(t1).Seconds()

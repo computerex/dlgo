@@ -76,6 +76,18 @@ func (p *Pipeline) RebuildBuffers() {
 	p.BatchState = NewBatchState(cfg, batchCap, p.MaxSeqLen)
 }
 
+// ResetSequenceState clears every per-sequence recurrent buffer: the KV cache,
+// the SSM state, and the short-convolution history. Call it before prefilling a
+// new prompt on a reused pipeline.
+func (p *Pipeline) ResetSequenceState() {
+	p.ensureCPUState()
+	p.KVCache.Reset()
+	if p.RunState.SSMState != nil {
+		p.RunState.SSMState.Reset()
+	}
+	resetShortConvState(p.RunState)
+}
+
 // ensureCPUState lazily (re)creates the CPU-side buffers when they are absent.
 // NewPipeline allocates them eagerly, but something (an explicit FreeForGPU, or
 // GPU pipeline construction, which releases the CPU scratch to avoid doubling
@@ -411,6 +423,14 @@ func NewPipeline(modelPath string, maxSeqLen int, opts ...PipelineOption) (*Pipe
 		}
 	}
 	m.Config.AddBOS = tok.AddBOS
+	// The LFM2/LFM2MoE chat template renders {{ bos_token }} as its first
+	// element, so the prompt must begin with BOS even though these GGUFs omit
+	// tokenizer.ggml.add_bos_token. Without it the distribution right after the
+	// template's  thinking opener is badly shifted (EOS competes for the top).
+	if m.Config.ChatTemplate == "lfm2" {
+		m.Config.AddBOS = true
+		tok.AddBOS = true
+	}
 
 	// For architectures with structural tokens that should never appear in output,
 	// register them as stop tokens for fast token-level detection.
@@ -721,10 +741,7 @@ func (p *Pipeline) GenerateDetailed(prompt string, cfg GenerateConfig) (*Generat
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
-	p.KVCache.Reset()
-	if p.RunState.SSMState != nil {
-		p.RunState.SSMState.Reset()
-	}
+	p.ResetSequenceState()
 
 	// Minimize GC interference during inference (2000% = rare but not disabled,
 	// preventing unbounded heap growth from any allocating fallback paths)
@@ -883,10 +900,7 @@ func (p *Pipeline) GenerateDetailedWithEmbeddings(prompt string, images [][][]fl
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
-	p.KVCache.Reset()
-	if p.RunState.SSMState != nil {
-		p.RunState.SSMState.Reset()
-	}
+	p.ResetSequenceState()
 
 	runtime.GC()
 	prev := debug.SetGCPercent(2000)
@@ -1109,10 +1123,7 @@ func (p *Pipeline) GenerateTextWithStopStrings(prompt string, cfg GenerateConfig
 		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 
-	p.KVCache.Reset()
-	if p.RunState.SSMState != nil {
-		p.RunState.SSMState.Reset()
-	}
+	p.ResetSequenceState()
 	stopStrings := collectStopStrings(p.Model.Config)
 	inThinkBlock := cfg.ThinkingPhase
 	thinkBudget := cfg.MaxTokens * 4 / 5

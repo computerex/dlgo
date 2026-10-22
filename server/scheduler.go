@@ -223,6 +223,14 @@ func (s *Scheduler) processRequest(req *InferenceRequest) {
 func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
 	pipe := s.model.CPUPipeline
 
+	// The pipeline may have been built with llm.WithoutCPUState (the loader does
+	// that when it intends to use the GPU). If GPU pipeline creation then failed
+	// for any reason, the CPU scratch is still absent and the code below would
+	// dereference a nil KV cache. Rebuild it on demand.
+	if pipe.KVCache == nil || pipe.RunState == nil || pipe.BatchState == nil {
+		pipe.RebuildBuffers()
+	}
+
 	// Vision prefill uses the same device-agnostic Pipeline implementation as
 	// the CPU text path. Image rows are injected through ForwardEmbedding and
 	// use the Qwen M-RoPE grid positions carried in GenerateConfig.
@@ -249,11 +257,8 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		return
 	}
 
-	// Reset KV cache
-	pipe.KVCache.Reset()
-	if pipe.RunState.SSMState != nil {
-		pipe.RunState.SSMState.Reset()
-	}
+	// Reset KV cache and any recurrent state (SSM, short convolution)
+	pipe.ResetSequenceState()
 
 	// Prefill
 	llm.ForwardBatch(pipe.Model, req.Tokens, 0, pipe.KVCache, pipe.RunState, pipe.BatchState)

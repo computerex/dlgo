@@ -703,6 +703,10 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// falls back to CPU instead of dereferencing attention weights that
 	// short-conv layers do not carry.
 	if cfg.HasShortConv() {
+		// Honour the contract callers rely on: NewGpuPipeline leaves a usable
+		// CPU pipeline behind when it fails. The caller may have built the
+		// pipeline with llm.WithoutCPUState, so rebuild the scratch here.
+		cpuPipeline.RebuildBuffers()
 		return nil, fmt.Errorf("gpu: %s layers using short convolution are not supported yet; "+
 			"falling back to the CPU pipeline", cfg.Architecture)
 	}
