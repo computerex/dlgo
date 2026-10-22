@@ -130,8 +130,13 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 		attnLayers = (nLayers + int64(cfg.FullAttentionInterval) - 1) / int64(cfg.FullAttentionInterval)
 	}
 
-	// KV cache: only attention layers need it (float32 K and V per position)
+	// KV cache: only attention layers need it (float32 K and V per position).
+	// Short-convolution models also vary the KV width per layer, so use the
+	// exact per-token budget when one is derivable.
 	kvBytes := 2 * attnLayers * seq * kvDim * 4
+	if cfg.HasShortConv() {
+		kvBytes = seq * cfg.KVBytesPerToken()
+	}
 
 	// RunState: fixed per-token buffers (independent of sequence length except
 	// for HeadScores, Scores, RoPE tables which are small).
@@ -157,6 +162,12 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 		statePerLayer := ssmHeads * ssmHK * ssmHV * 4
 		convPerLayer := int64(4) * (ssmHK*2 + ssmHeads*ssmHV) * 4
 		rsBytes += nLayers * (statePerLayer + convPerLayer)
+	}
+
+	// Short convolution recurrent state + per-token scratch (LFM2/LFM2MoE).
+	if cfg.HasShortConv() {
+		rsBytes += nLayers * int64(ShortConvStateLen(cfg.ShortConvLCache, cfg.EmbeddingDim)) * 4
+		rsBytes += 5 * dim * 4
 	}
 
 	// BatchState: batch processing buffers are capped at prefillChunkSize.
@@ -189,6 +200,12 @@ func EstimateRuntimeBytes(cfg ModelConfig, seqLen int) int64 {
 		bsBytes += batchCap * (ssmQKVDim + ssmValueDim*2 + ssmHeads*2) * 4
 	}
 
+	// Short convolution batch scratch: 3*dim for the in-projection result plus
+	// dim for the gated conv output, per position.
+	if cfg.HasShortConv() && cfg.AttentionLayerCount() < cfg.NumLayers {
+		bsBytes += int64(batchCap) * 4 * dim * 4
+	}
+
 	// Score buffers: numWorkers * seqLen * 4, scaled to full context length
 	// (each attention head needs scores for all positions). Use est. 8 workers.
 	const estWorkers = 8
@@ -212,21 +229,26 @@ func max64(a, b int64) int64 {
 	return b
 }
 
-// newSparseKVCache creates caches for every layer. Hybrid SSM layers maintain
-// their sequence state in SSMState, but ForwardBatch's shared preparation path
-// stores projected KV rows before dispatching to the layer-specific core, so a
-// full-size cache is required for correct batched prefill.
+// newSparseKVCache creates caches for every layer that needs one. Hybrid SSM
+// layers keep a full-size cache because ForwardBatch's shared preparation path
+// stores projected KV rows before dispatching to the layer-specific core.
+// Short-convolution layers (LFM2/LFM2MoE) never touch the KV cache at all — the
+// batch and decode paths branch away before any store — so they get a nil entry
+// and cost nothing. With 40 layers at 100k context skipping 30 of them saves
+// ~125 GB of float32 cache.
 func newSparseKVCache(cfg ModelConfig, maxSeqLen, kvDim int) *memory.MultiLayerKVCache {
 	kv := &memory.MultiLayerKVCache{
 		Layers: make([]*memory.KVCache, cfg.NumLayers),
 	}
 	for l := 0; l < cfg.NumLayers; l++ {
-		// SSM layers do not consume attention KV data during token-by-token
-		// decoding, but ForwardBatch's common attention preparation currently
-		// stores into every layer's cache before selecting the layer core. Keep a
-		// full-size cache here so batched prefill remains safe for hybrid models.
-		// The recurrent SSM state is still the authoritative sequence state.
-		kv.Layers[l] = memory.NewKVCache(maxSeqLen, kvDim)
+		if cfg.IsShortConvLayer(l) {
+			continue
+		}
+		dim := cfg.LayerKVHeads(l) * cfg.HeadDim
+		if dim <= 0 {
+			dim = kvDim
+		}
+		kv.Layers[l] = memory.NewKVCache(maxSeqLen, dim)
 	}
 	return kv
 }
@@ -535,6 +557,7 @@ func (p *Pipeline) Generate(prompt []int32, cfg GenerateConfig) ([]int32, error)
 	if p.RunState.SSMState != nil {
 		p.RunState.SSMState.Reset()
 	}
+	resetShortConvState(p.RunState)
 
 	runtime.GC()
 	prev := debug.SetGCPercent(2000)

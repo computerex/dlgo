@@ -80,9 +80,12 @@ func NewMultiLayerKVCache(nLayers, maxPos, dim int) *MultiLayerKVCache {
 	return m
 }
 
-// Reset clears all layer caches.
+// Reset clears all layer caches. Layers without a cache (short-convolution
+// layers in LFM2/LFM2MoE) are nil and skipped.
 func (m *MultiLayerKVCache) Reset() {
 	for _, l := range m.Layers {
-		l.Reset()
+		if l != nil {
+			l.Reset()
+		}
 	}
 }

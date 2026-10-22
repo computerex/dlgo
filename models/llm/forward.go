@@ -73,8 +73,15 @@ type RunState struct {
 	SSMRun   *SSMRunState
 	SSMState *memory.SSMStateCache
 
+	// Short convolution (LFM2/LFM2MoE) scratch — nil when the model has none.
+	ShortConvBCX   []float32   // [3*dim] in_projection output
+	ShortConvBx    []float32   // [dim] b*x
+	ShortConvY     []float32   // [dim] c*conv_out
+	ShortConvState [][]float32 // [NumLayers][(lCache-1)*dim] rolling history
+
 	// MoE (Mixture of Experts) scratch buffers — nil for dense models
 	MoELogits     []float32   // [expertCount] router logits
+	MoESel        []float32   // [expertCount] selection scores (prob + bias), DeepSeek-V3 style
 	MoEGates      [][]float32 // [nUsed][expertFFNDim] per-expert gate (parallel)
 	MoEUps        [][]float32 // [nUsed][expertFFNDim] per-expert up (parallel)
 	MoEHiddens    [][]float32 // [nUsed][expertFFNDim] per-expert hidden (parallel)
@@ -165,6 +172,7 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		}
 		nUsed := cfg.ExpertUsedCount
 		rs.MoELogits = make([]float32, cfg.ExpertCount)
+		rs.MoESel = make([]float32, cfg.ExpertCount)
 		rs.MoEGates = make([][]float32, nUsed)
 		rs.MoEUps = make([][]float32, nUsed)
 		rs.MoEHiddens = make([][]float32, nUsed)
@@ -186,6 +194,29 @@ func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 		rs.MLAQAbsorbed = make([]float32, cfg.NumHeads*cfg.KVLORARank)
 		rs.MLAAttnKV = make([]float32, cfg.NumHeads*cfg.KVLORARank)
 		rs.PrecomputeRoPE(maxSeqLen, cfg.QKRopeDim, cfg.QKRopeDim, cfg.RopeFreqBase)
+	}
+
+	// Short convolution state (LFM2/LFM2MoE): no position dependence, so a
+	// per-layer rolling history of (kernel-1) rows is all that is needed.
+	if cfg.HasShortConv() {
+		stateLen := ShortConvStateLen(cfg.ShortConvLCache, dim)
+		rs.ShortConvBCX = make([]float32, 3*dim)
+		rs.ShortConvBx = make([]float32, dim)
+		rs.ShortConvY = make([]float32, dim)
+		rs.ShortConvState = make([][]float32, cfg.NumLayers)
+		var any bool
+		for l := 0; l < cfg.NumLayers; l++ {
+			if cfg.IsShortConvLayer(l) {
+				rs.ShortConvState[l] = make([]float32, stateLen)
+				any = true
+			}
+		}
+		if !any {
+			rs.ShortConvBCX = nil
+			rs.ShortConvBx = nil
+			rs.ShortConvY = nil
+			rs.ShortConvState = nil
+		}
 	}
 
 	if cfg.FullAttentionInterval > 0 && cfg.SSMInnerSize > 0 {
@@ -325,6 +356,8 @@ func forwardLayers(m *Model, pos, startLayer, endLayer int, kv *memory.MultiLaye
 		switch spec.Core {
 		case CoreSSM:
 			ForwardSSMLayer(layer, rs, rs.SSMRun, rs.SSMState.Layers[l], rs.XNorm, cfg, pool)
+		case CoreShortConv:
+			forwardShortConvLayer(l, layer, rs, rs.XNorm, cfg, pool)
 		case CoreMLA:
 			ForwardMLA(layer, rs, kv, l, pos, cfg, pool)
 		case CoreAttention:
@@ -758,7 +791,23 @@ func ForwardMoEFFN(layer *Layer, rs *RunState, input []float32, cfg ModelConfig,
 		for i := 0; i < nExperts; i++ {
 			rs.MoELogits[i] = ops.Sigmoid(rs.MoELogits[i])
 		}
-		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
+		if layer.FFNExpertSelBias != nil && 0 < nExperts && nExperts <= len(rs.MoESel) {
+			// DeepSeek-V3 / LFM2MoE: choose the experts by (probability + bias),
+			// but weight them by the *unbiased* probability.
+			sel := rs.MoESel[:nExperts]
+			for i := 0; i < nExperts; i++ {
+				sel[i] = rs.MoELogits[i] + layer.FFNExpertSelBias[i]
+			}
+			indices, _ = topKIndices(sel, nUsed)
+			weights = make([]float32, nUsed)
+			for j, idx := range indices {
+				if idx >= 0 {
+					weights[j] = rs.MoELogits[idx]
+				}
+			}
+		} else {
+			indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
+		}
 	case 3:
 		indices, weights = topKIndices(rs.MoELogits[:nExperts], nUsed)
 		quant.SIMDSoftmax(weights)

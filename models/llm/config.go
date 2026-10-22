@@ -17,8 +17,13 @@ type ModelConfig struct {
 	FFNDim        int
 	NumHeads      int
 	NumKVHeads    int
-	HeadDim       int
-	RMSNormEps    float32
+	// KVHeadsPerLayer holds a per-layer KV head count read from an array-valued
+	// attention.head_count_kv key (LFM2 / LFM2MoE). A zero entry means the layer
+	// has no attention at all — it is a shortconv (or other recurrent) layer.
+	// Nil when the model stores a single scalar head count.
+	KVHeadsPerLayer []int
+	HeadDim         int
+	RMSNormEps      float32
 	RopeFreqBase  float32
 	RopeNeox      bool
 	RopeDim       int // partial RoPE: 0 = full headDim, else only first RopeDim dims
@@ -57,6 +62,11 @@ type ModelConfig struct {
 	SSMTimeStepRank       int
 	SSMGroupCount         int
 	SSMTiledVOrder        bool // true = GGUF V heads in tiled order (Qwen3.5); false = grouped (Qwen3Next)
+
+	// Short convolution layers (LFM2 / LFM2MoE). 0 = the model has none.
+	// ShortConvLCache is the kernel size (3 for LFM2); the layer keeps
+	// ShortConvLCache-1 = 2 previous bx rows as recurrent state.
+	ShortConvLCache int
 
 	// MoE (Mixture of Experts)
 	ExpertCount        int     // 0 = dense (no MoE); >0 = number of experts per layer
@@ -138,6 +148,7 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 		SSMStateSize:          metaInt(md, arch+".ssm.state_size", 0),
 		SSMTimeStepRank:       metaInt(md, arch+".ssm.time_step_rank", 0),
 		SSMGroupCount:         metaInt(md, arch+".ssm.group_count", 0),
+		ShortConvLCache:       metaInt(md, arch+".shortconv.l_cache", 0),
 		ChatTemplate:          inferChatTemplate(md, arch),
 
 		ExpertCount:        metaInt(md, arch+".expert_count", 0),
@@ -172,6 +183,20 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 	}
 	if c.NumHeads == 0 {
 		return c, fmt.Errorf("missing %s.attention.head_count", arch)
+	}
+	// Some architectures (LFM2/LFM2MoE) store attention.head_count_kv as a
+	// per-layer array; a 0 entry marks a layer with no attention at all.
+	c.KVHeadsPerLayer = metaIntSlice(md, arch+".attention.head_count_kv")
+	if len(c.KVHeadsPerLayer) > c.NumLayers {
+		c.KVHeadsPerLayer = c.KVHeadsPerLayer[:c.NumLayers]
+	}
+	if c.NumKVHeads == 0 {
+		// metaInt cannot read an array, so derive the global figure from it.
+		for _, n := range c.KVHeadsPerLayer {
+			if n > c.NumKVHeads {
+				c.NumKVHeads = n
+			}
+		}
 	}
 	if c.NumKVHeads == 0 {
 		c.NumKVHeads = c.NumHeads
@@ -209,6 +234,59 @@ func parseConfig(md map[string]interface{}) (ModelConfig, error) {
 
 func sqrt32(x float32) float32 {
 	return float32(math.Sqrt(float64(x)))
+}
+
+// LayerKVHeads returns the KV head count for layer l. Layers described by an
+// array-valued attention.head_count_kv use their own entry; everything else
+// uses the scalar NumKVHeads.
+func (c ModelConfig) LayerKVHeads(l int) int {
+	if l >= 0 && l < len(c.KVHeadsPerLayer) {
+		return c.KVHeadsPerLayer[l]
+	}
+	return c.NumKVHeads
+}
+
+// IsShortConvLayer reports whether layer l runs a short convolution instead of
+// attention. LFM2/LFM2MoE signal this by a zero per-layer KV head count.
+func (c ModelConfig) IsShortConvLayer(l int) bool {
+	if c.ShortConvLCache <= 1 || l < 0 || l >= len(c.KVHeadsPerLayer) {
+		return false
+	}
+	return c.KVHeadsPerLayer[l] == 0
+}
+
+// HasShortConv reports whether any layer uses a short convolution core.
+func (c ModelConfig) HasShortConv() bool {
+	return c.ShortConvLCache > 1
+}
+
+// AttentionLayerCount returns the number of layers that keep a KV cache.
+// Short-convolution layers hold recurrent state instead, so they are excluded.
+func (c ModelConfig) AttentionLayerCount() int {
+	if !c.HasShortConv() {
+		return c.NumLayers
+	}
+	n := 0
+	for l := 0; l < c.NumLayers; l++ {
+		if !c.IsShortConvLayer(l) {
+			n++
+		}
+	}
+	return n
+}
+
+// KVBytesPerToken returns the KV cache cost of one token across all layers,
+// in bytes, assuming float32 K and V.
+func (c ModelConfig) KVBytesPerToken() int64 {
+	var total int64
+	for l := 0; l < c.NumLayers; l++ {
+		kvHeads := c.LayerKVHeads(l)
+		if c.IsShortConvLayer(l) {
+			kvHeads = 0
+		}
+		total += 2 * int64(kvHeads) * int64(c.HeadDim) * 4
+	}
+	return total
 }
 
 // parseRopeScaleType detects the RoPE scaling type from GGUF metadata.

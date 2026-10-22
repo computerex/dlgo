@@ -63,6 +63,10 @@ var archRegistry = map[string]ArchDescriptor{
 	"gpt-oss":   {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "harmony"},
 	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 	"qwen3next": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
+	// LFM2 / LFM2MoE: hybrid short-convolution + attention. NeoX RoPE, SwiGLU
+	// dense FFN, sigmoid-gated MoE, ChatML chat template, no thinking blocks.
+	"lfm2":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	"lfm2moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.
@@ -119,6 +123,22 @@ func applyArchDefaults(config *ModelConfig) {
 	// GQA mapping for SSM layers: tiled → h % numKVGroups, grouped → h / headsPerGroup.
 	if config.Architecture == "qwen35" || config.Architecture == "qwen35moe" {
 		config.SSMTiledVOrder = true
+	}
+	// LFM2MoE passes norm_w=true to build_moe_ffn (renormalize the selected
+	// expert weights) and defaults to sigmoid gating.
+	if config.Architecture == "lfm2moe" {
+		if config.ExpertCount > 0 {
+			config.ExpertWeightsNorm = true
+			if config.ExpertGatingFunc == 0 {
+				config.ExpertGatingFunc = 2
+			}
+		}
+		if config.ShortConvLCache == 0 {
+			config.ShortConvLCache = 3
+		}
+	}
+	if config.Architecture == "lfm2" && config.ShortConvLCache == 0 {
+		config.ShortConvLCache = 3
 	}
 }
 

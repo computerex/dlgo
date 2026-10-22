@@ -125,6 +125,8 @@ func resolveLayerSpec(l *Layer, cfg ModelConfig, layerIdx int) LayerSpec {
 
 	if isSSMLayer(layerIdx, cfg) && l.SSMInProj != nil {
 		s.Core = CoreSSM
+	} else if l.ShortConvInProj != nil && l.ShortConvOutProj != nil {
+		s.Core = CoreShortConv
 	} else if l.WqA != nil && l.WqB != nil {
 		s.Core = CoreMLA
 	} else {
@@ -203,6 +205,8 @@ func PinLayerToRAM(l *Layer) {
 	pinTensor(l.SSMAlpha)
 	pinTensor(l.SSMBeta)
 	pinTensor(l.SSMOut)
+	pinTensor(l.ShortConvInProj)
+	pinTensor(l.ShortConvOutProj)
 	pinTensor(l.FFNRouter)
 	pinTensor(l.FFNGateExps)
 	pinTensor(l.FFNUpExps)
@@ -238,6 +242,8 @@ func EstimateLayerBytes(l *Layer) int64 {
 	add(l.SSMAlpha)
 	add(l.SSMBeta)
 	add(l.SSMOut)
+	add(l.ShortConvInProj)
+	add(l.ShortConvOutProj)
 	add(l.FFNRouter)
 	add(l.FFNGateExps)
 	add(l.FFNUpExps)
@@ -272,6 +278,8 @@ func isNormOrBias(name string) bool {
 		strings.HasSuffix(name, "_norm.bias") ||
 		strings.HasSuffix(name, "ssm_a") ||
 		strings.HasSuffix(name, "ssm_conv1d.weight") ||
+		// LFM2 depthwise short-conv taps: 1-D per-channel parameters, [kernel] each.
+		strings.HasSuffix(name, "shortconv.conv.weight") ||
 		strings.HasSuffix(name, "ffn_gate_inp_shexp.weight") ||
 		strings.HasSuffix(name, "attn_sinks.weight")
 }
@@ -284,6 +292,10 @@ func dequantToF32(data []byte, ggmlType uint32, n int) []float32 {
 func mapTensorF32(m *Model, name string, data []float32) {
 	switch {
 	case name == "output_norm.weight":
+		m.OutputNorm = data
+	case name == "token_embd_norm.weight":
+		// LFM2/LFM2MoE name the output norm after the embedding table
+		// (llama.cpp: LLM_TENSOR_OUTPUT_NORM_LFM2).
 		m.OutputNorm = data
 	case name == "output_norm.bias":
 		m.OutputNormBias = data
@@ -337,10 +349,19 @@ func mapTensorF32(m *Model, name string, data []float32) {
 				l.SSMA = data
 		case "ssm_conv1d.weight":
 			l.SSMConv1dW = data
+		case "shortconv.conv.weight":
+			l.ShortConvConv = data
 		case "ffn_gate_inp_shexp.weight":
 			l.FFNRouterShared = data
 		case "exp_probs_b.bias":
-			l.FFNRouterBias = data
+			// LFM2MoE (DeepSeek-V3 lineage) adds this bias to the gating
+			// probabilities after the activation, for expert *selection* only.
+			// Other architectures treat it as a plain router logit bias.
+			if m.Config.Architecture == "lfm2moe" {
+				l.FFNExpertSelBias = data
+			} else {
+				l.FFNRouterBias = data
+			}
 		case "attn_sinks.weight":
 			l.AttnSinks = data
 		case "ffn_gate_inp.bias":
@@ -419,6 +440,11 @@ func mapTensorQT(m *Model, name string, qt *core.QuantizedTensor, qDim, kvDim in
 			l.FFNUpShared = qt
 		case "ffn_down_shexp.weight":
 			l.FFNDownShared = qt
+		// LFM2 short convolution
+		case "shortconv.in_proj.weight":
+			l.ShortConvInProj = qt
+		case "shortconv.out_proj.weight":
+			l.ShortConvOutProj = qt
 		}
 	}
 	}

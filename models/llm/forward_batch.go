@@ -50,6 +50,12 @@ type BatchState struct {
 	SSMBetaBatch  []float32 // [maxPos * numHeads]
 	SSMYBatch     []float32 // [maxPos * valueDim]
 
+	// Short convolution (LFM2/LFM2MoE) batch buffers — nil when unused.
+	// The in-projection is batched; the depthwise conv is a per-position
+	// recurrence over the shared rolling state.
+	ShortConvBCX []float32 // [maxPos * 3*dim]
+	ShortConvY   []float32 // [maxPos * dim]
+
 	// MoE batch buffers
 	MoERouterBatch []float32 // [maxPos * expertCount] router logits
 	MoEExpDim      int       // expert FFN hidden dim
@@ -147,6 +153,12 @@ func NewBatchState(cfg ModelConfig, maxPos int, maxSeqLenHint ...int) *BatchStat
 		vGather = make([]float32, kgatherElems)
 	}
 
+	var scBCX, scY []float32
+	if cfg.HasShortConv() && cfg.AttentionLayerCount() < cfg.NumLayers {
+		scBCX = make([]float32, maxPos*3*dim)
+		scY = make([]float32, maxPos*dim)
+	}
+
 	return &BatchState{
 		maxPos:    maxPos,
 		maxSeqLen: maxSeqLen,
@@ -178,6 +190,8 @@ func NewBatchState(cfg ModelConfig, maxPos int, maxSeqLenHint ...int) *BatchStat
 		SSMAlphaBatch: ssmAlphaBatch,
 		SSMBetaBatch:  ssmBetaBatch,
 		SSMYBatch:     ssmYBatch,
+		ShortConvBCX:  scBCX,
+		ShortConvY:    scY,
 		ScoreBufs:     scoreBufs,
 		KGather:       kGather,
 		VGather:       vGather,
@@ -381,6 +395,43 @@ func ForwardBatch(m *Model, tokens []int32, startPos int, kv *memory.MultiLayerK
 				ForwardMLA(layer, rs, kv, l, pos, cfg, pool)
 				copy(bs.ProjBatch[p*dim:(p+1)*dim], rs.AttnProj)
 			}
+			batchResidualFFN(layer, bs, rs, nPos, dim, cfg, pool)
+			continue
+		}
+
+		// Short convolution layers: no KV cache, per-position recurrence over a
+		// shared rolling state (LFM2/LFM2MoE).
+		if spec.Core == CoreShortConv {
+			lcache := cfg.ShortConvLCache
+			if lcache <= 1 {
+				lcache = 3
+			}
+			state := rs.ShortConvState[l]
+
+			pool.ParallelFor(nPos, func(p int) {
+				x := bs.XBatch[p*dim : (p+1)*dim]
+				xn := bs.XNormBatch[p*dim : (p+1)*dim]
+				switch spec.Norm {
+				case NormRMS:
+					ops.RMSNorm(xn, x, layer.AttnNorm, cfg.RMSNormEps)
+				case NormLayer:
+					ops.LayerNorm(xn, x, layer.AttnNorm, layer.AttnNormBias, cfg.RMSNormEps)
+				}
+			})
+
+			blas.QBatchGEMMParallel(bs.ShortConvBCX[:nPos*3*dim], layer.ShortConvInProj,
+				bs.XNormBatch[:nPos*dim], nPos, pool)
+
+			// The conv consumes bx in submission order, so this stays serial.
+			for p := 0; p < nPos; p++ {
+				shortConvPrefillRow(state, layer.ShortConvConv,
+					bs.ShortConvBCX[p*3*dim:(p+1)*3*dim],
+					bs.ShortConvY[p*dim:(p+1)*dim], lcache, dim)
+			}
+
+			blas.QBatchGEMMParallel(bs.ProjBatch[:nPos*dim], layer.ShortConvOutProj,
+				bs.ShortConvY[:nPos*dim], nPos, pool)
+
 			batchResidualFFN(layer, bs, rs, nPos, dim, cfg, pool)
 			continue
 		}

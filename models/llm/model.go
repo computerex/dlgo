@@ -24,6 +24,7 @@ const (
 	CoreAttention CoreKind = iota // Standard grouped-query attention
 	CoreSSM                       // Gated Delta Network (Qwen3.5 linear attention)
 	CoreMLA                       // Multi-head Latent Attention (DeepSeek-V2/GLM-4)
+	CoreShortConv                 // Depthwise short convolution over the token axis (LFM2)
 )
 
 // ResKind selects the residual connection + FFN-norm wiring.
@@ -103,6 +104,15 @@ type Layer struct {
 	FFNDownShared   *core.QuantizedTensor // [dim × sharedFFNDim] shared expert down
 	FFNRouterShared []float32             // [dim] shared expert gate weight (sigmoid of dot product)
 	FFNRouterBias   []float32             // [expertCount] router logit bias (DeepSeek-V2/GLM-4)
+	// FFNExpertSelBias is DeepSeek-V3 / LFM2MoE style: the bias is added to the
+	// gating *probabilities* (after the activation) purely to pick the top-K
+	// experts. The weights applied to the experts stay unbiased.
+	FFNExpertSelBias []float32 // [expertCount]
+
+	// Short convolution core (LFM2 / LFM2MoE). Only set on CoreShortConv layers.
+	ShortConvConv    []float32             // [dim*kernel] depthwise taps, layout channel*kernel+tap
+	ShortConvInProj  *core.QuantizedTensor // [3*dim × dim]
+	ShortConvOutProj *core.QuantizedTensor // [dim × dim]
 
 	// MLA (Multi-head Latent Attention) — DeepSeek-V2/GLM-4
 	WqA      *core.QuantizedTensor // [qLORARank × dim] Q down-projection
