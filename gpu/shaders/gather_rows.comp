@@ -1,0 +1,28 @@
+#version 450
+
+// Row gather: dst[i] = src[idx[i]] for whole rows of `dim` floats.
+//
+// Used by the position-batched MoE to pack the input rows of one expert into a
+// dense buffer, so the existing batched matvec (which walks x contiguously) can
+// run one real GEMM per expert instead of one matvec per (token, expert) pair.
+//
+// Dispatch: groups = (ceil(dim/256), n, 1).
+
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) buffer Dst { float dst_data[]; };
+layout(set = 0, binding = 1) buffer Src { float src_data[]; };
+layout(set = 0, binding = 2) buffer Idx { int idx[]; };
+
+layout(push_constant) uniform Params {
+    int n;      // number of destination rows
+    int dim;    // elements per row
+};
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    int i = int(gl_GlobalInvocationID.y);
+    if (i >= n || c >= dim) return;
+    dst_data[uint(i) * uint(dim) + uint(c)] =
+        src_data[uint(idx[i]) * uint(dim) + uint(c)];
+}

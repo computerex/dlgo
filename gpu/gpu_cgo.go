@@ -1009,6 +1009,47 @@ func SetGemmQ3K(on bool) {
 	C.gpu_set_gemm_q3k(v)
 }
 
+// MinSSBOOffsetAlign returns the device requirement for storage-buffer
+// descriptor offsets, in bytes.
+func MinSSBOOffsetAlign() uint64 { return uint64(C.gpu_min_ssbo_offset_align()) }
+
+// BatchMatVecOffset performs a batched matvec against a weight slice that starts
+// weightsOffBytes into a packed tensor (one MoE expert). The plain per-format
+// matvec kernels walk input columns by workgroup.y, so shifting the weight
+// binding turns "one matvec per (token, expert)" into "one GEMM per expert".
+func BatchMatVecOffset(out, weights, x Buf, rows, cols, npos int, qtype uint32, weightsOffBytes uint64) error {
+	rc := C.gpu_batch_matvec_offset(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.int(rows), C.int(cols), C.int(npos), C.int(qtype), C.uint64_t(weightsOffBytes))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_matvec_offset failed (%d)", rc)
+	}
+	return nil
+}
+
+// GatherRows performs dst[i] = src[idx[i]] over whole rows of `dim` floats.
+func GatherRows(dst, src, idx Buf, n, dim int) error {
+	rc := C.gpu_gather_rows(C.GpuBuf(dst), C.GpuBuf(src), C.GpuBuf(idx), C.int(n), C.int(dim))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gather_rows failed (%d)", rc)
+	}
+	return nil
+}
+
+// ScatterRows performs dst[idx[i]] (+)= w[i]*src[i] over whole rows of `dim`
+// floats. add=false stores, add=true accumulates.
+func ScatterRows(dst, src, idx, weights Buf, n, dim int, add bool) error {
+	a := 0
+	if add {
+		a = 1
+	}
+	rc := C.gpu_scatter_rows(C.GpuBuf(dst), C.GpuBuf(src), C.GpuBuf(idx),
+		C.GpuBuf(weights), C.int(n), C.int(dim), C.int(a))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: scatter_rows failed (%d)", rc)
+	}
+	return nil
+}
+
 // SetNoCoopmatGemm disables cooperative-matrix GEMMs, forcing the
 // FP32-activation GEMM paths. The diffusion DiT needs this: its activations
 // (e.g. the SwiGLU output) exceed the FP16 range the coopmat kernels narrow to,

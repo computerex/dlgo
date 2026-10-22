@@ -1,0 +1,39 @@
+#version 450
+
+// Weighted row scatter-add: dst[idx[i]] (+)= w[i] * src[i] for whole rows of
+// `dim` floats.
+//
+// The position-batched MoE runs one GEMM per expert over only the tokens that
+// selected it, so each expert's output has to be accumulated back into the row
+// of the token it belongs to. Rows written by one dispatch are always distinct
+// (a token selects each expert at most once), so with `add=0` this is also a
+// plain weighted store, and with `add=1` successive experts accumulate without
+// needing atomics.
+//
+// Dispatch: groups = (ceil(dim/256), n, 1).
+
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) buffer Dst { float dst_data[]; };
+layout(set = 0, binding = 1) buffer Src { float src_data[]; };
+layout(set = 0, binding = 2) buffer Idx { int idx[]; };
+layout(set = 0, binding = 3) buffer W { float weights[]; };
+
+layout(push_constant) uniform Params {
+    int n;      // number of source rows
+    int dim;    // elements per row
+    int add;    // 0 = store, 1 = accumulate
+};
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    int i = int(gl_GlobalInvocationID.y);
+    if (i >= n || c >= dim) return;
+    uint o = uint(idx[i]) * uint(dim) + uint(c);
+    float v = weights[i] * src_data[uint(i) * uint(dim) + uint(c)];
+    if (add != 0) {
+        dst_data[o] = dst_data[o] + v;
+    } else {
+        dst_data[o] = v;
+    }
+}

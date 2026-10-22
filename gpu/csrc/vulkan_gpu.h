@@ -235,6 +235,15 @@ typedef enum {
     // (gpu/shaders/shortconv.comp). Appended at the end so existing pipeline
     // IDs stay stable.
     PIPE_SHORT_CONV,
+    // Position-batched MoE row remap helpers.
+    // gather_rows (gpu/shaders/gather_rows.comp): dst[i] = src[idx[i]] whole
+    // rows, used to pack the tokens that selected one expert into a dense
+    // buffer so a single batched matvec per expert is a real GEMM.
+    // scatter_rows (gpu/shaders/scatter_rows.comp): dst[idx[i]] (+)= w[i]*src[i],
+    // the matching weighted accumulate back into the token rows.
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_GATHER_ROWS,
+    PIPE_SCATTER_ROWS,
     PIPE_COUNT
 } PipelineID;
 
@@ -257,6 +266,11 @@ uint64_t gpu_host_visible_bytes(void);
 // Allocations past the ceiling go to host-visible memory and are still read
 // directly by shaders over PCIe, so they stay on the GPU compute path.
 void gpu_set_vram_ceiling(uint64_t bytes);
+// gpu_min_ssbo_offset_align returns minStorageBufferOffsetAlignment, i.e. the
+// largest power of two that a storage-buffer descriptor offset (used to point a
+// matvec at one MoE expert inside a packed tensor) must be a multiple of.
+uint64_t gpu_min_ssbo_offset_align(void);
+
 uint64_t gpu_vram_ceiling_bytes(void);
 uint64_t gpu_device_local_bytes(void);
 int gpu_is_initialized(void);
@@ -316,6 +330,22 @@ int gpu_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
                       GpuBuf weights_buf, int weights_offset_bytes,
                       GpuBuf x_buf, int rows, int cols, int qtype);
+
+// Batched matvec against a weight slice starting at weights_offset_bytes inside
+// a packed tensor (one MoE expert). Uses the same per-format matvec kernels,
+// walking input columns by workgroup.y and shifting the weight binding, so a
+// per-expert GEMM needs no dedicated kernel. Returns GPU_ERR_DISPATCH when the
+// quant type has no plain matvec pipeline.
+int gpu_batch_matvec_offset(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                            int rows, int cols, int npos, int qtype,
+                            uint64_t weights_offset_bytes);
+
+// Position-batched MoE row remap.
+// gather:  dst[i] = src[idx[i]]
+// scatter: dst[idx[i]] (+)= w[i] * src[i]   (add != 0 accumulates)
+int gpu_gather_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, int n, int dim);
+int gpu_scatter_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, GpuBuf weights,
+                     int n, int dim, int add);
 
 // Batch matrix-vector: out[p*rows+r] = dot(W[r,:], x[p*cols...]) for each position p
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,

@@ -244,6 +244,15 @@ uint64_t gpu_vram_ceiling_bytes(void) {
     return ceiling;
 }
 
+// Device requirement for storage-buffer descriptor offsets. The position-batched
+// MoE points a matvec at one expert inside a packed tensor by offsetting the
+// weight binding, so an expert's byte stride has to be a multiple of this.
+uint64_t gpu_min_ssbo_offset_align(void) {
+    if (!g.initialized) return 1;
+    uint64_t a = g.dev_props.limits.minStorageBufferOffsetAlignment;
+    return a ? a : 1;
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic Vulkan loading
 // ---------------------------------------------------------------------------
@@ -1625,6 +1634,11 @@ int gpu_matvec_offset(GpuBuf out_buf, int out_offset_bytes,
 
     int rows_per_wg = 4;
     switch (qtype) {
+        // Must match gpu_matvec's table: rows_per_wg has to equal the kernel's
+        // NUM_ROWS or half the rows are never computed. Q4_0/Q8_0 were missing
+        // here, which made every offset matvec on a Q4_0 expert slice (i.e. the
+        // whole per-token MoE offset path) silently wrong.
+        case QTYPE_Q4_0: case QTYPE_Q8_0:
         case QTYPE_Q4_K: case QTYPE_Q6_K: case QTYPE_Q3_K: case QTYPE_Q5_K:
         case QTYPE_Q2_K: case QTYPE_TQ1_0:
         case QTYPE_IQ1_S: case QTYPE_IQ1_M:
@@ -2875,6 +2889,133 @@ int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     dp.bufs[0] = out_buf;
     dp.bufs[1] = weights_buf;
     dp.bufs[2] = x_buf;
+    dp.num_bufs = 3;
+    if (table_buf) {
+        dp.bufs[3] = table_buf;
+        dp.num_bufs = 4;
+    }
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + rows_per_wg - 1) / rows_per_wg;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// ---------------------------------------------------------------------------
+// Position-batched MoE helpers.
+//
+// The per-token MoE walks one (token, expert) pair at a time, so a prompt token
+// re-reads the 4 experts it selected and nothing is shared between tokens: at
+// B=512 that is 2048 expert reads where one dense pass over the expert tensor
+// would do, i.e. ~32x the DRAM traffic. Batching by expert instead needs two
+// primitives that the token-axis indexing lacks: pack the rows of the tokens
+// that selected an expert into a dense buffer, and accumulate the expert's
+// output back into those rows.
+// ---------------------------------------------------------------------------
+
+// dst[i] = src[idx[i]] over whole rows of `dim` floats.
+int gpu_gather_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, int n, int dim) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (n <= 0 || dim <= 0) return GPU_OK;
+
+    struct { int n; int dim; } pc = {n, dim};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_GATHER_ROWS;
+    dp.bufs[0] = dst;
+    dp.bufs[1] = src;
+    dp.bufs[2] = idx;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (dim + 255) / 256;
+    dp.groups_y = n;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// dst[idx[i]] (+)= w[i] * src[i] over whole rows of `dim` floats.
+// add=0 stores, add=1 accumulates. Rows written by one dispatch are distinct.
+int gpu_scatter_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, GpuBuf weights,
+                     int n, int dim, int add) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (n <= 0 || dim <= 0) return GPU_OK;
+
+    struct { int n; int dim; int add; } pc = {n, dim, add};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_SCATTER_ROWS;
+    dp.bufs[0] = dst;
+    dp.bufs[1] = src;
+    dp.bufs[2] = idx;
+    dp.bufs[3] = weights;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (dim + 255) / 256;
+    dp.groups_y = n;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// gpu_batch_matvec_offset: batched matvec against a weight slice that starts at
+// `weights_offset_bytes` inside a packed tensor (one MoE expert).
+//
+// The plain per-format matvec kernels already walk their input columns by
+// gl_WorkGroupID.y and their weights through the descriptor, so an expert slice
+// needs no new kernel: shift the binding and set groups_y = npos. That turns
+// "one matvec per (token, expert)" into "one GEMM per expert" for free.
+//
+// Returns GPU_ERR_DISPATCH for quant types without a plain matvec pipeline; the
+// caller must then keep the per-token MoE.
+int gpu_batch_matvec_offset(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                            int rows, int cols, int npos, int qtype,
+                            uint64_t weights_offset_bytes) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0) return GPU_OK;
+    if (rows <= 0 || cols <= 0) return GPU_OK;
+    if (npos == 1)
+        return gpu_matvec_offset(out_buf, 0, weights_buf, (int)weights_offset_bytes,
+                                 x_buf, rows, cols, qtype);
+
+    PipelineID pipe;
+    GpuBuf table_buf = 0;
+    int rows_per_wg = 4;
+    switch (qtype) {
+        case QTYPE_F32:     pipe = PIPE_MATVEC_F32; break;
+        case QTYPE_F16:     pipe = PIPE_MATVEC_F16; break;
+        case QTYPE_Q4_0:    pipe = PIPE_MATVEC_Q4_0; rows_per_wg = 2; break;
+        case QTYPE_Q8_0:    pipe = PIPE_MATVEC_Q8_0; rows_per_wg = 2; break;
+        case QTYPE_Q5_0:    pipe = PIPE_MATVEC_Q5_0; break;
+        case QTYPE_Q5_1:    pipe = PIPE_MATVEC_Q5_1; break;
+        case QTYPE_Q3_K:    pipe = PIPE_MATVEC_Q3_K; rows_per_wg = 2; break;
+        case QTYPE_Q4_K:    pipe = PIPE_MATVEC_Q4_K; rows_per_wg = 2; break;
+        case QTYPE_Q5_K:    pipe = PIPE_MATVEC_Q5_K; rows_per_wg = 2; break;
+        case QTYPE_Q6_K:    pipe = PIPE_MATVEC_Q6_K; rows_per_wg = 2; break;
+        case QTYPE_Q2_K:    pipe = PIPE_MATVEC_Q2_K; rows_per_wg = 2; break;
+        case QTYPE_TQ1_0:   pipe = PIPE_MATVEC_TQ1_0; rows_per_wg = 2; break;
+        case QTYPE_IQ1_S:   pipe = PIPE_MATVEC_IQ1_S;   table_buf = g_iq_tables[IQ_TABLE_IQ1S];   rows_per_wg = 2; break;
+        case QTYPE_IQ1_M:   pipe = PIPE_MATVEC_IQ1_M;   table_buf = g_iq_tables[IQ_TABLE_IQ1S];   rows_per_wg = 2; break;
+        case QTYPE_IQ2_XXS: pipe = PIPE_MATVEC_IQ2_XXS; table_buf = g_iq_tables[IQ_TABLE_IQ2XXS]; rows_per_wg = 2; break;
+        case QTYPE_IQ2_S:   pipe = PIPE_MATVEC_IQ2_S;   table_buf = g_iq_tables[IQ_TABLE_IQ2S];   rows_per_wg = 2; break;
+        case QTYPE_IQ3_XXS: pipe = PIPE_MATVEC_IQ3_XXS; rows_per_wg = 2; break;
+        case QTYPE_IQ3_S:   pipe = PIPE_MATVEC_IQ3_S;   table_buf = g_iq_tables[IQ_TABLE_IQ3S];   rows_per_wg = 2; break;
+        case QTYPE_IQ4_XS:  pipe = PIPE_MATVEC_IQ4_XS;  rows_per_wg = 2; break;
+        case 20:            pipe = PIPE_MATVEC_IQ4_NL;  rows_per_wg = 2; break;
+        case 39:            pipe = PIPE_MATVEC_MXFP4;   rows_per_wg = 1; break;
+        case QTYPE_BF16:    pipe = PIPE_MATVEC_BF16;    rows_per_wg = 8; break;
+        default: return GPU_ERR_DISPATCH;
+    }
+
+    struct { int rows; int cols; } pc = {rows, cols};
+    DispatchParams dp = {0};
+    dp.pipe = pipe;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.buf_offsets[1] = weights_offset_bytes;
     dp.num_bufs = 3;
     if (table_buf) {
         dp.bufs[3] = table_buf;

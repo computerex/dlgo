@@ -604,6 +604,15 @@ type GpuBatchState struct {
 	QFull Buf // [npos * 2*qDim]
 	QGate Buf // [npos * qDim]
 
+	// Position-batched MoE scratch (see gpuForwardMoEBatch). Gate/Up/Hidden are
+	// shared with the dense-FFN scratch because ffnDim >= expDim on every MoE
+	// arch here, so only the row-sized pieces are new.
+	MoELogits Buf // [npos * nExperts] router logits for the chunk
+	MoEXE     Buf // [npos * dim]  input rows gathered for one expert
+	MoEOut    Buf // [npos * dim]  one expert's down-projection output
+	MoEIdx    Buf // [npos * int32] token ids routed to one expert
+	MoEW      Buf // [npos * float32] routing weights for those tokens
+
 	// SSM batch buffers (input projections batched, recurrence per-position)
 	SSMQKV   Buf // [npos * qkvDim]
 	SSMZ     Buf // [npos * valueDim]
@@ -647,6 +656,22 @@ func (bs *GpuBatchState) AllocGatedQBatch(npos, qDim int) error {
 	return nil
 }
 
+// AllocMoEBatch allocates the position-batched MoE scratch. Gate/Up/Hidden are
+// not allocated here: the dense-FFN scratch already has npos*ffnDim elements and
+// ffnDim >= expDim on every MoE arch in the tree.
+func (bs *GpuBatchState) AllocMoEBatch(npos, dim, nExperts int) error {
+	a := allocChecker{}
+	bs.MoELogits = a.alloc(uint64(npos * nExperts * 4))
+	bs.MoEXE = a.alloc(uint64(npos * dim * 4))
+	bs.MoEOut = a.alloc(uint64(npos * dim * 4))
+	bs.MoEIdx = a.alloc(uint64(npos * 4))
+	bs.MoEW = a.alloc(uint64(npos * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocMoEBatch: %w", a.err)
+	}
+	return nil
+}
+
 // AllocSSMBatch allocates batch-sized SSM scratch buffers.
 func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) error {
 	a := allocChecker{}
@@ -686,6 +711,11 @@ func (bs *GpuBatchState) Free() {
 	Free(bs.SSMAlpha)
 	Free(bs.SSMBeta)
 	Free(bs.SSMY)
+	Free(bs.MoELogits)
+	Free(bs.MoEXE)
+	Free(bs.MoEOut)
+	Free(bs.MoEIdx)
+	Free(bs.MoEW)
 }
 
 // GpuKVCache holds GPU-resident KV cache for all layers.

@@ -157,7 +157,9 @@ $shaders = @(
     @{name="attention_decode_gqa"; file="attention_decode_gqa.comp"},
     @{name="attention_decode_merge"; file="attention_decode_merge.comp"},
     @{name="convert_to_affine"; file="convert_to_affine.comp"},
-    @{name="shortconv"; file="shortconv.comp"}
+    @{name="shortconv"; file="shortconv.comp"},
+    @{name="gather_rows"; file="gather_rows.comp"},
+    @{name="scatter_rows"; file="scatter_rows.comp"}
 )
 
 $header = @"
@@ -368,6 +370,8 @@ static const ShaderInfo shader_registry[] = {
     {"attention_decode_merge", spv_attention_decode_merge, spv_attention_decode_merge_size, 2, 12}, // PIPE_ATTENTION_DECODE_MERGE
     {"convert_to_affine", spv_convert_to_affine, spv_convert_to_affine_size, 2, 12}, // PIPE_CONVERT_TO_AFFINE
     {"shortconv", spv_shortconv, spv_shortconv_size, 4, 12}, // PIPE_SHORT_CONV
+    {"gather_rows", spv_gather_rows, spv_gather_rows_size, 3, 8}, // PIPE_GATHER_ROWS
+    {"scatter_rows", spv_scatter_rows, spv_scatter_rows_size, 4, 12}, // PIPE_SCATTER_ROWS
 };
 
 #endif // DLGO_SHADERS_SPIRV_H
