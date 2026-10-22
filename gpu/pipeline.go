@@ -1796,6 +1796,11 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	if thinkBudget > maxThinkBudget {
 		thinkBudget = maxThinkBudget
 	}
+	// Native-protocol models emit <tool_call>...</tool_call>, and frequently do
+	// so inside the thinking block and then repeat the block many times. Once
+	// one complete call exists there is nothing left to generate, so stop
+	// immediately: this kills the repetition loop and the wasted tokens.
+	nativeToolCall := llm.GetArchDescriptor(p.CPUModel.Config.Architecture).ToolCallFormat != llm.ToolCallFormatNone
 	gpuStep := 0
 	// Guard against an empty assistant turn: aggressive quantizations sometimes
 	// close </think> and immediately emit EOS, producing a response with no
@@ -1908,6 +1913,11 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 		genText.WriteString(tokenText)
 		if thinkClosed && strings.TrimSpace(tokenText) != "" {
 			answerStarted = true
+		}
+		// One complete native tool call is a finished answer: stop generating
+		// instead of letting the model re-emit the same block repeatedly.
+		if nativeToolCall && strings.Contains(genText.String(), "</tool_call>") {
+			break
 		}
 
 		if gpuInThinkBlock && strings.Contains(genText.String(), "</"+"think>") {

@@ -428,8 +428,10 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 
 	cfg := req.Config
 	thinkClose := "</" + "think>"
+	tcOpen := "<tool_call>"
 	var reasoningAll strings.Builder
 	reasoningStreamed := false
+	tcInThink := false
 	emitReasoning := func(s string) {
 		if s == "" {
 			return
@@ -459,6 +461,17 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 				}
 				return
 			}
+			// A tool call emitted inside the thinking block must never reach the
+			// client as reasoning text: stream the natural-language prefix only
+			// and let the call be delivered structurally as tool_calls.
+			if tcInThink {
+				return
+			}
+			if idx := strings.Index(buf, tcOpen); idx >= 0 {
+				emitReasoning(buf[:idx])
+				tcInThink = true
+				return
+			}
 			// Stream reasoning as it arrives so the client sees progress during
 			// thinking. Hold back a small tail so a close tag split across two
 			// stream chunks is still detected.
@@ -486,9 +499,11 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		return
 	}
 
-	// If still buffering (no </think> found), treat as truncated reasoning.
+	// If still buffering (no </think> found), treat as truncated reasoning. Keep
+	// any tool-call markup in thinkingContent: it is stripped for display but is
+	// the only copy available for structural extraction.
 	if inThinkBlock {
-		thinkingContent = strings.TrimSpace(thinkBuf.String() + reasoningAll.String())
+		thinkingContent = strings.TrimSpace(reasoningAll.String() + thinkBuf.String())
 	}
 
 	finishReason := "stop"
