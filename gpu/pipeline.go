@@ -1230,7 +1230,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 // backend is "GPU (Vulkan)" or "CPU". err is non-nil only for hard failures
 // (e.g. the model file could not be loaded).
 func NewRunner(modelPath string, ctx int) (llm.Runner, string, error) {
-	pipe, err := llm.NewPipeline(modelPath, ctx)
+	pipe, err := llm.NewPipeline(modelPath, ctx, llm.WithoutCPUState())
 	if err != nil {
 		return nil, "", err
 	}

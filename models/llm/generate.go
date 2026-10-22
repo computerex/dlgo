@@ -312,7 +312,34 @@ func CheckMemoryBudget(modelPath string, cfg ModelConfig, requestedSeqLen int) (
 
 // NewPipeline loads a GGUF model and creates a ready-to-use inference pipeline
 // with automatic tokenizer extraction from GGUF metadata.
-func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
+// PipelineOption tunes NewPipeline.
+type PipelineOption func(*pipelineConfig)
+
+type pipelineConfig struct {
+	deferCPUState bool
+}
+
+// WithoutCPUState skips the eager allocation of the CPU KV cache, run state and
+// batch state.
+//
+// Pass this when the caller is about to build a GPU pipeline: NewGpuPipeline
+// calls FreeForGPU() before uploading weights, so that scratch is allocated and
+// immediately discarded. It is not small — BatchState is sized for
+// prefillChunkSize (8192) tokens, and with ffnDim 12288 the three FFN staging
+// buffers alone are 3 x 384 MiB — so allocating it first is what exhausts the
+// Windows commit limit at large contexts, before the GPU upload even begins.
+// The CPU inference paths re-create the buffers on demand via ensureCPUState(),
+// so a deferred pipeline is still usable if GPU creation fails.
+func WithoutCPUState() PipelineOption {
+	return func(c *pipelineConfig) { c.deferCPUState = true }
+}
+
+func NewPipeline(modelPath string, maxSeqLen int, opts ...PipelineOption) (*Pipeline, error) {
+	var pcfg pipelineConfig
+	for _, o := range opts {
+		o(&pcfg)
+	}
+
 	gf, err := gguf.Open(modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("parse GGUF: %w", err)
@@ -402,17 +429,28 @@ func NewPipeline(modelPath string, maxSeqLen int) (*Pipeline, error) {
 
 	kvDim := m.Config.NumKVHeads * m.Config.HeadDim
 
-	// Build KV cache. Hybrid SSM layers still require full-size entries during
-	// ForwardBatch preparation; their recurrent SSM state remains separate.
-	kv := newSparseKVCache(m.Config, maxSeqLen, kvDim)
-	rs := NewRunState(m.Config, maxSeqLen)
-
 	// BatchState is capped at prefillChunkSize to keep RAM usage predictable.
 	// ForwardBatch chunks large prompts automatically.
 	batchCap := maxSeqLen
 	if batchCap > prefillChunkSize {
 		batchCap = prefillChunkSize
 	}
+
+	// A GPU-bound caller never uses the CPU-side scratch (NewGpuPipeline calls
+	// FreeForGPU before uploading), and ensureCPUState() rebuilds it if GPU
+	// creation fails, so skip an allocation worth several GiB here.
+	if pcfg.deferCPUState {
+		return &Pipeline{
+			Model:     m,
+			Tokenizer: tok,
+			MaxSeqLen: maxSeqLen,
+		}, nil
+	}
+
+	// Build KV cache. Hybrid SSM layers still require full-size entries during
+	// ForwardBatch preparation; their recurrent SSM state remains separate.
+	kv := newSparseKVCache(m.Config, maxSeqLen, kvDim)
+	rs := NewRunState(m.Config, maxSeqLen)
 
 	return &Pipeline{
 		Model:      m,

@@ -147,7 +147,15 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 		}
 	}
 
-	pipe, err := llm.NewPipeline(path, contextLen)
+	var pipeOpts []llm.PipelineOption
+	if useGPU && mm.gpuNewPipeline != nil {
+		// The GPU pipeline owns the batch/run state; NewGpuPipeline frees the
+		// CPU copy before uploading anyway. Skipping it here avoids a multi-GiB
+		// transient allocation between GPU init and the weight upload, which is
+		// what made very large contexts fail on a modest pagefile.
+		pipeOpts = append(pipeOpts, llm.WithoutCPUState())
+	}
+	pipe, err := llm.NewPipeline(path, contextLen, pipeOpts...)
 	if err != nil {
 		return fmt.Errorf("load pipeline: %w", err)
 	}
