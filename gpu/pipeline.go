@@ -1917,7 +1917,15 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 		}
 
 		if gpuCheckTextStop(genText.String(), stopStrings) {
-			break
+			// While the thinking block is still open, hitting a stop string means
+			// the model tried to bail mid-thought (aggressive quantizations
+			// sometimes spell out <|im_end|>). Honouring it there yields a
+			// response with no content and no tool call, which a client cannot
+			// act on. Logit-level EOS is already suppressed in this phase, so
+			// keep the text-level check consistent - bounded by the same budget.
+			if !(gpuInThinkBlock && gpuStep < thinkBudget) {
+				break
+			}
 		}
 
 		isStop := int32(nextToken) == p.CPUModel.Config.EOS
