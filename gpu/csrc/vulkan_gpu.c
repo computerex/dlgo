@@ -208,6 +208,42 @@ static struct {
 // Overflow goes to host-visible (system RAM accessible by GPU shaders via PCIe).
 #define VRAM_RESERVE_BYTES (3ULL * 1024 * 1024 * 1024)
 
+// Explicit device-local ceiling in bytes. 0 = use the VRAM_RESERVE_BYTES rule.
+// Set from Go (--max-vram / DLGO_MAX_VRAM_MB) so a caller can deliberately keep
+// part of the model out of VRAM and let it stream from system RAM instead. The
+// override may only *lower* the effective ceiling, never raise it above the
+// reserve-based default — that rule exists to stop WDDM freezing the desktop.
+static uint64_t g_vram_ceiling_override = 0;
+
+void gpu_set_vram_ceiling(uint64_t bytes) {
+    g_vram_ceiling_override = bytes;
+    if (bytes > 0) {
+        fprintf(stderr, "[gpu] device-local ceiling pinned to %llu MB\n",
+                (unsigned long long)(bytes / (1024 * 1024)));
+        fflush(stderr);
+    }
+}
+
+// Bytes currently held in device-local memory (allocated minus host-visible).
+uint64_t gpu_device_local_bytes(void) {
+    uint64_t total = 0;
+    for (int i = 0; i < g.buf_count; i++) {
+        if (g.buffers[i].buffer && !g.buffers[i].host_visible)
+            total += g.buffers[i].size;
+    }
+    return total;
+}
+
+// The ceiling gpu_alloc enforces right now (for diagnostics).
+uint64_t gpu_vram_ceiling_bytes(void) {
+    uint64_t total_vram = gpu_vram_bytes();
+    uint64_t ceiling = (total_vram > VRAM_RESERVE_BYTES)
+        ? (total_vram - VRAM_RESERVE_BYTES) : (total_vram / 2);
+    if (g_vram_ceiling_override > 0 && g_vram_ceiling_override < ceiling)
+        ceiling = g_vram_ceiling_override;
+    return ceiling;
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic Vulkan loading
 // ---------------------------------------------------------------------------
@@ -1011,8 +1047,7 @@ GpuBuf gpu_alloc(uint64_t size_bytes, int usage) {
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
     uint64_t total_vram = gpu_vram_bytes();
-    uint64_t vram_ceiling = (total_vram > VRAM_RESERVE_BYTES)
-        ? (total_vram - VRAM_RESERVE_BYTES) : (total_vram / 2);
+    uint64_t vram_ceiling = gpu_vram_ceiling_bytes();
     int under_ceiling = (g.allocated_bytes + size_bytes <= vram_ceiling);
 
     if (under_ceiling) {

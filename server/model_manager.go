@@ -127,6 +127,26 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 
 	log.Printf("Loading model %q from %s (gpu=%v, ctx=%d)", id, path, useGPU, contextLen)
 
+	// Bring the GPU up *before* building the CPU pipeline.
+	//
+	// llm.NewPipeline allocates run/batch state sized by the context length. At
+	// very large contexts that can exhaust the Windows commit limit; the Vulkan
+	// staging allocation then fails, we "fall back to CPU", and the process is
+	// left holding a context-sized CPU pipeline it cannot actually afford —
+	// which takes the whole machine down with it. Acquiring the device first
+	// makes a GPU failure cheap and keeps the fallback honest.
+	gpuReady := false
+	if useGPU && mm.gpuNewPipeline != nil {
+		if mm.gpuInit != nil {
+			if err := mm.gpuInit(); err != nil {
+				log.Printf("GPU init failed, falling back to CPU: %v", err)
+				useGPU = false
+			} else {
+				gpuReady = true
+			}
+		}
+	}
+
 	pipe, err := llm.NewPipeline(path, contextLen)
 	if err != nil {
 		return fmt.Errorf("load pipeline: %w", err)
@@ -148,14 +168,7 @@ func (mm *ModelManager) LoadModel(id, path string, useGPU bool, contextLen int) 
 		},
 	}
 
-	if useGPU && mm.gpuNewPipeline != nil {
-		if mm.gpuInit != nil {
-			if err := mm.gpuInit(); err != nil {
-				log.Printf("GPU init failed, falling back to CPU: %v", err)
-				useGPU = false
-			}
-		}
-
+	if useGPU && gpuReady && mm.gpuNewPipeline != nil {
 		if useGPU {
 			// gpu.NewGpuPipeline releases the CPU-side KV/run/batch scratch before
 			// uploading weights (avoiding a double peak in host memory at large

@@ -697,17 +697,56 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	fmt.Printf("[dlgo/gpu] Uploading model to %s (%.0f MB total, %.0f MB usable)...\n",
 		DeviceName(), totalVRAM, freeVRAM)
 
-	// GPU-aware context capping: if the native context is too large to fit
-	// all layers in VRAM, reduce it to the largest value that does fit.
-	// This prevents OOM crashes with models that have very large native
-	// contexts (e.g., 256K for Qwen3.5) on GPUs with limited VRAM.
+	// GPU-aware context capping.
+	//
+	// Two strategies:
+	//
+	//   spill (default): weights are allowed to overflow VRAM into system RAM
+	//     via the allocator's host-visible fallback, so the context is bounded
+	//     by (VRAM + host budget) rather than by VRAM alone. This is what lets
+	//     a model whose weights exceed VRAM still run at a useful context.
+	//
+	//   no-spill (DLGO_GPU_SPILL=0): the historical rule — every layer's weights
+	//     plus its KV must fit in device-local VRAM, otherwise shrink until
+	//     they do. Kept as a fallback for debugging and for machines where
+	//     pinning multi-GB host-visible buffers is undesirable.
+	layerBytes, nonLayerBytes := modelWeightBytes(m)
+	modelBytes := layerBytes + nonLayerBytes
+
 	maxSeqLen := cpuPipeline.MaxSeqLen
-	gpuSafeCtx := computeMaxGPUContext(m, maxSeqLen)
-	if gpuSafeCtx < maxSeqLen {
-		fmt.Printf("[dlgo/gpu] Reducing context from %d to %d tokens to fit all layers in VRAM (%.0f MB)\n",
-			maxSeqLen, gpuSafeCtx, freeVRAM)
-		maxSeqLen = gpuSafeCtx
-		cpuPipeline.MaxSeqLen = maxSeqLen
+	if SpillEnabled() {
+		// Spilling is strictly additive: the streaming budget may allow a
+		// larger context than the VRAM-only rule, but must never shrink one
+		// below what that rule would have allowed — the VRAM-only rule is what
+		// protects WDDM from freezing, and it is the conservative bound.
+		streamed := computeStreamingContext(m, maxSeqLen)
+		vramOnly := computeMaxGPUContext(m, maxSeqLen)
+		planned := vramOnly
+		if streamed > planned {
+			planned = streamed
+		}
+		if planned <= 0 {
+			planned = 4096
+		}
+		if planned < maxSeqLen {
+			fmt.Printf("[dlgo/gpu] Context %d -> %d tokens (weights %.0f MB; VRAM %.0f MB + RAM %.0f MB)\n",
+				maxSeqLen, planned, float64(modelBytes)/mib,
+				float64(vramSpillBudget())/mib, float64(hostSpillBudget())/mib)
+			maxSeqLen = planned
+			cpuPipeline.MaxSeqLen = maxSeqLen
+		} else {
+			fmt.Printf("[dlgo/gpu] Context %d tokens fits (weights %.0f MB; VRAM %.0f MB + RAM %.0f MB)\n",
+				maxSeqLen, float64(modelBytes)/mib,
+				float64(vramSpillBudget())/mib, float64(hostSpillBudget())/mib)
+		}
+	} else {
+		gpuSafeCtx := computeMaxGPUContext(m, maxSeqLen)
+		if gpuSafeCtx < maxSeqLen {
+			fmt.Printf("[dlgo/gpu] Reducing context from %d to %d tokens to fit all layers in VRAM (%.0f MB)\n",
+				maxSeqLen, gpuSafeCtx, freeVRAM)
+			maxSeqLen = gpuSafeCtx
+			cpuPipeline.MaxSeqLen = maxSeqLen
+		}
 	}
 
 	// Default: upload ALL layers. The C-level gpu_alloc fallback chain handles
@@ -777,6 +816,11 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			if gm.NumGPULayers < numGPULayers {
 				numGPULayers = gm.NumGPULayers
 				isPartial = numGPULayers < cfg.NumLayers
+			}
+
+			// Report the VRAM/RAM residency split for the weights just placed.
+			if attempt == 0 {
+				residencyReport(modelBytes)
 			}
 
 			rs, err = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)

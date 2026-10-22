@@ -16,6 +16,9 @@ func VRAMBytes() uint64     { return 0 }
 func VRAMFreeBytes() uint64 { return 0 }
 func AllocatedBytes() uint64   { return 0 }
 func HostVisibleBytes() uint64 { return 0 }
+func DeviceLocalBytes() uint64 { return 0 }
+func SetVRAMCeiling(uint64)    {}
+func VRAMCeilingBytes() uint64 { return 0 }
 func Alloc(uint64) Buf                 { return 0 }
 func AllocE(n uint64) (Buf, error)     { return 0, errNoGPU }
 func Free(Buf)              {}

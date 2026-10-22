@@ -40,6 +40,14 @@ func Init() error {
 			return fmt.Errorf("gpu: init error %d", rc)
 		}
 	}
+	// Honour --max-vram / DLGO_MAX_VRAM_MB at the allocator level. Everything
+	// past this ceiling is placed in host-visible memory, which shaders read
+	// over PCIe — weights stay on the GPU compute path, just slower. This is how
+	// a caller deliberately trades VRAM for PCIe bandwidth.
+	loadMaxVRAM()
+	if MaxVRAMBytes > 0 {
+		SetVRAMCeiling(uint64(MaxVRAMBytes))
+	}
 	return nil
 }
 
@@ -67,6 +75,21 @@ func AllocatedBytes() uint64 { return uint64(C.gpu_allocated_bytes()) }
 
 // HostVisibleBytes returns bytes allocated in host-visible (non-device-local) memory.
 func HostVisibleBytes() uint64 { return uint64(C.gpu_host_visible_bytes()) }
+
+// DeviceLocalBytes returns bytes currently held in device-local (VRAM) memory.
+func DeviceLocalBytes() uint64 { return uint64(C.gpu_device_local_bytes()) }
+
+// SetVRAMCeiling pins the device-local VRAM ceiling, in bytes. 0 restores the
+// default rule (total VRAM minus a 3 GB reserve for the desktop/driver).
+//
+// Allocations past the ceiling land in host-visible memory, which shaders still
+// read directly across PCIe — the weights keep running on the GPU compute path,
+// just slower. Lowering the ceiling is therefore how a caller opts into
+// RAM-tiered weights. It can only lower the ceiling, never raise it.
+func SetVRAMCeiling(sizeBytes uint64) { C.gpu_set_vram_ceiling(C.uint64_t(sizeBytes)) }
+
+// VRAMCeilingBytes returns the device-local ceiling currently enforced.
+func VRAMCeilingBytes() uint64 { return uint64(C.gpu_vram_ceiling_bytes()) }
 
 // Alloc allocates a GPU buffer of the given size.
 // Returns 0 on failure — callers that cannot tolerate OOM should use AllocE.

@@ -246,6 +246,15 @@ uint64_t gpu_vram_bytes(void);
 uint64_t gpu_vram_free_bytes(void);
 uint64_t gpu_allocated_bytes(void);
 uint64_t gpu_host_visible_bytes(void);
+
+// Device-local VRAM tiering control.
+// gpu_set_vram_ceiling pins the device-local ceiling (0 = default rule). It can
+// only lower the ceiling, never raise it above the VRAM_RESERVE_BYTES rule.
+// Allocations past the ceiling go to host-visible memory and are still read
+// directly by shaders over PCIe, so they stay on the GPU compute path.
+void gpu_set_vram_ceiling(uint64_t bytes);
+uint64_t gpu_vram_ceiling_bytes(void);
+uint64_t gpu_device_local_bytes(void);
 int gpu_is_initialized(void);
 int gpu_has_dp4a(void);
 
