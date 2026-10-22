@@ -43,6 +43,15 @@ type ArchDescriptor struct {
 const (
 	ToolCallFormatNone   = ""
 	ToolCallFormatQwen35 = "qwen35"
+	// ToolCallFormatLFM2 selects the LFM2 / LFM2MoE native protocol defined by
+	// the model's embedded Jinja template:
+	//
+	//   - The available tools are appended to the system turn as
+	//     "List of tools: [<json>, <json>]" rather than a <tools> block.
+	//   - The model emits calls as a Python-call list:
+	//         <|tool_call_start|>[name(arg='value'), other(x=1)]<|tool_call_end|>
+	//   - Results are ordinary "tool" role turns, with no wrapper markup.
+	ToolCallFormatLFM2 = "lfm2"
 )
 
 // archRegistry maps architecture names to their descriptors.
@@ -64,9 +73,10 @@ var archRegistry = map[string]ArchDescriptor{
 	"qwen3moe":  {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 	"qwen3next": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml", SupportsThinking: true},
 	// LFM2 / LFM2MoE: hybrid short-convolution + attention. NeoX RoPE, SwiGLU
-	// dense FFN, sigmoid-gated MoE, ChatML chat template, no thinking blocks.
-	"lfm2":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
-	"lfm2moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "chatml"},
+	// dense FFN, sigmoid-gated MoE, and a ChatML-shaped template whose
+	// generation prompt opens a  thinking block.
+	"lfm2":    {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "lfm2", ToolCallFormat: ToolCallFormatLFM2},
+	"lfm2moe": {RopeNeox: true, FFNGelu: false, EmbedScaleMode: "none", ChatTemplate: "lfm2", ToolCallFormat: ToolCallFormatLFM2},
 }
 
 // GetArchDescriptor returns the descriptor for the given architecture.
@@ -215,6 +225,8 @@ func FormatMessages(cfg ModelConfig, messages []Message, opts ...FormatOptions) 
 	switch template {
 	case "chatml":
 		prompt = formatChatMLDispatch(messages, arch)
+	case "lfm2":
+		prompt = formatLFM2Messages(messages)
 	case "chatml_sep":
 		prompt = formatChatMLSepMessages(messages)
 	case "llama3":
@@ -681,6 +693,131 @@ func formatChatMLSepMessages(messages []Message) string {
 	}
 	b.WriteString("<|im_start|>assistant<|im_sep|>\n")
 	return b.String()
+}
+
+// formatLFM2Messages renders messages using the LFM2 / LFM2MoE Jinja template
+// embedded in the GGUF. It is ChatML-shaped with three LFM-specific details:
+//
+//   - The generation prompt is "<|im_start|>assistant\n thinking", so the model
+//     always opens a reasoning block and closes it with </think>.
+//   - Assistant turns at or before the last user turn drop their  thinking block
+//     (the template's keep_thinking logic) so reasoning is not replayed.
+//   - Tool calls render as a Python-call list between <|tool_call_start|> and
+//     <|tool_call_end|>: {name}({key}={value}, ...), not XML.
+func formatLFM2Messages(messages []Message) string {
+	var systemText string
+	rest := messages
+	if len(rest) > 0 && (rest[0].Role == "system" || rest[0].Role == "developer") {
+		systemText = rest[0].Content
+		rest = rest[1:]
+	}
+
+	lastUserIndex := -1
+	for i, m := range rest {
+		if m.Role == "user" {
+			lastUserIndex = i
+		}
+	}
+
+	var b strings.Builder
+	if systemText != "" {
+		b.WriteString("<|im_start|>system\n")
+		b.WriteString(systemText)
+		b.WriteString("<|im_end|>\n")
+	}
+
+	for i, m := range rest {
+		b.WriteString("<|im_start|>")
+		b.WriteString(m.Role)
+		b.WriteString("\n")
+
+		if m.Role == "assistant" {
+			content := m.Content
+			keepThinking := i > lastUserIndex
+			if !keepThinking {
+				if idx := strings.LastIndex(content, "</think>"); idx >= 0 {
+					content = strings.TrimSpace(content[idx+len("</think>"):])
+				}
+			}
+			b.WriteString(content)
+			if len(m.ToolCalls) > 0 {
+				b.WriteString(lfmToolCallBlock(m.ToolCalls))
+			}
+		} else {
+			b.WriteString(m.Content)
+		}
+
+		b.WriteString("<|im_end|>\n")
+	}
+
+	b.WriteString("<|im_start|>assistant\n thinking")
+	return b.String()
+}
+
+// lfmToolCallBlock renders tool calls the way the LFM2 template does:
+// <|tool_call_start|>[name(arg='value'), other(x=1)]<|tool_call_end|>
+func lfmToolCallBlock(calls []ToolCallData) string {
+	rendered := make([]string, 0, len(calls))
+	for _, tc := range calls {
+		rendered = append(rendered, tc.Name+"("+lfmToolArgs(tc.Arguments)+")")
+	}
+	return "<|tool_call_start|>[" + strings.Join(rendered, ", ") + "]<|tool_call_end|>"
+}
+
+// lfmToolArgs formats a JSON argument object as the template's comma-separated
+// key=value list, preserving key order.
+func lfmToolArgs(argsJSON string) string {
+	trimmed := strings.TrimSpace(argsJSON)
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return ""
+	}
+	// Clients sometimes send a JSON string that itself contains the object.
+	if strings.HasPrefix(trimmed, "\"") {
+		var s string
+		if json.Unmarshal([]byte(trimmed), &s) == nil {
+			trimmed = strings.TrimSpace(s)
+		}
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var obj map[string]interface{}
+	if err := dec.Decode(&obj); err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(obj))
+	for _, k := range orderedKeys(trimmed) {
+		if v, ok := obj[k]; ok {
+			parts = append(parts, k+"="+lfmArgValue(v))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// lfmArgValue formats one argument value: strings are single-quoted and escaped
+// the way the Jinja format_arg_value macro does, containers become compact JSON,
+// and everything else falls back to its string form.
+func lfmArgValue(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		r := strings.NewReplacer(`\`, `\\`, `'`, `\'`, "\n", `\n`, "\r", `\r`)
+		return "'" + r.Replace(x) + "'"
+	case map[string]interface{}, []interface{}:
+		if b, err := json.Marshal(x); err == nil {
+			return string(b)
+		}
+		return ""
+	case json.Number:
+		return x.String()
+	case bool:
+		return strconv.FormatBool(x)
+	case nil:
+		return "None"
+	default:
+		if b, err := json.Marshal(x); err == nil {
+			return string(b)
+		}
+		return fmt.Sprintf("%v", x)
+	}
 }
 
 // formatHarmonyMessages formats messages using the OpenAI Harmony template (gpt-oss).

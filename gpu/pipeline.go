@@ -430,6 +430,11 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 // all layers are uploaded. Otherwise, only the first numGPULayers layers are
 // uploaded. Layers beyond that limit have OnGPU=false and empty GPU tensors.
 func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
+	// Short-convolution layers (LFM2/LFM2MoE) have no GPU kernel yet.
+	if m.Config.HasShortConv() {
+		return nil, fmt.Errorf("gpu: %s layers using short convolution are not supported yet",
+			m.Config.Architecture)
+	}
 	maxLayers := len(m.Layers)
 	if len(numGPULayers) > 0 && numGPULayers[0] >= 0 {
 		maxLayers = numGPULayers[0]
@@ -691,6 +696,16 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 	m := cpuPipeline.Model
 	cfg := m.Config
+
+	// LFM2/LFM2MoE hybrid short-convolution layers have no GPU kernel yet: the
+	// core needs a depthwise convolution over the token axis with its own
+	// rolling state, plus a per-layer KV width. Refuse cleanly so the caller
+	// falls back to CPU instead of dereferencing attention weights that
+	// short-conv layers do not carry.
+	if cfg.HasShortConv() {
+		return nil, fmt.Errorf("gpu: %s layers using short convolution are not supported yet; "+
+			"falling back to the CPU pipeline", cfg.Architecture)
+	}
 
 	totalVRAM := float64(VRAMBytes()) / (1024 * 1024)
 	freeVRAM := float64(effectiveFreeVRAM()) / (1024 * 1024)

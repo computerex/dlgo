@@ -423,6 +423,10 @@ func inferChatTemplate(md map[string]interface{}, arch string) string {
 	if chatTemplate != "" {
 		lower := strings.ToLower(chatTemplate)
 		switch {
+		case strings.Contains(lower, "<|tool_call_start|>"):
+			// LFM2 / LFM2MoE: ChatML framing with a Python-style tool-call list
+			// and a generation prompt that opens a  thinking block.
+			return "lfm2"
 		case strings.Contains(lower, "<|start_header_id|>") || strings.Contains(lower, "<|eot_id|>"):
 			return "llama3"
 		case strings.Contains(lower, "<|im_start|>") && strings.Contains(lower, "<|im_sep|>"):
