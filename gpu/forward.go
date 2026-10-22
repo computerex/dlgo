@@ -1371,6 +1371,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 
 	GpuDiag.Init()
 	diagOn := GpuDiag.Enabled
+	defer opTimeTick()
 
 	BeginBatch()
 	if err := UploadF32(rs.X, xCPU); err != nil {
@@ -1388,6 +1389,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 		diagL := diagOn && GpuDiag.Active(l, pos)
 
 		Barrier()
+		tNorm, tNormOn := opTimeBegin()
 		if spec.Norm == llm.NormRMS {
 			if err := RMSNorm(rs.XNorm, rs.X, gl.AttnNorm, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d attn rmsnorm: %w", l, err)
@@ -1397,6 +1399,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				return fmt.Errorf("layer %d attn layernorm: %w", l, err)
 			}
 		}
+		opTimeEnd(opTimeNorm, tNorm, tNormOn)
 
 		if diagL {
 			GpuDiag.LogBuf("GPU", l, pos, "XNorm", rs.XNorm, dim)
@@ -1519,21 +1522,27 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				scK = 3
 			}
 			Barrier()
+			tSCIn, tSCInOn := opTimeBegin()
 			if err := gpuMatVec(rs.ShortConvBCX, gl.ShortConvInProj, layer.ShortConvInProj, rs.XNorm, rs); err != nil {
 				return fmt.Errorf("layer %d shortconv in_proj: %w", l, err)
 			}
+			opTimeEnd(opTimeQKV, tSCIn, tSCInOn)
 			Barrier()
+			tSCCore, tSCCoreOn := opTimeBegin()
 			if err := ShortConv(rs.ShortConvBCX, rs.ShortConvY, gl.ShortConvState, gl.ShortConvConv,
 				dim, scK, 1); err != nil {
 				return fmt.Errorf("layer %d shortconv conv: %w", l, err)
 			}
+			opTimeEnd(opTimeCore, tSCCore, tSCCoreOn)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "ShortConv Y", rs.ShortConvY, dim)
 			}
 			Barrier()
+			tSCOut, tSCOutOn := opTimeBegin()
 			if err := gpuMatVec(rs.AttnProj, gl.ShortConvOutProj, layer.ShortConvOutProj, rs.ShortConvY, rs); err != nil {
 				return fmt.Errorf("layer %d shortconv out_proj: %w", l, err)
 			}
+			opTimeEnd(opTimeOutProj, tSCOut, tSCOutOn)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "ShortConv AttnProj", rs.AttnProj, dim)
 			}
@@ -1571,6 +1580,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				continue
 			}
 			Barrier()
+			tAQKV, tAQKVOn := opTimeBegin()
 			if err := gpuMatVec(rs.Q, gl.Wq, layer.Wq, rs.XNorm, rs); err != nil {
 				return fmt.Errorf("layer %d wq: %w", l, err)
 			}
@@ -1598,12 +1608,14 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				}
 			}
 
+			opTimeEnd(opTimeQKV, tAQKV, tAQKVOn)
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "Q+bias", rs.Q, numHeads*headDim)
 				GpuDiag.LogBuf("GPU", l, pos, "K+bias", rs.K, kvDim)
 				GpuDiag.LogBuf("GPU", l, pos, "V+bias", rs.V, kvDim)
 			}
 
+			tANormRope, tANormRopeOn := opTimeBegin()
 			if spec.QKNorm {
 				Barrier()
 				if err := RMSNormHeads(rs.Q, gl.AttnQNorm, numHeads, headDim, cfg.RMSNormEps); err != nil {
@@ -1628,12 +1640,14 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 			if err := KVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], rs.K, rs.V, pos, kvDim); err != nil {
 				return fmt.Errorf("layer %d kvstore: %w", l, err)
 			}
+			opTimeEnd(opTimeNormRope, tANormRope, tANormRopeOn)
 
 			Barrier()
 			winStart := 0
 			if w := m.Layers[l].Spec.SlidingWindow; w > 0 && seqLen > w {
 				winStart = seqLen - w
 			}
+			tACore, tACoreOn := opTimeBegin()
 			if gl.AttnSinks != 0 {
 				if err := AttentionF16Sinks(rs.AttnOut, rs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 					gl.AttnSinks, numHeads, numKVHeads, headDim, kvDim, seqLen, winStart, scale, 0); err != nil {
@@ -1645,12 +1659,14 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 					return fmt.Errorf("layer %d attention: %w", l, err)
 				}
 			}
+			opTimeEnd(opTimeCore, tACore, tACoreOn)
 
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "AttnOut", rs.AttnOut, numHeads*headDim)
 			}
 
 			Barrier()
+			tAWo, tAWoOn := opTimeBegin()
 			if err := gpuMatVec(rs.AttnProj, gl.Wo, layer.Wo, rs.AttnOut, rs); err != nil {
 				return fmt.Errorf("layer %d wo: %w", l, err)
 			}
@@ -1660,6 +1676,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 					return fmt.Errorf("layer %d bo: %w", l, err)
 				}
 			}
+			opTimeEnd(opTimeOutProj, tAWo, tAWoOn)
 
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "AttnProj", rs.AttnProj, dim)
@@ -1672,6 +1689,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				ffnNormW = gl.PostAttnNorm
 			}
 			Barrier()
+			tMoE, tMoEOn := opTimeBegin()
 			if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, ffnNormW, dim, cfg.RMSNormEps); err != nil {
 				return fmt.Errorf("layer %d moe add+rmsnorm: %w", l, err)
 			}
@@ -1684,13 +1702,16 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				if err := GpuForwardMoEFFN(gl, layer, rs, cfg, diagL, l, pos); err != nil {
 					return fmt.Errorf("layer %d gpu moe: %w", l, err)
 				}
+				opTimeEnd(opTimeMoE, tMoE, tMoEOn)
 				if diagL {
 					GpuDiag.LogBuf("GPU", l, pos, "FFNOut(MoE)", rs.FFNOut, dim)
 				}
 				Barrier()
+				tRes, tResOn := opTimeBegin()
 				if err := Add(rs.X, rs.FFNIn, rs.FFNOut, dim); err != nil {
 					return fmt.Errorf("layer %d moe residual: %w", l, err)
 				}
+				opTimeEnd(opTimeResidual, tRes, tResOn)
 			} else {
 				EndBatch()
 				cpuRS := p.CPURunState
@@ -1719,6 +1740,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 			switch spec.Residual {
 			case llm.ResStandard:
 				Barrier()
+				tRes, tResOn := opTimeBegin()
 				if gl.PostAttnNorm != 0 {
 					if err := RMSNorm(rs.AttnProj, rs.AttnProj, gl.PostAttnNorm, dim, cfg.RMSNormEps); err != nil {
 						return fmt.Errorf("layer %d post-attn norm: %w", l, err)
@@ -1728,10 +1750,13 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				if err := AddRMSNorm(rs.FFNNorm, rs.FFNIn, rs.X, rs.AttnProj, gl.FFNNorm, dim, cfg.RMSNormEps); err != nil {
 					return fmt.Errorf("layer %d add+rmsnorm: %w", l, err)
 				}
+				opTimeEnd(opTimeResidual, tRes, tResOn)
 				Barrier()
+				tFFN, tFFNOn := opTimeBegin()
 				if err := gpuForwardFFN(layer, gl, rs, rs.FFNNorm, dim, cfg); err != nil {
 					return fmt.Errorf("layer %d ffn: %w", l, err)
 				}
+				opTimeEnd(opTimeFFN, tFFN, tFFNOn)
 				Barrier()
 				if gl.PostFFNNorm != 0 {
 					if err := RMSNorm(rs.FFNOut, rs.FFNOut, gl.PostFFNNorm, dim, cfg.RMSNormEps); err != nil {
@@ -1799,6 +1824,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 		output = gm.TokenEmbed
 		outputCPU = m.TokenEmbed
 	}
+	tLogits, tLogitsOn := opTimeBegin()
 	if err := gpuMatVec(rs.Logits, output, outputCPU, rs.X, rs); err != nil {
 		if output == gm.TokenEmbed {
 			return fmt.Errorf("output matvec (token embed): %w", err)
@@ -1809,6 +1835,7 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 	if err := DownloadF32(rs.Logits, logitsBuf); err != nil {
 		return err
 	}
+	opTimeEnd(opTimeLogits, tLogits, tLogitsOn)
 	if cfg.FinalLogitSoftcap > 0 {
 		cap := float64(cfg.FinalLogitSoftcap)
 		for i := range logitsBuf {
