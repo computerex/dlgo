@@ -59,7 +59,18 @@ func main() {
 	dumpOnly := flag.Bool("dump", false, "only dump the architecture, no generation")
 	useGPU := flag.Bool("gpu", false, "run the generation on the GPU pipeline instead of the CPU one")
 	parity := flag.Bool("parity", false, "run the prompt through the CPU and GPU per-token forwards and compare logits each step")
+	promptFile := flag.String("prompt-file", "", "read the prompt from a file (UTF-8) instead of -prompt")
+	decodeCurve := flag.Bool("decode-curve", false, "print the decode rate every 128 tokens (shows how it degrades with context)")
 	flag.Parse()
+
+	if *promptFile != "" {
+		b, err := os.ReadFile(*promptFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read prompt file: %v\n", err)
+			os.Exit(1)
+		}
+		*prompt = string(b)
+	}
 
 	t0 := time.Now()
 	p, err := llm.NewPipeline(*model, *ctx)
@@ -74,6 +85,8 @@ func main() {
 		cfg.Architecture, cfg.NumLayers, cfg.EmbeddingDim, cfg.NumHeads, cfg.NumKVHeads,
 		cfg.HeadDim, cfg.FFNDim, cfg.VocabSize)
 	fmt.Printf("rope: neox=%v dim=%d base=%.1f eps=%.1e\n", cfg.RopeNeox, cfg.RopeDim, cfg.RopeFreqBase, cfg.RMSNormEps)
+	fmt.Printf("contextLength=%d ropeScaleType=%d ropeScaleFactor=%.4f ropeOrigMaxPos=%d\n",
+		cfg.ContextLength, cfg.RopeScaleType, cfg.RopeScaleFactor, cfg.RopeOrigMaxPos)
 	fmt.Printf("moe: experts=%d used=%d expFFN=%d gatingFunc=%d weightsNorm=%v weightsScale=%v leadingDense=%d\n",
 		cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNDim, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale, cfg.LeadingDenseCount)
@@ -227,9 +240,32 @@ func main() {
 		}
 		defer gp.FreeAll()
 		var res *gpu.GenerateResult
+		if *decodeCurve {
+			// Timestamp every 128th streamed token so the decode rate can be read
+			// off as a function of context depth instead of guessed.
+			plen := len(p.Tokenizer.Encode(text))
+			n := 0
+			var lastT time.Time
+			gcfg.Stream = func(string) {
+				if n == 0 {
+					lastT = time.Now() // first token: prefill is behind us
+				}
+				n++
+				if n > 0 && n%128 == 0 {
+					now := time.Now()
+					fmt.Printf("  [curve] tok %5d (ctx %6d)  %6.1f tok/s\n",
+						n, plen+n, 128.0/now.Sub(lastT).Seconds())
+					lastT = now
+				}
+			}
+		}
 		res, err = gp.GenerateDetailed(text, gcfg)
 		if err == nil {
 			out, tps = res.Text, res.TokensPerSec
+			fmt.Printf("\n== prefill: %d prompt tokens in %.2fs (%.2f tok/s); decode: %d tokens in %.2fs (%.2f tok/s)\n",
+				res.PromptTokens, res.PrefillTimeMs/1000.0,
+				float64(res.PromptTokens)/(res.PrefillTimeMs/1000.0),
+				res.TotalTokens, res.GenerateTimeMs/1000.0, res.TokensPerSec)
 		}
 		elapsed := time.Since(t1).Seconds()
 		if err != nil {
