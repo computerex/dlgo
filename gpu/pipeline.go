@@ -70,6 +70,12 @@ type GpuPipeline struct {
 
 	AllCPUAttn bool // true if ALL GPU layers use CPU attention fallback
 
+	// UseBatchPrefill routes prompt processing for hybrid short-convolution +
+	// MoE models through GpuForwardPrefillBatchShortConv instead of one forward
+	// per token. Set lazily by ensurePrefillBatchState, which is also where the
+	// extra scratch gets allocated. DLGO_PREFILL_BATCH=0 disables it.
+	UseBatchPrefill bool
+
 	// hasCPUAttn is true when ANY GPU layer needs the CPU attention fallback;
 	// batched prefill cannot serve those layers, so System One hidden
 	// extraction refuses to run on such models.
@@ -1670,6 +1676,21 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			for i, tok := range tokens {
 				GpuForwardPartial(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 			}
+		} else if p.UseBatchPrefill {
+			// Hybrid short-conv + MoE: run the prompt in chunks with the whole
+			// token axis batched. This is the only path that can batch these
+			// models — the fused C dispatcher has no short-conv core, and the
+			// hybrid batch path runs MoE per position on the CPU.
+			for cs := prefillFrom; cs < npos; cs += prefillChunkSize {
+				ce := cs + prefillChunkSize
+				if ce > npos {
+					ce = npos
+				}
+				if err := GpuForwardPrefillBatchShortConv(p.CPUModel, p.GpuModel, tokens[cs:ce],
+					p.KVCache, p.RunState, p.BatchState, p.LogitsBuf, p, cs, ce >= npos); err != nil {
+					return nil, err
+				}
+			}
 		} else if !p.UseFusedForward {
 			for i, tok := range tokens {
 				GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
@@ -2138,6 +2159,26 @@ func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
 		if err := p.BatchState.AllocSSMBatch(batchSize, qkvDim, valueDim, numHeads); err != nil {
 			return fmt.Errorf("gpu: prefill SSM batch alloc: %w", err)
 		}
+	}
+	// Hybrid short-conv + MoE models get their own chunked prefill path, which
+	// needs per-expert MoE scratch and a [npos*3*dim] short-conv buffer. Decide
+	// once, here, because this is where the batch state is (re)built.
+	//
+	// OPT-IN for now: the path is implemented and every kernel it uses has been
+	// verified exact in isolation, but the composed prefill still diverges from
+	// the per-token path at the first attention layer of the first chunk
+	// (position 0 agrees, position 1 does not), so it must not be the default.
+	// See gpu/prefill_batch_test.go for the bisection harness.
+	p.UseBatchPrefill = false
+	if !p.IsPartialGPU && os.Getenv("DLGO_PREFILL_BATCH") == "1" &&
+		shortConvBatchSupported(p.CPUModel, p.GpuModel, mcfg) {
+		if err := p.BatchState.AllocMoEBatch(batchSize, dim, mcfg.ExpertCount); err != nil {
+			return fmt.Errorf("gpu: prefill MoE batch alloc: %w", err)
+		}
+		if err := p.BatchState.AllocShortConvBatch(batchSize, dim); err != nil {
+			return fmt.Errorf("gpu: prefill shortconv batch alloc: %w", err)
+		}
+		p.UseBatchPrefill = true
 	}
 	return nil
 }

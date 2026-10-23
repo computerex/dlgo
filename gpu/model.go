@@ -613,6 +613,10 @@ type GpuBatchState struct {
 	MoEIdx    Buf // [npos * int32] token ids routed to one expert
 	MoEW      Buf // [npos * float32] routing weights for those tokens
 
+	// ShortConvBCX is the [npos * 3*dim] in_proj output for a chunk of
+	// short-convolution layers (b | c | x interleaved per position).
+	ShortConvBCX Buf
+
 	// SSM batch buffers (input projections batched, recurrence per-position)
 	SSMQKV   Buf // [npos * qkvDim]
 	SSMZ     Buf // [npos * valueDim]
@@ -672,6 +676,18 @@ func (bs *GpuBatchState) AllocMoEBatch(npos, dim, nExperts int) error {
 	return nil
 }
 
+// AllocShortConvBatch allocates the [npos * 3*dim] in_proj scratch the batched
+// short-convolution core needs. The conv output reuses MoEOut (also npos*dim and
+// free until the MoE runs).
+func (bs *GpuBatchState) AllocShortConvBatch(npos, dim int) error {
+	a := allocChecker{}
+	bs.ShortConvBCX = a.alloc(uint64(npos * 3 * dim * 4))
+	if a.err != nil {
+		return fmt.Errorf("gpu: AllocShortConvBatch: %w", a.err)
+	}
+	return nil
+}
+
 // AllocSSMBatch allocates batch-sized SSM scratch buffers.
 func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) error {
 	a := allocChecker{}
@@ -716,6 +732,7 @@ func (bs *GpuBatchState) Free() {
 	Free(bs.MoEOut)
 	Free(bs.MoEIdx)
 	Free(bs.MoEW)
+	Free(bs.ShortConvBCX)
 }
 
 // GpuKVCache holds GPU-resident KV cache for all layers.

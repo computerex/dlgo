@@ -366,6 +366,14 @@ int gpu_gemm_affine4(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 int gpu_rmsnorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, int n, float eps);
 int gpu_layernorm(GpuBuf out_buf, GpuBuf x_buf, GpuBuf weight_buf, GpuBuf bias_buf, int n, float eps);
 int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int head_dim, float eps);
+
+// npos-token forms: same shaders, groups_y = position. Used by the batched
+// prefill for the q/k norm and the fused FFN residual + attention norm.
+int gpu_batch_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf,
+                            int num_heads, int head_dim, float eps, int npos);
+int gpu_batch_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
+                          GpuBuf a_buf, GpuBuf b_buf, GpuBuf weight_buf,
+                          int n, float eps, int npos);
 int gpu_softmax(GpuBuf buf, int n);
 int gpu_rope(GpuBuf q_buf, GpuBuf k_buf, GpuBuf cos_table, GpuBuf sin_table,
              int num_heads, int num_kv_heads, int head_dim, int rope_dim,

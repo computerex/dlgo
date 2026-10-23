@@ -1013,6 +1013,27 @@ func SetGemmQ3K(on bool) {
 // descriptor offsets, in bytes.
 func MinSSBOOffsetAlign() uint64 { return uint64(C.gpu_min_ssbo_offset_align()) }
 
+// BatchRMSNormHeads performs per-head RMS normalization over npos positions.
+func BatchRMSNormHeads(data, weight Buf, numHeads, headDim int, eps float32, npos int) error {
+	rc := C.gpu_batch_rmsnorm_heads(C.GpuBuf(data), C.GpuBuf(weight),
+		C.int(numHeads), C.int(headDim), C.float(eps), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_rmsnorm_heads failed (%d)", rc)
+	}
+	return nil
+}
+
+// BatchAddRMSNorm is the npos-token form of AddRMSNorm: sumOut = a+b per
+// position and normOut = RMSNorm(sumOut, weight).
+func BatchAddRMSNorm(normOut, sumOut, a, b, weight Buf, n int, eps float32, npos int) error {
+	rc := C.gpu_batch_add_rmsnorm(C.GpuBuf(normOut), C.GpuBuf(sumOut), C.GpuBuf(a),
+		C.GpuBuf(b), C.GpuBuf(weight), C.int(n), C.float(eps), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: batch_add_rmsnorm failed (%d)", rc)
+	}
+	return nil
+}
+
 // BatchMatVecOffset performs a batched matvec against a weight slice that starts
 // weightsOffBytes into a packed tensor (one MoE expert). The plain per-format
 // matvec kernels walk input columns by workgroup.y, so shifting the weight

@@ -1404,6 +1404,12 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 		if diagL {
 			GpuDiag.LogBuf("GPU", l, pos, "XNorm", rs.XNorm, dim)
 		}
+		if layerDumpEnabled {
+			EndBatch()
+			Sync()
+			layerDumpRow("xn-pertoken", l, rs.XNorm, dim)
+			BeginBatch()
+		}
 
 		if spec.Core == llm.CoreSSM && p != nil && p.HasSSM {
 			Barrier()
@@ -1683,6 +1689,13 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 			}
 		}
 
+		if layerDumpEnabled {
+			EndBatch()
+			Sync()
+			layerDumpRow("core-pertoken", l, rs.AttnProj, dim)
+			BeginBatch()
+		}
+
 		if gl.IsMoE && p != nil && p.HasMoE {
 			ffnNormW := gl.FFNNorm
 			if spec.Residual == llm.ResPostAttnFFN {
@@ -1800,6 +1813,12 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 
 		if diagL {
 			GpuDiag.LogBuf("GPU", l, pos, "X(end-of-layer)", rs.X, dim)
+		}
+		if layerDumpEnabled {
+			EndBatch()
+			Sync()
+			layerDumpRow("pertoken", l, rs.X, dim)
+			BeginBatch()
 		}
 	}
 

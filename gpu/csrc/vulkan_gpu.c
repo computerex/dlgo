@@ -2299,6 +2299,28 @@ int gpu_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf, int num_heads, int hea
     return dispatch_compute(&dp);
 }
 
+// gpu_batch_rmsnorm_heads: per-head RMSNorm over npos positions in one dispatch
+// (groups_y = position), used by the batched prefill's q/k norm step.
+int gpu_batch_rmsnorm_heads(GpuBuf data_buf, GpuBuf weight_buf,
+                            int num_heads, int head_dim, float eps, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0 || num_heads <= 0) return GPU_OK;
+
+    struct { int head_dim; float eps; } pc = {head_dim, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_RMSNORM_HEADS;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = weight_buf;
+    dp.num_bufs = 2;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = num_heads;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 int gpu_softmax(GpuBuf buf, int n) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
@@ -2631,6 +2653,33 @@ int gpu_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
     dp.push_size = sizeof(pc);
     dp.groups_x = 1;
     dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
+// gpu_batch_add_rmsnorm: the npos-token form of gpu_add_rmsnorm. Same shader;
+// ADD_RMSNORM already indexes by workgroup.y, which is how the hybrid batch path
+// fuses the FFN residual with the next attention norm.
+int gpu_batch_add_rmsnorm(GpuBuf norm_out, GpuBuf sum_out,
+                          GpuBuf a_buf, GpuBuf b_buf, GpuBuf weight_buf,
+                          int n, float eps, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0 || n <= 0) return GPU_OK;
+
+    struct { int n; float eps; } pc = {n, eps};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_ADD_RMSNORM;
+    dp.bufs[0] = norm_out;
+    dp.bufs[1] = sum_out;
+    dp.bufs[2] = a_buf;
+    dp.bufs[3] = b_buf;
+    dp.bufs[4] = weight_buf;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = 1;
+    dp.groups_y = npos;
     dp.groups_z = 1;
     return dispatch_compute(&dp);
 }
