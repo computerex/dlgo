@@ -359,6 +359,14 @@ func planMoEBatch(p *moeBatchPlan, selBias []float32, gatingFunc int,
 // that skipped that allocation — keep the per-expert loop.
 func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	cfg llm.ModelConfig, npos int) error {
+	// Both implementations index npos-sized rows of bs.FFNNorm and npos*nUsed
+	// pairs of the pair-major scratch, so a chunk longer than the batch state was
+	// sized for would write past the end of it. The pipeline chunks by
+	// min(npos, prefillChunkSize) and sizes the state with the same value, but
+	// nothing else enforces it.
+	if bs == nil || npos <= 0 || npos > bs.Npos {
+		return fmt.Errorf("moe: chunk of %d positions does not fit the batch state (%d)", npos, bs.Npos)
+	}
 	if moeGroupedSupported(layer, gl, cfg, bs) {
 		return gpuForwardMoEGrouped(layer, gl, bs, cfg, npos)
 	}
@@ -393,6 +401,12 @@ func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchSta
 	}
 	planMoEBatch(p, layer.FFNExpertSelBias, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale))
+
+	// gpu_download has to submit the batch to read the staging buffer, so the
+	// recording state is gone here. Re-open it, otherwise every remaining
+	// dispatch of this chunk becomes its own submit+wait. No-op if a batch is
+	// already open.
+	BeginBatch()
 
 	fused := gl.FFNGateUpExps != nil
 	gateW := gl.FFNGateExps
@@ -585,6 +599,13 @@ func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	}
 	planMoEBatch(p, layer.FFNExpertSelBias, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale))
+
+	// gpu_download has to submit the batch to read the staging buffer, so the
+	// recording state is gone at this point. Re-open it: otherwise the routing
+	// tables below and every dispatch for the rest of the chunk becomes its own
+	// submit+wait, which drains the GPU between dispatches. BeginBatch is a no-op
+	// when a batch is already open, so this is safe from any caller.
+	BeginBatch()
 
 	// Routing tables: pair -> token (so the GEMMs can read the activations), the
 	// per-expert pair range, and the slot-major inverse the reduce needs.

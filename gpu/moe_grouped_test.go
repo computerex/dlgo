@@ -10,6 +10,151 @@ import (
 	"github.com/computerex/dlgo/models/llm"
 )
 
+// TestMoEGroupedMultiNTile exercises the one branch the layer-parity test cannot
+// reach: an expert that owns more pairs than the kernel's BN = 128 token tile, so
+// the n-tile loop (grid.y > 1) actually runs.
+//
+// Real routing never produces that here — a 64-expert top-4 layer splits ~64
+// pairs per expert at chunk 1024 — so the second tile would otherwise be dead
+// code until some hotter model or a bigger chunk hit it.
+//
+// The check is exact by construction. Run A gives one expert 200 pairs, so rows
+// 128..199 are produced by n-tile 1. Run B gives one expert just those last 72
+// tokens, all inside n-tile 0. Same weights, same activation rows, same kernel,
+// same k order, so the two must agree bit-for-bit; a mis-strided tile shows up as
+// an O(1) difference rather than fp noise.
+func TestMoEGroupedMultiNTile(t *testing.T) {
+	const modelPath = `C:\Users\mohd\Downloads\LFM2.5-24B-A2B-QAD-Q4_0.gguf`
+	if _, err := os.Stat(modelPath); err != nil {
+		t.Skipf("model not present: %v", err)
+	}
+	if err := Init(); err != nil {
+		t.Skipf("no GPU: %v", err)
+	}
+	t.Cleanup(Shutdown)
+
+	p, err := llm.NewPipeline(modelPath, 256)
+	if err != nil {
+		t.Fatalf("load model: %v", err)
+	}
+	m := p.Model
+	cfg := m.Config
+
+	moeLayer := -1
+	for l := 0; l < cfg.NumLayers; l++ {
+		if m.Layers[l].Spec.FFN == llm.FFNMoE {
+			moeLayer = l
+			break
+		}
+	}
+	if moeLayer < 0 {
+		t.Skip("model has no MoE layer")
+	}
+	gm, err := UploadModel(m, moeLayer+1)
+	if err != nil {
+		t.Fatalf("upload model: %v", err)
+	}
+	t.Cleanup(gm.FreeAll)
+
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	qDim := cfg.NumHeads * cfg.HeadDim
+	kvDim := cfg.NumKVHeads * cfg.HeadDim
+	gl := &gm.Layers[moeLayer]
+	layer := &m.Layers[moeLayer]
+
+	// Enough pairs for two full tiles.
+	const nA = 200
+	const nB = nA - 128 // the part that lands in n-tile 1
+
+	bs, err := NewGpuBatchState(nA, dim, qDim, kvDim, cfg.FFNDim)
+	if err != nil {
+		t.Fatalf("batch state: %v", err)
+	}
+	t.Cleanup(bs.Free)
+	if err := bs.AllocMoEBatch(nA, dim, cfg.ExpertCount); err != nil {
+		t.Fatalf("moe batch scratch: %v", err)
+	}
+	if err := bs.AllocMoEGrouped(nA, dim, expDim, cfg.ExpertUsedCount, cfg.ExpertCount); err != nil {
+		t.Fatalf("moe grouped scratch: %v", err)
+	}
+
+	gateW := gl.FFNGateUpExps
+	if gateW == nil {
+		gateW = gl.FFNGateExps
+	}
+	if gateW == nil {
+		t.Skip("layer has no gate expert tensor")
+	}
+	blk := moeAffineBlockBytes(gateW.Type)
+	if blk == 0 {
+		t.Skipf("gate weights are not Affine (type %d)", gateW.Type)
+	}
+	strides := moeBatchExpertStrides(layer, gl, cfg)
+	if strides[0] <= 0 || strides[0]%blk != 0 {
+		t.Fatalf("gate expert stride %d is not a block multiple of %d", strides[0], blk)
+	}
+	gateBlocks := strides[0] / blk
+
+	// Inputs: distinct rows so a swapped tile cannot look correct.
+	x := make([]float32, nA*dim)
+	seed := uint32(99)
+	for i := range x {
+		seed = seed*1664525 + 1013904223
+		x[i] = (float32(seed>>16)/65536.0 - 0.5) * 4.0
+	}
+	if err := UploadF32(bs.FFNNorm, x); err != nil {
+		t.Fatalf("upload x: %v", err)
+	}
+
+	// starts: expert 0 owns every pair, everyone else owns none.
+	tokIdx := make([]int32, nA)
+	for i := range tokIdx {
+		tokIdx[i] = int32(i)
+	}
+
+	run := func(n int, tok []int32) []float32 {
+		st := make([]int32, cfg.ExpertCount+1)
+		st[1] = int32(n)
+		for i := 2; i <= cfg.ExpertCount; i++ {
+			st[i] = int32(n)
+		}
+		if err := UploadI32(bs.MoEStarts, st); err != nil {
+			t.Fatalf("upload starts: %v", err)
+		}
+		if err := UploadI32(bs.MoETokIdx, tok); err != nil {
+			t.Fatalf("upload tok: %v", err)
+		}
+		BeginBatch()
+		Barrier()
+		if err := GemmAffine4MoEGrouped(bs.MoEGate, gateW.Buf, bs.FFNNorm, bs.MoETokIdx,
+			bs.MoEStarts, expDim, dim, n, cfg.ExpertCount, gateBlocks, 0); err != nil {
+			t.Fatalf("grouped gemm n=%d: %v", n, err)
+		}
+		Sync()
+		out := make([]float32, n*expDim)
+		if err := DownloadF32(bs.MoEGate, out); err != nil {
+			t.Fatalf("download n=%d: %v", n, err)
+		}
+		return out
+	}
+
+	a := run(nA, tokIdx)              // rows 128..199 come from n-tile 1
+	b := run(nB, tokIdx[128:nA])      // the same rows, all in n-tile 0
+
+	var maxAbs float64
+	for i := 0; i < nB*expDim; i++ {
+		d := math.Abs(float64(a[128*expDim+i] - b[i]))
+		if d > maxAbs {
+			maxAbs = d
+		}
+	}
+	t.Logf("n-tile 1 vs n-tile 0 for the same %d pairs: maxAbs=%.3e", nB, maxAbs)
+	if maxAbs != 0 {
+		t.Fatalf("n-tile 1 disagrees with n-tile 0: maxAbs %.3e", maxAbs)
+	}
+}
+
 // TestMoEGroupedVsPerExpert checks the grouped MoE (one GEMM dispatch covering
 // every expert) against the per-expert loop on real LFM2.5-24B-A2B weights, for
 // every MoE layer in the model.
