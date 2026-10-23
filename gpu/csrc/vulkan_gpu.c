@@ -3029,6 +3029,32 @@ int gpu_batch_matvec_offset(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
         return gpu_matvec_offset(out_buf, 0, weights_buf, (int)weights_offset_bytes,
                                  x_buf, rows, cols, qtype);
 
+    /* Canonical Affine4/Affine8: those matvec kernels already own a token axis
+     * (gl_WorkGroupID.y selects the position and they index the activations by
+     * pos_id*cols) and take the expert slice as a 32-weight block index, so the
+     * same kernel serves the batched expert GEMM with no new shader. Without
+     * this the batched MoE would be unusable on the default unified-quant path,
+     * where every weight tensor is repacked to Affine. */
+    if (qtype == QTYPE_AFFINE8 || qtype == QTYPE_AFFINE4) {
+        int is8 = (qtype == QTYPE_AFFINE8);
+        uint64_t blk_bytes = is8 ? 36u : 20u;
+        if (weights_offset_bytes % blk_bytes != 0) return GPU_ERR_DISPATCH;
+        struct { int rows; int cols; int w_off; } apc =
+            {rows, cols, (int)(weights_offset_bytes / blk_bytes)};
+        DispatchParams adp = {0};
+        adp.pipe = is8 ? PIPE_MATVEC_AFFINE8 : PIPE_MATVEC_AFFINE4;
+        adp.bufs[0] = out_buf;
+        adp.bufs[1] = weights_buf;
+        adp.bufs[2] = x_buf;
+        adp.num_bufs = 3;
+        adp.push_data = &apc;
+        adp.push_size = sizeof(apc);
+        adp.groups_x = (rows + 1) / 2;  /* both kernels own NUM_ROWS = 2 rows */
+        adp.groups_y = npos;
+        adp.groups_z = 1;
+        return dispatch_compute(&adp);
+    }
+
     PipelineID pipe;
     GpuBuf table_buf = 0;
     int rows_per_wg = 4;

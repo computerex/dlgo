@@ -158,6 +158,11 @@ func TestShortConvBatchPrefillParity(t *testing.T) {
 		t.Logf("n=%3d %-18s maxAbs=%.4e meanRel=%.4e top1 agree=%v", n, label, maxAbs, meanRel, agree)
 	}
 
+	// Chunking must be *invariant*: how the prompt is split cannot change the
+	// answer. This is exact on every quant path, because both sides go through
+	// the same batched kernels.
+	worstSplit := 0.0
+
 	worst := 0.0
 	worstLen := 0
 	for _, n := range lengths {
@@ -169,7 +174,11 @@ func TestShortConvBatchPrefillParity(t *testing.T) {
 			t.Fatalf("batched prefill n=%d: %v", n, err)
 		}
 
-		// Whole chunk in one call vs token-at-a-time.
+		// Whole chunk in one call vs token-at-a-time. On the native-quant path
+		// this is bit-exact (both sides dispatch the same kernels). On the
+		// unified Affine path npos==1 takes the single-token matvec while npos>1
+		// takes the coopmat GEMM, so the two differ by fp accumulation order;
+		// that is expected and is why the bound below is a tolerance.
 		sequential, err := runSequential(tokens[:n], 1)
 		if err != nil {
 			t.Fatalf("sequential batched prefill n=%d: %v", n, err)
@@ -184,24 +193,35 @@ func TestShortConvBatchPrefillParity(t *testing.T) {
 		if rel := sumAbs / math.Max(sumMag, 1e-9); rel > worst {
 			worst, worstLen = rel, n
 		}
+		if !argmaxF32Equal(batched, sequential) {
+			t.Errorf("n=%d: batched chunk and token-at-a-time disagree on the top-1 token", n)
+		}
 
-		// A second chunking of the same prompt must land on the same logits.
+		// A second chunking of the same prompt must land on identical logits.
 		if n >= 4 {
 			halves, err := runSequential(tokens[:n], 2)
 			if err != nil {
 				t.Fatalf("two-token chunks n=%d: %v", n, err)
 			}
-			report(n, "chunk2-vs-tokenwise", halves, sequential)
+			report(n, "chunk2-vs-chunk", halves, batched)
+			for i := range batched {
+				if d := math.Abs(float64(halves[i] - batched[i])); d > worstSplit {
+					worstSplit = d
+				}
+			}
 		}
 	}
 
-	// Tighten to bit-exactness: batching the token axis must not change a single
-	// bit, and it does not (see the header comment).
-	if worst > 0 {
+	if worstSplit != 0 {
+		t.Errorf("chunk size changed the logits: maxAbs=%.4e", worstSplit)
+	}
+	if worst > 2e-2 {
 		t.Errorf("batched chunk differs from token-at-a-time by mean rel %.4e (worst at n=%d)",
 			worst, worstLen)
 	}
 }
+
+func argmaxF32Equal(a, b []float32) bool { return argmaxF32(a) == argmaxF32(b) }
 
 func argmaxF32(v []float32) int {
 	best := 0

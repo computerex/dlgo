@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/models/llm"
 )
 
@@ -81,39 +82,70 @@ func moeBatchSupported(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig) bool
 }
 
 // moeBatchQTypeOK mirrors the quant types gpu_batch_matvec_offset can dispatch.
+// 60/61 are the canonical Affine8/Affine4 forms, which the default unified-quant
+// path repacks every weight tensor into.
 func moeBatchQTypeOK(t uint32) bool {
 	switch t {
 	case 0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-		16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 34, 35, 39:
+		16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 34, 35, 39, 60, 61:
 		return true
 	}
 	return false
 }
 
+// moeBatchExpertBytes returns the byte size of one expert's slice of a GPU
+// weight tensor, for the layouts whose block size is known here.
+//
+// This must be derived from the GPU tensor, not from the CPU tensor's payload:
+// the unified-quant path repacks every weight to Affine4/Affine8 at upload time
+// while the CPU tensor keeps the original GGUF bytes, so mixing the two gives a
+// stride that is off by the block-size ratio (e.g. 18/20 for a Q4_0 source
+// repacked to Affine4).
+func moeBatchExpertBytes(gt *GpuTensor, nExperts int) int {
+	if gt == nil || nExperts <= 0 || gt.Rows <= 0 || gt.Cols <= 0 {
+		return 0
+	}
+	var blockBytes int
+	switch gt.Type {
+	case 60: // Affine8: 36-byte block per 32 weights
+		blockBytes = 36
+	case 61: // Affine4: 20-byte block per 32 weights
+		blockBytes = 20
+	default:
+		return 0
+	}
+	blocksPerRow := (gt.Cols + 31) / 32
+	return (gt.Rows / nExperts) * blocksPerRow * blockBytes
+}
+
 // moeBatchExpertStrides returns the byte sizes of one expert slice for the gate,
-// up and down tensors, derived from the CPU tensors' payload so the result is
-// independent of any block-size table.
+// up and down tensors.
 func moeBatchExpertStrides(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig) [3]int {
 	n := cfg.ExpertCount
 	var out [3]int
 	if n <= 0 {
 		return out
 	}
+	// bytesOf prefers the canonical (repacked) GPU layout and falls back to the
+	// CPU payload for native per-quant tensors, where the byte length is exact.
+	bytesOf := func(gt *GpuTensor, ct *core.QuantizedTensor) int {
+		if v := moeBatchExpertBytes(gt, n); v > 0 {
+			return v
+		}
+		if ct != nil {
+			return len(ct.Data) / n
+		}
+		return 0
+	}
 	if gl.FFNGateUpExps != nil && layer.FFNGateUpExps != nil {
 		// Fused [expert][gate | up]: gate first, then up at +stride/2.
-		out[0] = len(layer.FFNGateUpExps.Data) / n
+		out[0] = bytesOf(gl.FFNGateUpExps, layer.FFNGateUpExps)
 		out[1] = out[0] / 2
 	} else {
-		if layer.FFNGateExps != nil {
-			out[0] = len(layer.FFNGateExps.Data) / n
-		}
-		if layer.FFNUpExps != nil {
-			out[1] = len(layer.FFNUpExps.Data) / n
-		}
+		out[0] = bytesOf(gl.FFNGateExps, layer.FFNGateExps)
+		out[1] = bytesOf(gl.FFNUpExps, layer.FFNUpExps)
 	}
-	if layer.FFNDownExps != nil {
-		out[2] = len(layer.FFNDownExps.Data) / n
-	}
+	out[2] = bytesOf(gl.FFNDownExps, layer.FFNDownExps)
 	return out
 }
 
@@ -377,7 +409,8 @@ func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 
 		if err := BatchMatVecOffset(bs.Gate, gateW.Buf, bs.MoEXE, expDim, dim, cnt,
 			gateW.Type, uint64(e)*uint64(strides[0])); err != nil {
-			return fmt.Errorf("moe batch gate: %w", err)
+			return fmt.Errorf("moe batch gate (type=%d rows=%d cols=%d stride=%d off=%d): %w",
+				gateW.Type, expDim, dim, strides[0], uint64(e)*uint64(strides[0]), err)
 		}
 		if err := BatchMatVecOffset(bs.Up, upW.Buf, bs.MoEXE, expDim, dim, cnt,
 			upW.Type, uint64(e)*uint64(upStride)+uint64(upBase)); err != nil {
