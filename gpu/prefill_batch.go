@@ -159,6 +159,10 @@ func GpuForwardPrefillBatchShortConv(m *llm.Model, gm *GpuModel, tokens []int32,
 			if err := BatchMatVec(bs.V, gl.Wv.Buf, bs.XNorm, kvDim, dim, npos, gl.Wv.Type); err != nil {
 				return fmt.Errorf("layer %d wv: %w", l, err)
 			}
+			if inlineDumpOn("batch") {
+				layerDumpBatchRow("qkv-batched", l, bs.Q, npos, qDim)
+				layerDumpBatchRow("qkv-batched", l, bs.V, npos, kvDim)
+			}
 			if gl.Bq != 0 || gl.Bk != 0 || gl.Bv != 0 {
 				Barrier()
 				// The bias scratch is only needed when the kernel cannot read the
@@ -188,12 +192,19 @@ func GpuForwardPrefillBatchShortConv(m *llm.Model, gm *GpuModel, tokens []int32,
 				if err := BatchRMSNormHeads(bs.K, gl.AttnKNorm, numKVHeads, headDim, eps, npos); err != nil {
 					return fmt.Errorf("layer %d knorm: %w", l, err)
 				}
+				if inlineDumpOn("batch") {
+					layerDumpBatchRow("qknorm-batched", l, bs.Q, npos, qDim)
+				}
 			}
 			Barrier()
 			ropeCos, ropeSin := ropeTablesForLayer(pipe, *spec)
 			if err := BatchRoPE(bs.Q, bs.K, ropeCos, ropeSin, numHeads, numKVHeads,
 				headDim, cfg.RopeDim, startPos, cfg.RopeNeox, npos); err != nil {
 				return fmt.Errorf("layer %d rope: %w", l, err)
+			}
+			if inlineDumpOn("batch") {
+				layerDumpBatchRow("rope-batched", l, bs.Q, npos, qDim)
+				layerDumpBatchRow("rope-batched", l, bs.K, npos, kvDim)
 			}
 			Barrier()
 			if err := BatchKVStoreF16(kv.KeyBufs[l], kv.ValBufs[l], bs.K, bs.V,
@@ -204,6 +215,9 @@ func GpuForwardPrefillBatchShortConv(m *llm.Model, gm *GpuModel, tokens []int32,
 			if err := BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
 				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos); err != nil {
 				return fmt.Errorf("layer %d attention: %w", l, err)
+			}
+			if inlineDumpOn("batch") {
+				layerDumpBatchRow("attn-batched", l, bs.AttnOut, npos, qDim)
 			}
 			Barrier()
 			if err := BatchMatVec(bs.AttnProj, gl.Wo.Buf, bs.AttnOut, dim, qDim, npos, gl.Wo.Type); err != nil {

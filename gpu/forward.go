@@ -1615,6 +1615,10 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 			}
 
 			opTimeEnd(opTimeQKV, tAQKV, tAQKVOn)
+			if inlineDumpOn("token") {
+				layerDumpRow("qkv-pertoken", l, rs.Q, numHeads*headDim)
+				layerDumpRow("qkv-pertoken", l, rs.V, kvDim)
+			}
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "Q+bias", rs.Q, numHeads*headDim)
 				GpuDiag.LogBuf("GPU", l, pos, "K+bias", rs.K, kvDim)
@@ -1630,12 +1634,19 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				if err := RMSNormHeads(rs.K, gl.AttnKNorm, numKVHeads, headDim, cfg.RMSNormEps); err != nil {
 					return fmt.Errorf("layer %d knorm: %w", l, err)
 				}
+				if inlineDumpOn("token") {
+					layerDumpRow("qknorm-pertoken", l, rs.Q, numHeads*headDim)
+				}
 			}
 
 			Barrier()
 			ropeCos, ropeSin := ropeTablesForLayer(p, *spec)
 			if err := RoPE(rs.Q, rs.K, ropeCos, ropeSin, numHeads, numKVHeads, headDim, cfg.RopeDim, pos, cfg.RopeNeox); err != nil {
 				return fmt.Errorf("layer %d rope: %w", l, err)
+			}
+			if inlineDumpOn("token") {
+				layerDumpRow("rope-pertoken", l, rs.Q, numHeads*headDim)
+				layerDumpRow("rope-pertoken", l, rs.K, kvDim)
 			}
 
 			if diagL {
@@ -1666,6 +1677,9 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 				}
 			}
 			opTimeEnd(opTimeCore, tACore, tACoreOn)
+			if inlineDumpOn("token") {
+				layerDumpRow("attn-pertoken", l, rs.AttnOut, numHeads*headDim)
+			}
 
 			if diagL {
 				GpuDiag.LogBuf("GPU", l, pos, "AttnOut", rs.AttnOut, numHeads*headDim)

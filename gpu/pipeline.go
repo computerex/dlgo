@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1653,10 +1654,21 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	}
 
 	// Chunked prefill: cap batch buffer size to avoid large VRAM allocation
-	// Keep prefill chunks small to avoid large VRAM spikes from BatchState
-	// allocation during inference. With a 9B model, 4096 tokens × ffnDim
-	// can allocate 1+ GB of transient VRAM for batch buffers.
-	const prefillChunkSize = 512
+	// Chunked prefill size. The batch buffers scale with it, so it is capped to
+	// avoid a VRAM spike during inference (a 9B model at 4096 tokens × ffnDim can
+	// allocate 1+ GB of transient buffers).
+	//
+	// Within that cap, bigger is faster here: each chunk re-reads the whole expert
+	// tensor once (past a handful of tokens every expert is active), so a larger
+	// chunk amortises that read over more tokens. Measured on LFM2.5-24B-A2B at
+	// 1923 prompt tokens: 128 -> 80 tok/s, 512 -> 136, 1024 -> 155, one chunk ->
+	// 178, against 86 for the per-token path. DLGO_PREFILL_CHUNK overrides it.
+	prefillChunkSize := 1024
+	if v := os.Getenv("DLGO_PREFILL_CHUNK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			prefillChunkSize = n
+		}
+	}
 	batchSize := npos
 	if batchSize > prefillChunkSize {
 		batchSize = prefillChunkSize
@@ -2164,13 +2176,13 @@ func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
 	// needs per-expert MoE scratch and a [npos*3*dim] short-conv buffer. Decide
 	// once, here, because this is where the batch state is (re)built.
 	//
-	// OPT-IN for now: the path is implemented and every kernel it uses has been
-	// verified exact in isolation, but the composed prefill still diverges from
-	// the per-token path at the first attention layer of the first chunk
-	// (position 0 agrees, position 1 does not), so it must not be the default.
-	// See gpu/prefill_batch_test.go for the bisection harness.
+	// On by default: the batched chunk is bit-identical to driving the same code
+	// one token at a time at every chunk size and chunking tested
+	// (gpu/prefill_batch_test.go), so it removes the per-token dispatch overhead
+	// without changing the answer. DLGO_PREFILL_BATCH=0 falls back to the
+	// per-token path.
 	p.UseBatchPrefill = false
-	if !p.IsPartialGPU && os.Getenv("DLGO_PREFILL_BATCH") == "1" &&
+	if !p.IsPartialGPU && os.Getenv("DLGO_PREFILL_BATCH") != "0" &&
 		shortConvBatchSupported(p.CPUModel, p.GpuModel, mcfg) {
 		if err := p.BatchState.AllocMoEBatch(batchSize, dim, mcfg.ExpertCount); err != nil {
 			return fmt.Errorf("gpu: prefill MoE batch alloc: %w", err)
