@@ -1071,6 +1071,49 @@ func ScatterRows(dst, src, idx, weights Buf, n, dim int, add bool) error {
 	return nil
 }
 
+// GemmAffine4MoEGrouped runs one grouped GEMM covering every expert of a MoE
+// layer over canonical Affine4 weights (gpu/shaders/
+// gemm_affine4_moe_grouped.comp). tokIdx holds the token id of each grouped pair
+// and starts the [lo, hi) pair range of each expert, so the activations are read
+// through the routing instead of being gathered. aBlocks is the Affine block count
+// of one expert slice and aBase an extra block offset (fused [gate|up] layouts).
+// The output is pair-major: out[(starts[e]+n)*rows + m].
+func GemmAffine4MoEGrouped(out, weights, x, tokIdx, starts Buf,
+	rows, cols, npos, nExperts, aBlocks, aBase int) error {
+	rc := C.gpu_gemm_affine4_moe_grouped(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.GpuBuf(tokIdx), C.GpuBuf(starts), C.int(rows), C.int(cols), C.int(npos),
+		C.int(nExperts), C.int(aBlocks), C.int(aBase))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gemm_affine4_moe_grouped failed (%d)", rc)
+	}
+	return nil
+}
+
+// GemmAffine8MoEGrouped is the Affine8 form of GemmAffine4MoEGrouped.
+func GemmAffine8MoEGrouped(out, weights, x, tokIdx, starts Buf,
+	rows, cols, npos, nExperts, aBlocks, aBase int) error {
+	rc := C.gpu_gemm_affine8_moe_grouped(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
+		C.GpuBuf(tokIdx), C.GpuBuf(starts), C.int(rows), C.int(cols), C.int(npos),
+		C.int(nExperts), C.int(aBlocks), C.int(aBase))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: gemm_affine8_moe_grouped failed (%d)", rc)
+	}
+	return nil
+}
+
+// MoESlotReduce finishes the grouped MoE with a weighted top-k sum in ascending
+// slot order: out[t*dim+c] = sum_s w[t*nUsed+s] * pair[slotPair[t*nUsed+s]][c].
+// Doing it as a separate kernel keeps the down projection free of atomics, which
+// is what makes a chunk bit-reproducible.
+func MoESlotReduce(out, pair, slotPair, slotW Buf, dim, nUsed, npos int) error {
+	rc := C.gpu_moe_slot_reduce(C.GpuBuf(out), C.GpuBuf(pair), C.GpuBuf(slotPair),
+		C.GpuBuf(slotW), C.int(dim), C.int(nUsed), C.int(npos))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_slot_reduce failed (%d)", rc)
+	}
+	return nil
+}
+
 // SetNoCoopmatGemm disables cooperative-matrix GEMMs, forcing the
 // FP32-activation GEMM paths. The diffusion DiT needs this: its activations
 // (e.g. the SwiGLU output) exceed the FP16 range the coopmat kernels narrow to,

@@ -2187,6 +2187,13 @@ func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
 		if err := p.BatchState.AllocMoEBatch(batchSize, dim, mcfg.ExpertCount); err != nil {
 			return fmt.Errorf("gpu: prefill MoE batch alloc: %w", err)
 		}
+		// Pair-major scratch for the grouped MoE, which runs one dispatch per
+		// projection instead of one per expert. Not fatal on failure: the
+		// per-expert loop is the fallback and needs only the scratch above.
+		if err := p.BatchState.AllocMoEGrouped(batchSize, dim, mcfg.ExpertFFNDim,
+			mcfg.ExpertUsedCount, mcfg.ExpertCount); err != nil {
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu] grouped MoE scratch unavailable, using the per-expert loop: %v\n", err)
+		}
 		if err := p.BatchState.AllocShortConvBatch(batchSize, dim); err != nil {
 			return fmt.Errorf("gpu: prefill shortconv batch alloc: %w", err)
 		}

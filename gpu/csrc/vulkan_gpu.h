@@ -244,6 +244,15 @@ typedef enum {
     // Appended at the end so existing pipeline IDs stay stable.
     PIPE_GATHER_ROWS,
     PIPE_SCATTER_ROWS,
+    // Grouped MoE GEMM: one dispatch per projection covering every expert, with
+    // the expert as the z dimension of the grid and the token axis read through
+    // the expert's token list (gpu/shaders/gemm_affine4_moe_grouped.comp). This
+    // replaces the per-expert loop's ~192 dispatches per layer with 3. The
+    // companion moe_slot_reduce does the weighted top-k sum in slot order.
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_GEMM_AFFINE4_MOE_GROUPED,
+    PIPE_GEMM_AFFINE8_MOE_GROUPED,
+    PIPE_MOE_SLOT_REDUCE,
     PIPE_COUNT
 } PipelineID;
 
@@ -346,6 +355,30 @@ int gpu_batch_matvec_offset(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
 int gpu_gather_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, int n, int dim);
 int gpu_scatter_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, GpuBuf weights,
                      int n, int dim, int add);
+
+// Grouped MoE GEMM: one dispatch covers every expert of the layer.
+//
+// Grid is (ceil(rows/64), ceil(npos/128), n_experts), so a workgroup whose expert
+// received no tokens returns immediately. The token axis is read through
+// tok_idx[starts[e] .. starts[e+1]-1], i.e. the positions that routed to expert
+// e, which is why no gathered activation buffer is needed. The result is written
+// pair-major: out[(starts[e] + n) * rows + m]. a_blocks is the Affine block count
+// of one expert slice and a_base an extra block offset (fused [gate|up] slices);
+// expressing the slice in blocks rather than bytes keeps it independent of
+// minStorageBufferOffsetAlignment.
+int gpu_gemm_affine4_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                                 GpuBuf tok_idx, GpuBuf starts, int rows, int cols,
+                                 int npos, int n_experts, int a_blocks, int a_base);
+int gpu_gemm_affine8_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                                 GpuBuf tok_idx, GpuBuf starts, int rows, int cols,
+                                 int npos, int n_experts, int a_blocks, int a_base);
+
+// Deterministic top-k slot reduce for the grouped MoE:
+// out[t*dim + c] = sum_s slot_w[t*nUsed+s] * pair[slot_pair[t*nUsed+s]*dim + c].
+// Slot order is ascending, matching the per-token path's accumulate order, so the
+// result never depends on scheduling.
+int gpu_moe_slot_reduce(GpuBuf out_buf, GpuBuf pair_buf, GpuBuf slot_pair_buf,
+                        GpuBuf slot_w_buf, int dim, int n_used, int npos);
 
 // Batch matrix-vector: out[p*rows+r] = dot(W[r,:], x[p*cols...]) for each position p
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,

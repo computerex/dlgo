@@ -77,6 +77,14 @@ func TestMoEBatchParity(t *testing.T) {
 	if err := bs.AllocMoEBatch(npos, dim, cfg.ExpertCount); err != nil {
 		t.Fatalf("moe batch scratch: %v", err)
 	}
+	// The pair-major scratch makes gpuForwardMoEBatch take the grouped path
+	// (one GEMM dispatch covering every expert). Without it the per-expert loop
+	// runs instead, so this test covers whichever is selected.
+	if err := bs.AllocMoEGrouped(npos, dim, cfg.ExpertFFNDim,
+		cfg.ExpertUsedCount, cfg.ExpertCount); err != nil {
+		t.Fatalf("moe grouped scratch: %v", err)
+	}
+	t.Logf("grouped MoE path active: %v", moeGroupedSupported(layer, gl, cfg, bs))
 
 	// Deterministic pseudo-random input with a realistic magnitude.
 	x := make([]float32, npos*dim)

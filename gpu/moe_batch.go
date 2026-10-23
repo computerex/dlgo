@@ -5,6 +5,8 @@ package gpu
 import (
 	"fmt"
 	"math"
+	"os"
+	"sync"
 
 	"github.com/computerex/dlgo/core"
 	"github.com/computerex/dlgo/models/llm"
@@ -159,6 +161,7 @@ type moeBatchPlan struct {
 	cursor []int32   // [nExperts]
 	tokens []int32   // [npos*nUsed] token ids grouped by expert
 	weight []float32 // [npos*nUsed] routing weights, parallel to tokens
+	pair   []int32   // [npos*nUsed] slot-major -> pair index (inverse of tokens)
 	selIdx []int32   // [npos*nUsed] slot-major top-k before grouping
 	selW   []float32 // [npos*nUsed]
 	logits []float32 // [npos*nExperts] router logits downloaded from the GPU
@@ -189,11 +192,13 @@ func getMoEPlan(npos, nExperts, nUsed int) *moeBatchPlan {
 		p.weight = make([]float32, total)
 		p.selIdx = make([]int32, total)
 		p.selW = make([]float32, total)
+		p.pair = make([]int32, total)
 	}
 	p.tokens = p.tokens[:total]
 	p.weight = p.weight[:total]
 	p.selIdx = p.selIdx[:total]
 	p.selW = p.selW[:total]
+	p.pair = p.pair[:total]
 
 	nl := npos * nExperts
 	if cap(p.logits) < nl {
@@ -337,6 +342,7 @@ func planMoEBatch(p *moeBatchPlan, selBias []float32, gatingFunc int,
 			d := p.cursor[e]
 			p.tokens[d] = int32(t)
 			p.weight[d] = p.selW[i]
+			p.pair[i] = d
 			p.cursor[e] = d + 1
 		}
 	}
@@ -344,8 +350,27 @@ func planMoEBatch(p *moeBatchPlan, selBias []float32, gatingFunc int,
 
 // gpuForwardMoEBatch runs one MoE layer for a chunk of npos positions, consuming
 // bs.FFNNorm (the normed FFN input for the chunk) and producing bs.FFNOut.
-// Gate/Up/Hidden come from the dense-FFN scratch, which is unused on MoE layers.
+//
+// Two implementations exist. The grouped one (gpuForwardMoEGrouped) issues a
+// single dispatch per projection covering every expert; the per-expert one
+// (gpuForwardMoEBatchPerExpert) loops over experts with one dispatch each. The
+// grouped path needs canonical Affine weights (see moeGroupedSupported) and the
+// pair-major scratch from AllocMoEGrouped, so native-quant models — and any build
+// that skipped that allocation — keep the per-expert loop.
 func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
+	cfg llm.ModelConfig, npos int) error {
+	if moeGroupedSupported(layer, gl, cfg, bs) {
+		return gpuForwardMoEGrouped(layer, gl, bs, cfg, npos)
+	}
+	return gpuForwardMoEBatchPerExpert(layer, gl, bs, cfg, npos)
+}
+
+// gpuForwardMoEBatchPerExpert is the position-batched MoE with one GEMM per
+// expert. It is the reference implementation and the fallback for quant types
+// that have no grouped kernel.
+//
+// Gate/Up/Hidden come from the dense-FFN scratch, which is unused on MoE layers.
+func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	cfg llm.ModelConfig, npos int) error {
 
 	dim := cfg.EmbeddingDim
@@ -433,6 +458,245 @@ func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 			return fmt.Errorf("moe batch scatter: %w", err)
 		}
 		Barrier()
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Grouped MoE: one dispatch per projection covering every expert.
+// ---------------------------------------------------------------------------
+
+// moeGroupedQTypeOK reports whether a grouped MoE GEMM kernel exists for a
+// weight type. Only the canonical Affine formats have one: they are what the
+// default unified-quant path repacks every weight tensor into, so that is where
+// the win is. Native per-quant types keep the per-expert loop, which is already
+// correct and only one kernel per type away if it ever matters.
+func moeGroupedQTypeOK(t uint32) bool {
+	return t == QuantTypeAffine4 || t == QuantTypeAffine8
+}
+
+// moeAffineBlockBytes returns the byte size of one canonical Affine block (32
+// weights), or 0 for any other type.
+func moeAffineBlockBytes(t uint32) int {
+	switch t {
+	case QuantTypeAffine8:
+		return 36
+	case QuantTypeAffine4:
+		return 20
+	}
+	return 0
+}
+
+// moeGroupedForce is a test hook for the end-to-end parity tests, which need both
+// implementations inside one process: 0 forces the per-expert loop, any other
+// value leaves the normal decision alone.
+var moeGroupedForce = -1
+
+// moeGroupedEnvOn caches DLGO_MOE_GROUPED. moeGroupedSupported runs once per MoE
+// layer per chunk, so the lookup is cached rather than repeated 38 times a chunk.
+var moeGroupedEnvOn = struct {
+	once sync.Once
+	on   bool
+}{}
+
+func moeGroupedEnabled() bool {
+	moeGroupedEnvOn.once.Do(func() {
+		moeGroupedEnvOn.on = os.Getenv("DLGO_MOE_GROUPED") != "0"
+	})
+	return moeGroupedEnvOn.on
+}
+
+// moeGroupedSupported reports whether the grouped path can run this layer.
+//
+// Besides the path's own buffer requirements it reuses moeBatchSupported, so
+// every condition the per-expert loop needs (no shared expert, no expert biases,
+// a batched router, an aligned expert stride) holds for both — the grouped path
+// is a faster way to compute the same thing, not a second semantics.
+func moeGroupedSupported(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig, bs *GpuBatchState) bool {
+	if bs == nil || bs.MoEGate == 0 || bs.MoEUp == 0 || bs.MoEPairOut == 0 ||
+		bs.MoEStarts == 0 || bs.MoETokIdx == 0 || bs.MoEPairIdx == 0 ||
+		bs.MoESlotPair == 0 || bs.MoESlotW == 0 {
+		return false
+	}
+	if moeGroupedForce == 0 {
+		return false
+	}
+	if !moeBatchSupported(layer, gl, cfg) {
+		return false
+	}
+	if !moeGroupedEnabled() {
+		return false
+	}
+	// BK == 32 is exactly one Affine block, so the k-tile boundary and the
+	// per-row block count only line up when both dims are block-multiples.
+	if cfg.EmbeddingDim%32 != 0 || cfg.ExpertFFNDim%32 != 0 {
+		return false
+	}
+	types := []uint32{gl.FFNDownExps.Type}
+	if gl.FFNGateUpExps != nil {
+		types = append(types, gl.FFNGateUpExps.Type)
+	} else {
+		if gl.FFNGateExps == nil || gl.FFNUpExps == nil {
+			return false
+		}
+		types = append(types, gl.FFNGateExps.Type, gl.FFNUpExps.Type)
+	}
+	for _, t := range types {
+		if !moeGroupedQTypeOK(t) {
+			return false
+		}
+	}
+	return true
+}
+
+// gpuForwardMoEGrouped runs one MoE layer for a chunk with one GEMM dispatch per
+// projection covering every expert.
+//
+// This removes ~3*nExperts dispatches per layer (192 on a 64-expert layer) and,
+// more importantly, the reason each expert's weights were read once per
+// (token, expert) pair: every expert now sweeps its slice a single time for all
+// of its tokens. The gather/scatter pair disappears too — activations are read
+// through the routing table by the GEMM's B-side, and the down projection writes
+// pair-major, so moe_slot_reduce can do the weighted top-k sum without atomics
+// (which is what keeps a chunk bit-reproducible).
+//
+// Expert slices are addressed as Affine *block* indices (a_blocks stride, a_base
+// offset), so unlike the descriptor-offset form of the per-expert loop they need
+// no storage-buffer alignment.
+func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
+	cfg llm.ModelConfig, npos int) error {
+
+	dim := cfg.EmbeddingDim
+	expDim := cfg.ExpertFFNDim
+	nExperts := cfg.ExpertCount
+	nUsed := cfg.ExpertUsedCount
+	npair := npos * nUsed
+
+	// Router for the whole chunk in one dispatch.
+	if err := BatchMatVec(bs.MoELogits, gl.FFNRouter.Buf, bs.FFNNorm,
+		nExperts, dim, npos, gl.FFNRouter.Type); err != nil {
+		return fmt.Errorf("moe grouped router: %w", err)
+	}
+	Barrier()
+
+	p := getMoEPlan(npos, nExperts, nUsed)
+	if err := DownloadF32(bs.MoELogits, p.logits); err != nil {
+		return fmt.Errorf("moe grouped router download: %w", err)
+	}
+	planMoEBatch(p, layer.FFNExpertSelBias, cfg.ExpertGatingFunc,
+		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale))
+
+	// Routing tables: pair -> token (so the GEMMs can read the activations), the
+	// per-expert pair range, and the slot-major inverse the reduce needs.
+	if err := UploadI32(bs.MoEStarts, p.starts[:nExperts+1]); err != nil {
+		return fmt.Errorf("moe grouped starts upload: %w", err)
+	}
+	if err := UploadI32(bs.MoETokIdx, p.tokens[:npair]); err != nil {
+		return fmt.Errorf("moe grouped token idx upload: %w", err)
+	}
+	if err := UploadI32(bs.MoESlotPair, p.pair[:npair]); err != nil {
+		return fmt.Errorf("moe grouped slot pair upload: %w", err)
+	}
+	if err := UploadF32(bs.MoESlotW, p.selW[:npair]); err != nil {
+		return fmt.Errorf("moe grouped slot weight upload: %w", err)
+	}
+	Barrier()
+
+	fused := gl.FFNGateUpExps != nil
+	gateW, upW := gl.FFNGateExps, gl.FFNUpExps
+	if fused {
+		// Fused [expert][gate | up]: one tensor, up at +expertStride/2.
+		gateW, upW = gl.FFNGateUpExps, gl.FFNGateUpExps
+	}
+	downW := gl.FFNDownExps
+	if gateW == nil || upW == nil || downW == nil {
+		return fmt.Errorf("moe grouped: missing expert tensors")
+	}
+	gateBlk := moeAffineBlockBytes(gateW.Type)
+	upBlk := moeAffineBlockBytes(upW.Type)
+	downBlk := moeAffineBlockBytes(downW.Type)
+	if gateBlk == 0 || upBlk == 0 || downBlk == 0 {
+		return fmt.Errorf("moe grouped: unsupported quant types gate=%d up=%d down=%d",
+			gateW.Type, upW.Type, downW.Type)
+	}
+
+	// Derive the block strides from the same byte strides the per-expert path
+	// uses, so both paths cannot disagree about the layout.
+	strides := moeBatchExpertStrides(layer, gl, cfg)
+	blocksOf := func(name string, idx, blk int) (int, error) {
+		if strides[idx] <= 0 || strides[idx]%blk != 0 {
+			return 0, fmt.Errorf("moe grouped: %s expert stride %d is not a multiple of %d",
+				name, strides[idx], blk)
+		}
+		return strides[idx] / blk, nil
+	}
+	gateBlocks, err := blocksOf("gate", 0, gateBlk)
+	if err != nil {
+		return err
+	}
+	upBlocks, upBase := 0, 0
+	if fused {
+		// Same tensor and therefore the same stride, with the up half offset.
+		upBlocks = gateBlocks
+		upBase, err = blocksOf("up", 1, upBlk)
+		if err != nil {
+			return err
+		}
+	} else {
+		upBlocks, err = blocksOf("up", 1, upBlk)
+		if err != nil {
+			return err
+		}
+	}
+	downBlocks, err := blocksOf("down", 2, downBlk)
+	if err != nil {
+		return err
+	}
+
+	gemm := func(out, weights, idx, x Buf, qtype uint32, rows, cols, blocks, base int) error {
+		if qtype == QuantTypeAffine8 {
+			return GemmAffine8MoEGrouped(out, weights, x, idx, bs.MoEStarts,
+				rows, cols, npos, nExperts, blocks, base)
+		}
+		return GemmAffine4MoEGrouped(out, weights, x, idx, bs.MoEStarts,
+			rows, cols, npos, nExperts, blocks, base)
+	}
+
+	// gate / up: [npair][expDim] each, over the normed activations of the whole
+	// chunk. The B-side rows come from the routing table, so no gathered copy of
+	// the activations is needed.
+	if err := gemm(bs.MoEGate, gateW.Buf, bs.MoETokIdx, bs.FFNNorm, gateW.Type,
+		expDim, dim, gateBlocks, 0); err != nil {
+		return fmt.Errorf("moe grouped gate (type=%d blocks=%d): %w", gateW.Type, gateBlocks, err)
+	}
+	if err := gemm(bs.MoEUp, upW.Buf, bs.MoETokIdx, bs.FFNNorm, upW.Type,
+		expDim, dim, upBlocks, upBase); err != nil {
+		return fmt.Errorf("moe grouped up (type=%d blocks=%d base=%d): %w",
+			upW.Type, upBlocks, upBase, err)
+	}
+	Barrier()
+
+	// SwiGLU over the pair axis, in place into MoEGate (each thread reads before
+	// writing its own index). MoEGate then holds the down projection's input.
+	if err := SwiGLU(bs.MoEGate, bs.MoEGate, bs.MoEUp, expDim*npair); err != nil {
+		return fmt.Errorf("moe grouped swiglu: %w", err)
+	}
+	Barrier()
+
+	// The down projection's input is already pair-major, so its index table is the
+	// identity 0..npair-1 (filled once at allocation).
+	if err := gemm(bs.MoEPairOut, downW.Buf, bs.MoEPairIdx, bs.MoEGate, downW.Type,
+		dim, expDim, downBlocks, 0); err != nil {
+		return fmt.Errorf("moe grouped down (type=%d blocks=%d): %w",
+			downW.Type, downBlocks, err)
+	}
+	Barrier()
+
+	// Weighted top-k sum in slot order. Deterministic, so no atomics anywhere in
+	// this path and a chunk reproduces itself exactly.
+	if err := MoESlotReduce(bs.FFNOut, bs.MoEPairOut, bs.MoESlotPair, bs.MoESlotW,
+		dim, nUsed, npos); err != nil {
+		return fmt.Errorf("moe grouped slot reduce: %w", err)
 	}
 	return nil
 }

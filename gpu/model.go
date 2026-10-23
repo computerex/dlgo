@@ -613,6 +613,18 @@ type GpuBatchState struct {
 	MoEIdx    Buf // [npos * int32] token ids routed to one expert
 	MoEW      Buf // [npos * float32] routing weights for those tokens
 
+	// Grouped MoE scratch (see gpuForwardMoEGrouped). Allocated only when the
+	// layer's projections are in a canonical Affine format and the grouped path
+	// is enabled; MoEPairOut == 0 selects the per-expert loop instead.
+	MoEGate     Buf // [npair * expDim] pair-major gate projection
+	MoEUp       Buf // [npair * expDim] pair-major up projection
+	MoEPairOut  Buf // [npair * dim]    pair-major down projection
+	MoEStarts   Buf // [nExperts + 1] int32 expert -> [lo, hi) pair range
+	MoETokIdx   Buf // [npair] int32    pair -> token id (gate/up input rows)
+	MoEPairIdx  Buf // [npair] int32    identity pair -> pair (down input rows)
+	MoESlotPair Buf // [npair] int32    (token, slot) -> pair
+	MoESlotW    Buf // [npair] float32  (token, slot) -> routing weight
+
 	// ShortConvBCX is the [npos * 3*dim] in_proj output for a chunk of
 	// short-convolution layers (b | c | x interleaved per position).
 	ShortConvBCX Buf
@@ -702,6 +714,63 @@ func (bs *GpuBatchState) AllocSSMBatch(npos, qkvDim, valueDim, numHeads int) err
 	return nil
 }
 
+// AllocMoEGrouped allocates the pair-major scratch the grouped MoE GEMM needs
+// (see gpuForwardMoEGrouped). npair = npos*nUsed is the number of
+// (token, expert) pairs in one chunk, which is what makes the gate/up and down
+// outputs so much larger than the per-expert scratch: they are buffered whole so
+// that one dispatch can cover every expert.
+func (bs *GpuBatchState) AllocMoEGrouped(npos, dim, expDim, nUsed, nExperts int) error {
+	if npos <= 0 || dim <= 0 || expDim <= 0 || nUsed <= 0 || nExperts <= 0 {
+		return fmt.Errorf("gpu: AllocMoEGrouped: bad shape npos=%d dim=%d expDim=%d nUsed=%d nExperts=%d",
+			npos, dim, expDim, nUsed, nExperts)
+	}
+	pair := npos * nUsed
+	a := allocChecker{}
+	bs.MoEGate = a.alloc(uint64(pair * expDim * 4))
+	bs.MoEUp = a.alloc(uint64(pair * expDim * 4))
+	bs.MoEPairOut = a.alloc(uint64(pair * dim * 4))
+	bs.MoEStarts = a.alloc(uint64((nExperts + 1) * 4))
+	bs.MoETokIdx = a.alloc(uint64(pair * 4))
+	bs.MoEPairIdx = a.alloc(uint64(pair * 4))
+	bs.MoESlotPair = a.alloc(uint64(pair * 4))
+	bs.MoESlotW = a.alloc(uint64(pair * 4))
+	if a.err != nil {
+		bs.freeMoEGrouped()
+		return fmt.Errorf("gpu: AllocMoEGrouped(npos=%d dim=%d expDim=%d nUsed=%d): %w",
+			npos, dim, expDim, nUsed, a.err)
+	}
+
+	// The down projection's input is already pair-major (the gate/up result for
+	// pair p sits at row p), so its B-side index table is the identity. Filling it
+	// once here is what lets all three projections share one kernel: the GEMM
+	// always reads input row tok_idx[lo+n] and cannot tell the difference.
+	id := make([]int32, pair)
+	for i := range id {
+		id[i] = int32(i)
+	}
+	if err := UploadI32(bs.MoEPairIdx, id); err != nil {
+		bs.freeMoEGrouped()
+		return fmt.Errorf("gpu: AllocMoEGrouped identity index: %w", err)
+	}
+	return nil
+}
+
+// freeMoEGrouped releases just the grouped-MoE scratch. A failed
+// AllocMoEGrouped must not tear down the rest of the batch state: the pipeline
+// treats the grouped path as optional and falls back to the per-expert loop.
+func (bs *GpuBatchState) freeMoEGrouped() {
+	Free(bs.MoEGate)
+	Free(bs.MoEUp)
+	Free(bs.MoEPairOut)
+	Free(bs.MoEStarts)
+	Free(bs.MoETokIdx)
+	Free(bs.MoEPairIdx)
+	Free(bs.MoESlotPair)
+	Free(bs.MoESlotW)
+	bs.MoEGate, bs.MoEUp, bs.MoEPairOut, bs.MoEStarts = 0, 0, 0, 0
+	bs.MoETokIdx, bs.MoEPairIdx, bs.MoESlotPair, bs.MoESlotW = 0, 0, 0, 0
+}
+
 // FreeBatchState releases all batch GPU buffers.
 func (bs *GpuBatchState) Free() {
 	if bs == nil {
@@ -732,6 +801,7 @@ func (bs *GpuBatchState) Free() {
 	Free(bs.MoEOut)
 	Free(bs.MoEIdx)
 	Free(bs.MoEW)
+	bs.freeMoEGrouped()
 	Free(bs.ShortConvBCX)
 }
 

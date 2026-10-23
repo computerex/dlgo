@@ -3008,6 +3008,91 @@ int gpu_scatter_rows(GpuBuf dst, GpuBuf src, GpuBuf idx, GpuBuf weights,
     return dispatch_compute(&dp);
 }
 
+// gpu_gemm_affineX_moe_grouped: one GEMM dispatch covering every expert of the
+// layer. The per-expert loop it replaces issued gate/up/down for each expert
+// separately (~192 dispatches on a 64-expert layer) and every one of those
+// re-read its expert's weights for the few rows that selected it. Here the
+// expert is the z dimension of the grid, so an expert with no tokens exits
+// immediately and the whole tensor is swept exactly once.
+//
+// Two things differ from the dense gemm_affineX_coopmat:
+//   * the token axis of B is read through tok_idx (no gather_rows), and
+//   * the output is pair-major (no scatter_rows); moe_slot_reduce does the
+//     weighted top-k sum.
+//
+// The expert slice is addressed in Affine *blocks* rather than bytes, so it never
+// has to satisfy minStorageBufferOffsetAlignment.
+static int gemm_affine_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                                   GpuBuf tok_idx, GpuBuf starts, int rows, int cols,
+                                   int npos, int n_experts, int a_blocks, int a_base,
+                                   int is8) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0 || rows <= 0 || cols <= 0 || n_experts <= 0) return GPU_OK;
+    /* BK == 32 is exactly one Affine block, so the row stride and the k-tile
+     * boundary coincide only when cols is a multiple of 32. */
+    if (cols % 32 != 0) return GPU_ERR_DISPATCH;
+
+    struct { int rows; int cols; int a_blocks; int a_base; } pc =
+        {rows, cols, a_blocks, a_base};
+    DispatchParams dp = {0};
+    dp.pipe = is8 ? PIPE_GEMM_AFFINE8_MOE_GROUPED : PIPE_GEMM_AFFINE4_MOE_GROUPED;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = weights_buf;
+    dp.bufs[2] = x_buf;
+    dp.bufs[3] = tok_idx;
+    dp.bufs[4] = starts;
+    dp.num_bufs = 5;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (rows + 63) / 64;      /* BM = 64 */
+    dp.groups_y = (npos + 127) / 128;    /* BN = 128, upper bound on any expert */
+    dp.groups_z = n_experts;
+    return dispatch_compute(&dp);
+}
+
+int gpu_gemm_affine4_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                                 GpuBuf tok_idx, GpuBuf starts, int rows, int cols,
+                                 int npos, int n_experts, int a_blocks, int a_base) {
+    return gemm_affine_moe_grouped(out_buf, weights_buf, x_buf, tok_idx, starts,
+                                   rows, cols, npos, n_experts, a_blocks, a_base, 0);
+}
+
+int gpu_gemm_affine8_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
+                                 GpuBuf tok_idx, GpuBuf starts, int rows, int cols,
+                                 int npos, int n_experts, int a_blocks, int a_base) {
+    return gemm_affine_moe_grouped(out_buf, weights_buf, x_buf, tok_idx, starts,
+                                   rows, cols, npos, n_experts, a_blocks, a_base, 1);
+}
+
+// gpu_moe_slot_reduce: out[t*dim+c] = sum_s w[t*nUsed+s] * pair[slot[s]][c].
+//
+// Written as a separate kernel (rather than an accumulate in the down-projection
+// epilogue) so the grouped MoE needs no atomics: the slot order is fixed, so a
+// chunk is bit-reproducible and chunk-size invariance stays exact. It is also
+// the same accumulate order the per-token path uses.
+int gpu_moe_slot_reduce(GpuBuf out_buf, GpuBuf pair_buf, GpuBuf slot_pair_buf,
+                        GpuBuf slot_w_buf, int dim, int n_used, int npos) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (dim <= 0 || n_used <= 0 || npos <= 0) return GPU_OK;
+
+    struct { int dim; int n_used; } pc = {dim, n_used};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_MOE_SLOT_REDUCE;
+    dp.bufs[0] = out_buf;
+    dp.bufs[1] = pair_buf;
+    dp.bufs[2] = slot_pair_buf;
+    dp.bufs[3] = slot_w_buf;
+    dp.num_bufs = 4;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (dim + 255) / 256;
+    dp.groups_y = npos;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 // gpu_batch_matvec_offset: batched matvec against a weight slice that starts at
 // `weights_offset_bytes` inside a packed tensor (one MoE expert).
 //

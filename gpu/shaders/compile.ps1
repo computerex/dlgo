@@ -159,7 +159,10 @@ $shaders = @(
     @{name="convert_to_affine"; file="convert_to_affine.comp"},
     @{name="shortconv"; file="shortconv.comp"},
     @{name="gather_rows"; file="gather_rows.comp"},
-    @{name="scatter_rows"; file="scatter_rows.comp"}
+    @{name="scatter_rows"; file="scatter_rows.comp"},
+    @{name="gemm_affine4_moe_grouped"; file="gemm_affine4_moe_grouped.comp"; target="vulkan1.3"},
+    @{name="gemm_affine8_moe_grouped"; file="gemm_affine8_moe_grouped.comp"; target="vulkan1.3"},
+    @{name="moe_slot_reduce"; file="moe_slot_reduce.comp"}
 )
 
 $header = @"
@@ -372,6 +375,9 @@ static const ShaderInfo shader_registry[] = {
     {"shortconv", spv_shortconv, spv_shortconv_size, 4, 12}, // PIPE_SHORT_CONV
     {"gather_rows", spv_gather_rows, spv_gather_rows_size, 3, 8}, // PIPE_GATHER_ROWS
     {"scatter_rows", spv_scatter_rows, spv_scatter_rows_size, 4, 12}, // PIPE_SCATTER_ROWS
+    {"gemm_affine4_moe_grouped", spv_gemm_affine4_moe_grouped, spv_gemm_affine4_moe_grouped_size, 5, 16}, // PIPE_GEMM_AFFINE4_MOE_GROUPED
+    {"gemm_affine8_moe_grouped", spv_gemm_affine8_moe_grouped, spv_gemm_affine8_moe_grouped_size, 5, 16}, // PIPE_GEMM_AFFINE8_MOE_GROUPED
+    {"moe_slot_reduce", spv_moe_slot_reduce, spv_moe_slot_reduce_size, 4, 8}, // PIPE_MOE_SLOT_REDUCE
 };
 
 #endif // DLGO_SHADERS_SPIRV_H

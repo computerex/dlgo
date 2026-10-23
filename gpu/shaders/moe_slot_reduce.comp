@@ -1,0 +1,38 @@
+#version 450
+
+// Deterministic top-k slot reduce for the grouped MoE (gpu/shaders/
+// gemm_affine4_moe_grouped.comp).
+//
+// The grouped GEMM gives every (token, expert) pair its own row of the down
+// projection, because accumulating straight into the token row from several
+// experts at once would need atomics — and the atomic order would make a chunk
+// irreproducible, which would break the chunk-size invariance the prefill is
+// tested on. This kernel sums a token's k slots in ascending slot order, which is
+// also the order the per-token path accumulates them in.
+//
+// Dispatch: groups = (ceil(dim/256), npos, 1).
+
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set = 0, binding = 0) buffer Out { float out_data[]; };
+layout(set = 0, binding = 1) buffer Pair { float pair_data[]; };
+layout(set = 0, binding = 2) buffer SlotPair { int slot_pair[]; };
+layout(set = 0, binding = 3) buffer SlotW { float slot_w[]; };
+
+layout(push_constant) uniform Params {
+    int dim;    // elements per row
+    int nUsed;  // top-k slots per token
+};
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    int t = int(gl_GlobalInvocationID.y);
+    if (c >= dim) return;
+    int base = t * nUsed;
+    float acc = 0.0;
+    for (int s = 0; s < nUsed; s++) {
+        int i = base + s;
+        acc = acc + slot_w[i] * pair_data[uint(slot_pair[i]) * uint(dim) + uint(c)];
+    }
+    out_data[uint(t) * uint(dim) + uint(c)] = acc;
+}
