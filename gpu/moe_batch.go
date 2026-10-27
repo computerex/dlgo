@@ -40,16 +40,32 @@ func moeBatchSupported(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig) bool
 	if gl.FFNGateExps == nil && gl.FFNGateUpExps == nil {
 		return false
 	}
-	// Not batched yet: shared expert, expert biases, router bias. None of these
-	// occur on LFM2/SmolLM-style MoE, so falling back keeps the surface small.
-	if gl.FFNGateShared != nil || gl.FFNRouterShared != 0 {
-		return false
-	}
+	// Not batched yet: per-expert biases and a router logit bias. Neither occurs
+	// on LFM2/SmolLM/DeepSeek-style MoE here, so falling back keeps the surface
+	// small. A *selection* bias (FFNExpertSelBias) is fine — planMoEBatch
+	// reproduces moe_topk.comp's post-activation bias exactly.
 	if gl.FFNRouterBias != 0 {
 		return false
 	}
 	if gl.FFNGateExpsBias != 0 || gl.FFNUpExpsBias != 0 || gl.FFNDownExpsBias != 0 {
 		return false
+	}
+	// Shared expert (Qwen3-Next / Qwen3.5-class MoE): a dense FFN that runs on
+	// every token, whose output is added to the routed experts'. Batched by
+	// gpuForwardMoESharedBatch, which needs all three projections with matching
+	// inner dimensions.
+	if gl.FFNGateShared != nil {
+		if gl.FFNUpShared == nil || gl.FFNDownShared == nil {
+			return false
+		}
+		if !moeBatchQTypeOK(gl.FFNGateShared.Type) || !moeBatchQTypeOK(gl.FFNUpShared.Type) ||
+			!moeBatchQTypeOK(gl.FFNDownShared.Type) {
+			return false
+		}
+		if gl.FFNGateShared.Rows <= 0 || gl.FFNGateShared.Rows != gl.FFNUpShared.Rows ||
+			gl.FFNDownShared.Cols != gl.FFNGateShared.Rows {
+			return false
+		}
 	}
 	// moe_topk.comp keeps at most 512 experts in registers.
 	if cfg.ExpertCount <= 0 || cfg.ExpertCount > 512 {
@@ -81,6 +97,15 @@ func moeBatchSupported(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig) bool
 		}
 	}
 	return true
+}
+
+// moeBatchScratchReady reports whether the batch state carries the scratch
+// gpuForwardMoEBatch writes into. Only AllocMoEBatch allocates it, and the
+// pipeline skips that allocation (or it fails) when VRAM is tight, so callers
+// must check rather than assume.
+func moeBatchScratchReady(bs *GpuBatchState) bool {
+	return bs != nil && bs.MoELogits != 0 && bs.MoEOut != 0 && bs.MoEIdx != 0 &&
+		bs.MoEW != 0 && bs.Gate != 0 && bs.Up != 0 && bs.Hidden != 0
 }
 
 // moeBatchQTypeOK mirrors the quant types gpu_batch_matvec_offset can dispatch.
@@ -368,9 +393,119 @@ func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 		return fmt.Errorf("moe: chunk of %d positions does not fit the batch state (%d)", npos, bs.Npos)
 	}
 	if moeGroupedSupported(layer, gl, cfg, bs) {
-		return gpuForwardMoEGrouped(layer, gl, bs, cfg, npos)
+		if err := gpuForwardMoEGrouped(layer, gl, bs, cfg, npos); err != nil {
+			return err
+		}
+	} else if err := gpuForwardMoEBatchPerExpert(layer, gl, bs, cfg, npos); err != nil {
+		return err
 	}
-	return gpuForwardMoEBatchPerExpert(layer, gl, bs, cfg, npos)
+	// The shared expert is common to both implementations and runs after they
+	// have accumulated the routed experts into bs.FFNOut.
+	return gpuForwardMoESharedBatch(gl, bs, cfg, npos)
+}
+
+// gpuForwardMoESharedBatch adds the shared expert's output to bs.FFNOut.
+//
+// The shared expert is a plain dense FFN that runs on every token (Qwen3-Next /
+// Qwen3.5-class MoE), consuming the same normed FFN input and adding into the
+// same output the routed experts do: gate/up -> SwiGLU -> down.
+//
+// The one wrinkle is the optional FFNRouterShared: a [dim] vector whose dot
+// product with the FFN input, passed through a sigmoid, scales the whole
+// shared-expert output — one scalar per position. That is applied with
+// ScatterRows over an identity index rather than a dedicated row-scale kernel:
+// it already computes dst[i] += w[i] * src[i] for `dim`-wide rows, which is
+// exactly the weighted accumulate wanted, so the shared expert needs no shader
+// of its own.
+func gpuForwardMoESharedBatch(gl *GpuLayer, bs *GpuBatchState, cfg llm.ModelConfig, npos int) error {
+	if gl == nil || gl.FFNGateShared == nil {
+		return nil
+	}
+	dim := cfg.EmbeddingDim
+	shDim := gl.FFNGateShared.Rows
+	if dim <= 0 || shDim <= 0 {
+		return fmt.Errorf("moe shared: bad shape dim=%d shDim=%d", dim, shDim)
+	}
+	if bs.Gate == 0 || bs.Up == 0 || bs.Hidden == 0 || bs.MoEOut == 0 {
+		return fmt.Errorf("moe shared: missing batch scratch")
+	}
+
+	// MoEOut is dead here: the per-expert loop already scattered its last
+	// expert's down output and the grouped path never touches it.
+	Barrier()
+	if err := BatchMatVec(bs.Gate, gl.FFNGateShared.Buf, bs.FFNNorm, shDim, dim, npos,
+		gl.FFNGateShared.Type); err != nil {
+		return fmt.Errorf("moe shared gate (type=%d): %w", gl.FFNGateShared.Type, err)
+	}
+	if err := BatchMatVec(bs.Up, gl.FFNUpShared.Buf, bs.FFNNorm, shDim, dim, npos,
+		gl.FFNUpShared.Type); err != nil {
+		return fmt.Errorf("moe shared up (type=%d): %w", gl.FFNUpShared.Type, err)
+	}
+	Barrier()
+	if err := SwiGLU(bs.Hidden, bs.Gate, bs.Up, shDim*npos); err != nil {
+		return fmt.Errorf("moe shared swiglu: %w", err)
+	}
+	Barrier()
+	if err := BatchMatVec(bs.MoEOut, gl.FFNDownShared.Buf, bs.Hidden, dim, shDim, npos,
+		gl.FFNDownShared.Type); err != nil {
+		return fmt.Errorf("moe shared down (type=%d): %w", gl.FFNDownShared.Type, err)
+	}
+	Barrier()
+
+	if gl.FFNRouterShared == 0 {
+		return Add(bs.FFNOut, bs.FFNOut, bs.MoEOut, dim*npos)
+	}
+
+	// Per-position gate. One row of router weights over the whole chunk gives
+	// [npos] dot products; the sigmoid and the weighted accumulate stay cheap.
+	if bs.MoELogits == 0 || bs.MoEW == 0 || bs.MoEIdx == 0 {
+		return fmt.Errorf("moe shared: missing gate scratch")
+	}
+	if err := BatchMatVec(bs.MoELogits, gl.FFNRouterShared, bs.FFNNorm, 1, dim, npos, 0); err != nil {
+		return fmt.Errorf("moe shared router: %w", err)
+	}
+	g := ensureScratch(moeSharedGate, npos)
+	moeSharedGate = g
+	if err := DownloadF32(bs.MoELogits, g); err != nil {
+		return fmt.Errorf("moe shared router download: %w", err)
+	}
+	for i := 0; i < npos; i++ {
+		g[i] = float32(1) / (float32(1) + float32(math.Exp(float64(-g[i]))))
+	}
+	// DownloadF32 submits (and waits on) the recording batch, so the recording
+	// state is gone; reopen it or every remaining dispatch of this chunk becomes
+	// its own submit+wait.
+	BeginBatch()
+	if err := UploadF32(bs.MoEW, g); err != nil {
+		return fmt.Errorf("moe shared gate upload: %w", err)
+	}
+	moeSharedIdx = ensureI32Scratch(moeSharedIdx, npos)
+	for i := range moeSharedIdx {
+		moeSharedIdx[i] = int32(i)
+	}
+	if err := UploadI32(bs.MoEIdx, moeSharedIdx); err != nil {
+		return fmt.Errorf("moe shared index upload: %w", err)
+	}
+	Barrier()
+	if err := ScatterRows(bs.FFNOut, bs.MoEOut, bs.MoEIdx, bs.MoEW, npos, dim, true); err != nil {
+		return fmt.Errorf("moe shared gate apply: %w", err)
+	}
+	return nil
+}
+
+// moeSharedGate and moeSharedIdx are scratch for gpuForwardMoESharedBatch, kept
+// across layers (and chunks) the way moePlanScratch is. They hold npos entries,
+// so they only grow.
+var (
+	moeSharedGate []float32
+	moeSharedIdx  []int32
+)
+
+func ensureI32Scratch(buf []int32, n int) []int32 {
+	if cap(buf) < n {
+		return make([]int32, n)
+	}
+	return buf[:n]
 }
 
 // gpuForwardMoEBatchPerExpert is the position-batched MoE with one GEMM per

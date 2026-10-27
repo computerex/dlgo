@@ -77,6 +77,15 @@ type GpuPipeline struct {
 	// extra scratch gets allocated. DLGO_PREFILL_BATCH=0 disables it.
 	UseBatchPrefill bool
 
+	// UseBatchPrefillHybridMoE routes prompt processing for hybrid SSM+GatedQ
+	// attention models that carry a MoE FFN (Qwen3.5-class) through
+	// GpuForwardPrefillBatchHybrid with the position-batched GPU MoE instead of
+	// one full forward per token. Without it such a model re-reads every active
+	// expert once per prompt token; with it the expert tensor is swept once per
+	// chunk. Set by ensurePrefillBatchState, which is also where the MoE scratch
+	// is allocated; DLGO_PREFILL_BATCH=0 disables it.
+	UseBatchPrefillHybridMoE bool
+
 	// hasCPUAttn is true when ANY GPU layer needs the CPU attention fallback;
 	// batched prefill cannot serve those layers, so System One hidden
 	// extraction refuses to run on such models.
@@ -1707,7 +1716,7 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			for i, tok := range tokens {
 				GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
 			}
-		} else if p.HasMoE {
+		} else if p.HasMoE && !p.UseBatchPrefillHybridMoE {
 			for i, tok := range tokens {
 				GpuForwardFusedSSM(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
 			}
@@ -2145,7 +2154,7 @@ func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
 	dim := mcfg.EmbeddingDim
 	qDim := mcfg.NumHeads * mcfg.HeadDim
 	kvDim := mcfg.NumKVHeads * mcfg.HeadDim
-	ffnDim := mcfg.FFNDim
+	ffnDim := batchFFNScratchDim(p.CPUModel)
 	var bsErr error
 	p.BatchState, bsErr = NewGpuBatchState(batchSize, dim, qDim, kvDim, ffnDim)
 	if bsErr != nil {
@@ -2199,7 +2208,139 @@ func (p *GpuPipeline) ensurePrefillBatchState(batchSize int) error {
 		}
 		p.UseBatchPrefill = true
 	}
+
+	// Hybrid SSM + GatedQ attention models with a MoE FFN (Qwen3.5-class) go
+	// through GpuForwardPrefillBatchHybrid with the position-batched GPU MoE.
+	// The alternative branch — one full forward per token — re-reads every
+	// active expert for every prompt token, which on a model large enough to
+	// spill its experts to host RAM is almost entirely PCIe traffic.
+	//
+	// A failed MoE scratch allocation is not fatal: UseBatchPrefillHybridMoE
+	// stays false and the model keeps the per-token path it has today.
+	//
+	// !p.UseBatchPrefill: the short-conv path above already allocated this
+	// scratch, and AllocMoEBatch would overwrite the handles and leak the first
+	// set. A model that satisfies both descriptions takes the short-conv path,
+	// which is checked first in generateSegments.
+	p.UseBatchPrefillHybridMoE = false
+	if !p.IsPartialGPU && !p.UseBatchPrefill && os.Getenv("DLGO_PREFILL_BATCH") != "0" && p.HasMoE {
+		if ok, why := hybridBatchMoESupported(p.CPUModel, p.GpuModel, mcfg,
+			p.HasSSM, p.HasGatedQ); !ok {
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu] batched prefill MoE not usable (%s); "+
+				"prompt tokens will each re-read their experts\n", why)
+		} else if err := p.BatchState.AllocMoEBatch(batchSize, dim, mcfg.ExpertCount); err != nil {
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu] batched MoE scratch unavailable, keeping the per-token prefill: %v\n", err)
+		} else {
+			if err := p.BatchState.AllocMoEGrouped(batchSize, dim, mcfg.ExpertFFNDim,
+				mcfg.ExpertUsedCount, mcfg.ExpertCount); err != nil {
+				fmt.Fprintf(os.Stderr, "[dlgo/gpu] grouped MoE scratch unavailable, using the per-expert loop: %v\n", err)
+			}
+			p.UseBatchPrefillHybridMoE = true
+			fmt.Fprintf(os.Stderr, "[dlgo/gpu] batched prefill MoE active: %d-token chunks, "+
+				"router %s, grouped=%v\n", batchSize, p.CPUModel.Config.Architecture,
+				p.BatchState.MoEPairOut != 0)
+		}
+	}
 	return nil
+}
+
+// batchFFNScratchDim returns the row count the batched-FFN scratch (bs.Gate /
+// bs.Up / bs.Hidden) has to hold. It is not just cfg.FFNDim: models whose layers
+// are all MoE report ffnDim = 0, and both the batched MoE and the shared expert
+// reuse that scratch for their own gate/up/hidden rows.
+func batchFFNScratchDim(m *llm.Model) int {
+	d := m.Config.FFNDim
+	if m.Config.ExpertFFNDim > d {
+		d = m.Config.ExpertFFNDim
+	}
+	for i := range m.Layers {
+		if g := m.Layers[i].FFNGate; g != nil && g.Rows > d {
+			d = g.Rows
+		}
+		if g := m.Layers[i].FFNGateUpExps; g != nil {
+			// Fused [expert][gate | up]: one expert's gate (or up) half.
+			if n := g.Rows; n > 0 {
+				if e := m.Config.ExpertCount; e > 1 {
+					n /= e
+				}
+				if n > d {
+					d = n
+				}
+			}
+		}
+		if g := m.Layers[i].FFNGateShared; g != nil && g.Rows > d {
+			d = g.Rows
+		}
+	}
+	return d
+}
+
+// hybridBatchMoESupported reports whether GpuForwardPrefillBatchHybrid can run
+// this whole model with the position-batched GPU MoE.
+//
+// It mirrors the routing inside that function: every layer's core must be one
+// the batched loop handles itself (SSM, GatedQ attention) or the fused C graph
+// handles (plain attention with q/k/v/o), and every MoE layer must satisfy
+// moeBatchSupported. Residual and norm style are restricted to the ones the
+// batched kernels implement.
+//
+// On rejection it returns a human-readable reason naming the first offending
+// layer, which the pipeline prints so a model that silently keeps the slow path
+// can be diagnosed without a rebuild.
+func hybridBatchMoESupported(m *llm.Model, gm *GpuModel, cfg llm.ModelConfig,
+	hasSSM, hasGatedQ bool) (bool, string) {
+	if !hasSSM {
+		return false, "no SSM state on the GPU"
+	}
+	if !isHybridSSMModel(m) {
+		return false, "not a hybrid SSM model"
+	}
+	for l := range m.Layers {
+		layer := &m.Layers[l]
+		gl := &gm.Layers[l]
+		if !gl.OnGPU {
+			return false, fmt.Sprintf("layer %d is not on the GPU", l)
+		}
+		if layer.Spec.Norm != llm.NormRMS {
+			return false, fmt.Sprintf("layer %d norm is not RMSNorm", l)
+		}
+		// ResStandard and ResPostAttnFFN both compile to residual_type == 0 and
+		// only differ in which weight normalises the FFN input, which
+		// BuildBatchLayerConfs already resolves. ResParallel is a different
+		// graph (it feeds x_norm to the FFN and never materialises ffn_in) and
+		// cannot support the post-MoE residual below.
+		if layer.Spec.Residual != llm.ResStandard && layer.Spec.Residual != llm.ResPostAttnFFN {
+			return false, fmt.Sprintf("layer %d residual kind %d is not batched", l, layer.Spec.Residual)
+		}
+		switch {
+		case layer.Spec.Core == llm.CoreSSM:
+			// Handled by the batched SSM loop (batched input projections, then
+			// the per-position recurrence).
+		case layer.Spec.GatedQ:
+			if !hasGatedQ || gl.Wq == nil || gl.Wk == nil || gl.Wv == nil || gl.Wo == nil {
+				return false, fmt.Sprintf("layer %d gated attention is incomplete", l)
+			}
+		case layer.Spec.Core == llm.CoreAttention:
+			if gl.CPUAttn || gl.Wq == nil || gl.Wk == nil || gl.Wv == nil || gl.Wo == nil {
+				return false, fmt.Sprintf("layer %d attention is not fully on the GPU", l)
+			}
+		default:
+			return false, fmt.Sprintf("layer %d core kind %d is not batched", l, layer.Spec.Core)
+		}
+		switch layer.Spec.FFN {
+		case llm.FFNMoE:
+			if !moeBatchSupported(layer, gl, cfg) {
+				return false, fmt.Sprintf("layer %d MoE is not batchable", l)
+			}
+		case llm.FFNSwiGLU, llm.FFNGeGLU:
+			if gl.FFNGate == nil || gl.FFNUp == nil || gl.FFNDown == nil {
+				return false, fmt.Sprintf("layer %d dense FFN tensors are incomplete", l)
+			}
+		default:
+			return false, fmt.Sprintf("layer %d FFN kind %d is not batched", l, layer.Spec.FFN)
+		}
+	}
+	return true, ""
 }
 
 // SystemOneHidden extracts the final normalized hidden state for a compiled

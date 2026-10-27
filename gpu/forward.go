@@ -1241,25 +1241,59 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 		ssmTimeEnd(3, ffnStart, ffnOn)
 
 		if gl.IsMoE && pipe.HasMoE {
-			// Batch prefill MoE: download raw FFNIn, recompute norm on CPU with f64 precision
-			Sync()
-			cpuRS := pipe.CPURunState
-			ffnInBatch := make([]float32, npos*dim)
-			DownloadF32(bs.FFNIn, ffnInBatch)
-			ffnOutBatch := make([]float32, npos*dim)
-			for p := 0; p < npos; p++ {
-				posFFNIn := ffnInBatch[p*dim : (p+1)*dim]
-				ops.RMSNorm(cpuRS.FFNNorm, posFFNIn, layer.FFNNorm, cfg.RMSNormEps)
-				llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
-				copy(ffnOutBatch[p*dim:(p+1)*dim], cpuRS.FFNOut)
-			}
-			BeginBatch()
-			UploadF32(bs.FFNOut, ffnOutBatch)
-			Barrier()
-			Add(bs.X, bs.FFNIn, bs.FFNOut, dim*npos)
-			if nextAttnNorm != 0 {
+			// ForwardLayerBatch already produced ffn_in = x + attn_proj and
+			// ffn_norm for this layer and returned (ffn_type == 3). All that is
+			// left is the MoE and the residual.
+			//
+			// The batched MoE is what makes this path worth having on a MoE
+			// model: the per-position alternative issues a matvec per
+			// (token, expert) pair, so a prompt token re-reads the 8 experts it
+			// routed to and nothing is shared between tokens. On a model whose
+			// expert tensors partly live in host RAM that is one PCIe sweep of
+			// ~0.6 GB per token; batched by expert it is one sweep of the whole
+			// expert tensor per chunk.
+			if moeBatchSupported(layer, gl, cfg) && moeBatchScratchReady(bs) {
 				Barrier()
-				BatchRMSNorm(bs.XNorm, bs.X, nextAttnNorm, dim, npos, cfg.RMSNormEps)
+				if err := gpuForwardMoEBatch(layer, gl, bs, cfg, npos); err != nil {
+					panic(fmt.Errorf("layer %d batched moe: %w", l, err))
+				}
+				Barrier()
+				Add(bs.X, bs.FFNIn, bs.FFNOut, dim*npos)
+				if nextAttnNorm != 0 {
+					Barrier()
+					BatchRMSNorm(bs.XNorm, bs.X, nextAttnNorm, dim, npos, cfg.RMSNormEps)
+				}
+			} else if pipe.CPURunState != nil {
+				// Batch prefill MoE: download raw FFNIn, recompute norm on CPU with f64 precision
+				Sync()
+				cpuRS := pipe.CPURunState
+				// ResPostAttnFFN normalises the FFN input with post_attention_norm
+				// instead of ffn_norm, matching BuildBatchLayerConfs.
+				cpuFFNNormW := layer.FFNNorm
+				if layer.Spec.Residual == llm.ResPostAttnFFN {
+					cpuFFNNormW = layer.PostAttnNorm
+				}
+				ffnInBatch := make([]float32, npos*dim)
+				DownloadF32(bs.FFNIn, ffnInBatch)
+				ffnOutBatch := make([]float32, npos*dim)
+				for p := 0; p < npos; p++ {
+					posFFNIn := ffnInBatch[p*dim : (p+1)*dim]
+					ops.RMSNorm(cpuRS.FFNNorm, posFFNIn, cpuFFNNormW, cfg.RMSNormEps)
+					llm.ForwardMoEFFNDispatch(layer, cpuRS, cpuRS.FFNNorm, cfg, cpuRS.Pool)
+					copy(ffnOutBatch[p*dim:(p+1)*dim], cpuRS.FFNOut)
+				}
+				BeginBatch()
+				UploadF32(bs.FFNOut, ffnOutBatch)
+				Barrier()
+				Add(bs.X, bs.FFNIn, bs.FFNOut, dim*npos)
+				if nextAttnNorm != 0 {
+					Barrier()
+					BatchRMSNorm(bs.XNorm, bs.X, nextAttnNorm, dim, npos, cfg.RMSNormEps)
+				}
+			} else {
+				panic(fmt.Errorf("layer %d: MoE has neither the batched GPU path "+
+					"(moeBatchSupported=%v, scratch=%v) nor a CPU run state",
+					l, moeBatchSupported(layer, gl, cfg), moeBatchScratchReady(bs)))
 			}
 		}
 	}
