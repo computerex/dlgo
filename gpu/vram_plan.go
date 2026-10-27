@@ -101,7 +101,13 @@ func hostSpillBudget() int64 {
 	const reserve = 2 << 30
 	budget -= reserve
 	if budget < 0 {
-		return 0
+		budget = 0
+	}
+	// The tier decision is otherwise invisible: it silently caps the context at
+	// its floor, so make the inputs available when asked.
+	if os.Getenv("DLGO_DEBUG_VRAM_PLAN") != "" {
+		fmt.Printf("[dlgo/plan] host tier: availPhys=%d MB commitAvail=%d MB -> budget=%d MB\n",
+			int64(info.AvailablePhysical)/mib, int64(info.CommitAvailable)/mib, budget/mib)
 	}
 	return budget
 }

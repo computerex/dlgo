@@ -775,6 +775,33 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	//     plus its KV must fit in device-local VRAM, otherwise shrink until
 	//     they do. Kept as a fallback for debugging and for machines where
 	//     pinning multi-GB host-visible buffers is undesirable.
+	//
+	// Release the CPU-side KV cache / run state / batch state BEFORE planning,
+	// not just before the upload. Both planners below read the remaining Windows
+	// commit charge, and the CPU scratch is a first-class consumer of it: its KV
+	// mirror is context-sized, so at a large context it can consume more commit
+	// than the host weight tier needs. Planning first then measured a host tier
+	// of zero and clamped the context to the 8K floor while 20 GB of physical RAM
+	// sat free — the model was told it could not spill for lack of the very
+	// memory it was about to release. The CPU buffers are rebuilt below if GPU
+	// creation ultimately fails and the caller falls back to CPU.
+	//
+	// The RoPE tables are Go slices computed by the CPU run state, and they carry
+	// the model's rope scaling (YaRN tables are not what RoPEFrequencyTable
+	// produces from the config alone), so hold them across the release instead of
+	// recomputing them.
+	var cpuCos, cpuSin, cpuCosSWA, cpuSinSWA []float32
+	if cpuPipeline.RunState != nil {
+		cpuCos, cpuSin = cpuPipeline.RunState.RoPETables()
+		if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
+			cpuCosSWA, cpuSinSWA = cpuPipeline.RunState.RoPETablesSWA()
+		}
+	}
+	cpuPipeline.FreeForGPU()
+	runtime.GC()
+	debug.FreeOSMemory()
+	mmap.TrimWorkingSet()
+
 	layerBytes, nonLayerBytes := modelWeightBytes(m)
 	modelBytes := layerBytes + nonLayerBytes
 
@@ -835,17 +862,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	kvDim := cfg.NumKVHeads * cfg.HeadDim
 	ffnDim := cfg.FFNDim
 
-	// Release the CPU-side KV cache / run state / batch state BEFORE uploading
-	// weights. The GPU pipeline owns its own KV in VRAM; holding the full-context
-	// CPU scratch during the (multi-second) weight upload roughly doubles peak
-	// host memory and can exhaust the Windows commit limit at large contexts
-	// (fatal: out of memory, errno 1455). The GPU path recomputes RoPE tables
-	// from config when RunState is nil, and the CPU buffers are rebuilt below if
-	// GPU creation ultimately fails and the caller falls back to CPU.
-	cpuPipeline.FreeForGPU()
-	runtime.GC()
-	debug.FreeOSMemory()
-	mmap.TrimWorkingSet()
+	// The CPU-side KV cache / run state / batch state were released above, before
+	// context planning, because their commit charge feeds the host spill budget.
 
 	// Retry loop: if GPU allocation fails, reduce layers and retry.
 	// Limited to 3 retries to avoid VRAM fragmentation from repeated
@@ -901,12 +919,12 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 				return err
 			}
 
-			// Upload RoPE tables. Prefer pre-computed tables from CPU RunState
-			// (if available), otherwise compute from config. RunState may be nil
-			// when CPU buffers were freed before GPU pipeline creation.
+			// Upload RoPE tables. The CPU tables captured before the release above
+			// carry the model's rope scaling; only fall back to config-derived
+			// tables when the CPU pipeline never had a run state.
 			var cosTable, sinTable []float32
-			if cpuPipeline.RunState != nil {
-				cosTable, sinTable = cpuPipeline.RunState.RoPETables()
+			if cpuCos != nil && cpuSin != nil {
+				cosTable, sinTable = cpuCos, cpuSin
 			}
 			if cosTable != nil && sinTable != nil {
 				ropeCosTable, err = UploadF32Slice(cosTable)
@@ -938,8 +956,8 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			// Upload SWA RoPE tables if per-layer RoPE is needed
 			if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
 				var swaCos, swaSin []float32
-				if cpuPipeline.RunState != nil {
-					swaCos, swaSin = cpuPipeline.RunState.RoPETablesSWA()
+				if cpuCosSWA != nil && cpuSinSWA != nil {
+					swaCos, swaSin = cpuCosSWA, cpuSinSWA
 				}
 				if swaCos != nil && swaSin != nil {
 					ropeCosTableSWA, err = UploadF32Slice(swaCos)

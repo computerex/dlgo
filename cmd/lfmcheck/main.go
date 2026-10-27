@@ -90,8 +90,25 @@ func main() {
 	fmt.Printf("moe: experts=%d used=%d expFFN=%d gatingFunc=%d weightsNorm=%v weightsScale=%v leadingDense=%d\n",
 		cfg.ExpertCount, cfg.ExpertUsedCount, cfg.ExpertFFNDim, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, cfg.ExpertWeightsScale, cfg.LeadingDenseCount)
-	fmt.Printf("shortconv: l_cache=%d hasShortConv=%v attnLayers=%d kvBytesPerTok=%d\n",
-		cfg.ShortConvLCache, cfg.HasShortConv(), cfg.AttentionLayerCount(), cfg.KVBytesPerToken())
+	// KVBytesPerToken charges a K/V cache to every layer that is not a
+	// short-convolution layer, at f32. SSM (and MLA) layers keep a fixed-size
+	// recurrent state instead and cost nothing per token, and the GPU cache is
+	// FP16 — so for a hybrid SSM model that figure is ~8x the truth (160 KB/token
+	// vs 20 KB/token here) and makes long contexts look impossible. Report what
+	// the GPU actually allocates.
+	var kvBytesPerTokGPU int64
+	kvLayers := 0
+	for l := range p.Model.Layers {
+		switch p.Model.Layers[l].Spec.Core {
+		case llm.CoreSSM, llm.CoreMLA, llm.CoreShortConv:
+			continue
+		}
+		kvBytesPerTokGPU += 2 * int64(cfg.NumKVHeads) * int64(cfg.HeadDim) * 2
+		kvLayers++
+	}
+	fmt.Printf("shortconv: l_cache=%d hasShortConv=%v attnLayers=%d kvLayers=%d kvBytesPerTokGPU=%d (cfg.KVBytesPerToken=%d)\n",
+		cfg.ShortConvLCache, cfg.HasShortConv(), cfg.AttentionLayerCount(), kvLayers,
+		kvBytesPerTokGPU, cfg.KVBytesPerToken())
 	if len(cfg.KVHeadsPerLayer) > 0 {
 		fmt.Printf("kvHeadsPerLayer=%v\n", cfg.KVHeadsPerLayer)
 	}
