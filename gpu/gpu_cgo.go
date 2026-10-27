@@ -1114,6 +1114,26 @@ func MoESlotReduce(out, pair, slotPair, slotW Buf, dim, nUsed, npos int) error {
 	return nil
 }
 
+// MoEExpertBiasAdd adds expert bias rows to a contiguous [n][expDim] activation
+// block: data[i] += bias[base + (i % expDim)].
+//
+// One expert covering many token rows (the per-expert loop) passes useIndex
+// false and biasBase = expert*expDim. The grouped path's activations are
+// pair-major and mix experts inside one buffer, so it passes useIndex true and a
+// GPU pair->expert table.
+func MoEExpertBiasAdd(data, bias, idx Buf, n, expDim int, useIndex bool, biasBase int) error {
+	ui := 0
+	if useIndex {
+		ui = 1
+	}
+	rc := C.gpu_moe_expert_bias_add(C.GpuBuf(data), C.GpuBuf(bias), C.GpuBuf(idx),
+		C.int(n), C.int(expDim), C.int(ui), C.int(biasBase))
+	if rc != C.GPU_OK {
+		return fmt.Errorf("gpu: moe_expert_bias_add failed (%d)", rc)
+	}
+	return nil
+}
+
 // SetNoCoopmatGemm disables cooperative-matrix GEMMs, forcing the
 // FP32-activation GEMM paths. The diffusion DiT needs this: its activations
 // (e.g. the SwiGLU output) exceed the FP16 range the coopmat kernels narrow to,
@@ -1601,12 +1621,16 @@ func BatchAttention(out, q, kCache, vCache Buf,
 }
 
 // BatchAttentionF16 performs tiled causal attention for npos positions with FP16 KV cache.
+//
+// window > 0 restricts every position to the last `window` keys (per-position,
+// so it is a mask inside the kernel, not a KV binding offset). 0 = full causal.
 func BatchAttentionF16(out, q, kCache, vCache Buf,
-	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale, softcap float32, npos int) error {
+	numHeads, numKVHeads, headDim, kvDim, startSeqLen int, scale, softcap float32,
+	npos, window int) error {
 	rc := C.gpu_batch_attention_f16(C.GpuBuf(out), C.GpuBuf(q),
 		C.GpuBuf(kCache), C.GpuBuf(vCache),
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim),
-		C.int(startSeqLen), C.float(scale), C.float(softcap), C.int(npos))
+		C.int(startSeqLen), C.float(scale), C.float(softcap), C.int(npos), C.int(window))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: batch_attention_f16 failed (%d)", rc)
 	}

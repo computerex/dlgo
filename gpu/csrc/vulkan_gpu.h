@@ -253,6 +253,14 @@ typedef enum {
     PIPE_GEMM_AFFINE4_MOE_GROUPED,
     PIPE_GEMM_AFFINE8_MOE_GROUPED,
     PIPE_MOE_SLOT_REDUCE,
+    // Per-expert bias add for the position-batched MoE: one expert's [n_rows]
+    // block of exp_dim-wide activations gets that expert's bias row added
+    // (gpu/shaders/moe_expert_bias_add.comp). gpt-oss carries
+    // ffn_{gate,up,down}_exps.bias, which the per-token path applies through
+    // moe_bias_add; this is the batched-by-expert equivalent and needs no GPU
+    // id list because the expert is a host-side loop variable.
+    // Appended at the end so existing pipeline IDs stay stable.
+    PIPE_MOE_EXPERT_BIAS_ADD,
     PIPE_COUNT
 } PipelineID;
 
@@ -380,6 +388,14 @@ int gpu_gemm_affine8_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_bu
 int gpu_moe_slot_reduce(GpuBuf out_buf, GpuBuf pair_buf, GpuBuf slot_pair_buf,
                         GpuBuf slot_w_buf, int dim, int n_used, int npos);
 
+// Per-expert bias add over a [n_rows][exp_dim] activation block:
+// data[i] += bias[base + (i % exp_dim)], where base is either bias_base (one
+// expert, from the loop variable) or eidx[i / exp_dim] * exp_dim (the grouped
+// path, whose pair-major activations mix experts). idx_buf must always be a
+// valid int32 buffer; it is only read when use_index != 0.
+int gpu_moe_expert_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf idx_buf,
+                            int n, int exp_dim, int use_index, int bias_base);
+
 // Batch matrix-vector: out[p*rows+r] = dot(W[r,:], x[p*cols...]) for each position p
 int gpu_batch_matvec(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos, int qtype);
@@ -461,7 +477,8 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
                       int seq_len, float scale, float softcap, int start_pos);
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
-                            int kv_dim, int start_seq_len, float scale, float softcap, int npos);
+                            int kv_dim, int start_seq_len, float scale, float softcap,
+                            int npos, int window);
 
 // Split-KV decode attention (npos == 1). Splits the KV range across num_splits
 // workgroups per head to fill the GPU, stages K/V tiles in shared memory and

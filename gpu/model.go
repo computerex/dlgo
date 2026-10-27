@@ -624,6 +624,11 @@ type GpuBatchState struct {
 	MoEPairIdx  Buf // [npair] int32    identity pair -> pair (down input rows)
 	MoESlotPair Buf // [npair] int32    (token, slot) -> pair
 	MoESlotW    Buf // [npair] float32  (token, slot) -> routing weight
+	// MoEPairExpert maps a pair to its expert id. The grouped path's activations
+	// are pair-major, so an expert bias add has to look the expert up per row
+	// rather than use a loop variable. Only written/read when a layer has
+	// per-expert biases (gpt-oss); moe_expert_bias_add reads it when use_index.
+	MoEPairExpert Buf // [npair] int32 pair -> expert id
 
 	// ShortConvBCX is the [npos * 3*dim] in_proj output for a chunk of
 	// short-convolution layers (b | c | x interleaved per position).
@@ -734,6 +739,7 @@ func (bs *GpuBatchState) AllocMoEGrouped(npos, dim, expDim, nUsed, nExperts int)
 	bs.MoEPairIdx = a.alloc(uint64(pair * 4))
 	bs.MoESlotPair = a.alloc(uint64(pair * 4))
 	bs.MoESlotW = a.alloc(uint64(pair * 4))
+	bs.MoEPairExpert = a.alloc(uint64(pair * 4))
 	if a.err != nil {
 		bs.freeMoEGrouped()
 		return fmt.Errorf("gpu: AllocMoEGrouped(npos=%d dim=%d expDim=%d nUsed=%d): %w",
@@ -769,6 +775,8 @@ func (bs *GpuBatchState) freeMoEGrouped() {
 	Free(bs.MoESlotW)
 	bs.MoEGate, bs.MoEUp, bs.MoEPairOut, bs.MoEStarts = 0, 0, 0, 0
 	bs.MoETokIdx, bs.MoEPairIdx, bs.MoESlotPair, bs.MoESlotW = 0, 0, 0, 0
+	Free(bs.MoEPairExpert)
+	bs.MoEPairExpert = 0
 }
 
 // FreeBatchState releases all batch GPU buffers.

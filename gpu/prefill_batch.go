@@ -213,7 +213,8 @@ func GpuForwardPrefillBatchShortConv(m *llm.Model, gm *GpuModel, tokens []int32,
 			}
 			Barrier()
 			if err := BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos); err != nil {
+				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos,
+				spec.SlidingWindow); err != nil {
 				return fmt.Errorf("layer %d attention: %w", l, err)
 			}
 			if inlineDumpOn("batch") {

@@ -1,0 +1,44 @@
+#version 450
+
+// Per-expert bias add for the position-batched MoE.
+//
+//   data[i] += bias[base(i) + (i % exp_dim)]
+//
+// where `base(i)` is either the caller-supplied `bias_base` (one expert covering
+// many token rows: the per-expert loop) or `eidx[i / exp_dim] * exp_dim` (the
+// grouped path, whose activations are pair-major and therefore mix experts
+// inside one buffer).
+//
+// Data layout: [n_rows][exp_dim] contiguous, row-major. Bias layout:
+// [n_experts][exp_dim], matching ffn_{gate,up,down}_exps.bias in the GGUF and
+// what the per-token CPU/GPU MoE paths index with expert*exp_dim.
+//
+// Replaces a host loop of one AddOffset dispatch per row per expert per
+// projection. The per-token path's moe_bias_add.comp cannot be reused here: it
+// expects a [n_used][exp_dim] block plus a GPU list of one token's top-k ids,
+// which is the transpose of the shape the batched loops have.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+layout(set = 0, binding = 1) readonly buffer Bias { float bias[]; };
+// Pair -> expert map. Always bound; only read when use_index != 0.
+layout(set = 0, binding = 2) readonly buffer ExpertIdx { int eidx[]; };
+
+layout(push_constant) uniform Params {
+    int n;          // n_rows * exp_dim
+    int exp_dim;    // bias row width
+    int use_index;  // 0: one expert (bias_base); 1: per-row expert from eidx
+    int bias_base;  // expert_id * exp_dim when use_index == 0
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(n)) return;
+    uint row = i / uint(exp_dim);
+    int base = bias_base;
+    if (use_index != 0) {
+        base = eidx[row] * exp_dim;
+    }
+    data[i] += bias[uint(base) + (i % uint(exp_dim))];
+}

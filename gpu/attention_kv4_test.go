@@ -61,7 +61,7 @@ func TestAttentionKV4ParityGPU(t *testing.T) {
 				SetAttentionKV4(kv4)
 				BeginBatch()
 				check(BatchAttentionF16(ob, qb, kb, vb, heads, kvheads, hd, kvheads*hd, start,
-					float32(1/math.Sqrt(float64(hd))), 0, n))
+					float32(1/math.Sqrt(float64(hd))), 0, n, 0))
 				EndBatch()
 				Sync()
 				out := make([]float32, len(q))

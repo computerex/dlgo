@@ -48,7 +48,9 @@ func AttentionF16Sinks(out, q, kc, vc, sinks Buf, nh, nkv, hd, kvd, sl, sp int, 
 func KVStore(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func KVStoreF16(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func BatchKVStoreF16(kc, vc, k, v Buf, sp, kvd, n int) error { return errNoGPU }
-func BatchAttentionF16(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl int, s, sc float32, n int) error { return errNoGPU }
+func BatchAttentionF16(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl int, s, sc float32, n, window int) error {
+	return errNoGPU
+}
 func Sync()                                 {}
 func PerfReset()                            {}
 func PerfPrint()                            {}

@@ -3,8 +3,14 @@
 // participates in softmax but has no V vector (adds zero to the weighted sum).
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap (28 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window (32 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2), 4=Sinks (float[num_heads])
+//
+// Sliding window: `window` > 0 restricts position p to the keys
+// [max(0, actual_seq_len - window), actual_seq_len). gpt-oss alternates
+// windowed and full layers, so the batched prefill must honour it per position
+// or it silently turns the banded layers into full attention. window == 0 keeps
+// full causal attention.
 
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
@@ -25,6 +31,7 @@ layout(push_constant) uniform Params {
     int seq_len;
     float scale;
     float softcap;
+    int window;     // sliding-window length; 0 = full causal attention
 };
 
 #define WG_SIZE 256
@@ -57,6 +64,12 @@ void main() {
         return;
     }
 
+    // First key this position may see. With window == 0 that is always 0.
+    int win_start = 0;
+    if (window > 0 && actual_seq_len > window) {
+        win_start = actual_seq_len - window;
+    }
+
     uint kv_half = kvd / 2u;
     uint kv_off_half = kv_offset / 2u;
     uint hd_half = hd / 2u;
@@ -72,7 +85,8 @@ void main() {
     float running_max = -1.0e30;
     float running_sum = 0.0;
 
-    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+    int first_tile = (win_start / TILE_SIZE) * TILE_SIZE;
+    for (int tile_start = first_tile; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
         int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
         int tile_len = tile_end - tile_start;
 
@@ -86,8 +100,9 @@ void main() {
                 dot_val = fma(q_sh[fi], k2.x, dot_val);
                 dot_val = fma(q_sh[fi + 1u], k2.y, dot_val);
             }
+            if (softcap > 0.0) dot_val = softcap * tanh(dot_val / softcap);
+            if (t < win_start) dot_val = -1.0e30;
             tile_s[tid] = dot_val;
-            if (softcap > 0.0) tile_s[tid] = softcap * tanh(tile_s[tid] / softcap);
         }
         barrier();
 

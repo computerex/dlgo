@@ -40,14 +40,28 @@ func moeBatchSupported(layer *llm.Layer, gl *GpuLayer, cfg llm.ModelConfig) bool
 	if gl.FFNGateExps == nil && gl.FFNGateUpExps == nil {
 		return false
 	}
-	// Not batched yet: per-expert biases and a router logit bias. Neither occurs
-	// on LFM2/SmolLM/DeepSeek-style MoE here, so falling back keeps the surface
-	// small. A *selection* bias (FFNExpertSelBias) is fine — planMoEBatch
-	// reproduces moe_topk.comp's post-activation bias exactly.
-	if gl.FFNRouterBias != 0 {
+	// Router logit bias (gpt-oss ffn_gate_inp.bias). gpu_forward_moe_ffn adds it
+	// to the logits on the device before moe_topk; the batched path has the whole
+	// chunk's logits on the host anyway, so it adds the same float32 values there
+	// and the selection matches. That needs the host copy, not just the GPU one.
+	if gl.FFNRouterBias != 0 && len(layer.FFNRouterBias) != cfg.ExpertCount {
 		return false
 	}
-	if gl.FFNGateExpsBias != 0 || gl.FFNUpExpsBias != 0 || gl.FFNDownExpsBias != 0 {
+	// Per-expert projection biases (gpt-oss ffn_{gate,up,down}_exps.bias), laid
+	// out [expertCount][expDim] for gate/up and [expertCount][dim] for down.
+	// gpu_moe_expert_bias_add applies them after each projection.
+	if gl.FFNGateExpsBias != 0 || gl.FFNUpExpsBias != 0 {
+		if cfg.ExpertFFNDim <= 0 {
+			return false
+		}
+		if gl.FFNGateExpsBias != 0 && len(layer.FFNGateExpsBias) != cfg.ExpertCount*cfg.ExpertFFNDim {
+			return false
+		}
+		if gl.FFNUpExpsBias != 0 && len(layer.FFNUpExpsBias) != cfg.ExpertCount*cfg.ExpertFFNDim {
+			return false
+		}
+	}
+	if gl.FFNDownExpsBias != 0 && len(layer.FFNDownExpsBias) != cfg.ExpertCount*cfg.EmbeddingDim {
 		return false
 	}
 	// Shared expert (Qwen3-Next / Qwen3.5-class MoE): a dense FFN that runs on
@@ -401,7 +415,7 @@ func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	}
 	// The shared expert is common to both implementations and runs after they
 	// have accumulated the routed experts into bs.FFNOut.
-	return gpuForwardMoESharedBatch(gl, bs, cfg, npos)
+	return gpuForwardMoESharedBatch(layer, gl, bs, cfg, npos)
 }
 
 // gpuForwardMoESharedBatch adds the shared expert's output to bs.FFNOut.
@@ -417,7 +431,8 @@ func gpuForwardMoEBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 // it already computes dst[i] += w[i] * src[i] for `dim`-wide rows, which is
 // exactly the weighted accumulate wanted, so the shared expert needs no shader
 // of its own.
-func gpuForwardMoESharedBatch(gl *GpuLayer, bs *GpuBatchState, cfg llm.ModelConfig, npos int) error {
+func gpuForwardMoESharedBatch(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
+	cfg llm.ModelConfig, npos int) error {
 	if gl == nil || gl.FFNGateShared == nil {
 		return nil
 	}
@@ -442,7 +457,11 @@ func gpuForwardMoESharedBatch(gl *GpuLayer, bs *GpuBatchState, cfg llm.ModelConf
 		return fmt.Errorf("moe shared up (type=%d): %w", gl.FFNUpShared.Type, err)
 	}
 	Barrier()
-	if err := SwiGLU(bs.Hidden, bs.Gate, bs.Up, shDim*npos); err != nil {
+	if layer.Spec.FFN == llm.FFNMoESwiOAI {
+		if err := SwiGLU_OAI(bs.Hidden, bs.Gate, bs.Up, shDim*npos, 1.702, 7.0); err != nil {
+			return fmt.Errorf("moe shared swiglu_oai: %w", err)
+		}
+	} else if err := SwiGLU(bs.Hidden, bs.Gate, bs.Up, shDim*npos); err != nil {
 		return fmt.Errorf("moe shared swiglu: %w", err)
 	}
 	Barrier()
@@ -501,11 +520,36 @@ var (
 	moeSharedIdx  []int32
 )
 
+// moePairExpert is the host staging copy of GpuBatchState.MoEPairExpert: a
+// pair -> expert id table for the grouped path's per-expert bias add. Only used
+// by models whose MoE layers carry expert biases (gpt-oss). Holds npair entries,
+// so it only grows.
+var moePairExpert []int32
+
 func ensureI32Scratch(buf []int32, n int) []int32 {
 	if cap(buf) < n {
 		return make([]int32, n)
 	}
 	return buf[:n]
+}
+
+// applyRouterBias adds the router logit bias (gpt-oss ffn_gate_inp.bias) to the
+// downloaded logits for the whole chunk.
+//
+// gpu_forward_moe_ffn adds the same vector on the device with a plain float32
+// gpu_add before moe_topk runs, so adding it here is bit-identical: both are one
+// IEEE float32 addition of the same two values. Length mismatches are ignored
+// because moeBatchSupported already rejects them.
+func applyRouterBias(bias, logits []float32, npos, nExperts int) {
+	if len(bias) != nExperts || nExperts <= 0 {
+		return
+	}
+	for t := 0; t < npos; t++ {
+		lg := logits[t*nExperts : (t+1)*nExperts]
+		for i := range lg {
+			lg[i] += bias[i]
+		}
+	}
 }
 
 // gpuForwardMoEBatchPerExpert is the position-batched MoE with one GEMM per
@@ -534,6 +578,7 @@ func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchSta
 	if err := DownloadF32(bs.MoELogits, p.logits); err != nil {
 		return fmt.Errorf("moe batch router download: %w", err)
 	}
+	applyRouterBias(layer.FFNRouterBias, p.logits, npos, nExperts)
 	planMoEBatch(p, layer.FFNExpertSelBias, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale))
 
@@ -561,6 +606,11 @@ func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchSta
 		return fmt.Errorf("moe batch zero: %w", err)
 	}
 	Barrier()
+
+	// gpt-oss carries per-expert projection biases and the OAI SwiGLU variant with
+	// clamp + alpha-scaled sigmoid. Both are per-layer constants, so hoist them.
+	oai := layer.Spec.FFN == llm.FFNMoESwiOAI
+	gateBias, upBias, downBias := gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias
 
 	for e := 0; e < nExperts; e++ {
 		cnt := int(p.counts[e])
@@ -590,9 +640,27 @@ func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchSta
 			upW.Type, uint64(e)*uint64(upStride)+uint64(upBase)); err != nil {
 			return fmt.Errorf("moe batch up: %w", err)
 		}
+		if gateBias != 0 {
+			Barrier()
+			if err := MoEExpertBiasAdd(bs.Gate, gateBias, bs.MoEIdx, expDim*cnt, expDim,
+				false, e*expDim); err != nil {
+				return fmt.Errorf("moe batch gate bias: %w", err)
+			}
+		}
+		if upBias != 0 {
+			Barrier()
+			if err := MoEExpertBiasAdd(bs.Up, upBias, bs.MoEIdx, expDim*cnt, expDim,
+				false, e*expDim); err != nil {
+				return fmt.Errorf("moe batch up bias: %w", err)
+			}
+		}
 		Barrier()
 
-		if err := SwiGLU(bs.Hidden, bs.Gate, bs.Up, expDim*cnt); err != nil {
+		if oai {
+			if err := SwiGLU_OAI(bs.Hidden, bs.Gate, bs.Up, expDim*cnt, 1.702, 7.0); err != nil {
+				return fmt.Errorf("moe batch swiglu_oai: %w", err)
+			}
+		} else if err := SwiGLU(bs.Hidden, bs.Gate, bs.Up, expDim*cnt); err != nil {
 			return fmt.Errorf("moe batch swiglu: %w", err)
 		}
 		Barrier()
@@ -600,6 +668,13 @@ func gpuForwardMoEBatchPerExpert(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchSta
 		if err := BatchMatVecOffset(bs.MoEOut, gl.FFNDownExps.Buf, bs.Hidden, dim, expDim,
 			cnt, gl.FFNDownExps.Type, uint64(e)*uint64(strides[2])); err != nil {
 			return fmt.Errorf("moe batch down: %w", err)
+		}
+		if downBias != 0 {
+			Barrier()
+			if err := MoEExpertBiasAdd(bs.MoEOut, downBias, bs.MoEIdx, dim*cnt, dim,
+				false, e*dim); err != nil {
+				return fmt.Errorf("moe batch down bias: %w", err)
+			}
 		}
 		Barrier()
 
@@ -732,6 +807,7 @@ func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	if err := DownloadF32(bs.MoELogits, p.logits); err != nil {
 		return fmt.Errorf("moe grouped router download: %w", err)
 	}
+	applyRouterBias(layer.FFNRouterBias, p.logits, npos, nExperts)
 	planMoEBatch(p, layer.FFNExpertSelBias, cfg.ExpertGatingFunc,
 		cfg.ExpertWeightsNorm, float32(cfg.ExpertWeightsScale))
 
@@ -755,6 +831,23 @@ func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 	}
 	if err := UploadF32(bs.MoESlotW, p.selW[:npair]); err != nil {
 		return fmt.Errorf("moe grouped slot weight upload: %w", err)
+	}
+	// Per-expert biases need a pair -> expert table: the grouped activations are
+	// pair-major, so a row's bias row is not a function of its index alone.
+	oai := layer.Spec.FFN == llm.FFNMoESwiOAI
+	gateBias, upBias, downBias := gl.FFNGateExpsBias, gl.FFNUpExpsBias, gl.FFNDownExpsBias
+	needPairExpert := gateBias != 0 || upBias != 0 || downBias != 0
+	if needPairExpert {
+		pe := ensureI32Scratch(moePairExpert, npair)
+		for e := 0; e < nExperts; e++ {
+			for i := int(p.starts[e]); i < int(p.starts[e+1]); i++ {
+				pe[i] = int32(e)
+			}
+		}
+		moePairExpert = pe
+		if err := UploadI32(bs.MoEPairExpert, pe[:npair]); err != nil {
+			return fmt.Errorf("moe grouped pair-expert upload: %w", err)
+		}
 	}
 	Barrier()
 
@@ -830,11 +923,29 @@ func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 		return fmt.Errorf("moe grouped up (type=%d blocks=%d base=%d): %w",
 			upW.Type, upBlocks, upBase, err)
 	}
+	if gateBias != 0 {
+		Barrier()
+		if err := MoEExpertBiasAdd(bs.MoEGate, gateBias, bs.MoEPairExpert, expDim*npair,
+			expDim, true, 0); err != nil {
+			return fmt.Errorf("moe grouped gate bias: %w", err)
+		}
+	}
+	if upBias != 0 {
+		Barrier()
+		if err := MoEExpertBiasAdd(bs.MoEUp, upBias, bs.MoEPairExpert, expDim*npair,
+			expDim, true, 0); err != nil {
+			return fmt.Errorf("moe grouped up bias: %w", err)
+		}
+	}
 	Barrier()
 
 	// SwiGLU over the pair axis, in place into MoEGate (each thread reads before
 	// writing its own index). MoEGate then holds the down projection's input.
-	if err := SwiGLU(bs.MoEGate, bs.MoEGate, bs.MoEUp, expDim*npair); err != nil {
+	if oai {
+		if err := SwiGLU_OAI(bs.MoEGate, bs.MoEGate, bs.MoEUp, expDim*npair, 1.702, 7.0); err != nil {
+			return fmt.Errorf("moe grouped swiglu_oai: %w", err)
+		}
+	} else if err := SwiGLU(bs.MoEGate, bs.MoEGate, bs.MoEUp, expDim*npair); err != nil {
 		return fmt.Errorf("moe grouped swiglu: %w", err)
 	}
 	Barrier()
@@ -845,6 +956,13 @@ func gpuForwardMoEGrouped(layer *llm.Layer, gl *GpuLayer, bs *GpuBatchState,
 		dim, expDim, downBlocks, 0); err != nil {
 		return fmt.Errorf("moe grouped down (type=%d blocks=%d): %w",
 			downW.Type, downBlocks, err)
+	}
+	if downBias != 0 {
+		Barrier()
+		if err := MoEExpertBiasAdd(bs.MoEPairOut, downBias, bs.MoEPairExpert, dim*npair,
+			dim, true, 0); err != nil {
+			return fmt.Errorf("moe grouped down bias: %w", err)
+		}
 	}
 	Barrier()
 

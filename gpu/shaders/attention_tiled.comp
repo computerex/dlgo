@@ -4,8 +4,16 @@
 // Uses FlashAttention-style online softmax to avoid materializing all scores.
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap (28 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window (32 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2)
+//
+// Sliding window: `window` > 0 restricts position p to the keys
+// [max(0, actual_seq_len - window), actual_seq_len), where actual_seq_len =
+// seq_len + p is the number of keys that position may attend to. That is the
+// same range the single-token path gets by byte-offsetting the KV binding to
+// seq_len - window, but expressed per position because a chunk spans many
+// different windows. window == 0 (the default for callers that pre-offset)
+// keeps full causal attention.
 
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
@@ -25,6 +33,7 @@ layout(push_constant) uniform Params {
     int seq_len;    // starting seq_len (batch attention: pos 0 attends to seq_len tokens)
     float scale;
     float softcap;
+    int window;     // sliding-window length; 0 = full causal attention
 };
 
 #define WG_SIZE 256
@@ -58,6 +67,12 @@ void main() {
         return;
     }
 
+    // First key this position may see. With window == 0 that is always 0.
+    int win_start = 0;
+    if (window > 0 && actual_seq_len > window) {
+        win_start = actual_seq_len - window;
+    }
+
     // Half-element counts for packed uint32 addressing
     uint kv_half = kvd / 2u;         // uint32s per KV position
     uint kv_off_half = kv_offset / 2u; // uint32 offset to this head's KV
@@ -77,8 +92,11 @@ void main() {
     float running_max = -1.0e30;
     float running_sum = 0.0;
 
-    // Process K/V in tiles of TILE_SIZE
-    for (int tile_start = 0; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
+    // Process K/V in tiles of TILE_SIZE, starting at the tile that contains the
+    // first visible key. Positions below win_start inside that first tile are
+    // masked to -inf in phase 1, so they contribute exactly zero to the softmax.
+    int first_tile = (win_start / TILE_SIZE) * TILE_SIZE;
+    for (int tile_start = first_tile; tile_start < actual_seq_len; tile_start += TILE_SIZE) {
         int tile_end = min(tile_start + TILE_SIZE, actual_seq_len);
         int tile_len = tile_end - tile_start;
 
@@ -93,8 +111,10 @@ void main() {
                 dot_val = fma(q_sh[fi], k2.x, dot_val);
                 dot_val = fma(q_sh[fi + 1u], k2.y, dot_val);
             }
+            if (softcap > 0.0) dot_val = softcap * tanh(dot_val / softcap);
+            // Mask after the softcap so a clamped score can never creep back in.
+            if (t < win_start) dot_val = -1.0e30;
             tile_s[tid] = dot_val;
-            if (softcap > 0.0) tile_s[tid] = softcap * tanh(tile_s[tid] / softcap);
         }
         barrier();
 

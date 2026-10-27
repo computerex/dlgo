@@ -3065,6 +3065,30 @@ int gpu_gemm_affine8_moe_grouped(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_bu
                                    rows, cols, npos, n_experts, a_blocks, a_base, 1);
 }
 
+// gpu_moe_expert_bias_add: data[i] += bias[base + (i % exp_dim)] over a
+// [n_rows][exp_dim] activation block. See moe_expert_bias_add.comp.
+int gpu_moe_expert_bias_add(GpuBuf data_buf, GpuBuf bias_buf, GpuBuf idx_buf,
+                            int n, int exp_dim, int use_index, int bias_base) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (n <= 0 || exp_dim <= 0) return GPU_OK;
+
+    struct { int n; int exp_dim; int use_index; int bias_base; } pc =
+        {n, exp_dim, use_index, bias_base};
+    DispatchParams dp = {0};
+    dp.pipe = PIPE_MOE_EXPERT_BIAS_ADD;
+    dp.bufs[0] = data_buf;
+    dp.bufs[1] = bias_buf;
+    dp.bufs[2] = idx_buf;
+    dp.num_bufs = 3;
+    dp.push_data = &pc;
+    dp.push_size = sizeof(pc);
+    dp.groups_x = (n + 255) / 256;
+    dp.groups_y = 1;
+    dp.groups_z = 1;
+    return dispatch_compute(&dp);
+}
+
 // gpu_moe_slot_reduce: out[t*dim+c] = sum_s w[t*nUsed+s] * pair[slot[s]][c].
 //
 // Written as a separate kernel (rather than an accumulate in the down-projection
@@ -4394,8 +4418,8 @@ int gpu_attention_f16(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, GpuBuf v
         }
     }
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; int window; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap, 0};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED;
     dp.bufs[0] = out_buf;
@@ -4539,8 +4563,8 @@ int gpu_attention_f16_sinks(GpuBuf out_buf, GpuBuf q_buf, GpuBuf k_cache_buf, Gp
     int window_len = seq_len - start_pos;
     uint64_t kv_byte_offset = (uint64_t)start_pos * kv_dim * 2;
 
-    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap};
+    struct { int num_heads; int num_kv_heads; int head_dim; int kv_dim; int seq_len; float scale; float softcap; int window; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, window_len, scale, softcap, 0};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED_SINKS;
     dp.bufs[0] = out_buf;
@@ -4584,13 +4608,16 @@ void gpu_set_attention_kv4(int on) { g_attention_kv4 = on ? 1 : 0; }
 
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                             int num_heads, int num_kv_heads, int head_dim,
-                            int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
+                            int kv_dim, int start_seq_len, float scale, float softcap,
+                            int npos, int window) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; int win; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap, window};
     DispatchParams dp = {0};
-    if (attention_kv4_selected() && num_heads == 4 * num_kv_heads) {
+    /* The KV4 experiment does not implement the window, so a windowed layer
+     * always takes the plain tiled kernel. It is opt-in anyway. */
+    if (window <= 0 && attention_kv4_selected() && num_heads == 4 * num_kv_heads) {
         dp.pipe = PIPE_ATTENTION_TILED_KV4;
         dp.groups_x = num_kv_heads;
     } else {
@@ -4607,11 +4634,12 @@ int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache
 
 int gpu_batch_attention_f16_sinks(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                                    GpuBuf sinks, int num_heads, int num_kv_heads, int head_dim,
-                                   int kv_dim, int start_seq_len, float scale, float softcap, int npos) {
+                                   int kv_dim, int start_seq_len, float scale, float softcap,
+                                   int npos, int window) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap};
+    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; int win; } pc =
+        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap, window};
     DispatchParams dp = {0};
     dp.pipe = PIPE_ATTENTION_TILED_SINKS;
     dp.bufs[0] = out; dp.bufs[1] = q;
@@ -5397,14 +5425,20 @@ int gpu_forward_layer_batch(const GpuLayerConf* lc, int npos, int start_pos,
 
     {
         gpu_barrier();
+        /* ISWA / sliding-window layers (gpt-oss alternates 12 banded and 12 full
+         * layers): the batch kernel applies the band as a per-position mask,
+         * because each position in the chunk has a different first visible key.
+         * Omitting this would silently turn every banded layer into full
+         * attention and change the model's output. */
+        int win = lc->sliding_window > 0 ? lc->sliding_window : 0;
         if (lc->attn_sinks) {
             gpu_batch_attention_f16_sinks(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
                                           lc->attn_sinks, num_heads, num_kv_heads, head_dim, kv_dim,
-                                          start_pos + 1, scale, lc->attn_logit_softcap, npos);
+                                          start_pos + 1, scale, lc->attn_logit_softcap, npos, win);
         } else {
             gpu_batch_attention_f16(lc->attn_out, lc->q, lc->k_cache, lc->v_cache,
                                     num_heads, num_kv_heads, head_dim, kv_dim,
-                                    start_pos + 1, scale, lc->attn_logit_softcap, npos);
+                                    start_pos + 1, scale, lc->attn_logit_softcap, npos, win);
         }
     }
 

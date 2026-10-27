@@ -57,7 +57,7 @@ func TestAttentionBarrierParityGPU(t *testing.T) {
 				run := func(on bool) []float32 {
 					SetAttentionBarrier(on)
 					BeginBatch()
-					check(BatchAttentionF16(ob, qb, kb, vb, heads, kvheads, hd, kvheads*hd, start, float32(1/math.Sqrt(float64(hd))), softcap, n))
+					check(BatchAttentionF16(ob, qb, kb, vb, heads, kvheads, hd, kvheads*hd, start, float32(1/math.Sqrt(float64(hd))), softcap, n, 0))
 					EndBatch()
 					Sync()
 					out := make([]float32, len(q))

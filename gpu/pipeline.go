@@ -2368,12 +2368,17 @@ func batchFFNScratchDim(m *llm.Model) int {
 // can be diagnosed without a rebuild.
 func hybridBatchMoESupported(m *llm.Model, gm *GpuModel, cfg llm.ModelConfig,
 	hasSSM, hasGatedQ bool) (bool, string) {
-	if !hasSSM {
-		return false, "no SSM state on the GPU"
-	}
 	if !isHybridSSMModel(m) {
 		return false, "not a hybrid SSM model"
 	}
+	// The SSM/GatedQ cores are driven by this loop itself; a plain CoreAttention
+	// layer is driven by the fused C graph underneath it (gpu_forward_layer_batch
+	// runs the whole norm -> q/k/v -> RoPE -> KV store -> attention -> o ->
+	// residual -> FFN chain). Both are therefore batchable, which is what lets a
+	// pure-attention MoE (gpt-oss: 24/24 attention layers, no SSM at all) use
+	// this path. Requiring hasSSM here kept such a model on one full forward per
+	// prompt token — for gpt-oss that was ~74 tok/s of prefill, i.e. the same as
+	// its decode rate.
 	for l := range m.Layers {
 		layer := &m.Layers[l]
 		gl := &gm.Layers[l]
@@ -2395,6 +2400,9 @@ func hybridBatchMoESupported(m *llm.Model, gm *GpuModel, cfg llm.ModelConfig,
 		case layer.Spec.Core == llm.CoreSSM:
 			// Handled by the batched SSM loop (batched input projections, then
 			// the per-position recurrence).
+			if !hasSSM {
+				return false, fmt.Sprintf("layer %d is SSM but has no GPU SSM state", l)
+			}
 		case layer.Spec.GatedQ:
 			if !hasGatedQ || gl.Wq == nil || gl.Wk == nil || gl.Wv == nil || gl.Wo == nil {
 				return false, fmt.Sprintf("layer %d gated attention is incomplete", l)
@@ -2403,11 +2411,17 @@ func hybridBatchMoESupported(m *llm.Model, gm *GpuModel, cfg llm.ModelConfig,
 			if gl.CPUAttn || gl.Wq == nil || gl.Wk == nil || gl.Wv == nil || gl.Wo == nil {
 				return false, fmt.Sprintf("layer %d attention is not fully on the GPU", l)
 			}
+			// gpu_forward_layer_batch always dispatches the FP16 KV kernels; only
+			// the per-token path honours DLGO_F32_KV. Keep the per-token path when
+			// that debug switch is on rather than reading a float32 cache as f16.
+			if f32KV {
+				return false, "F32 KV cache is enabled (DLGO_F32_KV=1)"
+			}
 		default:
 			return false, fmt.Sprintf("layer %d core kind %d is not batched", l, layer.Spec.Core)
 		}
 		switch layer.Spec.FFN {
-		case llm.FFNMoE:
+		case llm.FFNMoE, llm.FFNMoESwiOAI:
 			if !moeBatchSupported(layer, gl, cfg) {
 				return false, fmt.Sprintf("layer %d MoE is not batchable", l)
 			}

@@ -107,7 +107,7 @@ func TestAttentionBatchParity(t *testing.T) {
 	}
 	Barrier()
 	if err := BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[li], kv.ValBufs[li],
-		numHeads, numKVHeads, headDim, kvDim, 1, scale, 0, npos); err != nil {
+		numHeads, numKVHeads, headDim, kvDim, 1, scale, 0, npos, 0); err != nil {
 		t.Fatalf("batch attention: %v", err)
 	}
 	Sync()

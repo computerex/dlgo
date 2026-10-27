@@ -1202,7 +1202,8 @@ func GpuForwardPrefillBatchHybrid(m *llm.Model, gm *GpuModel, tokens []int32,
 			opStart, opOn = ssmTimeBegin(chunkTimed)
 			Barrier()
 			BatchAttentionF16(bs.AttnOut, bs.Q, kv.KeyBufs[l], kv.ValBufs[l],
-				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos)
+				numHeads, numKVHeads, headDim, kvDim, startPos+1, scale, 0, npos,
+				layer.Spec.SlidingWindow)
 			ssmTimeEnd(12, opStart, opOn)
 			opStart, opOn = ssmTimeBegin(chunkTimed)
 			Barrier()
