@@ -424,6 +424,7 @@ func computeGPULayerBudget(m *llm.Model, maxSeqLen int) int {
 	// because per-layer costs include KV cache which dominates at large contexts
 	// and whose actual VRAM exceeds the formula due to alignment.
 	numLayers := 0
+
 	for l := 0; l < len(m.Layers); l++ {
 		layerCost := llm.EstimateLayerBytes(&m.Layers[l])
 		if layerNeedsKV(&m.Layers[l]) {
@@ -494,6 +495,10 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			return nil, fmt.Errorf("upload output_bias: %w", err)
 		}
 	}
+
+	// Which MoE layers still need their packed expert matrices uploaded. Those
+	// are deferred to a second pass, after every hot tensor has been placed.
+	moeExpertsPending := make([]bool, len(m.Layers))
 
 	for l := 0; l < len(m.Layers); l++ {
 		cl := &m.Layers[l]
@@ -588,41 +593,12 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			if cl.FFNExpertSelBias != nil {
 				gl.FFNExpertSelBias, _ = UploadF32Slice(cl.FFNExpertSelBias)
 			}
-			if moeUploaded && cl.FFNGateUpExps != nil && (supportsGPUQType(cl.FFNGateUpExps.Type) || llmUnifiedQuant()) {
-				gl.FFNGateUpExps, err = uploadProjWeight(cl.FFNGateUpExps)
-				if err != nil {
-					moeUploaded = false
-				}
-			} else if moeUploaded && cl.FFNGateExps != nil && (supportsGPUQType(cl.FFNGateExps.Type) || llmUnifiedQuant()) {
-				gl.FFNGateExps, err = uploadProjWeight(cl.FFNGateExps)
-				if err != nil {
-					moeUploaded = false
-				}
-				if moeUploaded && cl.FFNUpExps != nil {
-					gl.FFNUpExps, err = uploadProjWeight(cl.FFNUpExps)
-					if err != nil {
-						moeUploaded = false
-					}
-				}
-			} else {
-				moeUploaded = false
-			}
-			if moeUploaded && cl.FFNDownExps != nil {
-				gl.FFNDownExps, err = uploadProjWeight(cl.FFNDownExps)
-				if err != nil {
-					moeUploaded = false
-				}
-			}
-			gl.MoEOnGPU = moeUploaded
-			if moeUploaded && cl.FFNGateExpsBias != nil {
-				gl.FFNGateExpsBias, _ = UploadF32Slice(cl.FFNGateExpsBias)
-			}
-			if moeUploaded && cl.FFNUpExpsBias != nil {
-				gl.FFNUpExpsBias, _ = UploadF32Slice(cl.FFNUpExpsBias)
-			}
-			if moeUploaded && cl.FFNDownExpsBias != nil {
-				gl.FFNDownExpsBias, _ = UploadF32Slice(cl.FFNDownExpsBias)
-			}
+			// The packed expert matrices are deferred to the second pass below so
+			// that every tensor read in full on each token — the attention and SSM
+			// projections above, the norms, the router and the shared expert —
+			// claims device-local memory first. moeUploaded so far only reflects
+			// the router upload; the expert pass sets the final MoEOnGPU.
+			// The shared expert is hot: it runs for every token, so it stays here.
 			if cl.FFNGateShared != nil {
 				gl.FFNGateShared, _ = uploadProjWeight(cl.FFNGateShared)
 			}
@@ -635,6 +611,7 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			if cl.FFNRouterShared != nil {
 				gl.FFNRouterShared, _ = UploadF32Slice(cl.FFNRouterShared)
 			}
+			moeExpertsPending[l] = moeUploaded
 		} else {
 			gl.FFNGate, gl.GateA8, _ = uploadWeightPair(cl.FFNGate)
 			if cl.FFNUp != nil {
@@ -726,6 +703,66 @@ func UploadModel(m *llm.Model, numGPULayers ...int) (*GpuModel, error) {
 			}
 		}
 
+	}
+
+	// Second pass: the packed expert matrices, uploaded only after every hot
+	// tensor above has claimed device-local memory.
+	//
+	// gpu_alloc is first-come-first-served — it prefers device-local and falls
+	// back to host-visible once the ceiling is reached — so uploading strictly
+	// layer-by-layer meant that once the weights overflowed VRAM the LAST layers
+	// went to system RAM whole: their attention and SSM projections, norms and
+	// shared expert along with their experts. That is exactly backwards for an
+	// MoE. Those hot tensors are read in full on every token, while only
+	// ExpertUsedCount of ExpertCount experts are; on Qwen3.6-35B-A3B it put ~18
+	// of 40 layers entirely in host memory, making the always-read part of the
+	// spilled set cost more per token than the sparse part it was supposed to
+	// trade against.
+	//
+	// Uploading the sparse part last puts the overflow where an MoE can afford
+	// it: on expert matrices, of which a token touches 8 of 256.
+	for l := 0; l < maxLayers; l++ {
+		cl := &m.Layers[l]
+		gl := &gm.Layers[l]
+		if !gl.IsMoE || !moeExpertsPending[l] {
+			continue
+		}
+		moeUploaded := true
+		if cl.FFNGateUpExps != nil && (supportsGPUQType(cl.FFNGateUpExps.Type) || llmUnifiedQuant()) {
+			gl.FFNGateUpExps, err = uploadProjWeight(cl.FFNGateUpExps)
+			if err != nil {
+				moeUploaded = false
+			}
+		} else if cl.FFNGateExps != nil && (supportsGPUQType(cl.FFNGateExps.Type) || llmUnifiedQuant()) {
+			gl.FFNGateExps, err = uploadProjWeight(cl.FFNGateExps)
+			if err != nil {
+				moeUploaded = false
+			}
+			if moeUploaded && cl.FFNUpExps != nil {
+				gl.FFNUpExps, err = uploadProjWeight(cl.FFNUpExps)
+				if err != nil {
+					moeUploaded = false
+				}
+			}
+		} else {
+			moeUploaded = false
+		}
+		if moeUploaded && cl.FFNDownExps != nil {
+			gl.FFNDownExps, err = uploadProjWeight(cl.FFNDownExps)
+			if err != nil {
+				moeUploaded = false
+			}
+		}
+		gl.MoEOnGPU = moeUploaded
+		if moeUploaded && cl.FFNGateExpsBias != nil {
+			gl.FFNGateExpsBias, _ = UploadF32Slice(cl.FFNGateExpsBias)
+		}
+		if moeUploaded && cl.FFNUpExpsBias != nil {
+			gl.FFNUpExpsBias, _ = UploadF32Slice(cl.FFNUpExpsBias)
+		}
+		if moeUploaded && cl.FFNDownExpsBias != nil {
+			gl.FFNDownExpsBias, _ = UploadF32Slice(cl.FFNDownExpsBias)
+		}
 	}
 
 	gm.NumGPULayers = maxLayers
