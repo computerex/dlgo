@@ -889,6 +889,31 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 
 		allocErr := func() error {
 			var err error
+
+			// Allocate the KV cache BEFORE the weights.
+			//
+			// The allocator fills device-local memory first-come-first-served and
+			// falls back to host-visible once it is exhausted, so uploading the
+			// weights first lets the cold MoE expert matrices claim every byte of
+			// VRAM and leaves the KV cache in system RAM. That is backwards: the
+			// KV cache is read in full on every decode step and grows with the
+			// context, while only ExpertUsedCount of ExpertCount experts are
+			// touched per token. Measured on Qwen3.6-35B-A3B at ctx 100864 the
+			// 2 GB KV cache had been placed in host memory, i.e. a 2 GB PCIe read
+			// per decode step; spilling the same 2 GB of experts instead costs
+			// about 2 GB * (8/256) of expert bytes = 60 MB per token.
+			//
+			// needsKV and the KV size depend only on the model config, so this
+			// does not need the uploaded model.
+			needsKV := make([]bool, cfg.NumLayers)
+			for l := 0; l < cfg.NumLayers; l++ {
+				needsKV[l] = layerNeedsKV(&m.Layers[l])
+			}
+			kv, err = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
+			if err != nil {
+				return err
+			}
+
 			gm, err = UploadModel(m, numGPULayers)
 			if err != nil {
 				return fmt.Errorf("upload model: %w", err)
@@ -897,6 +922,13 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			// With the fallback chain, all requested layers should be uploaded.
 			// If UploadModel reports fewer, update our count.
 			if gm.NumGPULayers < numGPULayers {
+				// The KV cache was sized for the larger count; drop the tail so
+				// the VRAM it holds can still be used by the weights.
+				for l := gm.NumGPULayers; l < numGPULayers; l++ {
+					freeBuf(kv.KeyBufs[l])
+					freeBuf(kv.ValBufs[l])
+					kv.KeyBufs[l], kv.ValBufs[l] = 0, 0
+				}
 				numGPULayers = gm.NumGPULayers
 				isPartial = numGPULayers < cfg.NumLayers
 			}
@@ -907,14 +939,6 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			}
 
 			rs, err = NewGpuRunState(dim, qDim, kvDim, ffnDim, cfg.VocabSize)
-			if err != nil {
-				return err
-			}
-			needsKV := make([]bool, cfg.NumLayers)
-			for l := 0; l < cfg.NumLayers; l++ {
-				needsKV[l] = layerNeedsKV(&m.Layers[l])
-			}
-			kv, err = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
 			if err != nil {
 				return err
 			}

@@ -235,14 +235,17 @@ func residencyReport(weights int64) {
 	if weights > 0 {
 		fmt.Printf("[dlgo/gpu] Weights spilled to RAM: %.0f MB (%.0f%% of model), read over PCIe every token\n",
 			float64(host)/mib, 100*float64(host)/float64(weights))
-		// Everything device-local is ~free at GEMM level; everything host-
-		// resident crosses the bus on every token, so the sustained decode rate
-		// cannot exceed the time to stream the spilled bytes. 22 GB/s is the
-		// measured achievable rate on this box (PCIe 4.0 x16, ReBAR).
-		fmt.Printf("[dlgo/gpu] Spill bound: %.2f GB/token at ~%.0f GB/s = >=%.0f ms/token (<=%.1f tok/s) if PCIe-bound\n",
+		// Worst case: every host-resident byte read once per token. Decode only
+		// touches what the router selects (ExpertUsedCount of ExpertCount experts)
+		// plus the dense weights, so this is an upper bound, not a prediction:
+		// Qwen3.6-35B-A3B at 54% spill measured 16.3 tok/s against a 1.9 tok/s
+		// bound here. The active fraction is roughly all of the dense weights plus
+		// ExpertUsedCount/ExpertCount of the expert weights, which is what makes
+		// spilling the *experts* far cheaper per byte than spilling anything read
+		// every step (the KV cache, the output head, the routers).
+		fmt.Printf("[dlgo/gpu] Spill bound (worst case, all spilled bytes per token): %.2f GB/token at ~%.0f GB/s = >=%.0f ms/token\n",
 			float64(host)/(1<<30), spillPCIeGBs,
-			float64(host)/(spillPCIeGBs*1e9)*1000,
-			spillPCIeGBs*1e9/float64(host))
+			float64(host)/(spillPCIeGBs*1e9)*1000)
 	}
 }
 
