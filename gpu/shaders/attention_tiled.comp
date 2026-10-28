@@ -4,7 +4,8 @@
 // Uses FlashAttention-style online softmax to avoid materializing all scores.
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window (32 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window,
+//                 ring_base, ring_cap (40 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2)
 //
 // Sliding window: `window` > 0 restricts position p to the keys
@@ -14,6 +15,15 @@
 // seq_len - window, but expressed per position because a chunk spans many
 // different windows. window == 0 (the default for callers that pre-offset)
 // keeps full causal attention.
+//
+// Ring KV cache: `ring_cap` > 0 means the K/V buffer holds only ring_cap rows,
+// with logical position t stored at row t % ring_cap (sliding-window layers
+// never read outside their window, so the rest of the rows are dead weight).
+// The row is computed as (t + ring_base) % ring_cap, where ring_base makes the
+// row index absolute for callers that pass window-relative t. Because the
+// softmax over a key set is order-independent and this kernel still walks keys
+// in ascending logical order, the result is bit-identical to a linear cache.
+// ring_cap == 0 keeps the linear addressing (row = t) the callers already use.
 
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
@@ -34,6 +44,8 @@ layout(push_constant) uniform Params {
     float scale;
     float softcap;
     int window;     // sliding-window length; 0 = full causal attention
+    int ring_base;  // added to the logical position before wrapping (ring only)
+    int ring_cap;   // rows in the ring KV buffer; 0 = linear cache
 };
 
 #define WG_SIZE 256
@@ -43,6 +55,13 @@ shared float q_sh[256];        // query vector (supports head_dim up to 256)
 shared float tile_s[TILE_SIZE]; // Q·K scores for current tile
 shared float reduce_buf[WG_SIZE];
 shared float sh_out[256];      // running output accumulator (supports head_dim up to 256)
+
+// Map a logical KV position to a physical row in the cache. ring_cap is always
+// a power of two (enforced on the host), so the wrap is a mask, not a division.
+uint kv_row(int t) {
+    if (ring_cap == 0) return uint(t);
+    return (uint(t) + uint(ring_base)) & uint(ring_cap - 1);
+}
 
 void main() {
     uint head = gl_WorkGroupID.x;
@@ -104,7 +123,7 @@ void main() {
         if (int(tid) < tile_len) {
             int t = tile_start + int(tid);
             float dot_val = 0.0;
-            uint k_base = uint(t) * kv_half + kv_off_half;
+            uint k_base = kv_row(t) * kv_half + kv_off_half;
             for (uint d2 = 0; d2 < hd_half; d2++) {
                 vec2 k2 = unpackHalf2x16(k_packed[k_base + d2]);
                 uint fi = d2 * 2u;
@@ -172,7 +191,7 @@ void main() {
             float acc = 0.0;
             for (int ti = 0; ti < tile_len; ti++) {
                 float w = tile_s[ti];
-                uint v_base = uint(tile_start + ti) * kv_half + kv_off_half;
+                uint v_base = kv_row(tile_start + ti) * kv_half + kv_off_half;
                 vec2 v2 = unpackHalf2x16(v_packed[v_base + d_pair]);
                 float v_val = (d_which == 0u) ? v2.x : v2.y;
                 acc = fma(w, v_val, acc);

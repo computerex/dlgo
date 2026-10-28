@@ -874,6 +874,14 @@ func (lc *LayerConf) SetSlidingWindow(w int) {
 	lc.c.sliding_window = C.int(w)
 }
 
+// SetKVCap declares how many K/V rows this layer's cache holds. A value below
+// the max sequence length makes the kernels address the cache as a ring
+// (position t at row t%rows); it is only valid for sliding-window layers, whose
+// attention never reads outside the window. 0 keeps the linear layout.
+func (lc *LayerConf) SetKVCap(rows int) {
+	lc.c.kv_cap = C.int(rows)
+}
+
 func (lc *LayerConf) SetAttnLogitSoftcap(v float32) {
 	lc.c.attn_logit_softcap = C.float(v)
 }

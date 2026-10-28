@@ -958,7 +958,21 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 			for l := 0; l < cfg.NumLayers; l++ {
 				needsKV[l] = layerNeedsKV(&m.Layers[l])
 			}
-			kv, err = NewGpuKVCache(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV)
+			// Sliding-window layers never read outside their window, so the KV rows
+			// beyond it are dead weight. Give those layers a ring instead of the
+			// full context: for gpt-oss-20b at ctx 102400 that is 12 of 24 layers,
+			// ~2.5 GB, which is what pushes the working set out of VRAM.
+			kvCaps := make([]int, cfg.NumLayers)
+			if kvRingCap := kvRingCapFor(m, numGPULayers == cfg.NumLayers); kvRingCap > 0 {
+				for l := 0; l < cfg.NumLayers; l++ {
+					if m.Layers[l].Spec.SlidingWindow > 0 && needsKV[l] {
+						kvCaps[l] = kvRingCap
+					}
+				}
+				fmt.Printf("[dlgo/gpu] ring KV cache: %d sliding-window layers at %d rows instead of %d\n",
+					countRingLayers(m), kvRingCap, maxSeqLen)
+			}
+			kv, err = NewGpuKVCacheCaps(cfg.NumLayers, numGPULayers, maxSeqLen, kvDim, needsKV, kvCaps)
 			if err != nil {
 				return err
 			}
@@ -977,6 +991,7 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 					freeBuf(kv.KeyBufs[l])
 					freeBuf(kv.ValBufs[l])
 					kv.KeyBufs[l], kv.ValBufs[l] = 0, 0
+					kv.Cap[l] = 0
 				}
 				numGPULayers = gm.NumGPULayers
 				isPartial = numGPULayers < cfg.NumLayers
@@ -2989,6 +3004,91 @@ func isHybridSSMModel(m *llm.Model) bool {
 // execute the model without silently skipping any quantized matvecs. The
 // fused C path does not have CPU fallback, so every tensor it touches must
 // have a native GPU kernel.
+// kvRingEnabled reports whether sliding-window layers may keep their K/V cache
+// in a ring. DLGO_KV_RING=0 restores one full-length cache per layer.
+func kvRingEnabled() bool { return os.Getenv("DLGO_KV_RING") != "0" }
+
+// kvRingChunkSize is the largest number of positions any single batched prefill
+// dispatch can write. generateSegments defaults to 1024 and DLGO_PREFILL_CHUNK
+// overrides it; the SystemOne paths use 512, which this covers.
+func kvRingChunkSize() int {
+	const def = 1024
+	if v := os.Getenv("DLGO_PREFILL_CHUNK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// kvRingCapFor returns the ring size to give every sliding-window layer, or 0 to
+// leave all caches full-length.
+//
+// A ring is only lossless where the attention never reads outside its window and
+// no single dispatch writes more rows than the ring holds, so the function also
+// acts as the enablement gate. It requires:
+//
+//   - every layer to be plain attention (no SSM, short-conv, MLA or gated-Q), so
+//     the ring-aware kernels are the only attention kernels and no recurrent
+//     state can go stale when the ring wraps;
+//   - the fused single-token decode path and a fully-resident model, because the
+//     partial-GPU and CPU-fallback paths store and read K/V from Go, which is
+//     linear only;
+//   - chunked batched prefill (isHybridSSMModel), so no dispatch writes more than
+//     kvRingChunkSize rows. A single prompt-sized write would wrap onto rows the
+//     same dispatch still has to read.
+//
+// These restrictions also keep the ring away from every KV-rewind path:
+// chatPrefixEligible requires HasSSM and no MoE, and SystemOne snapshots assume
+// rows are laid out by position.
+//
+// The size covers one prefill chunk plus one full window: inside a chunk the
+// first position still attends to the keys written just before the chunk, so the
+// chunk's own writes must not reach back far enough to overwrite them.
+func kvRingCapFor(m *llm.Model, fullyOnGPU bool) int {
+	if !kvRingEnabled() || os.Getenv("DLGO_F32_KV") == "1" {
+		return 0
+	}
+	if !fullyOnGPU || !supportsFusedForwardGPU(m) || !isHybridSSMModel(m) {
+		return 0
+	}
+	maxWin := 0
+	sawWindow := false
+	for l := range m.Layers {
+		spec := m.Layers[l].Spec
+		if spec.Core != llm.CoreAttention || spec.GatedQ {
+			// The ring is only wired into the plain-attention kernels.
+			return 0
+		}
+		if spec.SlidingWindow > 0 {
+			sawWindow = true
+			if spec.SlidingWindow > maxWin {
+				maxWin = spec.SlidingWindow
+			}
+		}
+	}
+	if !sawWindow || maxWin <= 0 {
+		return 0
+	}
+	need := kvRingChunkSize() + maxWin
+	rows := 1
+	for rows < need {
+		rows <<= 1
+	}
+	return rows
+}
+
+// countRingLayers reports how many layers carry a sliding window.
+func countRingLayers(m *llm.Model) int {
+	n := 0
+	for l := range m.Layers {
+		if m.Layers[l].Spec.SlidingWindow > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 func supportsFusedForwardGPU(m *llm.Model) bool {
 	supported := func(t *core.QuantizedTensor) bool {
 		if t == nil {

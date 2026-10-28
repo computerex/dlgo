@@ -340,6 +340,11 @@ func BuildLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, rs *GpuRunSt
 			lc.SetAttn(gl.AttnNorm, gl.Wq, gl.Wk, gl.Wv, gl.Wo,
 				gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
 			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+			// A ring-sized cache must be announced to the kernels, or they would
+			// address rows linearly and read another position's K/V.
+			if rc := kv.RingCap(l); rc > 0 {
+				lc.SetKVCap(rc)
+			}
 			if gl.AttnSinks != 0 {
 				lc.SetAttnSinks(gl.AttnSinks)
 			}
@@ -871,6 +876,9 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 				pickA8(gl.WvA8, gl.Wv), pickA8(gl.WoA8, gl.Wo),
 				gl.Bq, gl.Bk, gl.Bv, gl.Bo, gl.AttnQNorm, gl.AttnKNorm)
 			lc.SetKV(kv.KeyBufs[l], kv.ValBufs[l])
+			if rc := kv.RingCap(l); rc > 0 {
+				lc.SetKVCap(rc)
+			}
 			if gl.AttnSinks != 0 {
 				lc.SetAttnSinks(gl.AttnSinks)
 			}

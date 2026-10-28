@@ -91,6 +91,7 @@ func (lc *LayerConf) SetScratch(x, xn, q, k, v, ao, ap, fn, fi, g, u, h, fo Buf)
 func (lc *LayerConf) SetAttn(an Buf, wq, wk, wv, wo *GpuTensor, bq, bk, bv, bo Buf, qn, kn Buf) {}
 func (lc *LayerConf) SetAttnSinks(s Buf) {}
 func (lc *LayerConf) SetSlidingWindow(w int) {}
+func (lc *LayerConf) SetKVCap(rows int)      {}
 func (lc *LayerConf) SetFFN(fn Buf, gate, up, down *GpuTensor, pan, pfn Buf)                     {}
 func (lc *LayerConf) SetFFNMoE(fn Buf, pan Buf)                          {}
 func (lc *LayerConf) SetKV(kc, vc Buf)                                   {}

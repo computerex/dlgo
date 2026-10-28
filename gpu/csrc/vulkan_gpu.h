@@ -673,6 +673,11 @@ typedef struct {
     int moe_use_native;  // 1=native matvec, 0=dp4a
     int moe_has_shared;  // 1=shared expert exists, Go handles shared+residual
     int f32_kv;          // 1=use F32 KV cache (debug: DLGO_F32_KV=1)
+    // kv_cap: rows in this layer's K/V cache. 0 (or >= the max sequence length)
+    // means the linear cache; a smaller power-of-two value turns the layer's KV
+    // into a ring of that many rows, which is lossless for sliding-window layers
+    // because they never read outside their window.
+    int kv_cap;
 } GpuLayerConf;
 
 // Records all dispatches for one transformer layer.

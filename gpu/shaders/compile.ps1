@@ -293,9 +293,9 @@ static const ShaderInfo shader_registry[] = {
     {"moe_accumulate", spv_moe_accumulate, spv_moe_accumulate_size, 5, 12}, // PIPE_MOE_ACCUMULATE
     {"swiglu_oai_bias_moe", spv_swiglu_oai_bias_moe, spv_swiglu_oai_bias_moe_size, 6, 16}, // PIPE_SWIGLU_OAI_BIAS_MOE
     {"moe_bias_add", spv_moe_bias_add, spv_moe_bias_add_size, 3, 8}, // PIPE_MOE_BIAS_ADD
-    {"attention_tiled", spv_attention_tiled, spv_attention_tiled_size, 4, 32}, // PIPE_ATTENTION_TILED
-    {"kv_store_f16", spv_kv_store_f16, spv_kv_store_f16_size, 4, 8}, // PIPE_KV_STORE_F16
-    {"kv_store_batch_f16", spv_kv_store_batch_f16, spv_kv_store_batch_f16_size, 4, 8}, // PIPE_KV_STORE_BATCH_F16
+    {"attention_tiled", spv_attention_tiled, spv_attention_tiled_size, 4, 40}, // PIPE_ATTENTION_TILED
+    {"kv_store_f16", spv_kv_store_f16, spv_kv_store_f16_size, 4, 12}, // PIPE_KV_STORE_F16
+    {"kv_store_batch_f16", spv_kv_store_batch_f16, spv_kv_store_batch_f16_size, 4, 12}, // PIPE_KV_STORE_BATCH_F16
     {"attention_tiled_f32", spv_attention_tiled_f32, spv_attention_tiled_f32_size, 4, 28}, // PIPE_ATTENTION_TILED_F32
     {"layernorm", spv_layernorm, spv_layernorm_size, 4, 8}, // PIPE_LAYERNORM
     {"matvec_bf16", spv_matvec_bf16, spv_matvec_bf16_size, 3, 8}, // PIPE_MATVEC_BF16
@@ -351,7 +351,7 @@ static const ShaderInfo shader_registry[] = {
     {"matvec_iq4_xs_dp4a_moe", spv_matvec_iq4_xs_dp4a_moe, spv_matvec_iq4_xs_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_XS_DP4A_MOE
     {"matvec_iq4_nl_dp4a_moe", spv_matvec_iq4_nl_dp4a_moe, spv_matvec_iq4_nl_dp4a_moe_size, 4, 20}, // PIPE_MATVEC_IQ4_NL_DP4A_MOE
     {"matvec_iq3_s_dp4a_moe", spv_matvec_iq3_s_dp4a_moe, spv_matvec_iq3_s_dp4a_moe_size, 5, 20}, // PIPE_MATVEC_IQ3_S_DP4A_MOE
-    {"attention_tiled_sinks", spv_attention_tiled_sinks, spv_attention_tiled_sinks_size, 5, 32}, // PIPE_ATTENTION_TILED_SINKS
+    {"attention_tiled_sinks", spv_attention_tiled_sinks, spv_attention_tiled_sinks_size, 5, 40}, // PIPE_ATTENTION_TILED_SINKS
     {"matvec_q5_1", spv_matvec_q5_1, spv_matvec_q5_1_size, 3, 8}, // PIPE_MATVEC_Q5_1
     {"ssm_conv1d_batch", spv_ssm_conv1d_batch, spv_ssm_conv1d_batch_size, 4, 12},
     {"ssm_preprocess_batch", spv_ssm_preprocess_batch, spv_ssm_preprocess_batch_size, 5, 24},

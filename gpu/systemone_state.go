@@ -33,6 +33,15 @@ func (p *GpuPipeline) SnapshotState(npos int) (*GpuStateSnapshot, error) {
 	if p.KVCache.BytesPerElem == 0 {
 		p.KVCache.BytesPerElem = 2
 	}
+	// Snapshot/restore copies each layer's first npos rows and assumes they are
+	// laid out by position. A ring cache breaks that layout, and the restore
+	// would also have to rewind rows that later positions have since overwritten
+	// (a ring only guarantees the last `cap` positions). Ring layers are only
+	// allocated for models with no SSM and no MoE, which are also the models that
+	// never reach this path, so refuse rather than silently corrupt.
+	if p.KVCache.RingLayers() > 0 {
+		return nil, fmt.Errorf("gpu: state snapshot is not supported with a ring KV cache (%d layers)", p.KVCache.RingLayers())
+	}
 	// The snapshot covers KV + SSM state only. LFM2/LFM2MoE also carries a
 	// per-layer short-convolution rolling history, so restoring one of these
 	// snapshots would silently resume with a stale conv window. Refuse instead:

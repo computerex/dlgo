@@ -8,4 +8,4 @@ package gpu
 // Go build cache sees a change when the embedded SPIR-V changes: cgo's action
 // ID does not include the transitively-included shader table, so without this
 // a shader edit reuses the stale binary and appears to do nothing.
-const ShaderTableSHA256 = "6C619BC68239C61418319D28958608105DA2203C2FDCCA26E9F17A7DC2ADB03B"
+const ShaderTableSHA256 = "B233D7F8620F9C8FDB433283027C73899926B811215DE673D03A2C5D51EA1948"

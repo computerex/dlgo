@@ -3,7 +3,8 @@
 // participates in softmax but has no V vector (adds zero to the weighted sum).
 //
 // Dispatch: groups_x = num_heads, groups_y = npos (or 1), groups_z = 1
-// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window (32 bytes)
+// Push constants: num_heads, num_kv_heads, head_dim, kv_dim, seq_len, scale, softcap, window,
+//                 ring_base, ring_cap (40 bytes)
 // Buffers: 0=out (float), 1=Q (float), 2=KCache (uint/packed_half2), 3=VCache (uint/packed_half2), 4=Sinks (float[num_heads])
 //
 // Sliding window: `window` > 0 restricts position p to the keys
@@ -11,6 +12,9 @@
 // windowed and full layers, so the batched prefill must honour it per position
 // or it silently turns the banded layers into full attention. window == 0 keeps
 // full causal attention.
+//
+// Ring KV cache: see attention_tiled.comp. ring_cap > 0 means logical position
+// t lives at row (t + ring_base) % ring_cap; ring_cap == 0 keeps linear rows.
 
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
@@ -32,6 +36,8 @@ layout(push_constant) uniform Params {
     float scale;
     float softcap;
     int window;     // sliding-window length; 0 = full causal attention
+    int ring_base;  // added to the logical position before wrapping (ring only)
+    int ring_cap;   // rows in the ring KV buffer; 0 = linear cache
 };
 
 #define WG_SIZE 256
@@ -41,6 +47,12 @@ shared float q_sh[256];
 shared float tile_s[TILE_SIZE];
 shared float reduce_buf[WG_SIZE];
 shared float sh_out[256];
+
+// See attention_tiled.comp: ring_cap is a power of two, so wrap is a mask.
+uint kv_row(int t) {
+    if (ring_cap == 0) return uint(t);
+    return (uint(t) + uint(ring_base)) & uint(ring_cap - 1);
+}
 
 void main() {
     uint head = gl_WorkGroupID.x;
@@ -93,7 +105,7 @@ void main() {
         if (int(tid) < tile_len) {
             int t = tile_start + int(tid);
             float dot_val = 0.0;
-            uint k_base = uint(t) * kv_half + kv_off_half;
+            uint k_base = kv_row(t) * kv_half + kv_off_half;
             for (uint d2 = 0; d2 < hd_half; d2++) {
                 vec2 k2 = unpackHalf2x16(k_packed[k_base + d2]);
                 uint fi = d2 * 2u;
@@ -152,7 +164,7 @@ void main() {
             float acc = 0.0;
             for (int ti = 0; ti < tile_len; ti++) {
                 float w = tile_s[ti];
-                uint v_base = uint(tile_start + ti) * kv_half + kv_off_half;
+                uint v_base = kv_row(tile_start + ti) * kv_half + kv_off_half;
                 vec2 v2 = unpackHalf2x16(v_packed[v_base + d_pair]);
                 float v_val = (d_which == 0u) ? v2.x : v2.y;
                 acc = fma(w, v_val, acc);

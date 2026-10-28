@@ -815,11 +815,18 @@ func (bs *GpuBatchState) Free() {
 
 // GpuKVCache holds GPU-resident KV cache for all layers.
 type GpuKVCache struct {
-	KeyBufs []Buf // [nLayers] each is [maxSeqLen * kvDim/2] packed uint32 (FP16)
+	KeyBufs []Buf // [nLayers] each is [Cap[l] * kvDim/2] packed uint32 (FP16)
 	ValBufs []Buf
 	KVDim   int
 	MaxSeq  int
 	Len     int
+	// Cap[l] is the number of K/V rows allocated for layer l. It equals MaxSeq
+	// for a normal linear cache. A smaller value means the layer's cache is a
+	// ring: logical position t lives at row t % Cap[l]. Only sliding-window
+	// layers use it, and they never read outside their window, so the rows
+	// outside it would never be touched — for gpt-oss-20b that is 12 of 24
+	// layers, i.e. ~2.5 GB of a 100k-context cache.
+	Cap []int
 	// BytesPerElem is 4 when the F32 KV cache is enabled (DLGO_F32_KV=1),
 	// otherwise 2 (packed FP16). State snapshot/restore needs the element
 	// size to compute byte spans of the used region.
@@ -830,6 +837,15 @@ type GpuKVCache struct {
 // gpuLayers controls how many layers get GPU-allocated KV buffers.
 // needsKV is a per-layer mask: only layers where needsKV[l] is true get buffers.
 func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool) (*GpuKVCache, error) {
+	return NewGpuKVCacheCaps(totalLayers, gpuLayers, maxSeqLen, kvDim, needsKV, nil)
+}
+
+// NewGpuKVCacheCaps is NewGpuKVCache with an explicit per-layer row count.
+// caps[l] == 0 means layer l gets the full maxSeqLen rows. A smaller value must
+// be a power of two and at least the layer's sliding window plus the largest
+// prefill chunk, and the caller must set the same value on the layer conf so
+// the kernels address the ring instead of the linear layout.
+func NewGpuKVCacheCaps(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool, caps []int) (*GpuKVCache, error) {
 	bytesPerElem := 2 // FP16: packed half2
 	if os.Getenv("DLGO_F32_KV") == "1" {
 		bytesPerElem = 4 // F32
@@ -840,14 +856,23 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 		ValBufs:      make([]Buf, totalLayers),
 		KVDim:        kvDim,
 		MaxSeq:       maxSeqLen,
+		Cap:          make([]int, totalLayers),
 		BytesPerElem: bytesPerElem,
 	}
-	size := uint64(maxSeqLen * kvDim * bytesPerElem)
+	for l := range c.Cap {
+		c.Cap[l] = maxSeqLen
+	}
 	a := allocChecker{}
 	for l := 0; l < gpuLayers && l < totalLayers; l++ {
 		if needsKV != nil && !needsKV[l] {
 			continue
 		}
+		rows := maxSeqLen
+		if l < len(caps) && caps[l] > 0 && caps[l] < maxSeqLen {
+			rows = caps[l]
+		}
+		c.Cap[l] = rows
+		size := uint64(rows * kvDim * bytesPerElem)
 		c.KeyBufs[l] = a.alloc(size)
 		c.ValBufs[l] = a.alloc(size)
 		if a.err != nil {
@@ -855,10 +880,55 @@ func NewGpuKVCache(totalLayers, gpuLayers, maxSeqLen, kvDim int, needsKV []bool)
 				freeBuf(c.KeyBufs[j])
 				freeBuf(c.ValBufs[j])
 			}
-			return nil, fmt.Errorf("gpu: NewGpuKVCache(layer %d/%d, maxSeq=%d, kvDim=%d): %w", l, totalLayers, maxSeqLen, kvDim, a.err)
+			return nil, fmt.Errorf("gpu: NewGpuKVCache(layer %d/%d, maxSeq=%d, rows=%d, kvDim=%d): %w", l, totalLayers, maxSeqLen, rows, kvDim, a.err)
 		}
 	}
 	return c, nil
+}
+
+// RingCap returns the layer's ring size, or 0 when the layer uses the linear
+// cache and the kernels should address rows directly.
+func (c *GpuKVCache) RingCap(l int) int {
+	if c == nil || l < 0 || l >= len(c.Cap) {
+		return 0
+	}
+	if c.Cap[l] <= 0 || c.Cap[l] >= c.MaxSeq {
+		return 0
+	}
+	return c.Cap[l]
+}
+
+// KVBytes returns the total bytes held by the KV cache buffers.
+func (c *GpuKVCache) KVBytes() uint64 {
+	if c == nil {
+		return 0
+	}
+	var total uint64
+	for l := range c.KeyBufs {
+		if c.KeyBufs[l] == 0 {
+			continue
+		}
+		rows := c.Cap[l]
+		if rows <= 0 {
+			rows = c.MaxSeq
+		}
+		total += 2 * uint64(rows) * uint64(c.KVDim) * uint64(c.BytesPerElem)
+	}
+	return total
+}
+
+// RingLayers reports how many layers keep their K/V cache in a ring.
+func (c *GpuKVCache) RingLayers() int {
+	if c == nil {
+		return 0
+	}
+	n := 0
+	for l := range c.Cap {
+		if c.RingCap(l) > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 func (c *GpuKVCache) Reset() { c.Len = 0 }

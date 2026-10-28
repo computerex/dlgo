@@ -1,8 +1,12 @@
 // Batch KV Store FP16: quantize npos float32 K/V vectors to packed half2.
 //
 // Dispatch: groups_x = ceil(kv_dim/2 / 256), groups_y = npos, groups_z = 1
-// Push constants: start_pos (int), kv_dim (int)
+// Push constants: start_pos (int), kv_dim (int), ring_cap (int)
 // Buffers: 0=KCache_out (uint), 1=VCache_out (uint), 2=K_batch (float), 3=V_batch (float)
+//
+// ring_cap > 0 stores each position at row (start_pos + pos_id) % ring_cap. The
+// modulo is per position, so a chunk that straddles the end of the ring writes
+// the head of the cache in the same dispatch — no host-side split needed.
 
 #version 450
 
@@ -16,6 +20,7 @@ layout(set = 0, binding = 3) readonly buffer VIn { float v_in[]; };
 layout(push_constant) uniform Params {
     int start_pos;
     int kv_dim;
+    int ring_cap;
 };
 
 void main() {
@@ -26,7 +31,9 @@ void main() {
 
     uint src_base = pos_id * uint(kv_dim);
     uint src = src_base + tid * 2u;
-    uint dst = (uint(start_pos) + pos_id) * half_dim + tid;
+    uint row = uint(start_pos) + pos_id;
+    if (ring_cap > 0) row = row % uint(ring_cap);
+    uint dst = row * half_dim + tid;
 
     k_out[dst] = packHalf2x16(vec2(k_in[src], k_in[src + 1u]));
     v_out[dst] = packHalf2x16(vec2(v_in[src], v_in[src + 1u]));
