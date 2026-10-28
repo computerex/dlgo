@@ -61,6 +61,7 @@ func main() {
 	parity := flag.Bool("parity", false, "run the prompt through the CPU and GPU per-token forwards and compare logits each step")
 	promptFile := flag.String("prompt-file", "", "read the prompt from a file (UTF-8) instead of -prompt")
 	decodeCurve := flag.Bool("decode-curve", false, "print the decode rate every 128 tokens (shows how it degrades with context)")
+	noCPUState := flag.Bool("nocpustate", false, "build the pipeline with llm.WithoutCPUState() (what the HTTP server does)")
 	flag.Parse()
 
 	if *promptFile != "" {
@@ -73,7 +74,11 @@ func main() {
 	}
 
 	t0 := time.Now()
-	p, err := llm.NewPipeline(*model, *ctx)
+	var pipeOpts []llm.PipelineOption
+	if *noCPUState {
+		pipeOpts = append(pipeOpts, llm.WithoutCPUState())
+	}
+	p, err := llm.NewPipeline(*model, *ctx, pipeOpts...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load failed: %v\n", err)
 		os.Exit(1)

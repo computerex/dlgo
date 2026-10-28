@@ -827,12 +827,24 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	// the model's rope scaling (YaRN tables are not what RoPEFrequencyTable
 	// produces from the config alone), so hold them across the release instead of
 	// recomputing them.
+	// The RoPE tables are Go slices computed by the CPU run state, and they carry
+	// the model's rope scaling (YaRN tables are not what RoPEFrequencyTable
+	// produces from the config alone), so hold them across the release instead of
+	// recomputing them.
+	//
+	// A pipeline built with llm.WithoutCPUState() has no run state to carry. It
+	// must still get the scaled tables: building them here is cheap (two
+	// maxSeqLen*ropeDim/2 slices, no FFN/logits scratch), whereas falling back to
+	// unscaled frequencies silently mis-rotates every position beyond the native
+	// context and drops the separate SWA base.
 	var cpuCos, cpuSin, cpuCosSWA, cpuSinSWA []float32
 	if cpuPipeline.RunState != nil {
 		cpuCos, cpuSin = cpuPipeline.RunState.RoPETables()
 		if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
 			cpuCosSWA, cpuSinSWA = cpuPipeline.RunState.RoPETablesSWA()
 		}
+	} else {
+		cpuCos, cpuSin, cpuCosSWA, cpuSinSWA = llm.RoPETablesFor(cfg, cpuPipeline.MaxSeqLen)
 	}
 	cpuPipeline.FreeForGPU()
 	runtime.GC()
@@ -1591,9 +1603,80 @@ func (p *GpuPipeline) FreeAll() {
 // behind llm.Runner and no caller needs to copy fields between two structs.
 type GenerateResult = llm.GenerateResult
 
+// debugEngineInput reports whether DLGO_DEBUG_LOGITS is set. When it is, the GPU
+// pipeline prints a digest of the exact token stream it is about to prefill and
+// the top logits produced by that prefill. Two front ends (the CLI and the HTTP
+// server) must feed the engine identical input; this makes that checkable
+// instead of inferred.
+func debugEngineInput() bool { return os.Getenv("DLGO_DEBUG_LOGITS") != "" }
+
+func debugDigestTokens(tag, prompt string, tokens []int32) {
+	if !debugEngineInput() {
+		return
+	}
+	buf := make([]byte, 0, len(tokens)*4)
+	for _, t := range tokens {
+		buf = append(buf, byte(t), byte(t>>8), byte(t>>16), byte(t>>24))
+	}
+	fmt.Fprintf(os.Stderr, "[debug] %s prompt_len=%d prompt_sha=%x tokens=%d tok_sha=%x first=%v last=%v\n",
+		tag, len(prompt), sha256.Sum256([]byte(prompt)), len(tokens), sha256.Sum256(buf),
+		head32(tokens, 12), tail32(tokens, 6))
+}
+
+func head32(v []int32, n int) []int32 {
+	if len(v) < n {
+		return v
+	}
+	return v[:n]
+}
+
+func tail32(v []int32, n int) []int32 {
+	if len(v) < n {
+		return v
+	}
+	return v[len(v)-n:]
+}
+
+func debugTopLogits(tag string, logits []float32, tok *llm.Tokenizer, n int) {
+	if !debugEngineInput() {
+		return
+	}
+	type kv struct {
+		id int
+		v  float32
+	}
+	top := make([]kv, 0, n+1)
+	for i, v := range logits {
+		if len(top) < n {
+			top = append(top, kv{i, v})
+			continue
+		}
+		worst := 0
+		for j := 1; j < len(top); j++ {
+			if top[j].v < top[worst].v {
+				worst = j
+			}
+		}
+		if v > top[worst].v {
+			top[worst] = kv{i, v}
+		}
+	}
+	for i := 1; i < len(top); i++ {
+		for j := i; j > 0 && top[j].v > top[j-1].v; j-- {
+			top[j], top[j-1] = top[j-1], top[j]
+		}
+	}
+	var sb strings.Builder
+	for _, e := range top {
+		sb.WriteString(fmt.Sprintf(" %d:%.4f<%q>", e.id, e.v, tok.DecodeToken(int32(e.id))))
+	}
+	fmt.Fprintf(os.Stderr, "[debug] %s top%d:%s\n", tag, n, sb.String())
+}
+
 // GenerateDetailed runs generation on GPU with detailed timing.
 func (p *GpuPipeline) GenerateDetailed(prompt string, cfg llm.GenerateConfig) (*GenerateResult, error) {
 	tokens := p.Tokenizer.Encode(prompt)
+	debugDigestTokens("GenerateDetailed", prompt, tokens)
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("tokenizer produced no tokens")
 	}
@@ -2089,6 +2172,11 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 		return ops.SampleToken(logits, cfg.Sampler, recentTokens, rng)
 	}
 
+	if debugEngineInput() {
+		fmt.Fprintf(os.Stderr, "[debug] decode template=%s stopStrings=%v maxTokens=%d sampler=%+v inThink=%v hasStream=%v pos=%d slot=%d\n",
+			template, stopStrings, cfg.MaxTokens, cfg.Sampler, gpuInThinkBlock, cfg.Stream != nil, pos, slot)
+		debugTopLogits("post-prefill", p.LogitsBuf, p.Tokenizer, 10)
+	}
 	nextToken := gpuGrammarSample(p.LogitsBuf)
 	var tokenText string
 

@@ -100,6 +100,39 @@ type RunState struct {
 	Pool *blas.Pool
 }
 
+// RoPETablesFor builds the RoPE cos/sin tables for a context of maxSeqLen
+// tokens without allocating a full RunState.
+//
+// NewRunState owns the table construction (PrecomputeYaRNRoPE / PrecomputeRoPE /
+// PrecomputeSWARoPE, selected by the model's rope scaling), and those methods
+// only touch rope fields, so a zero RunState reproduces them exactly.
+//
+// This exists because GPU pipeline construction carries the tables over from the
+// CPU run state (see gpu.NewGpuPipeline). When the caller used
+// llm.WithoutCPUState() there is no run state to carry, and the GPU used to fall
+// back to unscaled config-derived frequencies. That is not a performance
+// difference, it is silent corruption: a YaRN-extended model gets unscaled
+// positions (gpt-oss-20b: scale factor 32 against a 4096 native context) and its
+// sliding-window layers lose their separate frequency base entirely, so long
+// prompts produce garbage while short ones still look fine.
+//
+// swaCos/swaSin are nil when the model has no separate SWA frequency base.
+func RoPETablesFor(cfg ModelConfig, maxSeqLen int) (cos, sin, swaCos, swaSin []float32) {
+	rs := &RunState{}
+	if cfg.RopeScaleType == 2 && cfg.RopeScaleFactor > 0 {
+		rs.PrecomputeYaRNRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase,
+			cfg.RopeScaleFactor, cfg.RopeOrigMaxPos, cfg.RopeYaRNBetaFast, cfg.RopeYaRNBetaSlow,
+			cfg.RopeYaRNExtFactor, cfg.RopeYaRNAttnFactor)
+	} else {
+		rs.PrecomputeRoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBase)
+	}
+	rs.SetRopeNeox(cfg.RopeNeox)
+	if cfg.RopeFreqBaseSWA > 0 && cfg.RopeFreqBaseSWA != cfg.RopeFreqBase {
+		rs.PrecomputeSWARoPE(maxSeqLen, cfg.RopeDim, cfg.HeadDim, cfg.RopeFreqBaseSWA)
+	}
+	return rs.ropeCos, rs.ropeSin, rs.ropeCosSWA, rs.ropeSinSWA
+}
+
 // NewRunState allocates all buffers for a model.
 func NewRunState(cfg ModelConfig, maxSeqLen int) *RunState {
 	dim := cfg.EmbeddingDim
