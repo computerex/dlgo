@@ -76,14 +76,14 @@ type InferenceRequest struct {
 	// built from the request's tool schemas. Used to keep argument values
 	// schema-conformant (e.g. a "string" parameter never becomes a raw number).
 	ToolParamTypes map[string]map[string]string
-	Config          llm.GenerateConfig
-	Tokens          []int32 // prompt tokens after formatting
-	Generated       []int32 // output tokens so far
-	Position        int     // current sequence position
-	Status          RequestStatus
-	Output          chan StreamEvent
-	Ctx             context.Context
-	Cancel          context.CancelFunc
+	Config         llm.GenerateConfig
+	Tokens         []int32 // prompt tokens after formatting
+	Generated      []int32 // output tokens so far
+	Position       int     // current sequence position
+	Status         RequestStatus
+	Output         chan StreamEvent
+	Ctx            context.Context
+	Cancel         context.CancelFunc
 }
 
 // Scheduler manages the inference loop for a single loaded model.
@@ -278,6 +278,35 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	thinkingEnabled := supportsThinking && (req.EnableThinking == nil || *req.EnableThinking)
 	inThinkBlock := thinkingEnabled
 	var thinkingContent string
+
+	// Harmony models (gpt-oss) signal channels instead of <think> blocks.
+	var harmony *harmonySplitter
+	if llm.GetArchDescriptor(pipe.Model.Config.Architecture).ChatTemplate == "harmony" {
+		harmony = newHarmonySplitter()
+		inThinkBlock = false
+	}
+	reasoningStreamed := false
+	emitSplit := func(reasoning bool, text string) {
+		if text == "" {
+			return
+		}
+		if reasoning {
+			reasoningStreamed = true
+			req.Output <- StreamEvent{Type: EventReasoningToken, Token: text}
+			return
+		}
+		req.Output <- StreamEvent{Type: EventToken, Token: text}
+	}
+	emitText := func(text string) {
+		if text == "" {
+			return
+		}
+		if harmony != nil {
+			harmony.feed(text, emitSplit)
+			return
+		}
+		req.Output <- StreamEvent{Type: EventToken, Token: text}
+	}
 	// Thinking budget: suppress EOS for at most 80% of max_tokens during thinking,
 	// capped so a large max_tokens cannot forbid termination for tens of
 	// thousands of tokens. After that, let the model close </think> and produce
@@ -336,12 +365,10 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 			thinkingContent = strings.TrimSpace(genText.String()[:idx])
 			after := genText.String()[idx+len("</think>"):]
 			after = strings.TrimLeft(after, "\n")
-			if after != "" {
-				req.Output <- StreamEvent{Type: EventToken, Token: after}
-			}
+			emitText(after)
 		}
-	} else if tokenText != "" {
-		req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+	} else {
+		emitText(tokenText)
 	}
 	req.Generated = append(req.Generated, nextToken)
 	recentTokens = append(recentTokens, nextToken)
@@ -395,21 +422,22 @@ func (s *Scheduler) processCPU(req *InferenceRequest, rng *rand.Rand, promptToke
 				thinkingContent = strings.TrimSpace(genText.String()[:idx])
 				after := genText.String()[idx+len("</think>"):]
 				after = strings.TrimLeft(after, "\n")
-				if after != "" {
-					req.Output <- StreamEvent{Type: EventToken, Token: after}
-				}
+				emitText(after)
 			}
 		} else {
-			req.Output <- StreamEvent{Type: EventToken, Token: tokenText}
+			emitText(tokenText)
 		}
 	}
 
 	// If still buffering (no </think> found), treat as truncated reasoning.
-	if inThinkBlock {
+	if harmony != nil {
+		harmony.close(emitSplit)
+		thinkingContent = strings.TrimSpace(harmony.Reasoning())
+	} else if inThinkBlock {
 		thinkingContent = strings.TrimSpace(genText.String())
 	}
 
-	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent, GeneratedTokens: len(req.Generated)}
+	req.Output <- StreamEvent{Type: EventDone, FinishReason: "stop", PromptTokens: promptTokens, ReasoningContent: thinkingContent, ReasoningStreamed: reasoningStreamed, GeneratedTokens: len(req.Generated)}
 }
 
 func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptTokens int) {
@@ -431,6 +459,17 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	var thinkBuf strings.Builder
 	var thinkingContent string
 
+	// Harmony models (gpt-oss) do not mark reasoning with <think>…</think>;
+	// they multiplex named channels inside one assistant turn. Split them so
+	// the `analysis`/`commentary` channels become reasoning_content and only
+	// `final` reaches the visible answer, which is the only channel the client
+	// is supposed to see.
+	var harmony *harmonySplitter
+	if llm.GetArchDescriptor(s.model.CPUPipeline.Model.Config.Architecture).ChatTemplate == "harmony" {
+		harmony = newHarmonySplitter()
+		inThinkBlock = false
+	}
+
 	cfg := req.Config
 	thinkClose := "</" + "think>"
 	tcOpen := "<tool_call>"
@@ -448,8 +487,27 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 		reasoningStreamed = true
 		req.Output <- StreamEvent{Type: EventReasoningToken, Token: s}
 	}
+	// emitChannel routes one classified piece of a harmony stream: reasoning
+	// channels go out as reasoning deltas, `final` as assistant content.
+	emitChannel := func(reasoning bool, text string) {
+		if text == "" {
+			return
+		}
+		if reasoning {
+			emitReasoning(text)
+			return
+		}
+		if firstTokenAt < 0 {
+			firstTokenAt = time.Since(reqStart)
+		}
+		req.Output <- StreamEvent{Type: EventToken, Token: text}
+	}
 	cfg.Stream = func(token string) {
 		if req.Ctx.Err() != nil {
+			return
+		}
+		if harmony != nil {
+			harmony.feed(token, emitChannel)
 			return
 		}
 		if inThinkBlock {
@@ -507,7 +565,10 @@ func (s *Scheduler) processGPU(req *InferenceRequest, rng *rand.Rand, promptToke
 	// If still buffering (no </think> found), treat as truncated reasoning. Keep
 	// any tool-call markup in thinkingContent: it is stripped for display but is
 	// the only copy available for structural extraction.
-	if inThinkBlock {
+	if harmony != nil {
+		harmony.close(emitChannel)
+		thinkingContent = strings.TrimSpace(harmony.Reasoning())
+	} else if inThinkBlock {
 		thinkingContent = strings.TrimSpace(reasoningAll.String() + thinkBuf.String())
 	}
 
@@ -562,6 +623,17 @@ func suppressEOSLogits(logits []float32, cfg llm.ModelConfig) {
 }
 
 func collectStopStrings(cfg llm.ModelConfig) []string {
+	if llm.GetArchDescriptor(cfg.Architecture).ChatTemplate == "harmony" {
+		// Harmony models (gpt-oss) emit <|channel|>, <|start|>, <|message|>,
+		// <|end|>, <|constrain|> and <|call|> as structural protocol tokens in
+		// every turn. Treating them as stops truncates the turn after the first
+		// <|end|> (i.e. at the end of the analysis channel) and the answer is
+		// never produced. Only <|return|> and <|endoftext|> end a turn.
+		return []string{
+			"<|return|>",
+			"<|endoftext|>",
+		}
+	}
 	return []string{
 		"<end_of_turn><eos>",
 		"<eos>",
