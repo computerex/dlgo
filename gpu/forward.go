@@ -459,6 +459,14 @@ func GpuForwardFusedSSM(m *llm.Model, gm *GpuModel, token int32, pos int,
 	}
 
 	BeginBatch()
+	// A one-token forward is ~10 ms of GPU work from end to end, and every
+	// dispatch in it is already bounded by the backend's attention and GEMM
+	// tiling, so no batching of it can reach the display-driver watchdog.
+	// Opting out keeps the whole step in one submission; splitting it costs a
+	// fence round trip every few dispatches and measured 2.6x slower decode
+	// (160.4 -> 62.3 tok/s on Qwen3-4B).
+	SetTDRFlushExempt(true)
+	defer SetTDRFlushExempt(false)
 	UploadF32(rs.X, xCPU)
 
 	// Lazy setup of inline MoE confs after scratch buffers are allocated
@@ -950,9 +958,16 @@ func BuildBatchLayerConfs(m *llm.Model, gm *GpuModel, pipe *GpuPipeline, bs *Gpu
 // projection is skipped and the normalized final hidden state (System One
 // readout features) is downloaded into hiddenBuf instead of logits.
 func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
-	kv *GpuKVCache, rs *GpuRunState, bs *GpuBatchState, logitsBuf []float32,
+	kv *GpuKVCache, rs *GpuRunState, bs *GpuBatchState, startPos int, logitsBuf []float32,
 	batchLayerConfs []*LayerConf, hiddenBuf []float32) {
 
+	if cudaActive {
+		// CUDA has no Vulkan command-buffer recorder: the batched layer runs as
+		// ordinary kernel launches in Go, with the tensor-core Affine4/Affine8
+		// GEMM and the query-tiled prefill attention.
+		cudaPrefillBatch(m, gm, tokens, rs, bs, startPos, logitsBuf, batchLayerConfs, hiddenBuf)
+		return
+	}
 	npos := len(tokens)
 	cfg := m.Config
 	dim := cfg.EmbeddingDim
@@ -981,7 +996,7 @@ func GpuForwardPrefillBatch(m *llm.Model, gm *GpuModel, tokens []int32,
 		if l < cfg.NumLayers-1 {
 			nextAttnNorm = gm.Layers[l+1].AttnNorm
 		}
-		ForwardLayerBatch(batchLayerConfs[l], npos, 0, scale, nextAttnNorm)
+		ForwardLayerBatch(batchLayerConfs[l], npos, startPos, scale, nextAttnNorm)
 	}
 
 	Barrier()
@@ -1417,8 +1432,13 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 	defer opTimeTick()
 
 	BeginBatch()
-	if err := UploadF32(rs.X, xCPU); err != nil {
-		return err
+	// The token embedding is the only per-token host input. When the caller has
+	// already uploaded it (CUDA-graph capture/replay), xCPU is nil and the upload
+	// is skipped so the recorded graph stays free of memcpys.
+	if !suppressHostIO {
+		if err := UploadF32(rs.X, xCPU); err != nil {
+			return err
+		}
 	}
 
 	if diagOn && GpuDiag.Active(-1, pos) {
@@ -1908,14 +1928,16 @@ func gpuForwardCore(m *llm.Model, gm *GpuModel, token int32, xCPU []float32, pos
 		return fmt.Errorf("output matvec: %w", err)
 	}
 
-	if err := DownloadF32(rs.Logits, logitsBuf); err != nil {
-		return err
-	}
-	opTimeEnd(opTimeLogits, tLogits, tLogitsOn)
-	if cfg.FinalLogitSoftcap > 0 {
-		cap := float64(cfg.FinalLogitSoftcap)
-		for i := range logitsBuf {
-			logitsBuf[i] = float32(cap * math.Tanh(float64(logitsBuf[i])/cap))
+	if !suppressHostIO {
+		if err := DownloadF32(rs.Logits, logitsBuf); err != nil {
+			return err
+		}
+		opTimeEnd(opTimeLogits, tLogits, tLogitsOn)
+		if cfg.FinalLogitSoftcap > 0 {
+			cap := float64(cfg.FinalLogitSoftcap)
+			for i := range logitsBuf {
+				logitsBuf[i] = float32(cap * math.Tanh(float64(logitsBuf[i])/cap))
+			}
 		}
 	}
 	return nil

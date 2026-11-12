@@ -42,13 +42,13 @@ func setupRunner(pipe *llm.Pipeline, useGPU bool) (generateRunner, string) {
 		return &cpuRunner{pipe: pipe}, ""
 	}
 
-	fmt.Fprintln(os.Stdout, "[GPU] Attempting to initialize Vulkan backend...")
+	fmt.Fprintln(os.Stdout, "[GPU] Initializing GPU backend...")
 	if err := gpu.Init(); err != nil {
 		fmt.Fprintf(os.Stdout, "[GPU] Init failed: %v\n", err)
 		fmt.Fprintln(os.Stdout, "[GPU] Falling back to CPU backend")
 		return &cpuRunner{pipe: pipe}, ""
 	}
-	fmt.Fprintln(os.Stdout, "[GPU] Vulkan initialized successfully")
+	fmt.Fprintf(os.Stdout, "[GPU] %s backend initialized successfully\n", gpu.BackendName())
 
 	fmt.Fprintln(os.Stdout, "[GPU] Creating GPU pipeline...")
 	gp, err := gpu.NewGpuPipeline(pipe)

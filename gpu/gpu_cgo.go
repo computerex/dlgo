@@ -25,8 +25,12 @@ import (
 // Buf is a handle to a GPU buffer.
 type Buf = uint64
 
-// Init initializes the Vulkan compute backend.
+// Init initializes the GPU compute backend. By default this is Vulkan; set
+// DLGO_GPU_BACKEND=cuda to bring up the CUDA backend instead.
 func Init() error {
+	if tryInitCUDA() {
+		return nil
+	}
 	rc := C.gpu_init()
 	if rc != C.GPU_OK {
 		switch rc {
@@ -53,25 +57,54 @@ func Init() error {
 
 // Shutdown releases all GPU resources.
 func Shutdown() {
+	if cudaActive {
+		cudaShutdown()
+		cudaActive = false
+		return
+	}
 	C.gpu_shutdown()
 	ResetIQTables()
 }
 
 // IsInitialized returns true if the GPU backend is ready.
-func IsInitialized() bool { return C.gpu_is_initialized() != 0 }
+func IsInitialized() bool {
+	if cudaActive {
+		return true
+	}
+	return C.gpu_is_initialized() != 0
+}
 
 // DeviceName returns the GPU device name.
-func DeviceName() string { return C.GoString(C.gpu_device_name()) }
+func DeviceName() string {
+	if cudaActive {
+		return cudaBackendName
+	}
+	return C.GoString(C.gpu_device_name())
+}
 
 // VRAMBytes returns total device-local VRAM in bytes.
-func VRAMBytes() uint64 { return uint64(C.gpu_vram_bytes()) }
+func VRAMBytes() uint64 {
+	if cudaActive {
+		return cudaTotalMem()
+	}
+	return uint64(C.gpu_vram_bytes())
+}
 
 // VRAMFreeBytes returns currently available device-local VRAM in bytes.
-// Uses VK_EXT_memory_budget when available, otherwise falls back to 90% of total.
-func VRAMFreeBytes() uint64 { return uint64(C.gpu_vram_free_bytes()) }
+func VRAMFreeBytes() uint64 {
+	if cudaActive {
+		return cudaFreeMem()
+	}
+	return uint64(C.gpu_vram_free_bytes())
+}
 
 // AllocatedBytes returns cumulative VRAM allocated by this process (our own counter).
-func AllocatedBytes() uint64 { return uint64(C.gpu_allocated_bytes()) }
+func AllocatedBytes() uint64 {
+	if cudaActive {
+		return cudaAllocated()
+	}
+	return uint64(C.gpu_allocated_bytes())
+}
 
 // HostVisibleBytes returns bytes allocated in host-visible (non-device-local) memory.
 func HostVisibleBytes() uint64 { return uint64(C.gpu_host_visible_bytes()) }
@@ -86,14 +119,27 @@ func DeviceLocalBytes() uint64 { return uint64(C.gpu_device_local_bytes()) }
 // read directly across PCIe — the weights keep running on the GPU compute path,
 // just slower. Lowering the ceiling is therefore how a caller opts into
 // RAM-tiered weights. It can only lower the ceiling, never raise it.
-func SetVRAMCeiling(sizeBytes uint64) { C.gpu_set_vram_ceiling(C.uint64_t(sizeBytes)) }
+func SetVRAMCeiling(sizeBytes uint64) {
+	if cudaActive {
+		return
+	}
+	C.gpu_set_vram_ceiling(C.uint64_t(sizeBytes))
+}
 
 // VRAMCeilingBytes returns the device-local ceiling currently enforced.
-func VRAMCeilingBytes() uint64 { return uint64(C.gpu_vram_ceiling_bytes()) }
+func VRAMCeilingBytes() uint64 {
+	if cudaActive {
+		return cudaTotalMem()
+	}
+	return uint64(C.gpu_vram_ceiling_bytes())
+}
 
 // Alloc allocates a GPU buffer of the given size.
 // Returns 0 on failure — callers that cannot tolerate OOM should use AllocE.
 func Alloc(sizeBytes uint64) Buf {
+	if cudaActive {
+		return cudaAlloc(sizeBytes)
+	}
 	return uint64(C.gpu_alloc(C.uint64_t(sizeBytes), C.GPU_BUF_STORAGE))
 }
 
@@ -102,6 +148,9 @@ func Alloc(sizeBytes uint64) Buf {
 // a failure must be handled gracefully (like llama.cpp does) rather than
 // silently proceeding with a zero buffer.
 func AllocE(sizeBytes uint64) (Buf, error) {
+	if cudaActive {
+		return cudaAllocE(sizeBytes)
+	}
 	buf := uint64(C.gpu_alloc(C.uint64_t(sizeBytes), C.GPU_BUF_STORAGE))
 	if buf == 0 && sizeBytes > 0 {
 		return 0, fmt.Errorf("gpu: VRAM allocation failed for %d bytes (%.1f MB)", sizeBytes, float64(sizeBytes)/(1024*1024))
@@ -110,12 +159,20 @@ func AllocE(sizeBytes uint64) (Buf, error) {
 }
 
 // Free releases a GPU buffer.
-func Free(buf Buf) { C.gpu_free(C.GpuBuf(buf)) }
+func Free(buf Buf) {
+	if cudaActive {
+		cudaFree(buf)
+		return
+	}
+	C.gpu_free(C.GpuBuf(buf))
+}
 
-// PoolCreate creates a device-local memory pool for suballocation.
-// All subsequent Alloc/AllocE calls will suballocate from this pool
-// instead of creating individual vkAllocateMemory calls.
+// PoolCreate creates a device-local memory pool for suballocation. The CUDA
+// backend allocates directly from the driver, so this is a no-op there.
 func PoolCreate(sizeBytes uint64) error {
+	if cudaActive {
+		return nil
+	}
 	rc := C.gpu_pool_create(C.uint64_t(sizeBytes))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: pool create failed for %d bytes (%.1f MB)", sizeBytes, float64(sizeBytes)/(1024*1024))
@@ -124,19 +181,37 @@ func PoolCreate(sizeBytes uint64) error {
 }
 
 // PoolSeal stops suballocation mode but keeps the pool memory alive.
-func PoolSeal() { C.gpu_pool_seal() }
+func PoolSeal() {
+	if cudaActive {
+		return
+	}
+	C.gpu_pool_seal()
+}
 
 // PoolDestroy frees the pool and all buffers allocated from it.
-func PoolDestroy() { C.gpu_pool_destroy() }
+func PoolDestroy() {
+	if cudaActive {
+		return
+	}
+	C.gpu_pool_destroy()
+}
 
 // ResetBufferTable compacts the buffer ID table after freeing all buffers,
 // allowing new allocations to reuse slots from the beginning.
-func ResetBufferTable() { C.gpu_reset_buffer_table() }
+func ResetBufferTable() {
+	if cudaActive {
+		return
+	}
+	C.gpu_reset_buffer_table()
+}
 
 // Upload copies data from CPU to GPU.
 func Upload(dst Buf, src []byte) error {
 	if len(src) == 0 {
 		return nil
+	}
+	if cudaActive {
+		return cudaUpload(dst, src)
 	}
 	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(len(src)), 0)
 	if rc != C.GPU_OK {
@@ -149,6 +224,9 @@ func Upload(dst Buf, src []byte) error {
 func UploadF32(dst Buf, src []float32) error {
 	if len(src) == 0 {
 		return nil
+	}
+	if cudaActive {
+		return cudaUpload(dst, unsafe.Slice((*byte)(unsafe.Pointer(&src[0])), len(src)*4))
 	}
 	size := len(src) * 4
 	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(size), 0)
@@ -164,6 +242,9 @@ func UploadF32At(dst Buf, offsetFloats int, src []float32) error {
 	if len(src) == 0 {
 		return nil
 	}
+	if cudaActive {
+		return cudaUploadAt(dst, uint64(offsetFloats*4), unsafe.Slice((*byte)(unsafe.Pointer(&src[0])), len(src)*4))
+	}
 	size := len(src) * 4
 	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(size), C.uint64_t(offsetFloats*4))
 	if rc != C.GPU_OK {
@@ -177,6 +258,9 @@ func UploadI32(dst Buf, src []int32) error {
 	if len(src) == 0 {
 		return nil
 	}
+	if cudaActive {
+		return cudaUpload(dst, unsafe.Slice((*byte)(unsafe.Pointer(&src[0])), len(src)*4))
+	}
 	size := len(src) * 4
 	rc := C.gpu_upload(C.GpuBuf(dst), unsafe.Pointer(&src[0]), C.uint64_t(size), 0)
 	if rc != C.GPU_OK {
@@ -187,6 +271,10 @@ func UploadI32(dst Buf, src []int32) error {
 
 // ZeroFill writes zeros to a GPU buffer.
 func ZeroFill(dst Buf, sizeBytes uint64) {
+	if cudaActive {
+		cudaMemsetZero(dst, sizeBytes)
+		return
+	}
 	zeros := make([]byte, sizeBytes)
 	Upload(dst, zeros)
 }
@@ -195,6 +283,9 @@ func ZeroFill(dst Buf, sizeBytes uint64) {
 func Download(src Buf, dst []byte) error {
 	if len(dst) == 0 {
 		return nil
+	}
+	if cudaActive {
+		return cudaDownload(src, dst)
 	}
 	rc := C.gpu_download(unsafe.Pointer(&dst[0]), C.GpuBuf(src), C.uint64_t(len(dst)), 0)
 	if rc != C.GPU_OK {
@@ -208,6 +299,9 @@ func DownloadF32(src Buf, dst []float32) error {
 	if len(dst) == 0 {
 		return nil
 	}
+	if cudaActive {
+		return cudaDownload(src, unsafe.Slice((*byte)(unsafe.Pointer(&dst[0])), len(dst)*4))
+	}
 	size := len(dst) * 4
 	rc := C.gpu_download(unsafe.Pointer(&dst[0]), C.GpuBuf(src), C.uint64_t(size), 0)
 	if rc != C.GPU_OK {
@@ -218,6 +312,9 @@ func DownloadF32(src Buf, dst []float32) error {
 
 // MatVec performs quantized matrix-vector multiply on GPU.
 func MatVec(out, weights, x Buf, rows, cols int, qtype uint32) error {
+	if cudaActive {
+		return cudaMatVec(out, weights, x, rows, cols, qtype)
+	}
 	rc := C.gpu_matvec(C.GpuBuf(out), C.GpuBuf(weights), C.GpuBuf(x),
 		C.int(rows), C.int(cols), C.int(qtype))
 	if rc != C.GPU_OK {
@@ -240,6 +337,9 @@ func MatVecOffset(out Buf, outOffBytes int, weights Buf, weightsOffBytes int, x 
 
 // RMSNorm performs RMS normalization on GPU.
 func RMSNorm(out, x, weight Buf, n int, eps float32) error {
+	if cudaActive {
+		return cudaRMSNorm(out, x, weight, n, eps)
+	}
 	rc := C.gpu_rmsnorm(C.GpuBuf(out), C.GpuBuf(x), C.GpuBuf(weight), C.int(n), C.float(eps))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: rmsnorm failed (%d)", rc)
@@ -249,6 +349,9 @@ func RMSNorm(out, x, weight Buf, n int, eps float32) error {
 
 // LayerNorm performs layer normalization on GPU.
 func LayerNorm(out, x, weight, bias Buf, n int, eps float32) error {
+	if cudaActive {
+		return cudaLayerNorm(out, x, weight, bias, n, eps)
+	}
 	rc := C.gpu_layernorm(C.GpuBuf(out), C.GpuBuf(x), C.GpuBuf(weight), C.GpuBuf(bias), C.int(n), C.float(eps))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: layernorm failed (%d)", rc)
@@ -258,6 +361,9 @@ func LayerNorm(out, x, weight, bias Buf, n int, eps float32) error {
 
 // RMSNormHeads performs per-head in-place RMS normalization on GPU.
 func RMSNormHeads(data, weight Buf, numHeads, headDim int, eps float32) error {
+	if cudaActive {
+		return cudaRMSNormHeads(data, weight, numHeads, headDim, eps)
+	}
 	rc := C.gpu_rmsnorm_heads(C.GpuBuf(data), C.GpuBuf(weight), C.int(numHeads), C.int(headDim), C.float(eps))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: rmsnorm_heads failed (%d)", rc)
@@ -276,6 +382,9 @@ func Softmax(buf Buf, n int) error {
 
 // RoPE applies rotary position embedding on GPU using precomputed cos/sin tables.
 func RoPE(q, k, cosTable, sinTable Buf, numHeads, numKVHeads, headDim, ropeDim, pos int, neox bool) error {
+	if cudaActive {
+		return cudaRoPE(q, k, cosTable, sinTable, numHeads, numKVHeads, headDim, ropeDim, pos, neox)
+	}
 	n := 0
 	if neox {
 		n = 1
@@ -290,6 +399,9 @@ func RoPE(q, k, cosTable, sinTable Buf, numHeads, numKVHeads, headDim, ropeDim, 
 
 // SwiGLU performs SwiGLU activation on GPU.
 func SwiGLU(out, gate, up Buf, n int) error {
+	if cudaActive {
+		return cudaSwiGLU(out, gate, up, n)
+	}
 	rc := C.gpu_swiglu(C.GpuBuf(out), C.GpuBuf(gate), C.GpuBuf(up), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: swiglu failed (%d)", rc)
@@ -379,6 +491,9 @@ func GELU(buf Buf, n int) error {
 
 // Add performs element-wise addition on GPU.
 func Add(out, a, b Buf, n int) error {
+	if cudaActive {
+		return cudaAdd(out, a, b, n)
+	}
 	rc := C.gpu_add(C.GpuBuf(out), C.GpuBuf(a), C.GpuBuf(b), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: add failed (%d)", rc)
@@ -388,6 +503,9 @@ func Add(out, a, b Buf, n int) error {
 
 // Scale performs in-place scaling on GPU.
 func Scale(buf Buf, s float32, n int) error {
+	if cudaActive {
+		return cudaScale(buf, s, n)
+	}
 	rc := C.gpu_scale(C.GpuBuf(buf), C.float(s), C.int(n))
 	if rc != C.GPU_OK {
 		return fmt.Errorf("gpu: scale failed (%d)", rc)
@@ -429,6 +547,9 @@ func KVStore(kCache, vCache, k, v Buf, pos, kvDim int) error {
 
 // KVStoreF16 converts float32 K/V to packed half2 and stores in FP16 KV cache.
 func KVStoreF16(kCache, vCache, k, v Buf, pos, kvDim int) error {
+	if cudaActive {
+		return cudaKVStoreF16(kCache, vCache, k, v, pos, kvDim)
+	}
 	rc := C.gpu_kv_store_f16(C.GpuBuf(kCache), C.GpuBuf(vCache),
 		C.GpuBuf(k), C.GpuBuf(v), C.int(pos), C.int(kvDim))
 	if rc != C.GPU_OK {
@@ -437,8 +558,51 @@ func KVStoreF16(kCache, vCache, k, v Buf, pos, kvDim int) error {
 	return nil
 }
 
+// ---- CUDA-graph replay of the per-token layer loop -------------------------
+// graphDisabled is set when capture fails so the pipeline falls back to the
+// per-launch path instead of retrying every step.
+var graphDisabled bool
+
+// GraphReplaySupported reports whether the active backend can replay a captured
+// per-token graph.
+func GraphReplaySupported() bool { return cudaActive && !graphDisabled }
+
+// GraphCapture begins recording the subsequent kernel launches into a graph.
+func GraphCapture() error {
+	if !cudaActive {
+		return fmt.Errorf("gpu: graph capture requires the CUDA backend")
+	}
+	return cudaGraphCapture()
+}
+
+// GraphCaptureEnd finishes the recording and keeps it for replay.
+func GraphCaptureEnd() error {
+	if !cudaActive {
+		return fmt.Errorf("gpu: graph capture requires the CUDA backend")
+	}
+	return cudaGraphCaptureEnd()
+}
+
+// GraphReplay replays the captured per-token graph with fresh position scalars.
+func GraphReplay(pos, seqLen, winStart, kvCap int) error {
+	if !cudaActive {
+		return fmt.Errorf("gpu: graph replay requires the CUDA backend")
+	}
+	return cudaGraphReplay(pos, seqLen, winStart, kvCap)
+}
+
+// GraphDiscard drops any captured graph.
+func GraphDiscard() {
+	if cudaActive {
+		cudaGraphDiscard()
+	}
+}
+
 // AttentionF16 performs tiled attention with FP16 KV cache (online softmax, no seq_len limit).
 func AttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos int, scale, softcap float32) error {
+	if cudaActive {
+		return cudaAttentionF16(out, q, kCache, vCache, numHeads, numKVHeads, headDim, kvDim, seqLen, startPos, scale, softcap)
+	}
 	rc := C.gpu_attention_f16(C.GpuBuf(out), C.GpuBuf(q), C.GpuBuf(kCache), C.GpuBuf(vCache),
 		C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(kvDim), C.int(seqLen), C.float(scale), C.float(softcap), C.int(startPos))
 	if rc != C.GPU_OK {
@@ -493,25 +657,77 @@ func PagedAttention(out, q, kPool, vPool, blockTable Buf,
 }
 
 // Sync waits for all GPU operations to complete.
-func Sync() { C.gpu_sync() }
+func Sync() {
+	if cudaActive {
+		cudaStreamSync()
+		return
+	}
+	C.gpu_sync()
+}
 
 // PerfReset resets GPU performance counters.
-func PerfReset() { C.gpu_perf_reset() }
+func PerfReset() {
+	if cudaActive {
+		return
+	}
+	C.gpu_perf_reset()
+}
 
 // PerfPrint prints GPU performance counters to stderr.
-func PerfPrint() { C.gpu_perf_print() }
+func PerfPrint() {
+	if cudaActive {
+		return
+	}
+	C.gpu_perf_print()
+}
 
 // PerfGetGpuUs returns accumulated GPU fence-wait time in microseconds.
-func PerfGetGpuUs() float64 { return float64(C.gpu_perf_get_gpu_us()) }
+func PerfGetGpuUs() float64 {
+	if cudaActive {
+		return 0
+	}
+	return float64(C.gpu_perf_get_gpu_us())
+}
 
 // PerfGetDispatches returns accumulated dispatch count.
-func PerfGetDispatches() int { return int(C.gpu_perf_get_dispatches()) }
+func PerfGetDispatches() int {
+	if cudaActive {
+		return 0
+	}
+	return int(C.gpu_perf_get_dispatches())
+}
 
 // PerfGetBarriers returns accumulated barrier count.
-func PerfGetBarriers() int { return int(C.gpu_perf_get_barriers()) }
+func PerfGetBarriers() int {
+	if cudaActive {
+		return 0
+	}
+	return int(C.gpu_perf_get_barriers())
+}
+
+// SetTDRFlushExempt exempts the current batch from the backend's submission
+// splitting. Use it only for a batch whose total GPU work is provably a few
+// milliseconds (a one-token forward): the split exists so that a multi-second
+// batched prefill cannot trip the Windows display watchdog, and it costs a
+// fence round trip each time it fires.
+func SetTDRFlushExempt(on bool) {
+	if cudaActive {
+		return
+	}
+	if on {
+		C.gpu_tdr_set_batch_exempt(1)
+	} else {
+		C.gpu_tdr_set_batch_exempt(0)
+	}
+}
 
 // HasDp4a returns true if the GPU supports integer dot product (dp4a) acceleration.
-func HasDp4a() bool { return C.gpu_has_dp4a() != 0 }
+func HasDp4a() bool {
+	if cudaActive {
+		return false
+	}
+	return C.gpu_has_dp4a() != 0
+}
 
 // QuantizeQ8_1 quantizes an f32 buffer to Q8_1 format for dp4a operations.
 func QuantizeQ8_1(q8_1Buf, f32Buf Buf, nElements int) error {
@@ -780,16 +996,34 @@ func ForwardMoEFFN_Native_C(mc *MoEFFNConf) error {
 
 // BeginBatch starts recording GPU operations into a single command buffer.
 // All subsequent GPU calls are batched until EndBatch.
-func BeginBatch() { C.gpu_begin_batch() }
+func BeginBatch() {
+	if cudaActive {
+		return
+	}
+	C.gpu_begin_batch()
+}
 
 // EndBatch submits all batched operations at once and waits for completion.
-func EndBatch() { C.gpu_end_batch() }
+func EndBatch() {
+	if cudaActive {
+		return
+	}
+	C.gpu_end_batch()
+}
 
 // Barrier inserts a compute memory barrier so subsequent dispatches see prior writes.
-func Barrier() { C.gpu_barrier() }
+func Barrier() {
+	if cudaActive {
+		return
+	}
+	C.gpu_barrier()
+}
 
 // AddRMSNorm performs fused Add + RMSNorm: sumOut = a+b, normOut = RMSNorm(sumOut, weight).
 func AddRMSNorm(normOut, sumOut, a, b, weight Buf, n int, eps float32) error {
+	if cudaActive {
+		return cudaAddRMSNorm(normOut, sumOut, a, b, weight, n, eps)
+	}
 	rc := C.gpu_add_rmsnorm(C.GpuBuf(normOut), C.GpuBuf(sumOut),
 		C.GpuBuf(a), C.GpuBuf(b), C.GpuBuf(weight), C.int(n), C.float(eps))
 	if rc != C.GPU_OK {
@@ -1019,7 +1253,12 @@ func SetGemmQ3K(on bool) {
 
 // MinSSBOOffsetAlign returns the device requirement for storage-buffer
 // descriptor offsets, in bytes.
-func MinSSBOOffsetAlign() uint64 { return uint64(C.gpu_min_ssbo_offset_align()) }
+func MinSSBOOffsetAlign() uint64 {
+	if cudaActive {
+		return 256
+	}
+	return uint64(C.gpu_min_ssbo_offset_align())
+}
 
 // BatchRMSNormHeads performs per-head RMS normalization over npos positions.
 func BatchRMSNormHeads(data, weight Buf, numHeads, headDim int, eps float32, npos int) error {
@@ -1297,6 +1536,9 @@ func SetSSMRecT32(on bool) {
 
 // CopyRegion copies a region between GPU buffers.
 func CopyRegion(dst Buf, dstOff uint64, src Buf, srcOff, size uint64) error {
+	if cudaActive {
+		return cudaCopyRegion(dst, dstOff, src, srcOff, size)
+	}
 	rc := C.gpu_copy_region(C.GpuBuf(dst), C.uint64_t(dstOff),
 		C.GpuBuf(src), C.uint64_t(srcOff), C.uint64_t(size))
 	if rc != C.GPU_OK {

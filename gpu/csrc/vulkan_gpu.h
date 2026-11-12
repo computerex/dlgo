@@ -620,6 +620,13 @@ int gpu_matvec_dp4a_fused(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_f32_buf,
 // Performance counters
 void gpu_perf_reset(void);
 void gpu_perf_print(void);
+/* Print the TDR submission statistics (count, slowest submission, calibrated
+ * cost model, overshoots) to stderr. Safe to call at any time. */
+void gpu_tdr_report(void);
+/* Exempt the current/next batch from submission splitting. Only for batches
+ * whose total work is provably tiny (a one-token forward); the batched prefill
+ * must never set this. */
+void gpu_tdr_set_batch_exempt(int on);
 double gpu_perf_get_gpu_us(void);
 int    gpu_perf_get_dispatches(void);
 int    gpu_perf_get_barriers(void);

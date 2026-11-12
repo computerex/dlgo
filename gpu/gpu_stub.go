@@ -44,6 +44,15 @@ func Add(out, a, b Buf, n int) error        { return errNoGPU }
 func Scale(Buf, float32, int) error         { return errNoGPU }
 func Attention(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl, sp int, s float32) error { return errNoGPU }
 func AttentionF16(out, q, kc, vc Buf, nh, nkv, hd, kvd, sl, sp int, s, sc float32) error { return errNoGPU }
+
+// CUDA-graph replay is CUDA-only; the stub keeps the pipeline compiling.
+func GraphReplaySupported() bool { return false }
+func GraphCapture() error       { return errNoGPU }
+func GraphCaptureEnd() error    { return errNoGPU }
+func GraphReplay(pos, seqLen, winStart, kvCap int) error {
+	return errNoGPU
+}
+func GraphDiscard() {}
 func AttentionF16Sinks(out, q, kc, vc, sinks Buf, nh, nkv, hd, kvd, sl, sp int, s, sc float32) error { return errNoGPU }
 func KVStore(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
 func KVStoreF16(kc, vc, k, v Buf, pos, kvDim int) error { return errNoGPU }
@@ -74,6 +83,7 @@ func SwiGLU_OAI_At(o, g, u Buf, oo, go_, uo, n int, a, l float32) error         
 func QuantizeQ8_1At(q Buf, qo int, f Buf, fo, n int) error                         { return errNoGPU }
 func BeginBatch()                            {}
 func EndBatch()                              {}
+func SetTDRFlushExempt(on bool)              {}
 func SetGemmQ3K(bool)                        {}
 func SetNoCoopmatGemm(bool)                  {}
 func SetAttentionF16(bool)                   {}

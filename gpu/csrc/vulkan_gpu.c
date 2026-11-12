@@ -529,6 +529,162 @@ static void buffer_barrier(VkBuffer buf, uint64_t size) {
 }
 
 // ---------------------------------------------------------------------------
+// TDR safety: keep every vkQueueSubmit inside the Windows display watchdog
+// ---------------------------------------------------------------------------
+//
+// Windows resets the WHOLE display adapter when one submission fails to make
+// progress within TdrDelay (2 s by default; TdrDelay/TdrDdiDelay are unset on
+// this machine, so 2 s / 5 s apply). The reset kills every GPU process on the
+// box -- including the editor -- so overshooting it is not an error we can
+// recover from, it is a machine crash.
+//
+// Measured on the 16k-token Vulkan prefill that crashed this machine on
+// 2026-11-12: gpu_begin_batch()/gpu_end_batch() recorded the entire per-chunk
+// body of GpuForwardPrefillBatch -- every layer, ~480 dispatches -- into ONE
+// command buffer and submitted it once. The individual dispatches are short
+// (tens of ms at a 1024-token prefill chunk); the AGGREGATE submission was
+// ~14 s of GPU work, so the watchdog fired. The bug was the recording
+// granularity, not any single kernel.
+//
+// Fix: cut the recording into pieces and wait for each one, so no submission
+// can accumulate more than `budget` of work. The budget is enforced with a
+// self-calibrating cost model: a dispatch is charged the volume of its grid
+// (each invocation of these kernels does O(1) tile work, so grid volume tracks
+// cost well), and the microseconds-per-unit constant is re-measured from the
+// wall time of every flush. It only ever ratchets UP, which biases the system
+// towards shorter submissions. No caller changes are required, and a workload
+// that becomes slower automatically gets shorter submissions.
+//
+// Knobs (all optional):
+//   DLGO_VK_SUBMIT_BUDGET_MS  target wall time per submission, default 500.
+//                             Must stay well under the 2000 ms watchdog.
+//   DLGO_VK_TDR_OFF=1         disable flushing (for Linux/CI, where there is
+//                             no WDDM watchdog).
+//   DLGO_VK_TDR_REPORT=1      warn on stderr whenever a submission overshoots
+//                             the budget, with its dispatch count and units.
+//
+// This is defence in depth, NOT a substitute for bounding the work of a single
+// dispatch: batch_attention_f16_impl() and the cooperative-matrix GEMMs tile
+// themselves as well, so no one vkCmdDispatch grows with the context.
+// ---------------------------------------------------------------------------
+
+#define VK_TDR_DEFAULT_BUDGET_US  500000.0
+/* Conservative seed for the cost model: 100 us per grid unit. Calibrated from
+ * the measured 1024-token x 9728-row Affine8 GEMM (1216 grid units, ~90 ms =>
+ * ~74 us/unit); rounded up so the very first submission is already inside the
+ * budget. Every flush can only raise it, never lower it. */
+#define VK_TDR_SEED_US_PER_UNIT   100.0
+
+static struct {
+    int inited;
+    int off;
+    int report;
+    int batch_exempt;     /* current batch is provably too small to trip TDR */
+    double budget_us;
+    double us_per_unit;   /* calibrated cost of one grid unit; monotone up */
+    double chunk_units;   /* grid units recorded since the last submission */
+    int chunk_dispatches; /* dispatches recorded since the last submission */
+    int submits;
+    double max_submit_us;
+    int overshoots;
+} g_tdr;
+
+/* A one-token forward is ~10 ms of work end to end, and every dispatch inside
+ * it is already bounded by the attention/GEMM tiling, so however it is batched
+ * it cannot come close to the watchdog. Splitting it costs a fence round trip
+ * per few dispatches and halved the measured decode rate (160 -> 62 tok/s), so
+ * the decode caller opts out explicitly. The batched prefill, which is the
+ * workload that can genuinely run for seconds, never opts out. */
+void gpu_tdr_set_batch_exempt(int on) {
+    g_tdr.batch_exempt = on ? 1 : 0;
+}
+
+static void vk_tdr_init(void) {
+    if (g_tdr.inited) return;
+    g_tdr.inited = 1;
+    g_tdr.budget_us = VK_TDR_DEFAULT_BUDGET_US;
+    g_tdr.us_per_unit = VK_TDR_SEED_US_PER_UNIT;
+    const char* e = getenv("DLGO_VK_SUBMIT_BUDGET_MS");
+    if (e && e[0]) {
+        double ms = atof(e);
+        if (ms >= 1.0) g_tdr.budget_us = ms * 1000.0;
+    }
+    e = getenv("DLGO_VK_TDR_OFF");
+    if (e && e[0] == '1') g_tdr.off = 1;
+    e = getenv("DLGO_VK_TDR_REPORT");
+    if (e && e[0] == '1') g_tdr.report = 1;
+}
+
+/* Close the open command buffer, wait for it, and keep recording into a fresh
+ * one. Everything that lives IN a command buffer (pipeline bind cache, pending
+ * barrier flag) has to be re-armed; device memory is untouched, and the fence
+ * wait makes every prior write visible to the next submission. */
+static void vk_tdr_flush(void) {
+    if (g_tdr.chunk_dispatches <= 0) return;
+
+    int n = g_tdr.chunk_dispatches;
+    double units = g_tdr.chunk_units;
+    double before = g_perf_gpu_us;
+
+    submit_and_wait();
+
+    double us = g_perf_gpu_us - before;
+    g_tdr.submits++;
+    if (us > g_tdr.max_submit_us) g_tdr.max_submit_us = us;
+    if (units > 0.0) {
+        double per = us / units;
+        if (per > g_tdr.us_per_unit) g_tdr.us_per_unit = per;
+    }
+    if (us > g_tdr.budget_us) {
+        g_tdr.overshoots++;
+        if (g_tdr.report) {
+            fprintf(stderr, "[dlgo/gpu] TDR budget overshoot: submission %.1f ms "
+                            "over a %.0f ms budget (%d dispatches, %.0f units, "
+                            "%.1f us/unit) -- subsequent submissions will be shorter\n",
+                    us / 1000.0, g_tdr.budget_us / 1000.0, n, units,
+                    g_tdr.us_per_unit);
+            fflush(stderr);
+        }
+    }
+    if (g_tdr.report && (g_tdr.submits <= 3 || g_tdr.submits % 100 == 0)) {
+        fprintf(stderr, "[dlgo/gpu] TDR: %d submissions, slowest %.1f ms "
+                        "(budget %.0f ms), %.1f us/unit, overshoots %d\n",
+                g_tdr.submits, g_tdr.max_submit_us / 1000.0, g_tdr.budget_us / 1000.0,
+                g_tdr.us_per_unit, g_tdr.overshoots);
+        fflush(stderr);
+    }
+
+    g_tdr.chunk_units = 0.0;
+    g_tdr.chunk_dispatches = 0;
+
+    begin_cmd();
+    g.last_bound_pipe = PIPE_COUNT;
+    if (!vkCmdPushDescriptorSetKHR_) vkResetDescriptorPool_(g.device, g.desc_pool, 0);
+    /* g.need_barrier is deliberately left alone: emitting one extra barrier at
+     * the start of the new command buffer is free next to the fence wait we
+     * just did. */
+}
+
+/* Would recording a dispatch of `units` grid units push this submission over
+ * the watchdog budget? */
+static int vk_tdr_should_flush(double units) {
+    if (g_tdr.off || g_tdr.batch_exempt || !g.recording) return 0;
+    if (g_tdr.chunk_dispatches <= 0) return 0;
+    if (g_tdr.us_per_unit <= 0.0) return 0;
+    return (g_tdr.chunk_units + units) * g_tdr.us_per_unit > g_tdr.budget_us;
+}
+
+void gpu_tdr_report(void) {
+    if (!g_tdr.inited || g_tdr.submits <= 0) return;
+    fprintf(stderr, "[dlgo/gpu] submissions: %d, slowest %.1f ms, budget %.0f ms, "
+                    "calibrated %.1f us/unit, overshoots %d%s\n",
+            g_tdr.submits, g_tdr.max_submit_us / 1000.0, g_tdr.budget_us / 1000.0,
+            g_tdr.us_per_unit, g_tdr.overshoots,
+            g_tdr.off ? " (TDR flush disabled)" : "");
+    fflush(stderr);
+}
+
+// ---------------------------------------------------------------------------
 // Buffer ID <-> Vulkan buffer mapping
 // ---------------------------------------------------------------------------
 static GpuBuf register_buffer(VkBuffer buf, VkDeviceMemory mem, uint64_t size, int host_vis) {
@@ -1318,6 +1474,15 @@ static int dispatch_compute(DispatchParams* p) {
     }
 
     if (g.recording) {
+        /* Charge this dispatch to the open submission and cut it if the
+         * watchdog budget would be exceeded (see the TDR section above). */
+        uint64_t units = (uint64_t)p->groups_x * (uint64_t)p->groups_y * (uint64_t)p->groups_z;
+        if (units == 0) units = 1;
+        if (!g_tdr.inited) vk_tdr_init();
+        if (vk_tdr_should_flush((double)units)) vk_tdr_flush();
+        g_tdr.chunk_units += (double)units;
+        g_tdr.chunk_dispatches++;
+
         if (g.need_barrier) {
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1384,6 +1549,13 @@ static int dispatch_compute(DispatchParams* p) {
     return GPU_OK;
 }
 
+/* Defined with the batched GEMM helpers further down. Every position-batched
+ * GEMM routes through this so that no single vkCmdDispatch grows with the
+ * prompt length (see the token-tiling note on its definition). */
+static int dispatch_gemm_token_tiled(PipelineID pipe, GpuBuf out_buf, GpuBuf weights_buf,
+                                     GpuBuf x_buf, int rows, int cols, int npos,
+                                     int row_tile, int tok_tile);
+
 // ---------------------------------------------------------------------------
 // Compute shader SPIR-V will be loaded from embedded data
 // We use a separate file for the compiled shaders
@@ -1437,15 +1609,23 @@ void gpu_sync(void) {
 
 void gpu_begin_batch(void) {
     if (!g.initialized || g.recording) return;
+    vk_tdr_init();
     begin_cmd();
     g.recording = 1;
     g.dispatch_count = 0;
     g.last_bound_pipe = PIPE_COUNT;
+    g_tdr.chunk_units = 0.0;
+    g_tdr.chunk_dispatches = 0;
 }
 
 void gpu_end_batch(void) {
     if (!g.initialized || !g.recording) return;
     g.recording = 0;
+    /* `dispatch_count` counts every recorded command, including the staging
+     * copies that gpu_upload/gpu_download/gpu_copy_region append, so it is the
+     * right "is there anything in this command buffer" test. A TDR flush may
+     * have already submitted the dispatches; in that case the tail may hold
+     * copies only, and it must still not be dropped. */
     if (g.dispatch_count > 0) {
         submit_and_wait();
     }
@@ -1453,6 +1633,8 @@ void gpu_end_batch(void) {
     g.dispatch_count = 0;
     g.need_barrier = 0;
     g.staging_offset = 0;
+    g_tdr.chunk_units = 0.0;
+    g_tdr.chunk_dispatches = 0;
 }
 
 void gpu_barrier(void) {
@@ -3872,19 +4054,10 @@ int gpu_gemm_bf16(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_BF16;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 63) / 64);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    /* Token-tiled so a single dispatch stays inside the display watchdog
+     * (see dispatch_gemm_token_tiled). */
+    return dispatch_gemm_token_tiled(PIPE_GEMM_BF16, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 64);
 }
 
 int gpu_gemm_q4k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
@@ -3892,19 +4065,10 @@ int gpu_gemm_q4k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_Q4K_COOPMAT;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 63) / 64);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    /* Token-tiled so a single dispatch stays inside the display watchdog
+     * (see dispatch_gemm_token_tiled). */
+    return dispatch_gemm_token_tiled(PIPE_GEMM_Q4K_COOPMAT, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 64);
 }
 
 int gpu_gemm_q5k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
@@ -3912,20 +4076,10 @@ int gpu_gemm_q5k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_Q5K_COOPMAT;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    /* BM=64, BN=128 */
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    /* Token-tiled so a single dispatch stays inside the display watchdog
+     * (see dispatch_gemm_token_tiled). */
+    return dispatch_gemm_token_tiled(PIPE_GEMM_Q5K_COOPMAT, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 128);
 }
 
 int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
@@ -3933,20 +4087,90 @@ int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_Q6K_COOPMAT;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    /* BM=64, BN=128 */
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    /* Token-tiled so a single dispatch stays inside the display watchdog
+     * (see dispatch_gemm_token_tiled). */
+    return dispatch_gemm_token_tiled(PIPE_GEMM_Q6K_COOPMAT, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 128);
+}
+
+/* ---------------------------------------------------------------------------
+ * Token-axis tiling for the position-batched GEMMs
+ * ---------------------------------------------------------------------------
+ * These kernels already tile the token axis internally (BN=128 for the
+ * cooperative-matrix GEMMs, 64 for the Q4_K family), but every tile is
+ * flattened into ONE grid, so a single vkCmdDispatch still costs O(npos)
+ * weight sweeps. At 16k tokens that is seconds of work inside one dispatch --
+ * more than the display watchdog allows, no matter how the submissions are
+ * batched.
+ *
+ * The weight matrix is shared by every token, x is [token][col] and out is
+ * [token][row], so a token chunk is nothing but a byte offset into bindings 0
+ * and 2: no shader change and no re-tiling. `npos` in the push constants
+ * becomes the chunk length, which is exactly what the shaders use for their
+ * token bounds (and for the vec4 alignment of x, since a chunk starts on a
+ * tok_tile boundary and both strides are a multiple of 4 floats).
+ *
+ * The chunk is sized in the same "grid unit = one output tile" currency the
+ * submission budget uses. 1200 units is a measured ~90 ms on this box (1024
+ * tokens x 9728 rows at BN=128/BM=64), i.e. ~5x inside the watchdog.
+ * DLGO_VK_GEMM_UNITS overrides the ceiling.
+ */
+#define VK_GEMM_UNITS_PER_DISPATCH 1200.0
+
+typedef struct { int rows; int cols; int npos; } GemmPushConst;
+
+static int vk_gemm_token_chunk(int rows, int row_tile, int npos, int tok_tile) {
+    double budget = VK_GEMM_UNITS_PER_DISPATCH;
+    const char* e = getenv("DLGO_VK_GEMM_UNITS");
+    if (e && e[0]) {
+        double v = atof(e);
+        if (v > 0.0) budget = v;
+    }
+    int row_tiles = (rows + row_tile - 1) / row_tile;
+    if (row_tiles < 1) row_tiles = 1;
+    int max_tiles = (int)(budget / (double)row_tiles);
+    if (max_tiles < 1) max_tiles = 1;
+    long chunk = (long)max_tiles * (long)tok_tile;
+    if (chunk > (long)npos) chunk = npos;
+    if (chunk < 1) chunk = 1;
+    return (int)chunk;
+}
+
+/* Dispatch `pipe` over the token axis in TDR-bounded chunks. With chunk >= npos
+ * this is byte-identical to the previous single dispatch, so shapes that were
+ * already safe keep exactly the old behaviour. */
+static int dispatch_gemm_token_tiled(PipelineID pipe, GpuBuf out_buf, GpuBuf weights_buf,
+                                     GpuBuf x_buf, int rows, int cols, int npos,
+                                     int row_tile, int tok_tile) {
+    if (!g.initialized) return GPU_ERR_INIT_FAIL;
+    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0) return GPU_OK;
+
+    int chunk = vk_gemm_token_chunk(rows, row_tile, npos, tok_tile);
+    for (int base = 0; base < npos; base += chunk) {
+        int n = npos - base;
+        if (n > chunk) n = chunk;
+        GemmPushConst pc = {rows, cols, n};
+        DispatchParams dp = {0};
+        dp.pipe = pipe;
+        dp.bufs[0] = out_buf;
+        dp.bufs[1] = weights_buf;
+        dp.bufs[2] = x_buf;
+        dp.num_bufs = 3;
+        if (base > 0) {
+            /* out[token][row] and x[token][col], both f32. */
+            dp.buf_offsets[0] = (uint64_t)base * (uint64_t)rows * 4u;
+            dp.buf_offsets[2] = (uint64_t)base * (uint64_t)cols * 4u;
+        }
+        dp.push_data = &pc;
+        dp.push_size = sizeof(pc);
+        dp.groups_x = ((rows + row_tile - 1) / row_tile) * ((n + tok_tile - 1) / tok_tile);
+        dp.groups_y = 1;
+        dp.groups_z = 1;
+        int rc = dispatch_compute(&dp);
+        if (rc != GPU_OK) return rc;
+    }
+    return GPU_OK;
 }
 
 /* Unified GEMM over the canonical Affine8 weight format. Every weight tensor is
@@ -3954,44 +4178,16 @@ int gpu_gemm_q6k(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
  * serves all quantization schemes. BM=64, BN=128. */
 int gpu_gemm_affine8(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos) {
-    if (!g.initialized) return GPU_ERR_INIT_FAIL;
-    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_AFFINE8_COOPMAT;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    return dispatch_gemm_token_tiled(PIPE_GEMM_AFFINE8_COOPMAT, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 128);
 }
 
 // Batched GEMM over canonical Affine4 weights (byte-lean companion of
 // gpu_gemm_affine8). Same tiling (BM=64, BN=128, BK=32).
 int gpu_gemm_affine4(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
                      int rows, int cols, int npos) {
-    if (!g.initialized) return GPU_ERR_INIT_FAIL;
-    if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_AFFINE4_COOPMAT;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 127) / 128);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    return dispatch_gemm_token_tiled(PIPE_GEMM_AFFINE4_COOPMAT, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 128);
 }
 
 int gpu_gemm_q6k_f32(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
@@ -3999,20 +4195,10 @@ int gpu_gemm_q6k_f32(GpuBuf out_buf, GpuBuf weights_buf, GpuBuf x_buf,
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
 
-    struct { int rows; int cols; int npos; } pc = {rows, cols, npos};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_GEMM_Q6K_F32;
-    dp.bufs[0] = out_buf;
-    dp.bufs[1] = weights_buf;
-    dp.bufs[2] = x_buf;
-    dp.num_bufs = 3;
-    dp.push_data = &pc;
-    dp.push_size = sizeof(pc);
-    /* BM=64, BN=32 */
-    dp.groups_x = ((rows + 63) / 64) * ((npos + 31) / 32);
-    dp.groups_y = 1;
-    dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    /* Token-tiled so a single dispatch stays inside the display watchdog
+     * (see dispatch_gemm_token_tiled). */
+    return dispatch_gemm_token_tiled(PIPE_GEMM_Q6K_F32, out_buf, weights_buf, x_buf,
+                                     rows, cols, npos, 64, 32);
 }
 
 /* Fused Q3_K x FP32 tiled GEMM (no tensor cores). Dequantizes Q3_K tiles to
@@ -4659,34 +4845,89 @@ static int attention_kv4_selected(void) {
 }
 void gpu_set_attention_kv4(int on) { g_attention_kv4 = on ? 1 : 0; }
 
+/* Push constants shared by the position-batched attention kernels. Layout must
+ * match Params in attention_tiled.comp / attention_tiled_sinks.comp. */
+typedef struct {
+    int nh; int nkv; int hd; int kvd; int sl;
+    float sc; float scap; int win; int ring_base; int ring_cap;
+} AttnBatchPushConst;
+
+/* Upper bound on the work of ONE attention dispatch, in
+ * query*key*heads*head_dim units. The kernels below put one workgroup on each
+ * (head, position) and let it walk the whole key range, so a single
+ * vkCmdDispatch costs O(npos_queries * seq_len * heads * head_dim) and grows
+ * QUADRATICALLY with the context. At 16k that is seconds of work inside one
+ * dispatch, which trips the Windows watchdog however the submissions are
+ * batched -- only a smaller dispatch helps.
+ *
+ * Split the QUERY axis instead. Position p is fully described by its row in Q,
+ * its row in the output, and the absolute sequence length seq_len + p; all
+ * three are plain offsets, so the split is bit-identical to one big dispatch.
+ *
+ * 2e10 units is the measured Vulkan attention rate rounded down hard: 16k keys
+ * x 1024 queries x 32 heads x 128 dims = 6.9e10 units took ~340 ms on the RTX
+ * 4070 Ti SUPER, i.e. ~0.1 s at this budget. Deliberately an order of magnitude
+ * inside the watchdog -- a too-small chunk only costs submit overhead, while
+ * the first overshoot costs the machine. Override with DLGO_VK_ATTN_UNITS. */
+#define VK_ATTN_UNITS_PER_DISPATCH 2.0e10
+static int vk_attn_query_chunk(int num_heads, int head_dim, int keys, int npos) {
+    double budget = VK_ATTN_UNITS_PER_DISPATCH;
+    const char* e = getenv("DLGO_VK_ATTN_UNITS");
+    if (e && e[0]) {
+        double v = atof(e);
+        if (v > 0.0) budget = v;
+    }
+    double per_query = (double)keys * (double)num_heads * (double)head_dim;
+    int chunk = npos;
+    if (per_query > 0.0) {
+        double c = budget / per_query;
+        if (c < 1.0) c = 1.0;
+        if (c < (double)npos) chunk = (int)c;
+    }
+    if (chunk < 1) chunk = 1;
+    return chunk;
+}
+
 static int batch_attention_f16_impl(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
                                     int num_heads, int num_kv_heads, int head_dim,
                                     int kv_dim, int start_seq_len, float scale, float softcap,
                                     int npos, int window, int ring_cap) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
+    if (npos <= 0) return GPU_OK;
+
     /* Every position in the batch is addressed by its absolute index, so the
      * ring needs no base: row = t % ring_cap. */
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; int win;
-             int ring_base; int ring_cap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap, window, 0, ring_cap};
-    DispatchParams dp = {0};
+    int q_dim = num_heads * head_dim;
+    int qchunk = vk_attn_query_chunk(num_heads, head_dim, start_seq_len + npos, npos);
     /* The KV4 experiment implements neither the window nor the ring, so a
      * windowed or ringed layer always takes the plain tiled kernel. It is
      * opt-in anyway. */
-    if (window <= 0 && ring_cap == 0 && attention_kv4_selected() && num_heads == 4 * num_kv_heads) {
-        dp.pipe = PIPE_ATTENTION_TILED_KV4;
-        dp.groups_x = num_kv_heads;
-    } else {
-        dp.pipe = PIPE_ATTENTION_TILED;
-        dp.groups_x = num_heads;
+    int use_kv4 = (window <= 0 && ring_cap == 0 && attention_kv4_selected() &&
+                   num_heads == 4 * num_kv_heads);
+
+    for (int base = 0; base < npos; base += qchunk) {
+        int n = npos - base;
+        if (n > qchunk) n = qchunk;
+        /* seq_len + pos_id is the absolute key count, so feeding the chunk's
+         * own base as seq_len reproduces the global causal bound exactly. */
+        AttnBatchPushConst pc =
+            {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len + base,
+             scale, softcap, window, 0, ring_cap};
+        DispatchParams dp = {0};
+        dp.pipe = use_kv4 ? PIPE_ATTENTION_TILED_KV4 : PIPE_ATTENTION_TILED;
+        dp.groups_x = use_kv4 ? num_kv_heads : num_heads;
+        dp.bufs[0] = out; dp.bufs[1] = q;
+        dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+        dp.num_bufs = 4;
+        dp.buf_offsets[0] = (uint64_t)base * (uint64_t)q_dim * 4u;
+        dp.buf_offsets[1] = (uint64_t)base * (uint64_t)q_dim * 4u;
+        dp.push_data = &pc; dp.push_size = sizeof(pc);
+        dp.groups_y = n; dp.groups_z = 1;
+        int rc = dispatch_compute(&dp);
+        if (rc != GPU_OK) return rc;
     }
-    dp.bufs[0] = out; dp.bufs[1] = q;
-    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
-    dp.num_bufs = 4;
-    dp.push_data = &pc; dp.push_size = sizeof(pc);
-    dp.groups_y = npos; dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    return GPU_OK;
 }
 
 int gpu_batch_attention_f16(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,
@@ -4703,18 +4944,35 @@ static int batch_attention_f16_sinks_impl(GpuBuf out, GpuBuf q, GpuBuf k_cache, 
                                           int npos, int window, int ring_cap) {
     if (!g.initialized) return GPU_ERR_INIT_FAIL;
     if (!g.pipelines_ready && gpu_load_pipelines() != GPU_OK) return GPU_ERR_SHADER;
-    struct { int nh; int nkv; int hd; int kvd; int sl; float sc; float scap; int win;
-             int ring_base; int ring_cap; } pc =
-        {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len, scale, softcap, window, 0, ring_cap};
-    DispatchParams dp = {0};
-    dp.pipe = PIPE_ATTENTION_TILED_SINKS;
-    dp.bufs[0] = out; dp.bufs[1] = q;
-    dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
-    dp.bufs[4] = sinks;
-    dp.num_bufs = 5;
-    dp.push_data = &pc; dp.push_size = sizeof(pc);
-    dp.groups_x = num_heads; dp.groups_y = npos; dp.groups_z = 1;
-    return dispatch_compute(&dp);
+    if (npos <= 0) return GPU_OK;
+
+    /* Same query-axis tiling as batch_attention_f16_impl: the sinks kernel has
+     * the identical (head, position) dispatch shape and the identical
+     * pos_id-derived addressing, so a chunk is just a buffer offset plus the
+     * chunk's base folded into seq_len. */
+    int q_dim = num_heads * head_dim;
+    int qchunk = vk_attn_query_chunk(num_heads, head_dim, start_seq_len + npos, npos);
+
+    for (int base = 0; base < npos; base += qchunk) {
+        int n = npos - base;
+        if (n > qchunk) n = qchunk;
+        AttnBatchPushConst pc =
+            {num_heads, num_kv_heads, head_dim, kv_dim, start_seq_len + base,
+             scale, softcap, window, 0, ring_cap};
+        DispatchParams dp = {0};
+        dp.pipe = PIPE_ATTENTION_TILED_SINKS;
+        dp.bufs[0] = out; dp.bufs[1] = q;
+        dp.bufs[2] = k_cache; dp.bufs[3] = v_cache;
+        dp.bufs[4] = sinks;
+        dp.num_bufs = 5;
+        dp.buf_offsets[0] = (uint64_t)base * (uint64_t)q_dim * 4u;
+        dp.buf_offsets[1] = (uint64_t)base * (uint64_t)q_dim * 4u;
+        dp.push_data = &pc; dp.push_size = sizeof(pc);
+        dp.groups_x = num_heads; dp.groups_y = n; dp.groups_z = 1;
+        int rc = dispatch_compute(&dp);
+        if (rc != GPU_OK) return rc;
+    }
+    return GPU_OK;
 }
 
 int gpu_batch_attention_f16_sinks(GpuBuf out, GpuBuf q, GpuBuf k_cache, GpuBuf v_cache,

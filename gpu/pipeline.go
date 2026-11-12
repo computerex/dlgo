@@ -85,6 +85,11 @@ type GpuPipeline struct {
 	// chunk. Set by ensurePrefillBatchState, which is also where the MoE scratch
 	// is allocated; DLGO_PREFILL_BATCH=0 disables it.
 	UseBatchPrefillHybridMoE bool
+	// UseCudaBatchPrefill routes prompt processing for pure-attention models
+	// through the CUDA batched kernels (Affine4/Affine8 tensor-core GEMM +
+	// query-tiled flash attention) instead of one GpuForward per prompt token.
+	// Only set when cudaBatchPrefillSupported reports the model is fully covered.
+	UseCudaBatchPrefill bool
 
 	// hasCPUAttn is true when ANY GPU layer needs the CPU attention fallback;
 	// batched prefill cannot serve those layers, so System One hidden
@@ -1275,6 +1280,18 @@ func NewGpuPipeline(cpuPipeline *llm.Pipeline) (*GpuPipeline, error) {
 	if os.Getenv("DLGO_NO_FUSED") == "1" {
 		pipe.UseFusedForward = false
 	}
+	if cudaActive {
+		// gpu/csrc is a Vulkan command-buffer recorder. Under CUDA its fused
+		// single-token dispatcher would run against an uninitialized Vulkan
+		// runtime and silently produce garbage, so it is never eligible.
+		pipe.UseFusedForward = false
+	}
+
+	// CUDA batched prefill is independent of DLGO_NO_FUSED: that only turns off
+	// the Vulkan-only fused single-token C dispatcher.
+	if os.Getenv("DLGO_PREFILL_BATCH") != "0" {
+		pipe.UseCudaBatchPrefill = cudaBatchPrefillSupported(m, gm, isPartial)
+	}
 
 	// GatedQ and SSM state were allocated inside the retry loop (so the VRAM
 	// floor check covers them). Just set the pipeline flags here.
@@ -1810,6 +1827,119 @@ func (p *GpuPipeline) patchScalarRow(slot, logicalPos int) error {
 	return UploadF32At(p.RoPESinTable, slot*half, sinSrc[logicalPos*half:(logicalPos+1)*half])
 }
 
+// ---- CUDA-graph decode -----------------------------------------------------
+// The dense decode step fires ~13 kernels x 36 layers and each launch costs
+// ~10 us on this WDDM driver (~4.9 ms of an 8.9 ms token, measured by
+// TestLaunchOverhead). Capturing that sequence once and replaying it per token
+// collapses the dispatch to a single submission. DLGO_CUDA_GRAPH=0 disables it.
+var (
+	graphDecodeWanted   = os.Getenv("DLGO_CUDA_GRAPH") != "0"
+	graphDecodeCaptured bool
+	// suppressHostIO makes gpuForwardCore skip its two host round-trips (the
+	// per-token embedding upload and the logits download), which cannot be part of
+	// a CUDA graph. The caller performs them around the capture/replay instead.
+	suppressHostIO bool
+)
+
+// finishLogits performs the decode step's host-side epilogue: copy the logits to
+// the host and apply the final softcap. Runs outside the captured graph.
+func (p *GpuPipeline) finishLogits() error {
+	if err := DownloadF32(p.RunState.Logits, p.LogitsBuf); err != nil {
+		return err
+	}
+	if capv := float64(p.CPUModel.Config.FinalLogitSoftcap); capv > 0 {
+		for i := range p.LogitsBuf {
+			p.LogitsBuf[i] = float32(capv * math.Tanh(float64(p.LogitsBuf[i])/capv))
+		}
+	}
+	return nil
+}
+
+// embedUpload prepares rs.X for the next token: dequantize its embedding row on
+// the host and upload it. This is the only per-token host input, so it runs
+// outside the captured graph and the graph itself stays memcpy-free.
+func (p *GpuPipeline) embedUpload(tok int32) error {
+	cfg := p.CPUModel.Config
+	x := make([]float32, cfg.EmbeddingDim)
+	if err := p.CPUModel.TokenEmbed.DequantizeRow(int(tok), x); err != nil {
+		return err
+	}
+	if cfg.EmbedScale != 0 {
+		for i := range x {
+			x[i] *= cfg.EmbedScale
+		}
+	}
+	return UploadF32(p.RunState.X, x)
+}
+
+// graphDecodeEligible reports whether this model/pipeline may use graph replay.
+// Replay carries a single winStart scalar, so a model with per-layer sliding
+// windows is excluded (the window start would differ per layer).
+func (p *GpuPipeline) graphDecodeEligible() bool {
+	if !graphDecodeWanted || !GraphReplaySupported() {
+		return false
+	}
+	for i := range p.CPUModel.Layers {
+		if p.CPUModel.Layers[i].Spec.SlidingWindow > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// forwardDecodeStep runs one decode token, through a captured CUDA graph when
+// possible. The first step is recorded and then immediately replayed: kernels are
+// only recorded during capture, so it would otherwise never execute.
+func (p *GpuPipeline) forwardDecodeStep(tok int32, slot int) error {
+	plain := func() error {
+		return GpuForward(p.CPUModel, p.GpuModel, tok, slot, p.KVCache, p.RunState, p.LogitsBuf, p)
+	}
+	if !p.graphDecodeEligible() {
+		return plain()
+	}
+	// Upload the token's embedding outside the graph (the only per-token input).
+	if err := p.embedUpload(tok); err != nil {
+		return err
+	}
+	if graphDecodeCaptured {
+		if err := GraphReplay(slot, slot+1, 0, 0); err != nil {
+			return err
+		}
+		return p.finishLogits()
+	}
+	if err := GraphCapture(); err != nil {
+		println("[gpu] cuda graph capture begin failed:", err.Error(), "- using per-launch decode")
+		graphDecodeWanted = false
+		GraphDiscard()
+		return plain()
+	}
+	suppressHostIO = true
+	ferr := gpuForwardCore(p.CPUModel, p.GpuModel, tok, nil, slot, p.KVCache, p.RunState, p.LogitsBuf, p)
+	suppressHostIO = false
+	cerr := GraphCaptureEnd()
+	if cerr != nil || ferr != nil {
+		msg := "capture end"
+		if cerr != nil {
+			msg = cerr.Error()
+		} else {
+			msg = ferr.Error()
+		}
+		println("[gpu] cuda graph capture failed:", msg, "- using per-launch decode")
+		graphDecodeWanted = false
+		GraphDiscard()
+		if ferr != nil {
+			return ferr
+		}
+		return plain() // capture failed, so the kernels never ran: redo the step
+	}
+	graphDecodeCaptured = true
+	println("[gpu] cuda graph captured: replaying per token")
+	if err := GraphReplay(slot, slot+1, 0, 0); err != nil {
+		return err
+	}
+	return p.finishLogits()
+}
+
 // generateSegments runs the shared prefill + decode loop. tokenSegs[i] is the
 // text tokenized for segment i; images[i] (if non-nil) is spliced after it.
 func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, images [][][]float32, cfg llm.GenerateConfig) (*GenerateResult, error) {
@@ -1863,6 +1993,12 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	if err := p.ensurePrefillBatchState(batchSize); err != nil {
 		return nil, err
 	}
+	// Refuse a prompt whose prefill would trip the display-driver watchdog. This
+	// is a hard error rather than a fallback because a TDR takes the whole
+	// desktop with it.
+	if err := p.checkPrefillTDRBudget(npos); err != nil {
+		return nil, err
+	}
 
 	prefillStart := time.Now()
 	pos := 0
@@ -1889,9 +2025,14 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 					return nil, err
 				}
 			}
-		} else if !p.UseFusedForward {
+		} else if !p.UseFusedForward && !p.UseCudaBatchPrefill {
+			ptrace := os.Getenv("DLGO_PREFILL_TRACE") != ""
+			pt0 := time.Now()
 			for i, tok := range tokens {
 				GpuForward(p.CPUModel, p.GpuModel, tok, i, p.KVCache, p.RunState, p.LogitsBuf, p)
+				if ptrace && i > 0 && i%256 == 0 {
+					println("prefill pos", i, "elapsed_ms", int(time.Since(pt0).Milliseconds()))
+				}
 			}
 		} else if p.HasMoE && !p.UseBatchPrefillHybridMoE {
 			for i, tok := range tokens {
@@ -1939,8 +2080,20 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			}
 			runChunks(cacheableLen, npos)
 		} else {
-			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-				p.BatchState, p.LogitsBuf, p.BatchLayerConfs, nil)
+			// Pure-attention dense model: run the prompt in chunks capped to the
+			// batch-buffer size. Passing the whole prompt here (the old behaviour)
+			// overflows bs.* (allocated for prefillChunkSize rows) and runs one
+			// giant per-layer dispatch, which exceeds the Windows 2 s TDR and
+			// resets the device on prompts longer than the chunk. Each chunk
+			// continues at startPos so attention sees the earlier tokens.
+			for cs := prefillFrom; cs < npos; cs += prefillChunkSize {
+				ce := cs + prefillChunkSize
+				if ce > npos {
+					ce = npos
+				}
+				GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens[cs:ce], p.KVCache, p.RunState,
+					p.BatchState, cs, p.LogitsBuf, p.BatchLayerConfs, nil)
+			}
 		}
 		pos = npos
 		slot = npos
@@ -2243,7 +2396,7 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 			}
 		} else if p.UseFusedForward {
 			GpuForwardFusedSSM(p.CPUModel, p.GpuModel, lastTok, slot, p.KVCache, p.RunState, p.LogitsBuf, p.LayerConfs, p)
-		} else if err := GpuForward(p.CPUModel, p.GpuModel, lastTok, slot, p.KVCache, p.RunState, p.LogitsBuf, p); err != nil {
+		} else if err := p.forwardDecodeStep(lastTok, slot); err != nil {
 			return nil, err
 		}
 		slot++
@@ -2595,13 +2748,29 @@ func (p *GpuPipeline) SystemOneHidden(state string, q llm.SystemOneQuestion, cfg
 			Sync()
 		}
 	} else {
-		// Pure-attention model: single batched prefill covering every token.
-		if err := p.ensurePrefillBatchState(npos); err != nil {
+		// Pure-attention model: chunk the batched prefill so a long prompt does
+		// not run one giant per-layer dispatch (which exceeds the Windows 2 s TDR
+		// and resets the device). Buffers are sized to the chunk, not npos.
+		const prefillChunkSize = 512
+		batchSize := npos
+		if batchSize > prefillChunkSize {
+			batchSize = prefillChunkSize
+		}
+		if err := p.ensurePrefillBatchState(batchSize); err != nil {
 			return nil, nil, 0, fmt.Errorf("gpu: systemone batch alloc: %w", err)
 		}
-		GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens, p.KVCache, p.RunState,
-			p.BatchState, nil, p.BatchLayerConfs, hidden)
-		Sync()
+		for startPos := 0; startPos < npos; startPos += prefillChunkSize {
+			if err := cfg.Err(); err != nil {
+				return nil, nil, 0, err
+			}
+			end := startPos + prefillChunkSize
+			if end > npos {
+				end = npos
+			}
+			GpuForwardPrefillBatch(p.CPUModel, p.GpuModel, tokens[startPos:end], p.KVCache, p.RunState,
+				p.BatchState, startPos, nil, p.BatchLayerConfs, hidden)
+			Sync()
+		}
 	}
 
 	// A failed download would leave the buffer all zeros; RMSNorm output can
@@ -2989,6 +3158,69 @@ func (p *GpuPipeline) systemOneMultiPerQuestion(state string, questions []llm.Sy
 // batch path, and hybrid SSM+attention models use the hybrid batch path.
 func supportsBatchPrefillGPU(m *llm.Model) bool {
 	return true
+}
+
+// vulkanPrefillTDRLimit is the longest prompt the Vulkan batched prefill accepts
+// without an explicit opt-in.
+//
+// The original reason for this cap was structural, not a hardware limit: the
+// batch prefill recorded EVERY layer of a chunk into one command buffer, and the
+// batched attention dispatch covered the whole query chunk against the whole key
+// range, so a long prompt became a single multi-second submission and Windows
+// reset the display adapter (TDR counters are unset on this machine, so the
+// watchdog is the 2 s default). Both of those are now bounded inside the
+// backend, and each bound is configurable and self-measuring:
+//
+//   - gpu/csrc/vulkan_gpu.c cuts a recording into submissions of at most
+//     DLGO_VK_SUBMIT_BUDGET_MS (default 500 ms) using the wall time of the
+//     previous submission as its cost model, so no single vkQueueSubmit can
+//     accumulate more work than the watchdog allows;
+//   - batch_attention_f16_impl tiles the QUERY axis, so one attention dispatch
+//     no longer grows quadratically with the context (DLGO_VK_ATTN_UNITS);
+//   - the cooperative-matrix GEMMs tile the TOKEN axis, so one GEMM dispatch no
+//     longer grows linearly with the prompt (DLGO_VK_GEMM_UNITS).
+//
+// This constant is therefore a second line of defence, not the primary one.
+//
+// Measured on 2026-11-12 with the tiling in place (RTX 4070 Ti SUPER, default
+// 500 ms budget): a 15,999-token prompt completes in 71.8 s with a slowest
+// submission of 71.9 ms (28x inside the 2 s watchdog, 0 budget overshoots) and
+// returns the needle correctly; an 8,046-token prompt completes in 19 s with a
+// slowest submission of 66.8 ms at a 200 ms budget. Before the tiling the same
+// 16k prompt reset the adapter. The limit is set to the largest size actually
+// measured; raise it only against a fresh measurement of the same shape.
+// DLGO_VK_PREFILL_LIMIT overrides it (0 = no limit) so a longer prompt can be
+// measured instead of guessed at.
+const vulkanPrefillTDRLimit = 16384
+
+// checkPrefillTDRBudget refuses prompt sizes that could still exceed the
+// display-driver watchdog on the batched Vulkan paths. The per-token path is
+// exempt: it fires one small dispatch per token, which is slow but never trips
+// the watchdog.
+func (p *GpuPipeline) checkPrefillTDRBudget(npos int) error {
+	limit := vulkanPrefillTDRLimit
+	if v := os.Getenv("DLGO_VK_PREFILL_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			limit = n
+		}
+	}
+	if cudaActive || limit <= 0 || npos <= limit {
+		return nil
+	}
+	batched := p.UseFusedForward || p.UseBatchPrefill || p.UseBatchPrefillHybridMoE ||
+		(!p.IsPartialGPU && !p.HasMoE && !isHybridSSMModel(p.CPUModel))
+	if !batched {
+		return nil
+	}
+	if os.Getenv("DLGO_ALLOW_LONG_VULKAN_PREFILL") == "1" {
+		fmt.Fprintf(os.Stderr, "[dlgo/gpu] WARNING: %d-token prompt on Vulkan exceeds the "+
+			"configured prefill limit; a display-driver reset is possible\n", npos)
+		return nil
+	}
+	return fmt.Errorf("gpu: %d-token prompt exceeds the Vulkan prefill limit (%d tokens). "+
+		"The backend tiles submissions, attention and GEMMs to stay inside the display-driver "+
+		"watchdog, but this prompt size has not been measured on this machine. Set "+
+		"DLGO_VK_PREFILL_LIMIT=0 (or use DLGO_GPU_BACKEND=cuda) to attempt it", npos, limit)
 }
 
 // isHybridSSMModel returns true if the model has both SSM and attention layers,
