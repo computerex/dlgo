@@ -240,7 +240,8 @@ func TestAllocSSMScratch_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success: %v", err)
 	}
-	if rs.SSMQKV == 0 || rs.SSMZ == 0 || rs.SSMAlpha == 0 || rs.SSMBeta == 0 || rs.SSMY == 0 {
+	if rs.SSMQKV == 0 || rs.SSMZ == 0 || rs.SSMAlpha == 0 || rs.SSMBeta == 0 ||
+		rs.SSMY == 0 || rs.SSMPred == 0 {
 		t.Fatal("expected all SSM scratch bufs non-zero")
 	}
 }
@@ -778,8 +779,9 @@ func TestAllocSSMScratch_ExactAllocCount(t *testing.T) {
 
 	rs := &GpuRunState{}
 	_ = rs.AllocSSMScratch(1024, 512, 32)
-	if count != 5 {
-		t.Fatalf("expected 5 allocations, got %d", count)
+	// SSMQKV, SSMZ, SSMAlpha, SSMBeta, SSMY, SSMPred.
+	if count != 6 {
+		t.Fatalf("expected 6 allocations, got %d", count)
 	}
 }
 

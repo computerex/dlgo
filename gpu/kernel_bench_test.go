@@ -191,7 +191,6 @@ func TestBenchGemmQ6K(t *testing.T) {
 	t.Logf("gemm_q6k batched: %.3f ms/dispatch (vs %.3f ms single-submit)",
 		float64(bestB.Microseconds())/float64(nb)/1000, float64(best.Microseconds())/1000)
 
-
 	flops := 2.0 * float64(rows) * float64(cols) * float64(npos)
 	t.Logf("gemm_q6k: rows=%d cols=%d npos=%d  %.2f GFLOP/call  %.2f TFLOPS",
 		rows, cols, npos, flops/1e9, flops/1e12/best.Seconds())
@@ -439,7 +438,12 @@ func TestAttentionF16Parity(t *testing.T) {
 		t.Skip(err)
 	}
 	t.Cleanup(Shutdown)
-	t.Cleanup(func() { SetAttentionF16(true) })
+	t.Cleanup(func() { SetAttentionF16(true); SetAttentionCoopmat(true) })
+
+	// gpu_attention_full_f32 picks the coopmat kernel before consulting the f16
+	// toggle, and coopmat is on by default for head_dim 128. Disable it here so
+	// the f16 toggle actually selects the SIMT kernels this test compares.
+	SetAttentionCoopmat(false)
 
 	seq := benchEnvInt("BENCH_SEQ", 4175)
 	heads := benchEnvInt("BENCH_HEADS", 30)
@@ -1164,4 +1168,3 @@ func TestBenchAffineStream(t *testing.T) {
 		timeit(f.name, len(f.enc), flops, 10, streamBatch, fn)
 	}
 }
-
