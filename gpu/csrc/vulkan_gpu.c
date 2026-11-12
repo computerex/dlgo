@@ -1354,9 +1354,15 @@ int gpu_download(void* dst, GpuBuf src, uint64_t size_bytes, uint64_t offset) {
             VkBufferCopy region = {src_off, 0, chunk};
             vkCmdCopyBuffer_(g.cmd_buf, ba->buffer, g.staging_buf, 1, &region);
             g.dispatch_count++;
-            // Must end batch to get the data, then read staging
+            /* The batch has to be submitted here to read the staging buffer,
+             * but it must be re-opened afterwards: the caller may record more
+             * work after this download, and without this those commands would
+             * go into an already-submitted command buffer and be silently
+             * dropped. Splitting one batch into two submissions is always
+             * correct; losing the tail is not. */
             gpu_end_batch();
             memcpy(p, g.staging_mapped, chunk);
+            gpu_begin_batch();
         } else {
             begin_cmd();
             VkBufferCopy region = {src_off, 0, chunk};

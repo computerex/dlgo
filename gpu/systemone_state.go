@@ -239,18 +239,23 @@ func (p *GpuPipeline) restoreState(s *GpuStateSnapshot, restoreKV bool) error {
 		return fmt.Errorf("gpu: invalid state snapshot prefix length %d", s.kvLen)
 	}
 	Sync()
-	BeginBatch()
+	// Each copy is submitted and waited on its own, deliberately NOT batched.
+	// Restore is a rare operation (once per prefix switch) so the extra
+	// submit/fence round trips are irrelevant, while a batch introduces a whole
+	// class of silent-loss hazards: anything that ends or re-opens the
+	// recording mid-way (Download does, see gpu_download) drops the commands
+	// recorded after it, and a restore that silently copies nothing leaves the
+	// live state holding whatever the previous branch wrote. Two snapshot tests
+	// failed intermittently on exactly that symptom.
 	if restoreKV {
 		for l := range s.kvKeys {
 			if s.kvKeys[l] == 0 {
 				continue
 			}
 			if err := CopyRegion(p.KVCache.KeyBufs[l], 0, s.kvKeys[l], 0, s.kvBytes); err != nil {
-				EndBatch()
 				return fmt.Errorf("gpu: KV restore layer %d: %w", l, err)
 			}
 			if err := CopyRegion(p.KVCache.ValBufs[l], 0, s.kvVals[l], 0, s.kvBytes); err != nil {
-				EndBatch()
 				return fmt.Errorf("gpu: KV restore layer %d: %w", l, err)
 			}
 		}
@@ -260,15 +265,12 @@ func (p *GpuPipeline) restoreState(s *GpuStateSnapshot, restoreKV bool) error {
 			continue
 		}
 		if err := CopyRegion(p.GpuModel.Layers[l].SSMState, 0, s.ssmState[l], 0, s.ssmStateBytes); err != nil {
-			EndBatch()
 			return fmt.Errorf("gpu: SSM restore layer %d: %w", l, err)
 		}
 		if err := CopyRegion(p.GpuModel.Layers[l].SSMConvBuf, 0, s.ssmConv[l], 0, s.ssmConvBytes); err != nil {
-			EndBatch()
 			return fmt.Errorf("gpu: SSM conv restore layer %d: %w", l, err)
 		}
 	}
-	EndBatch()
 	p.KVCache.Len = s.kvLen
 	Sync()
 	return nil
