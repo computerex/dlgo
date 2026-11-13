@@ -177,6 +177,17 @@ func cpuAttn(q, kc, vc []float32, numHeads, numKVHeads, headDim, kvDim, startPos
 	return out
 }
 
+// padKV appends 32 zeroed rows to a KV-cache image. The prefill attention
+// kernel rounds its last key tile UP to 32 keys, so those rows must be readable
+// and finite -- the extra keys are causally masked, so their values are
+// irrelevant, but a stray NaN in V would make 0*V a NaN and poison the row. A
+// real KV cache is allocated with the whole context, so it always has the room.
+func padKV(data []byte, kvDim int) []byte {
+	out := make([]byte, len(data)+32*kvDim*2)
+	copy(out, data)
+	return out
+}
+
 func TestBatchAttnParity(t *testing.T) {
 	affineInit(t)
 	cases := []struct {
@@ -205,21 +216,21 @@ func TestBatchAttnParity(t *testing.T) {
 			if err := Upload(qb, affF32Bytes(q)); err != nil {
 				t.Fatal(err)
 			}
-			kb, err := Alloc(uint64(len(kf) * 2))
+			kb, err := Alloc(uint64(len(kf)+32*kvDim) * 2)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer Free(kb)
-			vb, err := Alloc(uint64(len(vf) * 2))
+			vb, err := Alloc(uint64(len(vf)+32*kvDim) * 2)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer Free(vb)
 			// f16 rounding on the host, matching the kernel's view of the cache.
-			if err := Upload(kb, f16bytes(kf)); err != nil {
+			if err := Upload(kb, padKV(f16bytes(kf), kvDim)); err != nil {
 				t.Fatal(err)
 			}
-			if err := Upload(vb, f16bytes(vf)); err != nil {
+			if err := Upload(vb, padKV(f16bytes(vf), kvDim)); err != nil {
 				t.Fatal(err)
 			}
 			ob, err := Alloc(uint64(len(q) * 4))

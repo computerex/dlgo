@@ -185,6 +185,93 @@ func TestAttentionBandwidth(t *testing.T) {
 	}
 }
 
+// Measures the batched prefill attention kernel by itself, in TFLOP/s of causal
+// attention work (QK^T + P*V). This is the number that has to move for prefill
+// parity: the same work costs llama.cpp about 2.3 s at 16k, i.e. ~55 TFLOP/s.
+//
+// Causal FLOPs per head = 2 * 2 * headDim * (npos*(npos+1)/2), so
+//   FLOPs = 2 * numHeads * headDim * npos * (npos+1).
+func benchPrefillAttn(t *testing.T, numHeads, numKVHeads, headDim, npos, iters int) {
+	if err := Init(); err != nil {
+		t.Skipf("init: %v", err)
+	}
+	kvDim := numKVHeads * headDim
+	qf := make([]float32, npos*numHeads*headDim)
+	for i := range qf {
+		qf[i] = float32(math.Sin(float64(i) * 0.001))
+	}
+	qb := make([]byte, len(qf)*4)
+	for i, v := range qf {
+		bits := math.Float32bits(v)
+		qb[i*4] = byte(bits)
+		qb[i*4+1] = byte(bits >> 8)
+		qb[i*4+2] = byte(bits >> 16)
+		qb[i*4+3] = byte(bits >> 24)
+	}
+	kvbytes := make([]byte, npos*kvDim*2)
+	for i := range kvbytes {
+		kvbytes[i] = byte(i*7 + 1)
+	}
+	Q, err := Alloc(uint64(len(qb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Free(Q)
+	K, err := Alloc(uint64(len(kvbytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Free(K)
+	V, err := Alloc(uint64(len(kvbytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Free(V)
+	O, err := Alloc(uint64(len(qb)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Free(O)
+	if err := Upload(Q, qb); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upload(K, kvbytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upload(V, kvbytes); err != nil {
+		t.Fatal(err)
+	}
+
+	scale := float32(1.0 / math.Sqrt(float64(headDim)))
+	run := func() {
+		if err := AttnPrefillF16(O, Q, K, V, numHeads, numKVHeads, headDim, kvDim,
+			0, npos, scale, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run()
+	if err := Sync(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 0; i < iters; i++ {
+		run()
+	}
+	if err := Sync(); err != nil {
+		t.Fatal(err)
+	}
+	per := time.Since(start).Seconds() / float64(iters)
+	flops := 2.0 * float64(numHeads) * float64(headDim) * float64(npos) * float64(npos+1)
+	t.Logf("prefill-attn heads=%d kv=%d hd=%d npos=%d  %.3f ms/call  %.1f TFLOP/s",
+		numHeads, numKVHeads, headDim, npos, per*1e3, flops/per/1e12)
+}
+
+func TestPrefillAttnThroughput(t *testing.T) {
+	for _, n := range []int{4096, 16384} {
+		benchPrefillAttn(t, 32, 8, 128, n, 3)
+	}
+}
+
 // TestLaunchOverhead measures the cost of dispatching one (trivial) kernel.
 // Decode fires ~13 kernels per layer, so this dominates when it is ~10 us.
 func TestLaunchOverhead(t *testing.T) {

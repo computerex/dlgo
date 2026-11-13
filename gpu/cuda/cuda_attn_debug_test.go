@@ -25,15 +25,15 @@ func TestDbgAttnOne(t *testing.T) {
 
 	qb, _ := Alloc(uint64(len(q) * 4))
 	defer Free(qb)
-	kb, _ := Alloc(uint64(len(kf) * 2))
+	kb, _ := Alloc(uint64(len(kf)+32*kvDim) * 2)
 	defer Free(kb)
-	vb, _ := Alloc(uint64(len(vf) * 2))
+	vb, _ := Alloc(uint64(len(vf)+32*kvDim) * 2)
 	defer Free(vb)
 	ob, _ := Alloc(uint64(len(q) * 4))
 	defer Free(ob)
 	Upload(qb, affF32Bytes(q))
-	Upload(kb, f16bytes(kf))
-	Upload(vb, f16bytes(vf))
+	Upload(kb, padKV(f16bytes(kf), kvDim))
+	Upload(vb, padKV(f16bytes(vf), kvDim))
 	Memset8(ob, 0, uint64(len(q)*4))
 
 	if err := AttnPrefillF16(ob, qb, kb, vb, numHeads, numKVHeads, headDim, kvDim,

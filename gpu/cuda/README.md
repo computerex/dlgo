@@ -102,6 +102,47 @@ End-to-end decode (Qwen3-4B Q4_K_M, `cmd/llmbench`, 128 tokens), in-session A/B:
 530 ctx 154.9 tok/s (was 154.1), 4114 ctx 123.8 (was 111.7), 16392 ctx 79.7
 (was 59.8). The 16k needle is still answered correctly.
 
+## Prefill attention: what actually made it faster (and what did not)
+
+`dl_attn_prefill_f16` was rewritten from "4 warps share a 32-key K/V tile staged
+in shared memory" to "one warp per 16-query tile, mma fragments loaded straight
+from the cache, no `__syncthreads()` in the key loop, each warp running to its
+own causal end". Measured on `TestPrefillAttnThroughput`
+(`go test ./gpu/cuda/ -run TestPrefillAttnThroughput -v`):
+
+| version | 4k | 16k |
+|---|---|---|
+| staged K/V, block-wide tiles | 11.2 TFLOP/s | 12.5 TFLOP/s |
+| no staging, per-warp causal end | 11.9 | 13.1 |
+| ...and no per-iteration `__syncwarp()` | 13.7 | 15.0 |
+| ...and fully unrolled d-loops (loads pipelined) | **16.3** | **16.6** |
+
+Two lessons, because the obvious diagnosis was wrong:
+
+1. **Occupancy was not the limit.** The no-staging rewrite cut static shared
+   memory from 44 KB to 28 KB (2 -> 3 blocks/SM), removed two block-wide
+   barriers per 32-key tile and let each warp stop at its own causal end. All of
+   that bought 5%. The staged version was already reading K/V once per block and
+   therefore had *better* L2 reuse than the per-warp version, which reads each
+   row once per warp.
+2. **Memory-level parallelism was the limit.** The win came from making the
+   d-loops fully unrollable (`for (d=0; d<DLATT_HD; d+=16) { if (d>=headDim) break; ... }`
+   with `#pragma unroll`, so headDim stays a runtime bound while the compiler
+   still sees 8 static iterations) and from deleting the redundant `__syncwarp()`
+   that had been sitting *inside* them. The compiler could then hoist several K/V
+   fragment loads above the mma chain instead of each mma waiting ~500 cycles for
+   its own load: 13.1 -> 16.6 TFLOP/s.
+
+End-to-end prefill: 16k 9519 -> 8601 ms (1722 -> 1906 tok/s), 4k 1350 -> 1322 ms,
+512 unchanged (it is GEMM-bound). llama.cpp is 2322 ms, so the gap is 3.7x.
+
+Still open, in order: attention is at 16.6 TFLOP/s where llama is at ~55 (the
+remaining structural gap needs higher arithmetic intensity per KV byte -- bigger
+query tiles, or applying the softmax to the mma accumulator fragments instead of
+round-tripping scores through shared memory -- and/or int8 tensor cores), then
+int8/int4 MMA for the GEMM itself.
+
+
 The v1-only numbers that this replaced, for reference:
 
 | ctx | `dl_attention_split_f16` + combine | GB/s (KV) |
