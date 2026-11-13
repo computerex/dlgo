@@ -1596,11 +1596,29 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
     const int kEnd = startPos + q0 + nq - 1;
     for (int k0 = 0; k0 <= kEnd; k0 += DLATT_KTOK) {
         const int nk = min(DLATT_KTOK, kEnd + 1 - k0);
-        for (int i = threadIdx.x; i < DLATT_KTOK * DLATT_HD; i += DLATT_THREADS) {
+        // 8 halves (16 B) per access. The scalar form issued 128 two-byte loads
+        // per thread per key tile, which at 16k ctx is the largest single
+        // instruction count in the kernel. f16 cache rows are headDim*2-byte
+        // aligned and DLATT_HD is 128, so each chunk is a legal 16-byte
+        // transaction; headDim < DLATT_HD zero-fills the tail columns scalar.
+        for (int ch = threadIdx.x; ch < DLATT_KTOK * (DLATT_HD / 8); ch += DLATT_THREADS) {
+            const int i = ch * 8;
             const int r = i / DLATT_HD, c = i % DLATT_HD;
             const size_t src = (size_t)(k0 + r) * kvDim + kvh * headDim + c;
-            sK[i] = (r < nk && c < headDim) ? kCache[src] : __float2half(0.f);
-            sV[i] = (r < nk && c < headDim) ? vCache[src] : __float2half(0.f);
+            if (r >= nk) {
+                *reinterpret_cast<int4*>(sK + i) = make_int4(0, 0, 0, 0);
+                *reinterpret_cast<int4*>(sV + i) = make_int4(0, 0, 0, 0);
+            } else if (c + 8 <= headDim) {
+                *reinterpret_cast<int4*>(sK + i) = *reinterpret_cast<const int4*>(kCache + src);
+                *reinterpret_cast<int4*>(sV + i) = *reinterpret_cast<const int4*>(vCache + src);
+            } else {
+#pragma unroll
+                for (int t = 0; t < 8; t++) {
+                    const bool ok = (c + t) < headDim;
+                    sK[i + t] = ok ? kCache[src + t] : __float2half(0.f);
+                    sV[i + t] = ok ? vCache[src + t] : __float2half(0.f);
+                }
+            }
         }
         __syncthreads();
 
@@ -1643,11 +1661,15 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
             }
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
             const float mnew = fmaxf(mrun, mx);
-            const float corr = expf(mrun - mnew);
+            // __expf: P is stored as f16 (11-bit mantissa) below, so the
+            // approximate exponential costs no accuracy, and the precise expf
+            // expands to ~25 instructions in a loop that runs 16 times per key
+            // tile.
+            const float corr = __expf(mrun - mnew);
             float sum = 0.0f;
 #pragma unroll
             for (int j = 0; j < 16; j++) {
-                const float e = expf(srow[j] - mnew);
+                const float e = __expf(srow[j] - mnew);
                 srow[j] = e;
                 sP[warp][row * DLATT_KTOK + halfk * 16 + j] = __float2half(e);
                 sum += e;
@@ -1660,13 +1682,20 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
             // row, so the factor is broadcast through a 16x16 tile and applied
             // fragment-wise: both fragments share a layout, so the product is
             // row-correct. (sS is free here - P already lives in sP.)
-            __syncwarp();
-            if (halfk == 0) {
+            //
+            // Skipped entirely when no row's running max moved. With a causal
+            // mask over a monotonically growing window that is every key tile
+            // after the first, and the rescale costs DLATT_HD/16 fragment
+            // multiplies plus a shared round trip. __any_sync keeps the branch
+            // warp-uniform, which the __syncwarp()s inside require (and
+            // __expf(0) is exactly 1.0f, so the test is exact).
+            if (__any_sync(0xffffffffu, corr != 1.0f)) {
+                __syncwarp();
+                if (halfk == 0) {
 #pragma unroll
-                for (int c = 0; c < 16; c++) sS[warp][row * 16 + c] = corr;
-            }
-            __syncwarp();
-            {
+                    for (int c = 0; c < 16; c++) sS[warp][row * 16 + c] = corr;
+                }
+                __syncwarp();
                 nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cf;
                 nvcuda::wmma::load_matrix_sync(cf, sS[warp], 16, nvcuda::wmma::mem_row_major);
 #pragma unroll
