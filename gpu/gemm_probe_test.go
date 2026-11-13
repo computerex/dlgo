@@ -27,6 +27,9 @@ func TestProbePrefillGemm(t *testing.T) {
 		t.Skip(err)
 	}
 	t.Cleanup(Shutdown)
+	if !cudaActive {
+		t.Skip("CUDA backend not active")
+	}
 
 	type shape struct {
 		name       string

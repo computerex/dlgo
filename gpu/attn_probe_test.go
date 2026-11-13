@@ -18,6 +18,9 @@ func TestProbePrefillAttn(t *testing.T) {
 		t.Skip(err)
 	}
 	t.Cleanup(Shutdown)
+	if !cudaActive {
+		t.Skip("CUDA backend not active")
+	}
 
 	numHeads, numKVHeads, headDim := 32, 8, 128
 	kvDim := numKVHeads * headDim

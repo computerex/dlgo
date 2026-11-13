@@ -232,3 +232,17 @@ Optimization log (measured; keep before "optimizing" again):
 powershell -File gpu/cuda/build_cuda.ps1          # rebuild kernels.cubin (needs VS2022 + CUDA)
 go test ./gpu/cuda/                                # parity + smoke tests
 ```
+
+## Prefill: where the time actually goes (measured, not inferred)
+
+`DLGO_CUDA_SKIP_OPS=<op-class>` elides one op class from the batched prefill, so the drop in total prefill time is that class's exact cost. Use it instead of `Sync()`-bracketing: a `cuStreamSynchronize` on this WDDM box costs ~800 us, which dwarfs every op and once inflated a 164 ms prefill into 472 ms of profile.
+
+At 16392 tokens (7739 ms) on Qwen3-4B-Q4_K_M: prefill attention 4781 ms (62%, 17 TFLOP/s), the five GEMMs 2204 ms (28%, 54 TFLOP/s), everything else 755 ms. At 530 tokens (127 ms): GEMM 107 ms (84%, 36 TFLOP/s), attention 11 ms, other 9 ms.
+
+So the two bottlenecks differ, and neither is 'flash attention at long context' alone:
+
+* **Attention is DRAM-bound on K/V re-reads.** One warp owns 16 queries and reads the whole K/V range for them, so a 64-query block re-reads K/V once per tile: 69 GB at 16k = 519 GB/s = 77% of peak. The 17 TFLOP/s is the bandwidth wall. Raising it needs 128+ queries per K/V load; doing so by doubling the query tile and halving the key tile to fit the 48 KB static shared limit made it worse (17.0 -> 10.9 TFLOP/s), so it needs dynamic shared memory or a flash-decoding split over keys.
+* **The GEMM is limited by block count at small batch, not by tiling.** The 128x128 tile reaches 47 TFLOP/s at 512 tokens and 60 at 16k in isolation, but `down` at 512 is only 80 blocks for 66 SMs (~1.2 waves), so the second wave is 21% full. Split-K is the fix, not a bigger tile.
+* **llama.cpp sustains ~83 TFLOP/s of the same work** at pp512, above what a dequantise-to-f16 GEMM reaches here, so the remaining gap is the int8 MMA path (MMQ). dlgo's Affine4 block is already one 32-weight group with f16 scale `d` and offset `m`, i.e. weights are `d*q + m`; the int8 route needs the `m` term as `coef = 8d + m` times the group sum of X, a secondary K=cols/32 GEMM worth about 3% of the main one.
+
+Harnesses: `gpu/gemm_probe_test.go` (the five Qwen3-4B GEMM shapes) and `gpu/attn_probe_test.go` (one layer of prefill attention, whole-prompt versus the chunked sequence the pipeline issues). `DLGO_DEBUG_ATTN=1` logs the launch geometry.
