@@ -42,6 +42,7 @@ type Kernels struct {
 	VectorAdd, KVStoreF16, RMSNorm, SiluMul, SoftmaxRow, Probe7, HalfProbe uint64
 	LayerNorm, RMSNormHeads, Add, Scale, AddRMSNorm, RoPE, AttentionF16    uint64
 	AttentionSplitF16, AttentionCombine                                    uint64
+	AttnSplitV2D2, AttnSplitV2D4                                          uint64
 	GemvQ4K, GemvQ6K, GemvF32, GemvF16                                     uint64
 	QuantizeX, GemvQ4KDp4a                                                 uint64
 	GemvQ4KBc                                                              uint64
@@ -107,6 +108,8 @@ func Init() error {
 			{"dl_rope", &kernels.RoPE},
 			{"dl_attention_f16", &kernels.AttentionF16},
 			{"dl_attention_split_f16", &kernels.AttentionSplitF16},
+			{"dl_attn_split_v2_d2", &kernels.AttnSplitV2D2},
+			{"dl_attn_split_v2_d4", &kernels.AttnSplitV2D4},
 			{"dl_attention_combine", &kernels.AttentionCombine},
 			{"dl_gemv_q4k", &kernels.GemvQ4K},
 			{"dl_gemv_q6k", &kernels.GemvQ6K},
@@ -515,7 +518,7 @@ func RoPE(q, k, cosT, sinT Buffer, numHeads, numKVHeads, headDim, ropeDim, pos i
 const (
 	attnThreads   = 256
 	attnTile      = 256
-	attnMaxSplits = 32
+	attnMaxSplits = 64
 )
 
 // cudaAttnSplits overrides the split count (experiments); 0 = derive from ctx.
@@ -707,10 +710,17 @@ func AttentionF16(q, kc, vc, out Buffer, numHeads, numKVHeads, headDim, kvDim,
 		kvMul := numHeads / numKVHeads
 		tph := attnThreads / kvMul
 		if kvMul <= 8 && attnThreads%kvMul == 0 && tph >= 32 && tph%32 == 0 && kvMul*headDim <= 512 {
-			// Split count: fixed at the max. Measured (RTX 4070 Ti SUPER, 32
-			// heads / 8 KV heads / head_dim 128): 32 splits is best or tied at
-			// every context length from 512 to 12000, because the kernel is
-			// latency-bound well below peak bandwidth.
+			// Split count. Measured (RTX 4070 Ti SUPER, 32 heads / 8 KV heads /
+			// head_dim 128): this kernel is parallelism-limited, not
+			// bandwidth-limited -- 8 -> 16 -> 32 splits each bought ~1.7-1.8x at
+			// 12k ctx, and 64 splits another 1.8x (0.2135 -> 0.1191 ms/layer,
+			// 230 -> 413 GB/s). 128 is no better and hurts short contexts.
+			//
+			// It MUST NOT depend on n. A captured CUDA graph bakes the grid into
+			// the replay, so a split count derived from the live key count makes
+			// the graph replay whatever tiny grid was live at capture time:
+			// capturing at n=1 and replaying at n=4114 cost 10x decode
+			// (111 -> 11 tok/s).
 			splits := cudaAttnSplits
 			if splits <= 0 {
 				splits = attnMaxSplits
@@ -723,9 +733,22 @@ func AttentionF16(q, kc, vc, out Buffer, numHeads, numKVHeads, headDim, kvDim,
 			if err != nil {
 				return err
 			}
-			nw := attnThreads / 32
-			shared := (kvMul*headDim + kvMul*attnTile + kvMul*nw + 5*kvMul) * 4
-			if err := launchN(kernels.AttentionSplitF16, numKVHeads, splits, attnThreads, shared, [][]byte{
+			// v2 (one warp per query head, lane-parallel 8-byte K/V loads, no
+			// shared memory) covers head_dim 64 and 128; other shapes keep the
+			// v1 key-per-thread kernel.
+			kfn := kernels.AttentionSplitF16
+			threads := attnThreads
+			shared := 0
+			switch {
+			case kvMul >= 2 && headDim == 128:
+				kfn, threads = kernels.AttnSplitV2D4, kvMul*32
+			case kvMul >= 2 && headDim == 64:
+				kfn, threads = kernels.AttnSplitV2D2, kvMul*32
+			default:
+				nw := attnThreads / 32
+				shared = (kvMul*headDim + kvMul*attnTile + kvMul*nw + 5*kvMul) * 4
+			}
+			if err := launchN(kfn, numKVHeads, splits, threads, shared, [][]byte{
 				ptrb(q), ptrb(kc), ptrb(vc), ptrb(part),
 				i32b(numHeads), i32b(numKVHeads), i32b(headDim), i32b(kvDim),
 				i32b(seqLen), f32b(scale), f32b(softcap), i32b(winStart),

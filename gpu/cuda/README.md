@@ -68,8 +68,41 @@ Without `DLGO_GPU_BACKEND=cuda` nothing changes — Vulkan stays the default
 | Vulkan (default) | ~121 tok/s | **83.5 @ 2.2k, 122.9 @ 5k** tok/s |
 | CUDA (this backend) | ~112 tok/s | **90.9 @ ~5k** tok/s (was 48.5) |
 
-Sequence-length sweep of the new attention kernel alone (32 heads / 8 KV heads /
-head_dim 128, one call = one layer at that context):
+Sequence-length sweep of the decode attention kernel alone (32 heads / 8 KV
+heads / head_dim 128, one call = one layer at that context). Current kernel is
+v2 (`dl_attn_split_v2_d4`, warp-per-query-head); v1 (`dl_attention_split_f16`,
+key-per-thread) is retained for head_dims other than 64/128:
+
+| ctx | v1 | v2 + combine | GB/s (KV), v2 |
+|---|---|---|---|
+| 512 | 0.0181 ms | 0.0120 ms | 175 |
+| 1024 | 0.0243 | 0.0157 | 268 |
+| 2048 | 0.0253 | 0.0212 | 395 |
+| 5000 | 0.0542 | 0.0367 | 558 |
+| 12000 | 0.2135 | 0.1191 | 413 |
+
+v2 exists because v1 scores one key per thread: a warp load touches 32 different
+256-byte K rows and its P*V pass reads V two bytes at a time, which measured
+230 GB/s (34% of peak) and was latency-bound, not bandwidth-bound. v2 puts one
+warp on one (query head, key split) with the 32 lanes spread across head_dim, so
+a single load covers a whole K/V row, and it consumes keys 16 at a time so 16 K
+loads (pass 1) and then 16 V loads (pass 2) are in flight per warp.
+
+Two hard-won constraints:
+
+1. The split count dominates everything (the kernel is parallelism-limited):
+   at 12000 ctx, 8 -> 16 -> 32 -> 64 splits gave 0.638 / 0.355 / 0.2155 /
+   0.1191 ms. 128 is no better (0.1261) and hurts short contexts.
+2. It MUST NOT be derived from the live key count. A captured CUDA graph bakes
+   the grid into the replay, so an n-derived split count makes the graph replay
+   whatever tiny grid was live at capture time -- capturing at n=1 and replaying
+   at n=4114 cost 10x decode (111 -> 11 tok/s).
+
+End-to-end decode (Qwen3-4B Q4_K_M, `cmd/llmbench`, 128 tokens), in-session A/B:
+530 ctx 154.9 tok/s (was 154.1), 4114 ctx 123.8 (was 111.7), 16392 ctx 79.7
+(was 59.8). The 16k needle is still answered correctly.
+
+The v1-only numbers that this replaced, for reference:
 
 | ctx | `dl_attention_split_f16` + combine | GB/s (KV) |
 |---|---|---|

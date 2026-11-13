@@ -14,6 +14,7 @@ type Kernels struct {
 	LayerNorm, RMSNormHeads, Add, Scale, AddRMSNorm, RoPE        uint64
 	AttentionF16                                                 uint64
 	AttentionSplitF16, AttentionCombine                          uint64
+	AttnSplitV2D2, AttnSplitV2D4                                uint64
 	GemvQ4K, GemvQ6K, GemvF32, GemvF16                           uint64
 }
 

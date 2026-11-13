@@ -557,7 +557,7 @@ extern "C" __global__ void dl_attention_f16(const float* __restrict__ q,
 // kv_mul <= 8, 256 % kv_mul == 0, head_dim even, kv_mul*head_dim <= 512.
 // ---------------------------------------------------------------------------
 #define ATTN_TILE 256
-#define ATTN_MAXSPLITS 32
+#define ATTN_MAXSPLITS 128
 
 __device__ __forceinline__ float attn_warp_max(float v) {
 #pragma unroll
@@ -789,6 +789,196 @@ extern "C" __global__ void dl_attention_combine(const float* __restrict__ part,
         }
         out[h * head_dim + d] = acc * sden;
     }
+}
+
+// ---------------------------------------------------------------------------
+// attention_split_v2: warp-per-query-head flash decode over the f16 KV cache.
+//
+// v1 (dl_attention_split_f16 above) assigns ONE KEY PER THREAD, so a warp load
+// instruction touches 32 different 256-byte K rows (one 32-byte sector each) and
+// its P*V stage reads V two bytes at a time. Measured 230 GB/s at 12k ctx = 34%
+// of the 672 GB/s this GPU can reach: it is latency-bound, not bandwidth-bound,
+// because each warp keeps only one or two dependent memory operations in flight.
+//
+// v2 maps one warp to one (query head, key split) and the 32 lanes across
+// head_dim, so a single load instruction covers one contiguous K/V row
+// (DPL*4 bytes per lane = 256 B per warp for DPL=4 -- a whole row, fully
+// coalesced). Keys are consumed a chunk at a time, so ATTN_V2_CHUNK independent
+// K loads (pass 1) and then ATTN_V2_CHUNK independent V loads (pass 2) are in
+// flight per warp. The GQA fold is kept: the kv_mul query heads sharing a KV
+// head are the warps of one block and walk the same keys in lockstep, so a KV
+// row is fetched from DRAM once and served from L2 to the sibling warps.
+//
+// Partial layout is byte-identical to v1 (SoA: m at [gj], l at [kv_mul+gj],
+// acc at [2*kv_mul + gj*head_dim + d]) so dl_attention_combine is unchanged.
+//
+// grid = (num_kv_heads, num_splits), block = kv_mul*32 threads.
+// ---------------------------------------------------------------------------
+#define ATTN_V2_CHUNK 16
+
+template <int DPL>
+__device__ __forceinline__ void attn_split_v2_body(
+        const float* __restrict__ q,
+        const __half* __restrict__ kc,
+        const __half* __restrict__ vc,
+        float* __restrict__ part,
+        int num_heads, int num_kv_heads, int head_dim, int kv_dim,
+        int seq_len, float scale, float softcap, int win_start,
+        int kv_cap, int num_splits,
+        const int* __restrict__ sc) {
+    if (sc) { seq_len = sc[1]; win_start = sc[2]; kv_cap = sc[3]; }  // graph replay
+
+    const int kh  = blockIdx.x;               // KV head
+    const int sid = blockIdx.y;               // key-range split
+    const int kv_mul = num_heads / num_kv_heads;
+    const int gj  = threadIdx.x >> 5;         // query head inside the group
+    const int lane = threadIdx.x & 31;
+    const int vb  = kh * head_dim;            // byte-offset base of this KV head
+    const int d0  = lane * DPL;               // this lane owns dims [d0, d0+DPL)
+    const int h   = kh * kv_mul + gj;         // global query head
+
+    // This lane's slice of Q (DPL contiguous floats: 16 B for DPL=4).
+    float qv[DPL];
+    {
+        const float* qh = q + (size_t)h * head_dim + d0;
+        if (DPL == 4) {
+            const float4 f = *reinterpret_cast<const float4*>(qh);
+            qv[0] = f.x; qv[1] = f.y; qv[2] = f.z; qv[3] = f.w;
+        } else {
+            const float2 f = *reinterpret_cast<const float2*>(qh);
+            qv[0] = f.x; qv[1] = f.y;
+        }
+    }
+
+    int n = seq_len - win_start;
+    if (n < 0) n = 0;
+    const int per = (n + num_splits - 1) / num_splits;
+    int j0 = sid * per;
+    if (j0 > n) j0 = n;
+    int j1 = j0 + per;
+    if (j1 > n) j1 = n;
+
+    float acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) acc[i] = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    int row = win_start + j0;
+    if (kv_cap > 0) row %= kv_cap;
+
+    for (int j = j0; j < j1; j += ATTN_V2_CHUNK) {
+        const int cnt = min(ATTN_V2_CHUNK, j1 - j);
+
+        // ---- pass 1: cnt scores, all loads independent ----------------------
+        float s[ATTN_V2_CHUNK];
+        const int rowBase = row;
+        int r = rowBase;
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) {
+            if (i >= cnt) { s[i] = -INFINITY; continue; }
+            const __half* krow = kc + (size_t)r * kv_dim + vb + d0;
+            float d;
+            if (DPL == 4) {
+                const int2 raw = *reinterpret_cast<const int2*>(krow);
+                const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+                const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+                d = fmaf(qv[0], a.x, fmaf(qv[1], a.y, fmaf(qv[2], b.x, qv[3] * b.y)));
+            } else {
+                const float2 a = __half22float2(*reinterpret_cast<const __half2*>(krow));
+                d = fmaf(qv[0], a.x, qv[1] * a.y);
+            }
+            s[i] = d;
+            if (++r == kv_cap) r = 0;
+        }
+        const int rowNext = r;
+
+        // ---- butterfly reduction: the dot product is spread over the warp ---
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) {
+            float v = s[i];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+            s[i] = v;
+        }
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) {
+            if (i >= cnt) continue;
+            float v = s[i] * scale;
+            if (softcap > 0.0f) v = softcap * tanhf(v / softcap);
+            s[i] = v;
+        }
+
+        // ---- online softmax over the chunk (registers only) ----------------
+        float cmax = -INFINITY;
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) cmax = fmaxf(cmax, s[i]);
+        const float mnew = fmaxf(m, cmax);
+        const float corr = (m == -INFINITY) ? 0.0f : __expf(m - mnew);
+        l *= corr;
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) acc[i] *= corr;
+        m = mnew;
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) {
+            if (i >= cnt) { s[i] = 0.0f; continue; }
+            s[i] = __expf(s[i] - mnew);
+            l += s[i];
+        }
+
+        // ---- pass 2: cnt independent V loads, accumulate P*V ----------------
+        r = rowBase;
+        #pragma unroll
+        for (int i = 0; i < ATTN_V2_CHUNK; i++) {
+            if (i >= cnt) break;
+            const __half* vrow = vc + (size_t)r * kv_dim + vb + d0;
+            const float p = s[i];
+            if (DPL == 4) {
+                const int2 raw = *reinterpret_cast<const int2*>(vrow);
+                const float2 a = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+                const float2 b = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+                acc[0] = fmaf(p, a.x, acc[0]);
+                acc[1] = fmaf(p, a.y, acc[1]);
+                acc[2] = fmaf(p, b.x, acc[2]);
+                acc[3] = fmaf(p, b.y, acc[3]);
+            } else {
+                const float2 a = __half22float2(*reinterpret_cast<const __half2*>(vrow));
+                acc[0] = fmaf(p, a.x, acc[0]);
+                acc[1] = fmaf(p, a.y, acc[1]);
+            }
+            if (++r == kv_cap) r = 0;
+        }
+        row = rowNext;
+    }
+
+    // ---- write the split partial (identical layout to v1) ------------------
+    const int stride = kv_mul * (head_dim + 2);
+    float* base = part + ((size_t)kh * num_splits + sid) * stride;
+    if (lane == 0) {
+        base[gj] = m;
+        base[kv_mul + gj] = l;
+    }
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) base[2 * kv_mul + gj * head_dim + d0 + i] = acc[i];
+}
+
+#define ATTN_V2_ARGS                                                          \
+    const float* __restrict__ q, const __half* __restrict__ kc,                \
+    const __half* __restrict__ vc, float* __restrict__ part,                   \
+    int num_heads, int num_kv_heads, int head_dim, int kv_dim, int seq_len,    \
+    float scale, float softcap, int win_start, int kv_cap, int num_splits,     \
+    const int* __restrict__ sc
+
+#define ATTN_V2_CALL                                                          \
+    q, kc, vc, part, num_heads, num_kv_heads, head_dim, kv_dim, seq_len,       \
+    scale, softcap, win_start, kv_cap, num_splits, sc
+
+extern "C" __global__ void dl_attn_split_v2_d2(ATTN_V2_ARGS) {
+    attn_split_v2_body<2>(ATTN_V2_CALL);
+}
+
+extern "C" __global__ void dl_attn_split_v2_d4(ATTN_V2_ARGS) {
+    attn_split_v2_body<4>(ATTN_V2_CALL);
 }
 
 // ---------------------------------------------------------------------------
