@@ -275,9 +275,25 @@ func cudaBatchKVStoreF16(kIn, vIn, kOut, vOut Buf, startPos, kvDim, npos int) er
 
 func cudaBatchAttentionF16(out, q, kCache, vCache Buf, numHeads, numKVHeads, headDim, kvDim,
 	startPos, npos int, scale, softcap float32) error {
+	if debugAttnArgs {
+		attnArgsPrinted++
+		if attnArgsPrinted <= 8 || attnArgsPrinted%100 == 0 {
+			fmt.Fprintf(os.Stderr,
+				"[gpu] attn#%d heads=%d kv=%d hd=%d kvDim=%d startPos=%d npos=%d scale=%g softcap=%g\n",
+				attnArgsPrinted, numHeads, numKVHeads, headDim, kvDim, startPos, npos, scale, softcap)
+		}
+	}
 	return cuda.AttnPrefillF16(uint64(out), uint64(q), uint64(kCache), uint64(vCache),
 		numHeads, numKVHeads, headDim, kvDim, startPos, npos, scale, softcap)
 }
+
+// debugAttnArgs logs the prefill-attention launch geometry once per call so a
+// per-layer cost that does not match the isolated kernel can be attributed to a
+// specific argument.
+var (
+	debugAttnArgs   = os.Getenv("DLGO_DEBUG_ATTN") == "1"
+	attnArgsPrinted int
+)
 
 // cudaPrimeAttentionPartials reserves the split-KV attention scratch up front so
 // that a later CUDA-graph capture never has to allocate.

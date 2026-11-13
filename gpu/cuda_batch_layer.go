@@ -28,7 +28,7 @@ var debugBatchPrefill = os.Getenv("DLGO_BATCH_DEBUG") == "1"
 
 // cudaBatchPrefillSupported reports whether the CUDA batched stack can execute
 // this model EXACTLY. GpuForwardPrefillBatch cannot return an error, so anything
-// not implemented here must be rejected here — otherwise the prompt would be
+// not implemented here must be rejected here â€” otherwise the prompt would be
 // silently mis-computed.
 func cudaBatchPrefillSupported(m *llm.Model, gm *GpuModel, isPartial bool) bool {
 	if !cudaActive || isPartial || gm == nil {
@@ -101,43 +101,58 @@ func cudaForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nex
 		if int(c.sliding_window) > 0 || int(c.kv_cap) > 0 {
 			return fmt.Errorf("cuda batch: requires a linear KV cache")
 		}
-		for _, p := range []struct {
-			out, w, x  Buf
-			rows, cols int
-			qtype      uint32
-		}{
-			{Buf(c.q), Buf(c.wq), Buf(c.x_norm), int(c.wq_rows), int(c.wq_cols), uint32(c.wq_type)},
-			{Buf(c.k), Buf(c.wk), Buf(c.x_norm), int(c.wk_rows), int(c.wk_cols), uint32(c.wk_type)},
-			{Buf(c.v), Buf(c.wv), Buf(c.x_norm), int(c.wv_rows), int(c.wv_cols), uint32(c.wv_type)},
-		} {
-			if err := cudaBatchMatVec(p.out, p.w, p.x, p.rows, p.cols, npos, p.qtype); err != nil {
-				return err
+		if err := cbpE(cbpQKV, func() error {
+			for _, p := range []struct {
+				out, w, x  Buf
+				rows, cols int
+				qtype      uint32
+			}{
+				{Buf(c.q), Buf(c.wq), Buf(c.x_norm), int(c.wq_rows), int(c.wq_cols), uint32(c.wq_type)},
+				{Buf(c.k), Buf(c.wk), Buf(c.x_norm), int(c.wk_rows), int(c.wk_cols), uint32(c.wk_type)},
+				{Buf(c.v), Buf(c.wv), Buf(c.x_norm), int(c.wv_rows), int(c.wv_cols), uint32(c.wv_type)},
+			} {
+				if err := cudaBatchMatVec(p.out, p.w, p.x, p.rows, p.cols, npos, p.qtype); err != nil {
+					return err
+				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		if c.q_norm_w != 0 {
-			if err := cudaBatchRMSNormHeads(Buf(c.q), Buf(c.q_norm_w), numHeads, headDim, npos, eps); err != nil {
+			if err := cbpE(cbpQKNorm, func() error {
+				if err := cudaBatchRMSNormHeads(Buf(c.q), Buf(c.q_norm_w), numHeads, headDim, npos, eps); err != nil {
+					return err
+				}
+				return cudaBatchRMSNormHeads(Buf(c.k), Buf(c.k_norm_w), numKVHeads, headDim, npos, eps)
+			}); err != nil {
 				return err
 			}
-			if err := cudaBatchRMSNormHeads(Buf(c.k), Buf(c.k_norm_w), numKVHeads, headDim, npos, eps); err != nil {
-				return err
-			}
 		}
-		if err := cudaBatchRoPE(Buf(c.q), Buf(c.k), Buf(c.rope_cos_table), Buf(c.rope_sin_table),
-			numHeads, numKVHeads, headDim, int(c.rope_dim), startPos,
-			int(c.rope_neox) != 0, npos); err != nil {
+		if err := cbpE(cbpRoPE, func() error {
+			return cudaBatchRoPE(Buf(c.q), Buf(c.k), Buf(c.rope_cos_table), Buf(c.rope_sin_table),
+				numHeads, numKVHeads, headDim, int(c.rope_dim), startPos,
+				int(c.rope_neox) != 0, npos)
+		}); err != nil {
 			return err
 		}
-		if err := cudaBatchKVStoreF16(Buf(c.k), Buf(c.v), Buf(c.k_cache), Buf(c.v_cache),
-			startPos, kvDim, npos); err != nil {
+		if err := cbpE(cbpKVStore, func() error {
+			return cudaBatchKVStoreF16(Buf(c.k), Buf(c.v), Buf(c.k_cache), Buf(c.v_cache),
+				startPos, kvDim, npos)
+		}); err != nil {
 			return err
 		}
-		if err := cudaBatchAttentionF16(Buf(c.attn_out), Buf(c.q), Buf(c.k_cache), Buf(c.v_cache),
-			numHeads, numKVHeads, headDim, kvDim, startPos, npos, scale,
-			float32(c.attn_logit_softcap)); err != nil {
+		if err := cbpE(cbpAttn, func() error {
+			return cudaBatchAttentionF16(Buf(c.attn_out), Buf(c.q), Buf(c.k_cache), Buf(c.v_cache),
+				numHeads, numKVHeads, headDim, kvDim, startPos, npos, scale,
+				float32(c.attn_logit_softcap))
+		}); err != nil {
 			return err
 		}
-		if err := cudaBatchMatVec(Buf(c.attn_proj), Buf(c.wo), Buf(c.attn_out),
-			int(c.wo_rows), int(c.wo_cols), npos, uint32(c.wo_type)); err != nil {
+		if err := cbpE(cbpOProj, func() error {
+			return cudaBatchMatVec(Buf(c.attn_proj), Buf(c.wo), Buf(c.attn_out),
+				int(c.wo_rows), int(c.wo_cols), npos, uint32(c.wo_type))
+		}); err != nil {
 			return err
 		}
 	}
@@ -153,8 +168,10 @@ func cudaForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nex
 		}
 	}
 	// x += attn_proj, and ffn_norm = rmsnorm(x) for the FFN block.
-	if err := cudaBatchAddRMSNorm(Buf(c.ffn_norm), Buf(c.ffn_in), Buf(c.x), Buf(c.attn_proj),
-		Buf(c.ffn_norm_w), dim, npos, eps); err != nil {
+	if err := cbpE(cbpAddNorm, func() error {
+		return cudaBatchAddRMSNorm(Buf(c.ffn_norm), Buf(c.ffn_in), Buf(c.x), Buf(c.attn_proj),
+			Buf(c.ffn_norm_w), dim, npos, eps)
+	}); err != nil {
 		return err
 	}
 
@@ -164,15 +181,21 @@ func cudaForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nex
 		return nil
 	case 0: // SwiGLU
 		gateRows := int(c.gate_rows)
-		if err := cudaBatchMatVec(Buf(c.gate), Buf(c.ffn_gate_w), Buf(c.ffn_norm),
-			gateRows, int(c.gate_cols), npos, uint32(c.gate_type)); err != nil {
+		if err := cbpE(cbpGate, func() error {
+			return cudaBatchMatVec(Buf(c.gate), Buf(c.ffn_gate_w), Buf(c.ffn_norm),
+				gateRows, int(c.gate_cols), npos, uint32(c.gate_type))
+		}); err != nil {
 			return err
 		}
-		if err := cudaBatchMatVec(Buf(c.up), Buf(c.ffn_up_w), Buf(c.ffn_norm),
-			int(c.up_rows), int(c.up_cols), npos, uint32(c.up_type)); err != nil {
+		if err := cbpE(cbpUp, func() error {
+			return cudaBatchMatVec(Buf(c.up), Buf(c.ffn_up_w), Buf(c.ffn_norm),
+				int(c.up_rows), int(c.up_cols), npos, uint32(c.up_type))
+		}); err != nil {
 			return err
 		}
-		if err := cudaSwiGLU(Buf(c.hidden), Buf(c.gate), Buf(c.up), gateRows*npos); err != nil {
+		if err := cbpE(cbpSwiGLU, func() error {
+			return cudaSwiGLU(Buf(c.hidden), Buf(c.gate), Buf(c.up), gateRows*npos)
+		}); err != nil {
 			return err
 		}
 		if debugBatchPrefill {
@@ -192,8 +215,10 @@ func cudaForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nex
 				fmt.Fprintf(os.Stderr, "[gpu] cuda batch: swiglu out max|x|=%.4g nonfinite=%d\n", mx, nf)
 			}
 		}
-		if err := cudaBatchMatVec(Buf(c.ffn_out), Buf(c.ffn_down_w), Buf(c.hidden),
-			int(c.down_rows), int(c.down_cols), npos, uint32(c.down_type)); err != nil {
+		if err := cbpE(cbpDown, func() error {
+			return cudaBatchMatVec(Buf(c.ffn_out), Buf(c.ffn_down_w), Buf(c.hidden),
+				int(c.down_rows), int(c.down_cols), npos, uint32(c.down_type))
+		}); err != nil {
 			return err
 		}
 	default:
@@ -208,8 +233,10 @@ func cudaForwardLayerBatch(lc *LayerConf, npos, startPos int, scale float32, nex
 	}
 	// x += ffn_out, then norm for the next layer (or a plain add on the last).
 	if nextAttnNorm != 0 {
-		return cudaBatchAddRMSNorm(Buf(c.x_norm), Buf(c.x), Buf(c.ffn_in), Buf(c.ffn_out),
-			Buf(nextAttnNorm), dim, npos, eps)
+		return cbpE(cbpAddNorm, func() error {
+			return cudaBatchAddRMSNorm(Buf(c.x_norm), Buf(c.x), Buf(c.ffn_in), Buf(c.ffn_out),
+				Buf(nextAttnNorm), dim, npos, eps)
+		})
 	}
 	return cudaAdd(Buf(c.x), Buf(c.ffn_in), Buf(c.ffn_out), dim*npos)
 }

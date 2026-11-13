@@ -71,7 +71,7 @@ var cudaQ4KMode = os.Getenv("DLGO_CUDA_Q4K")
 func do(f func()) { f() }
 
 // Init initializes the driver, retains the primary context, and loads the
-// embedded kernel image — all on the worker thread.
+// embedded kernel image â€” all on the worker thread.
 func Init() error {
 	var err error
 	do(func() {
@@ -850,14 +850,14 @@ func GEMVAffine8(W, x, out Buffer, rows, cols int) error {
 
 // gemmTileTok / gemmTileRow must match DLG_TOK / DLG_ROW in kernels.cu.
 const (
-	gemmTileTok = 64
-	gemmTileRow = 64
+	gemmTileTok = 128
+	gemmTileRow = 128
 	gemmBlock   = 256
 )
 
 // GemmAffine4F16 computes out[tok][row] = sum_c X[tok][c]*W[row][c] over npos
 // tokens with canonical Affine4 weights. X must already be float16 ([npos][cols],
-// see F32ToHalf); out is float32 [npos][rows] — token-major, which is the layout
+// see F32ToHalf); out is float32 [npos][rows] â€” token-major, which is the layout
 // every batch layer kernel expects.
 func GemmAffine4F16(W, xh, out Buffer, rows, cols, npos int) error {
 	return gemmAffine(kernels.GemmAffine4F16, W, xh, out, rows, cols, npos)
@@ -875,7 +875,9 @@ func gemmAffine(kern uint64, W, xh, out Buffer, rows, cols, npos int) error {
 	if cols%32 != 0 {
 		return fmt.Errorf("cuda: gemm cols %d is not a multiple of the affine group size 32", cols)
 	}
-	return launchN(kern, cdiv(npos, gemmTileTok), cdiv(rows, gemmTileRow), gemmBlock, 0, [][]byte{
+	// grid.x = row tiles (vary fastest, so a scheduling wave keeps its X token
+	// tiles hot in L2), grid.y = token tiles.
+	return launchN(kern, cdiv(rows, gemmTileRow), cdiv(npos, gemmTileTok), gemmBlock, 0, [][]byte{
 		ptrb(W), ptrb(xh), ptrb(out), i32b(rows), i32b(cols), i32b(npos),
 	})
 }

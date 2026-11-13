@@ -524,7 +524,7 @@ extern "C" __global__ void dl_attention_f16(const float* __restrict__ q,
     lsum = attn_block_sum(lsum, red, nt, tid);
     float inv = lsum > 0.0f ? 1.0f / lsum : 0.0f;
 
-    // Pass 3: PV — each thread owns output dims, coalesced V reads.
+    // Pass 3: PV â€” each thread owns output dims, coalesced V reads.
     for (int d = tid; d < head_dim; d += nt) {
         float acc = 0.0f;
         for (int i = 0; i < n; i++) {
@@ -548,8 +548,8 @@ extern "C" __global__ void dl_attention_f16(const float* __restrict__ q,
 //
 // Each block owns the kv_mul query heads that share KV head `blockIdx.x` and the
 // key window [i0, i1) of the visible range. It walks that window in 256-key
-// tiles with an online (flash) softmax — scores for all kv_mul heads come from
-// one K row read, and the P*V pass reads each V row once for all kv_mul heads —
+// tiles with an online (flash) softmax â€” scores for all kv_mul heads come from
+// one K row read, and the P*V pass reads each V row once for all kv_mul heads â€”
 // then writes a partial (m, l, acc) triple per query head. dl_attention_combine
 // merges the split partials into the final output.
 //
@@ -1040,7 +1040,7 @@ extern "C" __global__ void dl_half_probe(const float* __restrict__ in,
 // 8 sub-blocks are 32 *contiguous* positions each (sub s = positions s*32..s*32+31,
 // scale index s). Quantizing x to int8 per 32-group (scale dx_sub, integer sum
 // sumxq_sub) gives, per sub-block:
-//     sum_i (sc*q_i - mn) * x_i  ≈  dx_sub * ( sc_sub*dot(q,xq) - mn_sub*sumxq )
+//     sum_i (sc*q_i - mn) * x_i  â‰ˆ  dx_sub * ( sc_sub*dot(q,xq) - mn_sub*sumxq )
 // dot(q,xq) is computed 4-wide with __dp4a.
 // ===========================================================================
 
@@ -1303,10 +1303,13 @@ extern "C" __global__ void dl_gemv_affine8(const unsigned char* __restrict__ W,
 // wmma with A = X (row-major, m = tokens, k contiguous) and B = W (col_major,
 // n = rows) produces C[tok][row] directly, so the epilogue needs no transpose.
 // ---------------------------------------------------------------------------
-#define DLG_TOK 64
-#define DLG_ROW 64
+#define DLG_TOK 128
+#define DLG_ROW 128
 #define DLG_KC  32
 
+// Stage one k-tile of W (rows [row0,row0+DLG_ROW)) and X (tokens
+// [tok0,tok0+DLG_TOK)) into shared. 256 threads, 2 per row and 2 per token,
+// 16 codes / 16 halves each, so every staged store is a 16-byte vector.
 template <bool AFF8>
 __device__ __forceinline__ void dl_gemm_stage(const unsigned char* __restrict__ W,
                                               const __half* __restrict__ X,
@@ -1319,21 +1322,31 @@ __device__ __forceinline__ void dl_gemm_stage(const unsigned char* __restrict__ 
     const int grow = row0 + lrow;
     if (grow < rows) {
         const unsigned char* blk = W + ((size_t)grow * ng + (k0 >> 5)) * block_bytes;
-        dl_affine_part<AFF8>(blk, lpart, sw + lrow * DLG_KC + lpart * 8);
+        dl_affine_part<AFF8>(blk, lpart * 2, sw + lrow * DLG_KC + lpart * 16);
+        dl_affine_part<AFF8>(blk, lpart * 2 + 1, sw + lrow * DLG_KC + lpart * 16 + 8);
     } else {
 #pragma unroll
-        for (int i = 0; i < 8; i++) sw[lrow * DLG_KC + lpart * 8 + i] = __float2half(0.f);
+        for (int i = 0; i < 16; i++) sw[lrow * DLG_KC + lpart * 16 + i] = __float2half(0.f);
     }
     const int tok = tok0 + lrow;
     if (tok < npos) {
-        *(uint4*)(sx + lrow * DLG_KC + lpart * 8) =
-            *(const uint4*)(X + (size_t)tok * cols + k0 + lpart * 8);
+        const __half* p = X + (size_t)tok * cols + k0 + lpart * 16;
+        *(uint4*)(sx + lrow * DLG_KC + lpart * 16)     = *(const uint4*)p;
+        *(uint4*)(sx + lrow * DLG_KC + lpart * 16 + 8) = *(const uint4*)(p + 8);
     } else {
 #pragma unroll
-        for (int i = 0; i < 8; i++) sx[lrow * DLG_KC + lpart * 8 + i] = __float2half(0.f);
+        for (int i = 0; i < 16; i++) sx[lrow * DLG_KC + lpart * 16 + i] = __float2half(0.f);
     }
 }
 
+// Block tile DLG_TOK x DLG_ROW, 256 threads, 8 warps as 2 (token) x 4 (row):
+// each warp owns a 64-token x 32-row output tile = 8 wmma accumulators, so a
+// k-step of 32 costs 12 fragment loads for 16 mma (the previous 64x64 block had
+// 16x32 warp tiles and paid 6 loads for 4 mma).
+//
+// The bigger block also divides the DRAM re-read factors by two: W is streamed
+// once per token tile (npos/DLG_TOK of them) and X once per row tile
+// (rows/DLG_ROW), and the 48 MB L2 then serves most of the rest.
 template <bool AFF8>
 __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W,
                                              const __half* __restrict__ X,
@@ -1342,23 +1355,32 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
     const int tid = threadIdx.x;          // 256 threads
     const int warp = tid >> 5;            // 0..7
     const int lane = tid & 31;
-    const int row0 = blockIdx.y * DLG_ROW;
-    const int tok0 = blockIdx.x * DLG_TOK;
-    const int wt = warp & 3;              // token sub-tile (m) 0..3
-    const int wr = warp >> 2;             // row sub-tiles 2*wr, 2*wr+1
+    // grid.x = row tile, grid.y = token tile. Row tiles vary fastest so the
+    // blocks a scheduling wave picks up share (at most) a handful of X token
+    // tiles, instead of spanning every token tile and thrashing L2 on the
+    // activation matrix. That ordering is what makes the long-context prefill
+    // bandwidth-bound rather than compute-bound.
+    const int row0 = blockIdx.x * DLG_ROW;
+    const int tok0 = blockIdx.y * DLG_TOK;
+    const int wm = warp >> 2;             // token half: 64 tokens
+    const int wn = warp & 3;              // row quarter: 32 rows
 
     __align__(16) __shared__ __half sW[2][DLG_ROW * DLG_KC];
     __align__(16) __shared__ __half sX[2][DLG_TOK * DLG_KC];
-    __shared__ float sC[8][16 * 16];
+    // Epilogue scratch aliases one staging half (8 KB of the 16 KB it occupies);
+    // it is only touched after the final __syncthreads().
+    float* sC = (float*)sW;
 
-    const int lrow = tid >> 2;            // 0..63: row of this block's tile
-    const int lpart = tid & 3;            // 0..3: 8 codes / 8 halves of that row
+    const int lrow = tid >> 1;            // 0..127: row / token of the tile
+    const int lpart = tid & 1;            // 0..1: 16 codes / 16 halves
     const int ng = cols >> 5;
     const int nk = cols / DLG_KC;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[2];
-    nvcuda::wmma::fill_fragment(acc[0], 0.0f);
-    nvcuda::wmma::fill_fragment(acc[1], 0.0f);
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++) nvcuda::wmma::fill_fragment(acc[i][j], 0.0f);
 
     dl_gemm_stage<AFF8>(W, X, sW[0], sX[0], row0, tok0, rows, npos, cols, ng, 0, lrow, lpart);
     __syncthreads();
@@ -1370,33 +1392,49 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
                                 cols, ng, (ks + 1) * DLG_KC, lrow, lpart);
         }
         nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half,
-                               nvcuda::wmma::row_major> fa;
+                               nvcuda::wmma::row_major> fa[4];
         nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half,
-                               nvcuda::wmma::col_major> fb;
+                               nvcuda::wmma::col_major> fb[2];
 #pragma unroll
         for (int kh = 0; kh < 2; kh++) {
-            nvcuda::wmma::load_matrix_sync(fa, sX[buf] + (wt * 16) * DLG_KC + kh * 16, DLG_KC);
 #pragma unroll
-            for (int sub = 0; sub < 2; sub++) {
-                nvcuda::wmma::load_matrix_sync(fb, sW[buf] + (wr * 32 + sub * 16) * DLG_KC + kh * 16,
+            for (int i = 0; i < 4; i++) {
+                nvcuda::wmma::load_matrix_sync(fa[i], sX[buf] + (wm * 64 + i * 16) * DLG_KC + kh * 16,
                                                DLG_KC);
-                nvcuda::wmma::mma_sync(acc[sub], fa, fb, acc[sub]);
             }
+#pragma unroll
+            for (int j = 0; j < 2; j++) {
+                nvcuda::wmma::load_matrix_sync(fb[j], sW[buf] + (wn * 32 + j * 16) * DLG_KC + kh * 16,
+                                               DLG_KC);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+                    nvcuda::wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
         }
         __syncthreads();
         buf ^= 1;
     }
 
+    __syncthreads();
+    float* myC = sC + warp * 256;
 #pragma unroll
-    for (int sub = 0; sub < 2; sub++) {
-        nvcuda::wmma::store_matrix_sync(sC[warp], acc[sub], 16, nvcuda::wmma::mem_row_major);
-        __syncwarp();
-        for (int i = lane; i < 256; i += 32) {
-            const int t = tok0 + wt * 16 + (i >> 4);
-            const int r = row0 + wr * 32 + sub * 16 + (i & 15);
-            if (t < npos && r < rows) out[(size_t)t * rows + r] = sC[warp][i];
+    for (int i = 0; i < 4; i++) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            nvcuda::wmma::store_matrix_sync(myC, acc[i][j], 16, nvcuda::wmma::mem_row_major);
+            __syncwarp();
+            for (int e = lane; e < 256; e += 32) {
+                const int t = tok0 + wm * 64 + i * 16 + (e >> 4);
+                const int r = row0 + wn * 32 + j * 16 + (e & 15);
+                // Cache-streaming store: the result is read back by the next op,
+                // but letting it evict the activation matrix from L2 costs far
+                // more than that read. X is re-read rows/DLG_ROW times.
+                if (t < npos && r < rows) __stcs(&out[(size_t)t * rows + r], myC[e]);
+            }
+            __syncwarp();
         }
-        __syncwarp();
     }
 }
 
