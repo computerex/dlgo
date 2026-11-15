@@ -1351,6 +1351,12 @@ extern "C" __global__ void dl_gemv_affine8(const unsigned char* __restrict__ W,
 #define DLG_TOK 128
 #define DLG_ROW 128
 #define DLG_KC  32
+// Staged row stride in halves. DLG_KC would make each row 64 bytes = 16 banks,
+// so the 8 rows an ldmatrix.x4 touches alias onto just two bank groups (a 4-way
+// conflict on every fragment load). 40 halves = 80 bytes = 20 banks, which puts
+// 8 consecutive rows on 8 distinct groups. Still 16-byte aligned, so every
+// staged store stays a vector.
+#define DLG_KPAD 40
 
 // Stage one k-tile of W (rows [row0,row0+DLG_ROW)) and X (tokens
 // [tok0,tok0+DLG_TOK)) into shared. 256 threads, 2 per row and 2 per token,
@@ -1367,20 +1373,20 @@ __device__ __forceinline__ void dl_gemm_stage(const unsigned char* __restrict__ 
     const int grow = row0 + lrow;
     if (grow < rows) {
         const unsigned char* blk = W + ((size_t)grow * ng + (k0 >> 5)) * block_bytes;
-        dl_affine_part<AFF8>(blk, lpart * 2, sw + lrow * DLG_KC + lpart * 16);
-        dl_affine_part<AFF8>(blk, lpart * 2 + 1, sw + lrow * DLG_KC + lpart * 16 + 8);
+        dl_affine_part<AFF8>(blk, lpart * 2, sw + lrow * DLG_KPAD + lpart * 16);
+        dl_affine_part<AFF8>(blk, lpart * 2 + 1, sw + lrow * DLG_KPAD + lpart * 16 + 8);
     } else {
 #pragma unroll
-        for (int i = 0; i < 16; i++) sw[lrow * DLG_KC + lpart * 16 + i] = __float2half(0.f);
+        for (int i = 0; i < 16; i++) sw[lrow * DLG_KPAD + lpart * 16 + i] = __float2half(0.f);
     }
     const int tok = tok0 + lrow;
     if (tok < npos) {
         const __half* p = X + (size_t)tok * cols + k0 + lpart * 16;
-        *(uint4*)(sx + lrow * DLG_KC + lpart * 16)     = *(const uint4*)p;
-        *(uint4*)(sx + lrow * DLG_KC + lpart * 16 + 8) = *(const uint4*)(p + 8);
+        *(uint4*)(sx + lrow * DLG_KPAD + lpart * 16)     = *(const uint4*)p;
+        *(uint4*)(sx + lrow * DLG_KPAD + lpart * 16 + 8) = *(const uint4*)(p + 8);
     } else {
 #pragma unroll
-        for (int i = 0; i < 16; i++) sx[lrow * DLG_KC + lpart * 16 + i] = __float2half(0.f);
+        for (int i = 0; i < 16; i++) sx[lrow * DLG_KPAD + lpart * 16 + i] = __float2half(0.f);
     }
 }
 
@@ -1410,8 +1416,8 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
     const int wm = warp >> 2;             // token half: 64 tokens
     const int wn = warp & 3;              // row quarter: 32 rows
 
-    __align__(16) __shared__ __half sW[2][DLG_ROW * DLG_KC];
-    __align__(16) __shared__ __half sX[2][DLG_TOK * DLG_KC];
+    __align__(16) __shared__ __half sW[2][DLG_ROW * DLG_KPAD];
+    __align__(16) __shared__ __half sX[2][DLG_TOK * DLG_KPAD];
     // Epilogue scratch aliases one staging half (8 KB of the 16 KB it occupies);
     // it is only touched after the final __syncthreads().
     float* sC = (float*)sW;
@@ -1456,13 +1462,13 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
         for (int kh = 0; kh < 2; kh++) {
 #pragma unroll
             for (int i = 0; i < 4; i++) {
-                nvcuda::wmma::load_matrix_sync(fa[i], sX[buf] + (wm * 64 + i * 16) * DLG_KC + kh * 16,
-                                               DLG_KC);
+                nvcuda::wmma::load_matrix_sync(fa[i], sX[buf] + (wm * 64 + i * 16) * DLG_KPAD + kh * 16,
+                                               DLG_KPAD);
             }
 #pragma unroll
             for (int j = 0; j < 2; j++) {
-                nvcuda::wmma::load_matrix_sync(fb[j], sW[buf] + (wn * 32 + j * 16) * DLG_KC + kh * 16,
-                                               DLG_KC);
+                nvcuda::wmma::load_matrix_sync(fb[j], sW[buf] + (wn * 32 + j * 16) * DLG_KPAD + kh * 16,
+                                               DLG_KPAD);
             }
 #pragma unroll
             for (int i = 0; i < 4; i++)
