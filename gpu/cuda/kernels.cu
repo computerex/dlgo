@@ -1621,12 +1621,20 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
     const int grp = numHeads / numKVHeads;     // query heads per kv head
     const int kvh = head / grp;
 
-    __shared__ __align__(32) __half sQ[DLATT_QTOK * DLATT_HD];
-    __shared__ __align__(32) __half sK[DLATT_KTOK * DLATT_KPAD];
-    __shared__ __align__(32) __half sV[DLATT_KTOK * DLATT_KPAD];
-    __shared__ __align__(16) __half sP[4][16 * DLATT_KTOK];
-    __shared__ float sS[4][16 * DLATT_KTOK];
-    __shared__ float sL[4][16];
+    // One scratch block, carved by hand. sQ owns the first 16 KB only until the Q
+    // fragments have been built; after that the K/V tile, P, the score staging and
+    // 1/l live in the same bytes. 30.25 KB total instead of 46.25 is what keeps
+    // three blocks resident per SM, and the short-context case needs that more
+    // than the long one does because its key loop is too short to amortise a
+    // barrier.
+    __shared__ __align__(32) unsigned char sScratch[30976];
+    __half* sQ = (__half*)sScratch;
+    __half* sK = (__half*)sScratch;
+    __half* sV = sK + DLATT_KTOK * DLATT_KPAD;
+    __half (*sP)[16 * DLATT_KTOK] =
+        (__half (*)[16 * DLATT_KTOK])(sV + DLATT_KTOK * DLATT_KPAD);
+    float (*sS)[16 * DLATT_KTOK] = (float (*)[16 * DLATT_KTOK])(sP + 4);
+    float (*sL)[16] = (float (*)[16])(sS + 4);
 
     const int qBase = warp * 16;               // this warp's first query (tile-local)
     const int qcnt = nq - qBase > 0 ? min(16, nq - qBase) : 0;
@@ -1639,6 +1647,18 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                                  : 0.0f);
     }
     __syncthreads();
+
+    // Build this warp's Q fragments once. They are the only thing that has to
+    // survive the key loop, so holding them in registers lets the staging below
+    // reuse sQ's bytes and removes 8 shared loads from every key tile.
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half,
+                           nvcuda::wmma::row_major> qf[DLATT_HD / 16];
+#pragma unroll
+    for (int t = 0; t < DLATT_HD / 16; t++) {
+        if (t * 16 >= headDim) break;
+        nvcuda::wmma::load_matrix_sync(qf[t], sQ + qBase * DLATT_HD + t * 16, DLATT_HD);
+    }
+    __syncthreads();                           // sQ becomes the K/V staging area
 
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> oAcc[DLATT_HD / 16];
 #pragma unroll
@@ -1693,17 +1713,14 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
 #pragma unroll
             for (int d = 0; d < DLATT_HD; d += 16) {
                 if (d >= headDim) break;
-                nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half,
-                                       nvcuda::wmma::row_major> fa;
                 nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half,
                                        nvcuda::wmma::col_major> fb[2];
-                nvcuda::wmma::load_matrix_sync(fa, sQ + qBase * DLATT_HD + d, DLATT_HD);
                 // B is K^T: col_major with ldm=DLATT_KPAD maps (dim, key) to
                 // sK[key][dim], i.e. the tile's own layout.
                 nvcuda::wmma::load_matrix_sync(fb[0], sK + d, DLATT_KPAD);
                 nvcuda::wmma::load_matrix_sync(fb[1], sK + 16 * DLATT_KPAD + d, DLATT_KPAD);
-                nvcuda::wmma::mma_sync(sAcc[0], fa, fb[0], sAcc[0]);
-                nvcuda::wmma::mma_sync(sAcc[1], fa, fb[1], sAcc[1]);
+                nvcuda::wmma::mma_sync(sAcc[0], qf[d / 16], fb[0], sAcc[0]);
+                nvcuda::wmma::mma_sync(sAcc[1], qf[d / 16], fb[1], sAcc[1]);
             }
             nvcuda::wmma::store_matrix_sync(sS[warp], sAcc[0], DLATT_KTOK, nvcuda::wmma::mem_row_major);
             nvcuda::wmma::store_matrix_sync(sS[warp] + 16, sAcc[1], DLATT_KTOK, nvcuda::wmma::mem_row_major);
