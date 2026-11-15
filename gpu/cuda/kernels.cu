@@ -1396,7 +1396,7 @@ template <bool AFF8>
 __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W,
                                              const __half* __restrict__ X,
                                              float* __restrict__ out,
-                                             int rows, int cols, int npos) {
+                                             int rows, int cols, int npos, int ksplit) {
     const int tid = threadIdx.x;          // 256 threads
     const int warp = tid >> 5;            // 0..7
     const int lane = tid & 31;
@@ -1421,18 +1421,30 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
     const int ng = cols >> 5;
     const int nk = cols / DLG_KC;
 
+    // Split-K: blockIdx.z selects one contiguous slice of the k range. At short
+    // prompts the block count is the binding constraint (rows/128 * npos/128 can
+    // be under 1.2 waves, e.g. down-proj at 512 tokens = 80 blocks over 66 SMs),
+    // so slicing k multiplies the block count instead of leaving tensor pipes
+    // idle. ksplit > 1 accumulates with atomicAdd, so `out` must be pre-zeroed.
+    const int kper = (nk + ksplit - 1) / ksplit;
+    const int ks0 = blockIdx.z * kper;
+    int ks1 = ks0 + kper;
+    if (ks1 > nk) ks1 = nk;
+    if (ks0 >= ks1) return;
+
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[4][2];
 #pragma unroll
     for (int i = 0; i < 4; i++)
 #pragma unroll
         for (int j = 0; j < 2; j++) nvcuda::wmma::fill_fragment(acc[i][j], 0.0f);
 
-    dl_gemm_stage<AFF8>(W, X, sW[0], sX[0], row0, tok0, rows, npos, cols, ng, 0, lrow, lpart);
+    dl_gemm_stage<AFF8>(W, X, sW[0], sX[0], row0, tok0, rows, npos, cols, ng,
+                        ks0 * DLG_KC, lrow, lpart);
     __syncthreads();
 
     int buf = 0;
-    for (int ks = 0; ks < nk; ks++) {
-        if (ks + 1 < nk) {
+    for (int ks = ks0; ks < ks1; ks++) {
+        if (ks + 1 < ks1) {
             dl_gemm_stage<AFF8>(W, X, sW[buf ^ 1], sX[buf ^ 1], row0, tok0, rows, npos,
                                 cols, ng, (ks + 1) * DLG_KC, lrow, lpart);
         }
@@ -1476,7 +1488,10 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
                 // Cache-streaming store: the result is read back by the next op,
                 // but letting it evict the activation matrix from L2 costs far
                 // more than that read. X is re-read rows/DLG_ROW times.
-                if (t < npos && r < rows) __stcs(&out[(size_t)t * rows + r], myC[e]);
+                if (t < npos && r < rows) {
+                    if (ksplit == 1) __stcs(&out[(size_t)t * rows + r], myC[e]);
+                    else             atomicAdd(&out[(size_t)t * rows + r], myC[e]);
+                }
             }
             __syncwarp();
         }
@@ -1486,15 +1501,227 @@ __device__ __forceinline__ void dl_gemm_body(const unsigned char* __restrict__ W
 extern "C" __global__ void dl_gemm_affine4_f16(const unsigned char* __restrict__ W,
                                                const __half* __restrict__ X,
                                                float* __restrict__ out,
-                                               int rows, int cols, int npos) {
-    dl_gemm_body<false>(W, X, out, rows, cols, npos);
+                                               int rows, int cols, int npos, int ksplit) {
+    dl_gemm_body<false>(W, X, out, rows, cols, npos, ksplit);
 }
 
 extern "C" __global__ void dl_gemm_affine8_f16(const unsigned char* __restrict__ W,
                                                const __half* __restrict__ X,
                                                float* __restrict__ out,
-                                               int rows, int cols, int npos) {
-    dl_gemm_body<true>(W, X, out, rows, cols, npos);
+                                               int rows, int cols, int npos, int ksplit) {
+    dl_gemm_body<true>(W, X, out, rows, cols, npos, ksplit);
+}
+
+// ---------------------------------------------------------------------------
+// int8 tensor-core GEMM: out[tok][row] = sum_c X[tok][c] * W[row][c]
+//
+// Same Affine4 weight blocks as the f16 GEMM above, but the tensor-core datatype
+// is s8 x s8 -> s32 (mma.m16n8k32), which runs at twice the MAC rate of f16 on
+// Ada. The f16 GEMM's ceiling is the datatype, not the tiling: an isolated f16
+// tile runs ~60 TFLOP/s of the ~85 TFLOP/s f16 peak, while int8 offers ~170.
+//
+// The per-32-group weight scale d, the weight offset m and the activation scale
+// sx cannot be folded into an int32 accumulator, so each 32-wide k-group is
+// flushed into float accumulators as
+//
+//     out += C*dw*sx  +  mw*(sx*xsum)
+//
+// where xsum is the per-group integer sum of the activation codes, produced by
+// dl_quantize_x_q8. That identity is exact: with w = d*q + m and x = sx*xq,
+//     sum_c w*x = d*sx*sum_c q*xq + m*sx*sum_c xq.
+// ---------------------------------------------------------------------------
+#define DLG_I8_TOK     128
+#define DLG_I8_ROW     128
+#define DLG_I8_KC      32
+#define DLG_I8_THREADS 512
+
+__device__ __forceinline__ void dl_mma_i8(int& c0, int& c1, int& c2, int& c3,
+                                          int a0, int a1, int a2, int a3,
+                                          int b0, int b1) {
+    int z = 0;
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z));
+}
+
+// Unpack 16 nibbles (two Affine4 code words) into 16 int8 codes, low nibble
+// first, so the shared tile holds exactly the q of w = d*q + m.
+//
+// Code i of a word is bits 4i..4i+3, so lo = w&0x0F0F0F0F holds codes 0,2,4,6
+// and hi = (w>>4)&0x0F0F0F0F holds codes 1,3,5,7. Interleaving them back needs
+// selectors 0,4,1,5 (codes 0..3) and 2,6,3,7 (codes 4..7).
+__device__ __forceinline__ void dl_gemm_i8_stage4(const unsigned char* __restrict__ W,
+                                                  const signed char* __restrict__ XQ,
+                                                  const float* __restrict__ SX,
+                                                  const float* __restrict__ XSUM,
+                                                  signed char* __restrict__ sw,
+                                                  signed char* __restrict__ sxq,
+                                                  float* __restrict__ swd,
+                                                  float* __restrict__ swm,
+                                                  float* __restrict__ sxs,
+                                                  float* __restrict__ sxn,
+                                                  int row0, int tok0, int rows, int npos,
+                                                  int cols, int ng, int k0,
+                                                  int lrow, int lpart) {
+    const int grow = row0 + lrow;
+    if (grow < rows) {
+        const unsigned char* blk = W + ((size_t)grow * ng + (k0 >> 5)) * 20;
+        const unsigned int w = *(const unsigned int*)(blk + 4 * lpart);
+        const unsigned int lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+        int2 v;
+        v.x = __byte_perm(lo, hi, 0x5140);
+        v.y = __byte_perm(lo, hi, 0x7362);
+        *(int2*)(sw + lrow * DLG_I8_KC + lpart * 8) = v;
+        if (lpart == 0) {
+            swd[lrow] = __half2float(*(const __half*)(blk + 16));
+            swm[lrow] = __half2float(*(const __half*)(blk + 18));
+        }
+    } else {
+        *(int2*)(sw + lrow * DLG_I8_KC + lpart * 8) = make_int2(0, 0);
+        if (lpart == 0) { swd[lrow] = 0.f; swm[lrow] = 0.f; }
+    }
+    const int tok = tok0 + lrow;
+    if (tok < npos) {
+        *(int2*)(sxq + lrow * DLG_I8_KC + lpart * 8) =
+            *(const int2*)(XQ + (size_t)tok * cols + k0 + lpart * 8);
+        if (lpart == 0) {
+            const int g = k0 >> 5;
+            sxs[lrow] = SX[(size_t)tok * ng + g];
+            sxn[lrow] = XSUM[(size_t)tok * ng + g];
+        }
+    } else {
+        *(int2*)(sxq + lrow * DLG_I8_KC + lpart * 8) = make_int2(0, 0);
+        if (lpart == 0) { sxs[lrow] = 0.f; sxn[lrow] = 0.f; }
+    }
+}
+
+__device__ __forceinline__ void dl_gemm_i8_body(const unsigned char* __restrict__ W,
+                                                const signed char* __restrict__ XQ,
+                                                const float* __restrict__ SX,
+                                                const float* __restrict__ XSUM,
+                                                float* __restrict__ out,
+                                                int rows, int cols, int npos) {
+    const int tid  = threadIdx.x;   // 512
+    const int warp = tid >> 5;      // 0..15
+    const int lane = tid & 31;
+    const int row0 = blockIdx.x * DLG_I8_ROW;
+    const int tok0 = blockIdx.y * DLG_I8_TOK;
+    const int wm = warp >> 3;       // token half: 64 tokens
+    const int wn = warp & 7;        // row eighth: 16 rows
+
+    __align__(16) __shared__ signed char sW[2][DLG_I8_ROW * DLG_I8_KC];
+    __align__(16) __shared__ signed char sX[2][DLG_I8_TOK * DLG_I8_KC];
+    __align__(16) __shared__ float sWd[2][DLG_I8_ROW];
+    __align__(16) __shared__ float sWm[2][DLG_I8_ROW];
+    __align__(16) __shared__ float sXs[2][DLG_I8_TOK];
+    __align__(16) __shared__ float sXn[2][DLG_I8_TOK];
+
+    const int lrow  = tid >> 2;
+    const int lpart = tid & 3;
+    const int ng = cols >> 5;
+    const int nk = cols >> 5;
+
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+
+    float facc[4][2][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++)
+#pragma unroll
+            for (int l = 0; l < 4; l++) facc[i][j][l] = 0.f;
+
+    dl_gemm_i8_stage4(W, XQ, SX, XSUM, sW[0], sX[0], sWd[0], sWm[0], sXs[0], sXn[0],
+                      row0, tok0, rows, npos, cols, ng, 0, lrow, lpart);
+    __syncthreads();
+
+    int buf = 0;
+    for (int ks = 0; ks < nk; ks++) {
+        if (ks + 1 < nk) {
+            dl_gemm_i8_stage4(W, XQ, SX, XSUM, sW[buf ^ 1], sX[buf ^ 1], sWd[buf ^ 1],
+                              sWm[buf ^ 1], sXs[buf ^ 1], sXn[buf ^ 1],
+                              row0, tok0, rows, npos, cols, ng, (ks + 1) * DLG_I8_KC,
+                              lrow, lpart);
+        }
+
+        int af[4][4];
+        const signed char* xb = sX[buf];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int t = wm * 64 + i * 16 + gid;
+            af[i][0] = *(const int*)(xb + t * DLG_I8_KC + tig * 4);
+            af[i][1] = *(const int*)(xb + (t + 8) * DLG_I8_KC + tig * 4);
+            af[i][2] = *(const int*)(xb + t * DLG_I8_KC + tig * 4 + 16);
+            af[i][3] = *(const int*)(xb + (t + 8) * DLG_I8_KC + tig * 4 + 16);
+        }
+        int bf[2][2];
+        const signed char* wb = sW[buf];
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int r = wn * 16 + j * 8 + gid;
+            bf[j][0] = *(const int*)(wb + r * DLG_I8_KC + tig * 4);
+            bf[j][1] = *(const int*)(wb + r * DLG_I8_KC + tig * 4 + 16);
+        }
+
+        float stv[4][2], nsv[4][2];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int t = wm * 64 + i * 16 + gid;
+            stv[i][0] = sXs[buf][t];     nsv[i][0] = sXn[buf][t];
+            stv[i][1] = sXs[buf][t + 8]; nsv[i][1] = sXn[buf][t + 8];
+        }
+
+        int c0, c1, c2, c3;
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int r = wn * 16 + j * 8 + tig * 2;
+            const float dw0 = sWd[buf][r], dw1 = sWd[buf][r + 1];
+            const float mw0 = sWm[buf][r], mw1 = sWm[buf][r + 1];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float p00 = dw0 * stv[i][0], p01 = dw1 * stv[i][0];
+                const float p10 = dw0 * stv[i][1], p11 = dw1 * stv[i][1];
+                dl_mma_i8(c0, c1, c2, c3, af[i][0], af[i][1], af[i][2], af[i][3],
+                          bf[j][0], bf[j][1]);
+                facc[i][j][0] += (float)c0 * p00 + mw0 * nsv[i][0];
+                facc[i][j][1] += (float)c1 * p01 + mw1 * nsv[i][0];
+                facc[i][j][2] += (float)c2 * p10 + mw0 * nsv[i][1];
+                facc[i][j][3] += (float)c3 * p11 + mw1 * nsv[i][1];
+            }
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+#pragma unroll
+        for (int j = 0; j < 2; j++) {
+            const int tA = tok0 + wm * 64 + i * 16 + gid;
+            const int tB = tA + 8;
+            const int r0 = row0 + wn * 16 + j * 8 + tig * 2;
+            if (tA < npos) {
+                if (r0 < rows)     __stcs(&out[(size_t)tA * rows + r0],     facc[i][j][0]);
+                if (r0 + 1 < rows) __stcs(&out[(size_t)tA * rows + r0 + 1], facc[i][j][1]);
+            }
+            if (tB < npos) {
+                if (r0 < rows)     __stcs(&out[(size_t)tB * rows + r0],     facc[i][j][2]);
+                if (r0 + 1 < rows) __stcs(&out[(size_t)tB * rows + r0 + 1], facc[i][j][3]);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void dl_gemm_affine4_i8(const unsigned char* __restrict__ W,
+                                              const signed char* __restrict__ XQ,
+                                              const float* __restrict__ SX,
+                                              const float* __restrict__ XSUM,
+                                              float* __restrict__ out,
+                                              int rows, int cols, int npos) {
+    dl_gemm_i8_body(W, XQ, SX, XSUM, out, rows, cols, npos);
 }
 
 // ---------------------------------------------------------------------------

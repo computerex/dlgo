@@ -50,6 +50,7 @@ type Kernels struct {
 	BatchRMSNorm, BatchAddRMSNorm, BatchRMSNormHeads, BatchRoPE            uint64
 	BatchKVStoreF16, AttnPrefillF16                                        uint64
 	QuantizeXQ8                                                            uint64
+	GemmAffine4I8                                                          uint64
 	CopyRegion                                                             uint64
 }
 
@@ -131,6 +132,7 @@ func Init() error {
 			{"dl_batch_kv_store_f16", &kernels.BatchKVStoreF16},
 			{"dl_attn_prefill_f16", &kernels.AttnPrefillF16},
 			{"dl_quantize_x_q8", &kernels.QuantizeXQ8},
+			{"dl_gemm_affine4_i8", &kernels.GemmAffine4I8},
 			{"dl_copy_region", &kernels.CopyRegion},
 		} {
 			cn := C.CString(kv.n)
@@ -328,6 +330,13 @@ func launch(fn uint64, gx, bx int, args [][]byte) error {
 
 // launchN dispatches with an explicit grid.y and a dynamic shared-memory size.
 func launchN(fn uint64, gx, gy, bx, shared int, args [][]byte) error {
+	return launch3(fn, gx, gy, 1, bx, shared, args)
+}
+
+// launch3 is launchN with an explicit grid.z. The split-K GEMM uses the third
+// grid dimension for the k slice, and launchN's 5th parameter is the dynamic
+// shared-memory size, so it cannot carry z.
+func launch3(fn uint64, gx, gy, gz, bx, shared int, args [][]byte) error {
 	n := len(args)
 	if n == 0 {
 		return fmt.Errorf("cuda: launch with no params")
@@ -365,7 +374,7 @@ func launchN(fn uint64, gx, gy, bx, shared int, args [][]byte) error {
 	var err error
 	do(func() {
 		if C.dlcuda_launch(C.ulonglong(fn),
-			C.uint(gx), C.uint(gy), 1,
+			C.uint(gx), C.uint(gy), C.uint(gz),
 			C.uint(bx), 1, 1,
 			C.uint(shared),
 			(*unsafe.Pointer)(base)) != 0 {
@@ -850,12 +859,47 @@ func GEMVAffine8(W, x, out Buffer, rows, cols int) error {
 	return gemv(kernels.GemvAffine8, W, x, out, rows, cols)
 }
 
-// gemmTileTok / gemmTileRow must match DLG_TOK / DLG_ROW in kernels.cu.
+// gemmTileTok / gemmTileRow / gemmTileKC must match DLG_TOK / DLG_ROW / DLG_KC in
+// kernels.cu.
 const (
 	gemmTileTok = 128
 	gemmTileRow = 128
+	gemmTileKC  = 32
 	gemmBlock   = 256
+	// gemmTargetBlocks is roughly 4 waves on a 66-SM device. Below it a GEMM is
+	// block-count limited rather than compute limited, so splitting k is a win.
+	gemmTargetBlocks = 264
 )
+
+// gemmSplitK returns how many k-slices a GEMM should be cut into. At short
+// prompts rows/128*npos/128 can be well under one wave (down-proj at 512 tokens
+// is 80 blocks over 66 SMs, and measures 36 TFLOP/s against q-proj's 61), so the
+// blocks that do exist are queued behind each other while most of the tensor
+// pipes idle. Slicing k multiplies the block count; the cost is an atomicAdd
+// epilogue and a zeroed output.
+//
+// The trigger matters: at 128 row tiles (~2 waves) the split is a loss, because
+// the atomics scale with output size * ksplit and the balance was already fine.
+// Only shapes under ~1.7 waves are worth cutting, and then 4 slices is enough to
+// get the last wave nearly full.
+func gemmSplitK(rows, cols, npos int) int {
+	nk := cols / gemmTileKC
+	tiles := cdiv(rows, gemmTileRow) * cdiv(npos, gemmTileTok)
+	if nk < 16 || tiles <= 0 || tiles >= 112 {
+		return 1
+	}
+	ks := cdiv(gemmTargetBlocks, tiles)
+	if ks > 4 {
+		ks = 4
+	}
+	if ks > nk/8 {
+		ks = nk / 8
+	}
+	if ks < 1 {
+		ks = 1
+	}
+	return ks
+}
 
 // GemmAffine4F16 computes out[tok][row] = sum_c X[tok][c]*W[row][c] over npos
 // tokens with canonical Affine4 weights. X must already be float16 ([npos][cols],
@@ -877,11 +921,53 @@ func gemmAffine(kern uint64, W, xh, out Buffer, rows, cols, npos int) error {
 	if cols%32 != 0 {
 		return fmt.Errorf("cuda: gemm cols %d is not a multiple of the affine group size 32", cols)
 	}
+	ks := gemmSplitK(rows, cols, npos)
+	if ks > 1 {
+		if err := Memset8(out, 0, uint64(npos)*uint64(rows)*4); err != nil {
+			return err
+		}
+	}
 	// grid.x = row tiles (vary fastest, so a scheduling wave keeps its X token
-	// tiles hot in L2), grid.y = token tiles.
-	return launchN(kern, cdiv(rows, gemmTileRow), cdiv(npos, gemmTileTok), gemmBlock, 0, [][]byte{
-		ptrb(W), ptrb(xh), ptrb(out), i32b(rows), i32b(cols), i32b(npos),
-	})
+	// tiles hot in L2), grid.y = token tiles, grid.z = k slice.
+	return launch3(kern, cdiv(rows, gemmTileRow), cdiv(npos, gemmTileTok), ks, gemmBlock, 0,
+		[][]byte{
+			ptrb(W), ptrb(xh), ptrb(out), i32b(rows), i32b(cols), i32b(npos), i32b(ks),
+		})
+}
+
+// gemmI8TileTok / gemmI8TileRow / gemmI8Block must match DLG_I8_TOK /
+// DLG_I8_ROW / DLG_I8_THREADS in kernels.cu.
+const (
+	gemmI8TileTok = 128
+	gemmI8TileRow = 128
+	gemmI8Block   = 512
+)
+
+// GemmAffine4I8 is the int8 tensor-core form of GemmAffine4F16: same weights,
+// same output layout, but the activation operand is the int8 code stream from
+// QuantizeXQ8 and the accumulate is s8 x s8 -> s32, which is twice the MAC rate
+// of f16 on Ada.
+//
+//	xq   int8 codes   [npos][cols]
+//	sx   group scales [npos][cols/32]
+//	xsum group sums   [npos][cols/32]
+//
+// Every 32-wide k-group is flushed into float accumulators, because the weight
+// scale d, the weight offset m and the activation scale sx are all per-group:
+//
+//	out += C*d*sx + m*xsum
+func GemmAffine4I8(W, xq, sx, xsum, out Buffer, rows, cols, npos int) error {
+	if rows <= 0 || cols <= 0 || npos <= 0 {
+		return nil
+	}
+	if cols%32 != 0 {
+		return fmt.Errorf("cuda: gemm i8 cols %d is not a multiple of 32", cols)
+	}
+	return launchN(kernels.GemmAffine4I8, cdiv(rows, gemmI8TileRow), cdiv(npos, gemmI8TileTok),
+		gemmI8Block, 0, [][]byte{
+			ptrb(W), ptrb(xq), ptrb(sx), ptrb(xsum), ptrb(out),
+			i32b(rows), i32b(cols), i32b(npos),
+		})
 }
 
 // ---------------------------------------------------------------------------

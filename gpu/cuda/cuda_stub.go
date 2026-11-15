@@ -17,6 +17,7 @@ type Kernels struct {
 	AttnSplitV2D2, AttnSplitV2D4                                uint64
 	GemvQ4K, GemvQ6K, GemvF32, GemvF16                           uint64
 	QuantizeXQ8                                                  uint64
+	GemmAffine4I8                                                uint64
 }
 
 var errNoCUDA = errors.New("cuda: backend not built (requires windows + cgo)")
@@ -75,3 +76,8 @@ func GEMVF16(W, x, out Buffer, rows, cols int) error { return errNoCUDA }
 
 // QuantizeXQ8 converts f32 activations to int8 codes plus per-group scale and sum.
 func QuantizeXQ8(x, xq, sx, xsum Buffer, npos, cols int) error { return errNoCUDA }
+
+// GemmAffine4I8 is the int8 tensor-core prefill GEMM.
+func GemmAffine4I8(W, xq, sx, xsum, out Buffer, rows, cols, npos int) error {
+	return errNoCUDA
+}
