@@ -1211,6 +1211,51 @@ __device__ __forceinline__ void dl_affine_part(const unsigned char* __restrict__
     }
 }
 
+// Quantise activations to int8 with one scale per 32 elements, and record the
+// per-group sum of the reconstructed values.
+//
+// Layout: xq[tok*cols + c] int8, sx[tok*ng + g] float scale,
+// xsum[tok*ng + g] float group sum, ng = cols/32.
+//
+// The group sum is what makes an asymmetric 4-bit weight block dot without a
+// separate correction pass. Affine4 reconstructs w = d*q + m with q in [0,15]
+// and q an exact integer, so
+//     out = sum_c x*w = sum_g ( d_g * sum_c q*xq + m_g * sum_c x )
+// and sum_c x within a group is exactly xsum. The second term is the same trick
+// the reference int8 kernels use to fold a fixed -8 zero point, except here the
+// offset m is arbitrary and already sits in the weight block.
+extern "C" __global__ void dl_quantize_x_q8(const float* __restrict__ x,
+                                            signed char* __restrict__ xq,
+                                            float* __restrict__ sx,
+                                            float* __restrict__ xsum,
+                                            int cols) {
+    const int tok = blockIdx.x;
+    const int ng = cols >> 5;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarp = blockDim.x >> 5;
+    const float* xt = x + (size_t)tok * cols;
+    signed char* qt = xq + (size_t)tok * cols;
+
+    for (int g = warp; g < ng; g += nwarp) {
+        const float v = xt[g * 32 + lane];
+        float a = fabsf(v);
+#pragma unroll
+        for (int off = 16; off; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const float s = a * (1.0f / 127.0f);
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        int q = __float2int_rn(v * inv);
+        q = max(-127, min(127, q));
+        qt[g * 32 + lane] = (signed char)q;
+        int sum = q;
+#pragma unroll
+        for (int off = 16; off; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        if (lane == 0) {
+            sx[(size_t)tok * ng + g] = s;
+            xsum[(size_t)tok * ng + g] = s * (float)sum;
+        }
+    }
+}
+
 // f32 -> f16 conversion, used to stage the prefill activation matrix once per
 // GEMM instead of re-converting X for every output tile.
 extern "C" __global__ void dl_f32_to_half(const float* __restrict__ x,

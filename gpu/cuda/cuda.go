@@ -49,6 +49,7 @@ type Kernels struct {
 	F32ToHalf, GemvAffine4, GemvAffine8, GemmAffine4F16, GemmAffine8F16    uint64
 	BatchRMSNorm, BatchAddRMSNorm, BatchRMSNormHeads, BatchRoPE            uint64
 	BatchKVStoreF16, AttnPrefillF16                                        uint64
+	QuantizeXQ8                                                            uint64
 	CopyRegion                                                             uint64
 }
 
@@ -129,6 +130,7 @@ func Init() error {
 			{"dl_batch_rope", &kernels.BatchRoPE},
 			{"dl_batch_kv_store_f16", &kernels.BatchKVStoreF16},
 			{"dl_attn_prefill_f16", &kernels.AttnPrefillF16},
+			{"dl_quantize_x_q8", &kernels.QuantizeXQ8},
 			{"dl_copy_region", &kernels.CopyRegion},
 		} {
 			cn := C.CString(kv.n)
@@ -971,6 +973,30 @@ func AttnPrefillF16(out, q, kCache, vCache Buffer, numHeads, numKVHeads, headDim
 		ptrb(out), ptrb(q), ptrb(kCache), ptrb(vCache),
 		i32b(numHeads), i32b(numKVHeads), i32b(headDim), i32b(kvDim),
 		i32b(startPos), i32b(npos), f32b(scale), f32b(softcap),
+	})
+}
+
+// QuantizeXQ8 converts npos rows of f32 activations into int8 codes plus, per
+// 32-element group, a scale and the group sum of the reconstructed values.
+//
+//	xq[tok*cols+c]   int8 codes
+//	sx[tok*ng+g]     float scale, ng = cols/32
+//	xsum[tok*ng+g]   float sum of that group's reconstructed x
+//
+// The group sum is what an asymmetric 4-bit weight block needs: Affine4 is
+// w = d*q + m with integer q in [0,15], so a group's contribution is
+// d*sum(q*xq) + m*sum(x), and the second term is exactly xsum. That mirrors how
+// the reference int8 kernels fold their fixed -8 zero point, except dlgo's
+// offset is arbitrary and already stored in the weight block.
+func QuantizeXQ8(x, xq, sx, xsum Buffer, npos, cols int) error {
+	if npos <= 0 || cols <= 0 {
+		return nil
+	}
+	if cols%32 != 0 {
+		return fmt.Errorf("cuda: quantize x needs cols%%32==0 (got %d)", cols)
+	}
+	return launch(kernels.QuantizeXQ8, npos, 256, [][]byte{
+		ptrb(x), ptrb(xq), ptrb(sx), ptrb(xsum), i32b(cols),
 	})
 }
 

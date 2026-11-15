@@ -16,6 +16,7 @@ type Kernels struct {
 	AttentionSplitF16, AttentionCombine                          uint64
 	AttnSplitV2D2, AttnSplitV2D4                                uint64
 	GemvQ4K, GemvQ6K, GemvF32, GemvF16                           uint64
+	QuantizeXQ8                                                  uint64
 }
 
 var errNoCUDA = errors.New("cuda: backend not built (requires windows + cgo)")
@@ -71,3 +72,6 @@ func GEMVQ4K(W, x, out Buffer, rows, cols int) error { return errNoCUDA }
 func GEMVQ6K(W, x, out Buffer, rows, cols int) error { return errNoCUDA }
 func GEMVF32(W, x, out Buffer, rows, cols int) error { return errNoCUDA }
 func GEMVF16(W, x, out Buffer, rows, cols int) error { return errNoCUDA }
+
+// QuantizeXQ8 converts f32 activations to int8 codes plus per-group scale and sum.
+func QuantizeXQ8(x, xq, sx, xsum Buffer, npos, cols int) error { return errNoCUDA }
