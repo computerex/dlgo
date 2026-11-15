@@ -1979,7 +1979,14 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	// chunk amortises that read over more tokens. Measured on LFM2.5-24B-A2B at
 	// 1923 prompt tokens: 128 -> 80 tok/s, 512 -> 136, 1024 -> 155, one chunk ->
 	// 178, against 86 for the per-token path. DLGO_PREFILL_CHUNK overrides it.
-	prefillChunkSize := 1024
+	// Qwen3-4B at 16392 prompt tokens, CUDA prefill only: 1024 -> 5,139 ms,
+	// 2048 -> 4,815, 4096 -> 4,744, one chunk -> 4,687. Chunking costs real work
+	// because a chunk's attention walks the whole key range up to its own end, so
+	// split into n chunks the causal key visits are ~(1+2+...+n)/n^2 of the
+	// single-chunk count - 1.9x at n = 4, 8.5x at n = 16 - plus one launch per
+	// class per chunk. 4096 captures nearly all of the win while keeping the batch
+	// buffers (which scale with the chunk) at a quarter of the single-chunk spike.
+	prefillChunkSize := 4096
 	if v := os.Getenv("DLGO_PREFILL_CHUNK"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			prefillChunkSize = n
@@ -1987,8 +1994,24 @@ func (p *GpuPipeline) generateSegments(prompt string, tokenSegs [][]int32, image
 	}
 	batchSize := npos
 	if batchSize > prefillChunkSize {
-		batchSize = prefillChunkSize
+		if npos <= prefillChunkSize*4/3 {
+			// Only just over the cap: take it in one pass. The batch buffers are
+			// the same order either way, and the alternative is a stub chunk that
+			// pays a whole 36-layer launch sequence to process a few tokens.
+			batchSize = npos
+		} else {
+			// Balance the chunks instead of leaving a stub tail (16392 tokens at a
+			// 4096 cap would otherwise end with a 24-token chunk). Balanced
+			// chunking adds no causal attention work: chunk i walks i+1 key
+			// ranges either way.
+			n := (npos + prefillChunkSize - 1) / prefillChunkSize
+			batchSize = (npos + n - 1) / n
+		}
 	}
+
+	// The chunk loops below step by prefillChunkSize while the batch state is
+	// allocated for batchSize rows, so the two must stay equal.
+	prefillChunkSize = batchSize
 
 	if err := p.ensurePrefillBatchState(batchSize); err != nil {
 		return nil, err
