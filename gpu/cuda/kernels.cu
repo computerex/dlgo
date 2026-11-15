@@ -1597,6 +1597,11 @@ extern "C" __global__ void dl_batch_kv_store_f16(const float* __restrict__ kIn,
 #define DLATT_KTOK 32
 #define DLATT_HD   128
 #define DLATT_THREADS 128
+// Padded row stride for the shared K/V tile. 144 halves = 288 bytes = 9 x 32,
+// so every row is still 32-byte aligned (which load_matrix_sync requires) while
+// consecutive rows land on banks 8 apart instead of 0, cutting the ldmatrix
+// conflict from 32-way to 4-way.
+#define DLATT_KPAD (DLATT_HD + 16)
 
 extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                                                const float* __restrict__ q,
@@ -1616,7 +1621,9 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
     const int grp = numHeads / numKVHeads;     // query heads per kv head
     const int kvh = head / grp;
 
-    __shared__ __align__(16) __half sQ[DLATT_QTOK * DLATT_HD];
+    __shared__ __align__(32) __half sQ[DLATT_QTOK * DLATT_HD];
+    __shared__ __align__(32) __half sK[DLATT_KTOK * DLATT_KPAD];
+    __shared__ __align__(32) __half sV[DLATT_KTOK * DLATT_KPAD];
     __shared__ __align__(16) __half sP[4][16 * DLATT_KTOK];
     __shared__ float sS[4][16 * DLATT_KTOK];
     __shared__ float sL[4][16];
@@ -1624,8 +1631,7 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
     const int qBase = warp * 16;               // this warp's first query (tile-local)
     const int qcnt = nq - qBase > 0 ? min(16, nq - qBase) : 0;
 
-    // Stage this tile's queries once for the whole block (f32 -> f16). This is
-    // the kernel's only block-wide barrier.
+    // Stage this tile's queries once for the block (f32 -> f16).
     for (int i = threadIdx.x; i < DLATT_QTOK * DLATT_HD; i += DLATT_THREADS) {
         const int r = i / DLATT_HD, c = i % DLATT_HD;
         sQ[i] = __float2half((r < nq && c < headDim)
@@ -1633,41 +1639,57 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                                  : 0.0f);
     }
     __syncthreads();
-    if (qcnt <= 0) return;
 
     nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> oAcc[DLATT_HD / 16];
 #pragma unroll
     for (int i = 0; i < DLATT_HD / 16; i++) nvcuda::wmma::fill_fragment(oAcc[i], 0.0f);
     float mrun = -INFINITY, lrun = 0.0f;
 
-    // This warp only has to see keys up to its own last query, so it stops at
-    // kEndW rather than the block's end. Causal masking makes the surplus keys
-    // that the block's later warps need irrelevant here.
-    const int kEndW = startPos + q0 + qBase + qcnt - 1;
+    // The whole block walks the key tiles together so the K/V tile can be staged
+    // once and shared by all four warps. Warp 3 owns the highest queries, so the
+    // block's key range is that of its last query; the earlier warps simply mask
+    // the keys beyond their own last query, which costs at most 3 key tiles of
+    // wasted work per 64-query block.
+    //
+    // Why this replaced per-warp K/V loads straight out of the cache: a
+    // load_matrix_sync with a global pointer is not ldmatrix, it expands to a
+    // fistful of scalar loads per fragment (kvDim is the stride, so a 16-key
+    // fragment touches 16 different 256-byte-apart rows). Each warp issued ~24 of
+    // those per key tile against 32 mma, which is why the kernel sat at 17
+    // TFLOP/s of a ~85 TFLOP/s peak. From shared they are one ldmatrix each, and
+    // the global traffic is one vectorised copy per tile per operand for the
+    // whole block rather than four warps' worth of scattered scalar loads.
+    const int kEndBlock = startPos + q0 + nq - 1;
+    const int ntiles = (kEndBlock + DLATT_KTOK) / DLATT_KTOK;
+    for (int kt = 0; kt < ntiles; kt++) {
+        const int k0 = kt * DLATT_KTOK;
 
-    int kDone = 0;                             // keys [0, kDone) already folded in
-    int kStart = 0;
-    for (;;) {
-        int k0 = kStart;
-        if (k0 + DLATT_KTOK > kEndW + 1) {
-            // Round the last tile up to a full DLATT_KTOK by overlapping
-            // backwards instead of reading past the last valid key. The keys it
-            // re-covers are masked below (pos < kDone).
-            k0 = kEndW - (DLATT_KTOK - 1);
-            if (k0 < 0) k0 = 0;
+        // Stage K and V for keys [k0, k0+DLATT_KTOK) as 8-half vectors. Rows past
+        // the block's last query are zero-filled: the cache is only guaranteed to
+        // be readable up to the rounding of the final tile.
+        const int nchunk = DLATT_HD / 8;
+        for (int i = threadIdx.x; i < DLATT_KTOK * nchunk; i += DLATT_THREADS) {
+            const int r = i / nchunk;
+            const int c = (i % nchunk) * 8;
+            const int pos = k0 + r;
+            uint4 kv, vv;
+            kv.x = kv.y = kv.z = kv.w = 0;
+            vv = kv;
+            if (pos <= kEndBlock && c < headDim) {
+                const size_t off = (size_t)pos * kvDim + kvh * headDim + c;
+                kv = *(const uint4*)(kCache + off);
+                vv = *(const uint4*)(vCache + off);
+            }
+            *(uint4*)(sK + r * DLATT_KPAD + c) = kv;
+            *(uint4*)(sV + r * DLATT_KPAD + c) = vv;
         }
-        const size_t kbase = (size_t)k0 * kvDim + kvh * headDim;
+        __syncthreads();
 
-        // --- scores: S[16 queries][32 keys] = Q[warp] . K^T, from the cache ---
+        // --- scores: S[16 queries][32 keys] = Q[warp] . K^T, from shared ---
         {
             nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> sAcc[2];
             nvcuda::wmma::fill_fragment(sAcc[0], 0.0f);
             nvcuda::wmma::fill_fragment(sAcc[1], 0.0f);
-            // DLATT_HD is the compile-time maximum so this unrolls; headDim is a
-            // runtime bound. Full unrolling is what lets the compiler hoist the K
-            // fragment loads of several d-slices before consuming the first one.
-            // Without it each mma waits ~500 cycles for its own load, which is
-            // exactly the 13 TFLOP/s this kernel used to run at.
 #pragma unroll
             for (int d = 0; d < DLATT_HD; d += 16) {
                 if (d >= headDim) break;
@@ -1676,10 +1698,10 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                 nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half,
                                        nvcuda::wmma::col_major> fb[2];
                 nvcuda::wmma::load_matrix_sync(fa, sQ + qBase * DLATT_HD + d, DLATT_HD);
-                // B is K^T: col_major with ldm=kvDim maps (dim, key) to
-                // kCache[key][dim], i.e. the cache's own layout.
-                nvcuda::wmma::load_matrix_sync(fb[0], kCache + kbase + d, kvDim);
-                nvcuda::wmma::load_matrix_sync(fb[1], kCache + kbase + 16 * kvDim + d, kvDim);
+                // B is K^T: col_major with ldm=DLATT_KPAD maps (dim, key) to
+                // sK[key][dim], i.e. the tile's own layout.
+                nvcuda::wmma::load_matrix_sync(fb[0], sK + d, DLATT_KPAD);
+                nvcuda::wmma::load_matrix_sync(fb[1], sK + 16 * DLATT_KPAD + d, DLATT_KPAD);
                 nvcuda::wmma::mma_sync(sAcc[0], fa, fb[0], sAcc[0]);
                 nvcuda::wmma::mma_sync(sAcc[1], fa, fb[1], sAcc[1]);
             }
@@ -1702,17 +1724,12 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                 const int pos = kb + j;
                 float v = srow[j] * scale;
                 if (softcap > 0.0f) v = softcap * tanhf(v / softcap);
-                // pos > p: causally invisible. pos < kDone: already folded into a
-                // previous tile by the backwards overlap of the final tile.
-                if (pos > p || pos < kDone) v = -INFINITY;
+                if (pos > p) v = -INFINITY;
                 srow[j] = v;
                 mx = fmaxf(mx, v);
             }
             mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
             const float mnew = fmaxf(mrun, mx);
-            // __expf: P is stored as f16 (11-bit mantissa) below, so the
-            // approximate exponential costs no accuracy, and the precise expf
-            // expands to ~25 instructions in a loop that runs 16 times per tile.
             const float corr = __expf(mrun - mnew);
             float sum = 0.0f;
 #pragma unroll
@@ -1755,7 +1772,7 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
         }
         __syncwarp();
 
-        // --- O += P[16][32] * V[32][headDim], V fragments from the cache ---
+        // --- O += P[16][32] * V[32][headDim], V fragments from shared ---
         {
             // fa (P) does not depend on d0, so it is loaded once per tile rather
             // than once per 16 output dims.
@@ -1770,17 +1787,13 @@ extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                                        nvcuda::wmma::row_major> fb[2];
                 // Both V loads are issued before either mma consumes one, so the
                 // two 16-key halves overlap instead of serialising.
-                nvcuda::wmma::load_matrix_sync(fb[0], vCache + kbase + d0, kvDim);
-                nvcuda::wmma::load_matrix_sync(fb[1], vCache + kbase + 16 * kvDim + d0, kvDim);
+                nvcuda::wmma::load_matrix_sync(fb[0], sV + d0, DLATT_KPAD);
+                nvcuda::wmma::load_matrix_sync(fb[1], sV + 16 * DLATT_KPAD + d0, DLATT_KPAD);
                 nvcuda::wmma::mma_sync(oAcc[d0 / 16], fa[0], fb[0], oAcc[d0 / 16]);
                 nvcuda::wmma::mma_sync(oAcc[d0 / 16], fa[1], fb[1], oAcc[d0 / 16]);
             }
         }
-
-        kDone = k0 + DLATT_KTOK;
-        if (kDone > kEndW + 1) kDone = kEndW + 1;
-        if (k0 + DLATT_KTOK > kEndW) break;
-        kStart = k0 + DLATT_KTOK;
+        __syncthreads();
     }
 
     // --- epilogue: O/l, written token-major as out[pos][head][dim] ---
