@@ -1879,7 +1879,12 @@ extern "C" __global__ void dl_batch_kv_store_f16(const float* __restrict__ kIn,
 // so every row is still 32-byte aligned (which load_matrix_sync requires) while
 // consecutive rows land on banks 8 apart instead of 0, cutting the ldmatrix
 // conflict from 32-way to 4-way.
-#define DLATT_KPAD (DLATT_HD + 16)
+// Staged row stride in halves. It has to keep the K/V staging 16-byte aligned
+// (so a multiple of 8 halves) and it sets the ldmatrix bank pattern: an ldmatrix
+// touches 8 rows at this stride, and if the stride in 32-bit words is a multiple
+// of 8 the rows alias onto 4 bank groups. 136 halves = 68 words = 4 (mod 32)
+// spreads them over 8 distinct groups.
+#define DLATT_KPAD (DLATT_HD + 8)
 
 extern "C" __global__ void dl_attn_prefill_f16(float* __restrict__ out,
                                                const float* __restrict__ q,
